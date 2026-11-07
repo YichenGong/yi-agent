@@ -3013,6 +3013,137 @@ describe("App mobile repair path", () => {
     expect(screen.queryByRole("button", { name: "重新配对" })).toBeNull();
   });
 
+  it.each(["resolve", "reject"] as const)(
+    "A16 late %s after repair return keeps the old client",
+    async (outcome) => {
+      pairedPhone();
+      const originalRaw = localStorage.getItem("yi-agent.remote")!;
+      let reply: (() => void) | null = null;
+      class FakeSocket {
+        onopen: (() => void) | null = null;
+        onmessage: ((e: { data: unknown }) => void) | null = null;
+        onclose: ((e: { code: number }) => void) | null = null;
+        onerror: unknown = null;
+        constructor() {
+          queueMicrotask(() => this.onopen?.());
+        }
+        send(raw: string) {
+          const frame = JSON.parse(raw) as { id?: number; method?: string };
+          if (frame.method === "initialize") {
+            queueMicrotask(() =>
+              this.onmessage?.({
+                data: JSON.stringify({ jsonrpc: "2.0", id: frame.id, result: {} }),
+              }),
+            );
+          } else if (frame.method === "pair/redeem") {
+            reply = () =>
+              this.onmessage?.({
+                data: JSON.stringify(
+                  outcome === "resolve"
+                    ? {
+                        jsonrpc: "2.0",
+                        id: frame.id,
+                        result: { device_id: "dev-2", token: "yia_late", scope: "control" },
+                      }
+                    : {
+                        jsonrpc: "2.0",
+                        id: frame.id,
+                        error: { code: -32001, message: "invalid or expired pairing code" },
+                      },
+                ),
+              });
+          }
+        }
+        close() {}
+      }
+      vi.stubGlobal("WebSocket", FakeSocket);
+      try {
+        render(<App />);
+        await settle();
+        expect(clients.length).toBe(1);
+        fireEvent.click(screen.getByRole("button", { name: "重新配对" }));
+        fireEvent.change(screen.getByLabelText("配对码"), {
+          target: { value: "ABCD-EFGH" },
+        });
+        fireEvent.click(screen.getByRole("button", { name: "配对" }));
+        await settle();
+        expect(reply).toBeTypeOf("function");
+        expect(screen.getByRole("status", { name: "配对进度" })).toBeTruthy();
+
+        fireEvent.click(screen.getByRole("button", { name: "返回" }));
+        await settle();
+        act(() => {
+          reply!();
+        });
+        await settle();
+
+        expect(localStorage.getItem("yi-agent.remote")).toBe(originalRaw);
+        expect(clients.length).toBe(1);
+        expect(screen.queryByRole("form", { name: "配对" })).toBeNull();
+        expect(screen.queryByText("app render failed")).toBeNull();
+      } finally {
+        cleanup();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it("A13 invalid code while still on the repair page keeps the old config", async () => {
+    pairedPhone();
+    const originalRaw = localStorage.getItem("yi-agent.remote")!;
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((e: { data: unknown }) => void) | null = null;
+      onclose: ((e: { code: number }) => void) | null = null;
+      onerror: unknown = null;
+      constructor() {
+        queueMicrotask(() => this.onopen?.());
+      }
+      send(raw: string) {
+        const frame = JSON.parse(raw) as { id?: number; method?: string };
+        if (frame.method === "initialize") {
+          queueMicrotask(() =>
+            this.onmessage?.({
+              data: JSON.stringify({ jsonrpc: "2.0", id: frame.id, result: {} }),
+            }),
+          );
+        } else if (frame.method === "pair/redeem") {
+          queueMicrotask(() =>
+            this.onmessage?.({
+              data: JSON.stringify({
+                jsonrpc: "2.0",
+                id: frame.id,
+                error: { code: -32001, message: "invalid or expired pairing code" },
+              }),
+            }),
+          );
+        }
+      }
+      close() {}
+    }
+    vi.stubGlobal("WebSocket", FakeSocket);
+    try {
+      render(<App />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "重新配对" }));
+      fireEvent.change(screen.getByLabelText("配对码"), {
+        target: { value: "BAD-CODE" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "配对" }));
+      await settle();
+      await settle();
+
+      expect(screen.getByRole("alert").textContent).toBe(
+        "配对码无效或已过期，请在桌面重新生成",
+      );
+      expect(screen.queryByRole("status", { name: "配对进度" })).toBeNull();
+      expect(localStorage.getItem("yi-agent.remote")).toBe(originalRaw);
+      expect(clients.length).toBe(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("drops A's sessions from memory after re-pairing to B", async () => {
     class FakeSocket {
       onopen: (() => void) | null = null;
