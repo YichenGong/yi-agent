@@ -69,6 +69,9 @@ control socket under sun_path」（2026-11-07 20:05）。它给 `lifecycle::scop
 | 2 | guardian | `<runtime_dir>/guardian-control.sock` | `$TMPDIR/guardian-<hash>.sock` | 是（<103） |
 | 3 | 插件查询 | `{state_dir}/<plugin>.sock` | `$TMPDIR/plugin-<hash>.sock` | 是（<103） |
 
+本期对第 1、2 类：路径改到 `<instance_home>/sockets/<hash>/`，**并删掉 `$TMPDIR`
+兜底**（理由见 §3.2）——新布局下它不该再被触发。第 3 类一期不动。
+
 三者都有兜底了，所以「挂掉」不再是症状；剩下的症状是 §1.2 那四条。本期把 #1 #2
 统一到恒定路径，#3 保持现状（理由见 §7）。
 
@@ -172,31 +175,40 @@ pub fn daemon_socket(runtime_dir: &Path, instance_home: &Path) -> PathBuf;
 
 ### 3.2 长度兜底
 
-`<instance_home>` 本身也可能被指到深路径（例如容器里把 `HOME` 挂到很深的位置）。
-保留二级兜底，顺序为：
+`<instance_home>` 本身理论上也可能被指到深路径，但**本期去掉 `$TMPDIR` 兜底**，
+只保留「放不下就报明确错误」这一条：
 
-1. `socket_directory(...)` 下的路径能放下 → 用它（正常路径，永远走这条）。
-2. 放不下 → `$TMPDIR/<prefix>-<sha256(runtime_dir)[..16]>.sock`。
-3. 仍放不下 → 返回明确错误，由调用方转成可读提示。
-
-**兜底文件名必须带 socket 种类前缀，不能共用一套名字。** 现有实现已经如此，实施时
-照抄，不要为了"统一"把两者合并：
-
-| socket | 兜底文件名 | 现有出处 |
+| `instance_home` | guardian socket 长度 | |
 |---|---|---|
-| guardian | `guardian-<hash>.sock` | `scope.rs:210` |
-| 业务 daemon | `yi-agent-<hash>.sock` | `store/ipc/client.rs:97` |
+| `/Users/<user>/.yi-agent`（27） | 74 | OK，余量 29 |
+| `/root/.yi-agent`（15） | 62 | OK，余量 41 |
+| `/home/<user>/.yi-agent`（19） | 66 | OK，余量 37 |
 
-若两层都触发却共用 `yi-agent-<hash>.sock`，guardian 与 daemon 会争同一个
-`$TMPDIR` 文件，后 bind 的拿到 `AddrInUse`——而且只在兜底路径上出现，正常路径
-永远测不到。这是本轮评审专门查出来的坑。
+上限推算：`instance_home` 可以长到 **56 字节**才触顶，这已经覆盖了正常机器和容器的
+所有情况。
 
-第 2 步保留是为了不引入新的失败模式，但正常情况下永远走不到——写进 spec 是为了
-让后来者知道它存在的原因，而不是当成主路径。
+去掉的理由：
+
+1. **兜底本身是个新的失败面。** 它把「路径太长」从一处（项目目录)搬到一个谁都不
+   预期的地方，且只在异常输入下才走到，测试覆盖天然薄弱。
+2. **`$TMPDIR` 是可被系统回收的目录。** 这正是 §1.2 要摆脱的性质；把它留成兜底，
+   等于保留一条「socket 落在会被清理的地方」的路径。
+3. **去掉它才能删掉 `socket_file_name`。** 该函数（`client.rs:94`）唯一的用途就是
+   生成兜底文件名，而它直接哈希原始入参、不做规范化（§3.1 的 `/var` 隐患）。
+   删掉它比修它更彻底。
+4. **一人一套实例目录时不会触发。** `YI_AGENT_HOME` 是为隔离实例而设的开关
+   （见项目打包流程），它的值由用户显式给出，不该是深路径。
+
+行为：超限时 `control_socket` 返回 `SocketPathTooLong`，`socket_path_for` 返回
+`IpcError::SocketPathTooLong`（两者都已存在），由 bring-up 转成 §4 的可读提示。
 
 现成的错误类型不要重复造：`scope::control_socket(runtime_dir)`（`scope.rs:216`）
-已经实现了"返回路径，超限则给 `SocketPathTooLong`"。guardian 侧应继续走它，
-只把内部的路径计算换掉。
+已经实现了「返回路径，超限则给 `SocketPathTooLong`」。guardian 侧继续走它，只把
+内部的路径计算换掉；`socket_path_for`（`client.rs:74`）同理。
+
+**注意**：去掉兜底会让 §6.1 里那条 `a_long_runtime_directory_yields_a_socket_that_fits_the_platform_limit`
+彻底失效——它断言长路径**能**解析出可用 socket。新语义是「长路径无所谓，因为
+socket 不再在项目里」，所以这条用例要改写而不是删除，见 §6.1。
 
 ### 3.3 调用点：只有一个 choke point，不需要改签名
 
@@ -242,20 +254,23 @@ canonicalize，但 §3.1 已把规范化放进 `socket_directory` 内部，所�
 额外处理——这正是把规范化放函数内而不是放调用方的理由。
 
 `instance_home()` 返回 `None`（既无 `YI_AGENT_HOME` 也无 `HOME`）时不能直接报错——
-那是原先能工作的场景。回退顺序：`$TMPDIR` 规则 → 明确错误。
+那是原先能工作的场景。既然 `$TMPDIR` 兜底一并去掉，这里改为返回
+`IpcError::SocketPathTooLong` 之外的独立错误（`instance home unavailable`），
+而不是悄悄落回临时目录。实测这个分支在正常环境不可达，只为不 panic。
 
 可行性已核对：`store` 已有 `paths::instance_home()`（`paths.rs:20`），且 `store` 已
 依赖 `lifecycle`（`Cargo.toml:14`）——不新增依赖边。
 
-**同时收口现有哈希隐患**：`socket_file_name`（`client.rs:94`）直接哈希原始入参，
-在 `/var` vs `/private/var` 下会产生两个 `$TMPDIR` 文件名。新的分层里它只作为
-§3.2 的第 2 级兜底，仍应改用规范化后的路径取哈希，避免兜底路径本身不稳定。
+**`socket_file_name` 直接删除**。它（`client.rs:94`）唯一的用途是生成 `$TMPDIR`
+兜底文件名，§3.2 去掉兜底后没有调用者。它本身还有不规范的哈希（直接哈希原始入参，
+在 `/var` vs `/private/var` 下给出两个名字），删掉比修它干净。`socket_path_for` 里
+引用它的两行（`:79`、`:94`）一并去掉。
 
-### 3.4.1 测试隔离：这是本设计最大的落地风险
+### 3.4.1 测试侧影响
 
-`socket_path_for` 改用 `instance_home()` 之后，socket 路径**不再随 `runtime_dir`
-变化**，只随 `runtime_dir` 的哈希变化。而仓里有 130 处 `Daemon::start` 调用，绝大多数
-传的是 `TempDir`：
+`socket_path_for` 改用 `instance_home()` 之后，socket 路径**不再跟随 `runtime_dir`
+的父目录**，只跟它的哈希有关。仓里 130 处 `Daemon::start` 调用绝大多数传
+`TempDir::new().unwrap().path().join("runtime")`：
 
 ```rust
 let directory = TempDir::new().unwrap();
@@ -263,26 +278,31 @@ let runtime = directory.path().join("runtime");
 let daemon = Daemon::start(&runtime, &database).unwrap();
 ```
 
-改造后这些 socket 会全部落进**开发者真实的 `~/.yi-agent/sockets/<hash>/`**，产生两个
-后果：
+改布局后，这些 socket 会落进**开发者真实的 `~/.yi-agent/sockets/<hash>/`**
+（`YI_AGENT_HOME` 未设置时）。实际后果，按严重度排列：
 
-1. **污染本机**：每跑一次 `cargo test` 就往 `~/.yi-agent/sockets/` 里塞几十个目录，
-   且 `runtime.sock` 留在那里不会被 TempDir 回收。
-2. **并行测试互踩**：`TempDir` 保证 runtime_dir 唯一，所以哈希也唯一——这一点是安全的。
-   但**凡是不用 TempDir、而是共用同一个写死路径的用例**，现在会争同一个 socket 文件，
-   表现成随机的 `AddrInUse`。`ipc/client.rs:379` 的 `LONG_RUNTIME_DIR` 就是写死的。
+1. **残留空目录（一定会发生）。** `TempDir` 删掉的是项目侧目录，删不到
+   `~/.yi-agent/sockets/<hash>/`。daemon 退出时会 unlink socket 文件
+   （`remove_socket_if_same_inode`，`daemon.rs:526`），但**不会删目录**。所以跑
+   一次 `just test` 会在 `~/.yi-agent/sockets/` 留下几十上百个空目录。
+   — 无害，但会让人误以为有泄漏。**处理：在 `Daemon::start` 的退出路径里，若
+   socket 目录为空则尝试 `remove_dir`，失败忽略。** 这一条不改测试写法，改实现。
+2. **写死路径的用例会互相踩（只影响少数）。** `TempDir` 保证 runtime_dir 唯一，
+   所以哈希唯一、socket 唯一——这类用例是安全的。真正有风险的是拿**同一个写死
+   字符串**作 runtime_dir 的用例：它们现在争同一个 socket 文件。实测只有
+   `ipc/client.rs:379` 的 `LONG_RUNTIME_DIR` 是写死的，而它只被 `socket_path_for`
+   的**纯函数**测试使用，不 bind，所以当前零冲突。
+   — **处理：不需要引入 `instance_home` 注入参数。** 只要守住「测试不 bind 写死
+   路径」这条现状即可。
+3. **`std::env::set_var` 不能用来做隔离。** edition 2024 下它是 `unsafe`，且
+   `runtime_ipc.rs` 的用例在进程内并行跑。`maintenance_ipc.rs:33` 已经用全局
+   `Mutex` + `unsafe set_var` 做过这件事，不要再复制这种写法到别处。
 
-实施时必须先解决隔离，不能等测试红了再补：
+**结论：不做「给 `Daemon::start` 加 `instance_home` 参数」的改造。** 早先版本的
+spec 提出过这个方案，但它把生产签名为了测试而变复杂，而实际问题只有第 1 条
+（空目录残留），改实现即可解决。
 
-- 方案：给 store 侧加一个测试专用的 `instance_home` 覆盖入口（环境变量或参数），
-  并让所有 `Daemon::start` 测试在 `TempDir` 内指定它。**但这需要一个不依赖进程级
-  环境变量的入口**——`std::env::set_var` 在多线程测试里不安全（Rust 2024 已标
-  `unsafe`），而 `runtime_ipc.rs` 的用例是并行跑的。
-- 因此在 `socket_path_for` 旁提供 `socket_path_for_in(runtime_dir, instance_home)`，
-  `Daemon::start` 增加带 `instance_home` 的构造入口供测试用；生产路径仍走
-  `socket_path_for`。
-
-这一条如果被忽略，`just test` 会在改布局后大面积红，而失败原因是测试写法而不是实现。
+验收方式见 §5 第 10 条：跑完测试后 `~/.yi-agent/sockets/` 不应留下新目录。
 
 ### 3.5 目录创建与权限
 
@@ -331,8 +351,8 @@ let daemon = Daemon::start(&runtime, &database).unwrap();
 | 场景 | 行为 |
 |---|---|
 | `socket_directory` 能放下（正常） | 无错误 |
-| `instance_home` 过深 → `$TMPDIR` 兜底 | 正常启动，仅 trace 一条 info |
-| 连 `$TMPDIR` 都超限 | guardian 侧沿用 `control_socket` 返回 `SocketPathTooLong`，由 bring-up 转成可读拒绝 |
+| `instance_home` 使得路径超限（>56 字节） | `control_socket` / `socket_path_for` 返回 `SocketPathTooLong`，由 bring-up 转成可读拒绝 |
+| `instance_home()` 返回 `None` | 返回独立错误，不落回临时目录 |
 
 第 3 行的用户可见文案（替换现有的 30 秒超时弹窗）：
 
@@ -358,8 +378,8 @@ let daemon = Daemon::start(&runtime, &database).unwrap();
    `admission`、`thread_root`、`frontend_lease` 五处算出的路径两两相等。
    把任一处改回 `runtime_dir.join(...)` 即红。
 4. **项目隔离**：两个不同 runtime_dir 得到不同 `socket_directory`。
-5. **兜底链**：把 `instance_home` 指到超长路径，断言落到 `$TMPDIR` 规则；再把
-   `$TMPDIR` 也指到超长，断言返回明确错误而非 panic。
+5. **超限失败**：把 `instance_home` 指到 57 字节以上，断言返回 `SocketPathTooLong`
+   而非 panic、也**不**落回 `$TMPDIR`。去掉兜底后，这条是「不静默降级」的钉子。
 6. **规范化等价（`/var` 陷阱）**：对同一目录的 `/var/...` 与 `/private/var/...` 两种
    拼法，断言 `socket_directory` 返回相同结果。把 §3.1 里的
    `canonicalize_allowing_missing` 去掉即红——这条是本轮评审新增，没有它，
@@ -372,11 +392,11 @@ let daemon = Daemon::start(&runtime, &database).unwrap();
 8. **目录自动创建**：`sockets/<hash>/` 不存在时，`bind_control` 与 daemon 启动都能
    自己建出来并 bind 成功。删掉 §3.5 要求的 `create_dir_all` 即红——这条是"新布局
    比旧故障更糟"的防线。
-9. **错误文案**：`YI_AGENT_HOME` 与 `$TMPDIR` 都超限时，断言错误信息含
-   `YI_AGENT_HOME` 且**不含**"重启"、"更短的路径"。这条直接钉住 §4 的表述。
-10. **测试不污染本机**：跑完 `cargo test -p yi-agent-store` 后，断言
-    `~/.yi-agent/sockets/` 下没有新增目录。这条防的是 §3.4.1——它不会自己报错，
-    只会悄悄往开发者 home 里写。
+9. **错误文案**：`instance_home` 超限时，断言错误信息含 `YI_AGENT_HOME` 且**不含**
+   "重启"。这条直接钉住 §4 的表述。
+10. **测试不留垃圾**：跑完 `cargo test -p yi-agent-store` 后，断言
+    `~/.yi-agent/sockets/` 下没有新增**空目录**。这条防的是 §3.4.1 第 1 条——
+    它不会让任何测试变红，只会悄悄往开发者 home 里堆目录。
 11. **真机验收**：本项目启动后 socket 出现在 `~/.yi-agent/sockets/<hash>/`，
     `/agents` 可用。
 
@@ -398,7 +418,7 @@ let daemon = Daemon::start(&runtime, &database).unwrap();
 | 用例 | 现在的断言 | 改布局后 |
 |---|---|---|
 | `store/src/ipc/client.rs:382` `a_short_runtime_directory_keeps_the_socket_inside_it` | 短路径仍在 `runtime_dir` 内 | **语义反转**：改为断言恒在 `sockets/<hash>/` 下，与路径长短无关 |
-| `store/src/ipc/client.rs:394` `a_long_runtime_directory_yields_a_socket_that_fits_the_platform_limit` | 长路径回退到 `$TMPDIR` | 改为断言 ≤ 上限且落在 socket 目录（不再是 `$TMPDIR`） |
+| `store/src/ipc/client.rs:394` `a_long_runtime_directory_yields_a_socket_that_fits_the_platform_limit` | 长路径回退到 `$TMPDIR`，仍可用 | **语义反转**：删掉兜底后长路径不再有特殊处理，改为断言「无论 runtime_dir 多长，socket 都在 `sockets/<hash>/`」 |
 | `store/tests/runtime_ipc.rs:2981` | `!runtime.join("runtime.sock").exists()` | 位置变了，断言需指向新路径；该断言的本意是「socket 已清理」，不要改成空断言 |
 | `supervisors/tests/managed_bringup.rs:217` | `control_path.ends_with("guardian-control.sock")` | 文件名不变，应仍然绿——若红说明实现偏了 |
 
@@ -428,7 +448,7 @@ let daemon = Daemon::start(&runtime, &database).unwrap();
 - [ ] `bind_control` 与 daemon 在 bind 前创建 `sockets/<hash>/` 并设 0700
 - [ ] §6.1 列出的 4 个既有用例已逐条确认语义（不是简单改成能过）
 - [ ] §5 十一条测试全绿，且每条都做过「回退即红」验证
-- [ ] §3.4.1 测试隔离已落地，`cargo test -p yi-agent-store` 不写真实 `~/.yi-agent`
+- [ ] §3.4.1 已处理：daemon 退出时清空 `sockets/<hash>/`，测试不留空目录
 - [ ] 本项目真机启动：socket 出现在 `~/.yi-agent/sockets/<hash>/`，`/agents` 可用
 - [ ] `just ci` 全绿
 
