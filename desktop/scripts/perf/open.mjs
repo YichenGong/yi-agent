@@ -59,6 +59,11 @@ const remarkGfm = (await import("remark-gfm")).default;
 const rehypeHighlight = (await import("rehype-highlight")).default;
 const h = React.createElement;
 
+// Reuse the production window rule. Writing a copy of the paging logic here
+// would measure an algorithm that is not the one that ships, and any number it
+// produced would be meaningless.
+const { nextWindow, DEFAULT_LIMITS } = await import("../../src/lib/transcriptWindow.ts");
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DESKTOP = resolve(HERE, "../..");
 
@@ -190,15 +195,23 @@ const ChatItem = React.memo(
 );
 
 /**
- * Mirrors `ChatView`: a history prefix of `count` items plus a separately
- * mounted live tail. `limit` is the *windowed* variant — when set, only the
- * last `limit` items are mounted, which is what the design proposes.
+ * Mirrors `ChatView`: a history range plus a separately mounted live tail.
+ *
+ * Two ways to select the range, because the windowed case is not always
+ * anchored to the tail:
+ * - `limit`: mount the last N items (the cold-open case).
+ * - `win`: mount `[win.start, win.end)`, which is what paging up produces —
+ *   once the user leaves the tail, `end` stops tracking `itemCount` and the
+ *   range is no longer "the last N". Modelling it as a limit would silently
+ *   over-mount and inflate both the node count and the time.
  */
-function View({ items, limit }) {
-  const start = limit == null ? 0 : Math.max(0, items.length - limit);
+function View({ items, limit, win }) {
+  const start = win ? win.start : limit == null ? 0 : Math.max(0, items.length - limit);
+  const end = win ? win.end : items.length;
+  // The final item is always rendered separately as the live tail.
   const count = items.length - 1;
   const rows = [];
-  for (let i = start; i < count; i += 1) {
+  for (let i = start; i < Math.min(count, end); i += 1) {
     rows.push(h(ChatItem, { key: items[i].id, item: items[i] }));
   }
   const tail = items[items.length - 1];
@@ -289,6 +302,62 @@ async function renderPaged(items, chunks, label) {
   return ms;
 }
 
+/**
+ * Windowed open, then page up the way a user would: start at the tail (60
+ * items), and each time the viewport sits at the top of the mounted range,
+ * ask the production `nextWindow` for the next page, until the mounted count
+ * hits `maxMounted`. This measures the real cold-open-then-scroll-up path
+ * rather than an idealized constant window.
+ */
+async function renderWindowed(items, label) {
+  const el = document.createElement("div");
+  document.body.appendChild(el);
+  const root = createRoot(el);
+  const itemCount = items.length;
+  const t0 = process.hrtime.bigint();
+
+  let win = nextWindow({ current: null, itemCount, limits: DEFAULT_LIMITS, visible: null });
+  // Render the real range, not "the last N": after paging, `end` no longer
+  // tracks `itemCount`, and collapsing that to a trailing limit would mount
+  // more rows than the algorithm actually asks for.
+  const draw = () => {
+    root.render(h(View, { items, win }));
+  };
+  draw();
+  await new Promise((r) => setTimeout(r, 0));
+
+  let frames = 1;
+  let maxMountedSeen = win.end - win.start;
+  // Sit at the top edge: gapTopPx 0 means the first mounted row is flush with
+  // the viewport top, and the bottom edge is far below (negative gap).
+  while (win.start > 0) {
+    const next = nextWindow({
+      current: win,
+      itemCount,
+      limits: DEFAULT_LIMITS,
+      visible: { first: win.start, last: win.start + 10, gapTopPx: 0, gapBottomPx: -5000 },
+    });
+    if (next.start === win.start && next.end === win.end) break; // no progress
+    win = next;
+    draw();
+    await new Promise((r) => setTimeout(r, 0));
+    frames += 1;
+    maxMountedSeen = Math.max(maxMountedSeen, win.end - win.start);
+    if (win.end - win.start >= DEFAULT_LIMITS.maxMounted) break;
+  }
+
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  console.log(
+    `${label.padEnd(46)} ${ms.toFixed(0).padStart(6)} ms   ` +
+      `frames=${String(frames).padStart(4)}  mounted=${String(
+        el.querySelectorAll("[data-item-id]").length,
+      ).padStart(5)}  cap=${maxMountedSeen}`,
+  );
+  root.unmount();
+  el.remove();
+  return ms;
+}
+
 // ---------------------------------------------------------------------------
 
 const logPath = pickLog(process.argv[2]);
@@ -317,5 +386,6 @@ console.log("");
 await renderOnce(items, 60, "proposed: window = last 60");
 await renderOnce(items, 400, "proposed: window = last 400 (unload cap)");
 await renderOnce(items, 30, "reference: window = last 30");
+await renderWindowed(items, "proposed: windowed open + page up till cap");
 console.log("");
 console.log("Reminder: jsdom, not WKWebView. Ratios transfer, absolute ms do not.");
