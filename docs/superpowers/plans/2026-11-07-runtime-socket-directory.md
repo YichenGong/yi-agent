@@ -51,7 +51,7 @@
   - `pub fn daemon_socket(runtime_dir: &Path, instance_home: &Path) -> PathBuf`
   - `const DAEMON_SOCKET_FILE: &str = "runtime.sock";`（`pub`）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `crates/yi-agent-lifecycle/src/scope.rs` 的 `mod tests` 内追加：
 
@@ -130,7 +130,7 @@
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib scope::tests
@@ -138,7 +138,7 @@ cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib scope::tests
 
 Expected: 编译失败，`cannot find function socket_directory in this scope`（以及 `guardian_socket` / `daemon_socket` / `DAEMON_SOCKET_FILE`）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 在 `crates/yi-agent-lifecycle/src/scope.rs` 里，把 `MAX_SOCKET_PATH_BYTES` 常量之后插入：
 
@@ -186,7 +186,7 @@ fn canonical_or_self(path: &Path) -> PathBuf {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib scope::tests
@@ -194,7 +194,7 @@ cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib scope::tests
 
 Expected: PASS（4 个新用例 + 原有用例全绿）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && git add crates/yi-agent-lifecycle/src/scope.rs
@@ -215,7 +215,7 @@ git commit -m "feat(lifecycle): derive sockets from a depth-independent director
 
 **背景（必读）：** `store::paths::instance_home()`（`paths.rs:20`）在 `YI_AGENT_HOME=/foo` 时返回 `/foo/.yi-agent`（自动补 `.yi-agent` 后缀）。`lifecycle` 不依赖 `store`，所以这段归一化必须在这里复刻一遍，语义逐字一致，否则两侧算出不同目录。`store` 侧的对应测试在 `paths.rs` 的 `mod tests`（`a_bare_override_gains_the_dot_yi_agent_suffix` 等），可对照阅读。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
     #[test]
@@ -251,7 +251,7 @@ git commit -m "feat(lifecycle): derive sockets from a depth-independent director
 
 （`instance_home_from_env` 先做成可注入的纯函数，再让 `instance_home_for_sockets` 包一层真实 env —— 这样测试不需要 `set_var`，也就没有 edition 2024 的 `unsafe` 与并发问题。）
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib scope::tests
@@ -259,7 +259,7 @@ cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib scope::tests
 
 Expected: 编译失败，`cannot find function instance_home_from_env`。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 ```rust
 /// The instance home a socket path should be derived from.
@@ -310,7 +310,7 @@ pub fn instance_home_from_env(
 
 同时把 `use std::path::{Component, Path, PathBuf};` 附近补上 `use std::ffi::OsStr;`。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib scope::tests
@@ -318,7 +318,7 @@ cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib scope::tests
 
 Expected: PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && git add crates/yi-agent-lifecycle/src/scope.rs
@@ -338,7 +338,7 @@ git commit -m "feat(lifecycle): resolve the instance home for socket paths"
 - Consumes: Task 1 的 `guardian_socket`，Task 2 的 `instance_home_for_sockets`。
 - Produces: 签名不变的 `pub fn control_path(runtime_dir: &Path) -> PathBuf`、`pub fn control_socket(runtime_dir: &Path) -> Result<PathBuf, SocketPathTooLong>`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 把 `scope.rs` 的 `mod tests` 里这三条**替换**掉（它们断言的是旧布局）：
 
@@ -412,7 +412,7 @@ git commit -m "feat(lifecycle): resolve the instance home for socket paths"
 
 （`control_path_with_home` / `control_socket_with_home` 是 `#[cfg(test)]` 的薄封装，见 Step 3。）
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib scope::tests
@@ -420,7 +420,7 @@ cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib scope::tests
 
 Expected: 编译失败，`cannot find function control_path_with_home`。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 把 `control_path` 与 `control_socket` 整段（含文档注释）替换为：
 
@@ -519,7 +519,7 @@ impl std::fmt::Display for SocketPathTooLong {
 /// longer contributes, so this reports the one input a user can actually change.
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib
@@ -527,7 +527,7 @@ cd yi-agent-rs && cargo test -p yi-agent-lifecycle --lib
 
 Expected: PASS。若 `a_short_runtime_directory_keeps_the_control_socket_inside_it` 仍残留，会红 —— 那是本步骤要替换掉的那条，确认已删除。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && git add crates/yi-agent-lifecycle/src/scope.rs
@@ -547,7 +547,7 @@ git commit -m "refactor(lifecycle): derive the control socket from the instance 
 - Consumes: `yi_agent_lifecycle::scope::{daemon_socket, instance_home_for_sockets}`（Task 1、2）。
 - Produces: 签名不变的 `pub fn socket_path_for(runtime_dir: &Path) -> Result<PathBuf, IpcError>`；新增 `IpcError::InstanceHomeUnavailable`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `crates/yi-agent-store/src/ipc/client.rs` 的 `mod tests` 里，**替换**这两条（旧布局语义已失效）：
 
@@ -593,7 +593,7 @@ git commit -m "refactor(lifecycle): derive the control socket from the instance 
 
 并**删除** `the_fallback_is_deterministic_for_one_runtime_directory` 里对 fallback 措辞的引用（断言本身保留：同一 runtime 两次解析相等，仍然成立）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --lib ipc::client::tests
@@ -601,7 +601,7 @@ cd yi-agent-rs && cargo test -p yi-agent-store --lib ipc::client::tests
 
 Expected: 失败，`assertion failed: socket.to_string_lossy().contains("/sockets/")`（当前实现仍返回 `<runtime_dir>/runtime.sock`）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 把 `client.rs:64-99`（`socket_path_for` 与 `socket_file_name`）整体替换为：
 
@@ -651,7 +651,7 @@ pub fn socket_path_for(runtime_dir: &Path) -> Result<PathBuf, IpcError> {
     SocketPathTooLong { path: String, limit: usize },
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --lib
@@ -659,7 +659,7 @@ cd yi-agent-rs && cargo test -p yi-agent-store --lib
 
 Expected: PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && git add crates/yi-agent-store/src/ipc/client.rs crates/yi-agent-store/src/ipc/error.rs
@@ -679,7 +679,7 @@ git commit -m "refactor(store): move the daemon socket under the instance home"
 - Consumes: `socket_path_for`（Task 4）。
 - Produces: 无新公开接口；行为变更：`sockets/<hash>/` 自动创建为 `0700`，退出时若为空则删除。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `crates/yi-agent-store/tests/runtime_ipc.rs` 追加（与既有用例风格一致，用 `TempDir`）：
 
@@ -726,7 +726,7 @@ fn the_socket_directory_is_removed_on_shutdown_when_empty() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_ipc the_socket_directory
@@ -734,7 +734,7 @@ cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_ipc the_socket_dir
 
 Expected: 第一条约 0o755 而非 0o700 或目录不存在（取决于 umask）；第二条目录仍存在。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `crates/yi-agent-store/src/ipc/daemon.rs` 的 `start` 里，紧接原有的
 `let socket_path = socket_path_for(runtime_dir)?;`（`:297`）之后插入下面这段
@@ -763,7 +763,7 @@ Expected: 第一条约 0o755 而非 0o700 或目录不存在（取决于 umask�
             }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --test runtime_ipc
@@ -773,7 +773,7 @@ Expected: PASS（含新加两条与既有全部用例）。
 
 若既有用例 `a_daemon_stops_once_its_runtime_directory_is_gone`（`:2893`）或 `:2981` 的 `!runtime.join("runtime.sock").exists()` 变红，说明断言指向旧路径——把它们改成 `!daemon_socket(...)` 的等价断言（`runtime.sock` 现在不在 `runtime` 里，该断言恒真，改成对 `socket_path()` 的断言才有意义）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && git add crates/yi-agent-store/src/ipc/daemon.rs crates/yi-agent-store/tests/runtime_ipc.rs
@@ -791,7 +791,7 @@ git commit -m "feat(store): create and reap the daemon socket directory"
 - Consumes: `lifecycle::scope::{guardian_socket, MAX_SOCKET_PATH_BYTES}`（Task 1），`RuntimeScope.instance_home`（已有）。
 - Produces: 无签名变更；`bind_control` 不再经过 `control_path`、不读环境变量。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `crates/yi-agent-supervisors/tests/managed_bringup.rs` 追加：
 
@@ -822,7 +822,7 @@ fn the_guardian_binds_under_the_scope_instance_home() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-supervisors --test managed_bringup the_guardian_binds
@@ -830,7 +830,7 @@ cd yi-agent-rs && cargo test -p yi-agent-supervisors --test managed_bringup the_
 
 Expected: 失败——`expected` 的父目录 `sockets/<hash>/` 不存在，`bind` 报 `No such file or directory`（这正是 spec §3.7 指出的「新布局比旧故障更糟」的风险点）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 把 `bind_control` 的开头（`use std::os::unix::fs::FileTypeExt;` 到 `std::fs::create_dir_all(&self.scope.runtime_dir)?;`）改为：
 
@@ -868,7 +868,7 @@ Expected: 失败——`expected` 的父目录 `sockets/<hash>/` 不存在，`bin
         }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-supervisors
@@ -876,7 +876,7 @@ cd yi-agent-rs && cargo test -p yi-agent-supervisors
 
 Expected: PASS，含 `managed_bringup.rs:217` 的既有断言（文件名不变，应仍绿）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && git add crates/yi-agent-supervisors/src/lifecycle/guardian.rs crates/yi-agent-supervisors/tests/managed_bringup.rs
@@ -895,7 +895,7 @@ git commit -m "feat(supervisors): bind the control socket under the instance hom
 - Consumes: `lifecycle::scope::daemon_socket`（Task 1）、`store::paths`/`lifecycle::scope::instance_home_for_sockets`（Task 2）。
 - Produces: `attach_to_answer` 不再丢弃参数；`attach_managed_project_runtime` 传 `Some(instance_home)`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `attach.rs` 的 `mod tests` 里加（若该模块尚无 `mod tests`，在文件末尾新建）：
 
@@ -918,7 +918,7 @@ git commit -m "feat(supervisors): bind the control socket under the instance hom
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-subagent --lib attach::tests
@@ -926,7 +926,7 @@ cd yi-agent-rs && cargo test -p yi-agent-subagent --lib attach::tests
 
 Expected: 编译失败，`cannot find function attach_socket_path`。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 在 `attach.rs`（`attach_to_answer` 之前）加一个小函数，作为唯一的路径决策点：
 
@@ -970,7 +970,7 @@ fn attach_socket_path(
 
 把 `attach_managed_project_runtime`（`:1371`）里传的 `None` 改成 `Some(instance_home)`。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-subagent
@@ -978,7 +978,7 @@ cd yi-agent-rs && cargo test -p yi-agent-subagent
 
 Expected: PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && git add crates/yi-agent-subagent/src/attach.rs
@@ -997,7 +997,7 @@ git commit -m "fix(subagent): use the instance home the attach already carries"
 - Consumes: Task 2 的 `instance_home_for_sockets` / `instance_home_from_env`。
 - Produces: 无新接口，只加断言。
 
-- [ ] **Step 1: 写测试**
+- [x] **Step 1: 写测试**
 
 `crates/yi-agent-store/src/paths.rs` 的 `mod tests` 里加（钉住两处归一化逐字等价）：
 
@@ -1024,7 +1024,7 @@ git commit -m "fix(subagent): use the instance home the attach already carries"
 
 （`instance_home_from_env` 在 Task 2 里已经是 `#[doc(hidden)] pub`，这里不需要再改可见性。）
 
-- [ ] **Step 2: 跑测试**
+- [x] **Step 2: 跑测试**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-store --lib paths::tests && cargo test -p yi-agent-lifecycle --lib
@@ -1032,7 +1032,7 @@ cd yi-agent-rs && cargo test -p yi-agent-store --lib paths::tests && cargo test 
 
 Expected: PASS。
 
-- [ ] **Step 3: 全仓检查**
+- [x] **Step 3: 全仓检查**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && just ci
@@ -1040,7 +1040,7 @@ cd yi-agent-rs && cargo fmt --all && just ci
 
 Expected: 16 道门禁全绿。若 `secret-check` / `msrv-check` 之外有红，按输出逐条修。
 
-- [ ] **Step 4: 真机验收**
+- [x] **Step 4: 真机验收**
 
 ```bash
 cargo build -p yi-agent 2>&1 | tail -3
@@ -1049,7 +1049,7 @@ ls -la ~/.yi-agent/sockets/ 2>/dev/null
 
 启动 yi-agent 后确认 `~/.yi-agent/sockets/<16hex>/` 里出现 `guardian-control.sock` 与 `runtime.sock`，`/agents` 可用。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && git add -A
@@ -1095,7 +1095,7 @@ git commit -m "test: pin the two instance-home implementations together"
 **Interfaces:**
 - Consumes: Task 1 的 `guardian_socket`；各处既有入口 `control_path`。
 
-- [ ] **Step 1: 写测试**
+- [x] **Step 1: 写测试**
 
 新建 `crates/yi-agent-supervisors/tests/socket_agreement.rs`：
 
@@ -1143,7 +1143,7 @@ instance_home 的来源（前者用 scope，后者读 env）。用 scope 的那�
 的路，也是这次的真回归点，所以精确比对；走 env 的那条只比对形状，避免用例依赖宿主
 的 `YI_AGENT_HOME`。
 
-- [ ] **Step 2: 跑测试**
+- [x] **Step 2: 跑测试**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-supervisors --test socket_agreement
@@ -1151,7 +1151,7 @@ cd yi-agent-rs && cargo test -p yi-agent-supervisors --test socket_agreement
 
 Expected: PASS。
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && git add crates/yi-agent-supervisors/tests/socket_agreement.rs

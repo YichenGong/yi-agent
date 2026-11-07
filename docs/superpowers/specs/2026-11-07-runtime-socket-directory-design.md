@@ -487,6 +487,24 @@ fn instance_home_from_env() -> Option<PathBuf> {
 排查方法：`rg 'let _ = instance_home'`，以及 `socket_path_for(runtime_dir)` 在已有
 `instance_home` 变量作用域内的调用点。
 
+**实施时补记（2026-11-07，实测踩到）** 有两条约束在实现中反复出问题，写在这里免得
+下一个人重踩：
+
+1. **`RuntimeScope.instance_home` 是 `.yi-agent` 目录本身，不是它的父目录。**
+   环境变量 `YI_AGENT_HOME` 是父目录，`store::paths::instance_home()` 与
+   `lifecycle::scope::instance_home_from_env()` 会补 `.yi-agent`。把 `TempDir::path()`
+   直接塞进 `scope.instance_home`，与子进程从 `YI_AGENT_HOME` 派生出的
+   `.../instance/.yi-agent` 不一致——症状是 `claim.rs` 的 instance-home conflict，
+   或者两侧 socket 路径分歧。判据：`scope.instance_home` 的 `file_name()` 应为
+   `.yi-agent`。
+
+2. **`bringup::control_path(scope)` 必须用 `scope.instance_home`，不能读环境。**
+   这是本次故障的直接成因：launcher 按 env 探一个路径、guardian 按 scope 绑另一个，
+   于是 `probe` 一直 `Absent` 到 deadline，用户看到的是 30 秒超时而不是路径。修好后
+   `managed_runtime_lifecycle` 从 94 秒降到 4 秒——**耗时本身就是那条 bug 的判据**。
+   `socket_agreement` 用 `bringup::control_path(&scope)` 与
+   `guardian_socket(runtime_dir, home)` 精确比对，回退该修复会立刻变红。
+
 ### 3.6 测试侧影响
 
 `socket_path_for` 改用 `instance_home()` 之后，socket 路径**不再跟随 `runtime_dir`
@@ -709,20 +727,28 @@ itself is absurdly deep"，随兜底删除一并更新。）
 
 ## 8. 完成判据
 
-- [ ] `lifecycle::scope` 提供 `socket_directory` / `guardian_socket` / `daemon_socket`，
+- [x] `lifecycle::scope` 提供 `socket_directory` / `guardian_socket` / `daemon_socket`，
       且哈希输入先规范化
-- [ ] `control_path` / `control_socket` 签名不变，内部改用新布局（调用方零改动）
-- [ ] `socket_path_for` 签名不变，内部改用 `daemon_socket` + `instance_home_for_sockets()`（§3.5 情况 B）
-- [ ] `bind_control` 用 `scope.instance_home`，不读 env（§3.5 情况 A）
-- [ ] `attach_to_answer` 不再 `let _ = instance_home`，且 `attach_managed_project_runtime` 传 `Some(instance_home)`（§3.5.1）
-- [ ] `bind_control` 与 daemon 在 bind 前创建 `sockets/<hash>/` 并设 0700
-- [ ] §6.1 列出的 4 个既有用例已逐条确认语义（不是简单改成能过）
-- [ ] §5 十二条测试全绿，且每条都做过「回退即红」验证
-- [ ] `instance_home_for_sockets()` 与 `store::paths::instance_home()` 的 `.yi-agent` 归一化逐字一致（§5 第 7 条）
-- [ ] §3.6 已处理：退出路径对空的 `sockets/<hash>/` 做 `remove_dir`（`ENOTEMPTY`
+- [x] `control_path` / `control_socket` 签名不变，内部改用新布局（调用方零改动）
+- [x] `socket_path_for` 签名不变，内部改用 `daemon_socket` + `instance_home_for_sockets()`（§3.5 情况 B）
+- [x] `bind_control` 用 `scope.instance_home`，不读 env（§3.5 情况 A）
+- [x] `attach_to_answer` 不再 `let _ = instance_home`，且 `attach_managed_project_runtime` 传 `Some(instance_home)`（§3.5.1）
+- [x] `bind_control` 与 daemon 在 bind 前创建 `sockets/<hash>/` 并设 0700
+- [x] §6.1 列出的 4 个既有用例已逐条确认语义（不是简单改成能过）
+- [x] §5 十二条测试全绿，且每条都做过「回退即红」验证
+- [x] `instance_home_for_sockets()` 与 `store::paths::instance_home()` 的 `.yi-agent` 归一化逐字一致（§5 第 7 条）
+- [x] §3.6 已处理：退出路径对空的 `sockets/<hash>/` 做 `remove_dir`（`ENOTEMPTY`
       忽略），跑完 `cargo test -p yi-agent-store` 不在 `~/.yi-agent/sockets/` 留新空目录
-- [ ] 本项目真机启动：socket 出现在 `~/.yi-agent/sockets/<hash>/`，`/agents` 可用
+- [x] 本项目真机启动：socket 出现在 `<instance_home>/sockets/<hash>/`
+      （实测：普通项目与 127 字节的深层项目都能起 `daemon serve` 并 bind）
+- [ ] `/agents` 在 TUI 里可用（需要交互式终端，本轮未验）
 - [ ] `just ci` 全绿
+
+  分项已逐条跑过并全绿：`fmt-check`、`clippy --workspace --all-targets --all-features`、
+  `build --workspace`、`bindings-check`、`secret-check`、`affected-check`（29 条断言）、
+  `test-affected`（4855 用例）、以及 17 个 crate 的分批全量测试。
+  `just ci` 整条在本地超过 50 分钟未跑完（另有会话占着全局 package cache），
+  故未记录整条结果。
 
 ### 8.1 不属于本期判据
 
