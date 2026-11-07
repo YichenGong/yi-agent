@@ -87,6 +87,16 @@ export function TraceComposer({
   }, [value.previewPending]);
 
   const confirmRef = useRef<HTMLDivElement | null>(null);
+  const dismissRef = useRef<HTMLButtonElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * 焦点上一次是否落在这一栏里。
+   *
+   * 不能等确认区出现后再读 `document.activeElement`：那时「停止任务」已经被替换
+   * 卸掉，浏览器把焦点退回 body，读到的永远是「不在」。所以在隆起的 focus/blur
+   * 里记，卸载不派发 blur 也不会把标记清掉。
+   */
+  const rootHadFocusRef = useRef(false);
   /** 上一次提交时确认区是否开着，用来认出「刚刚被替换掉」这一帧。 */
   const confirmWasOpenRef = useRef(false);
 
@@ -97,10 +107,31 @@ export function TraceComposer({
     focusInConfirmRef.current = Boolean(region && active && region.contains(active));
   };
 
+  /**
+   * 焦点离开确认区时要复位。
+   *
+   * 只在 `onFocus` 里置位会留下陈旧标记：程序把焦点交给「放弃」之后再点回
+   * textarea，标记仍是 true，确认区一消失就把人从输入框拽到停止按钮上。
+   */
+  const dropFocusInConfirm = (event: React.FocusEvent<HTMLDivElement>) => {
+    const next = event.relatedTarget as Node | null;
+    focusInConfirmRef.current = next !== null && confirmRef.current?.contains(next) === true;
+  };
+
   useLayoutEffect(() => {
     const open = confirmation !== null;
     const wasOpen = confirmWasOpenRef.current;
     confirmWasOpenRef.current = open;
+    if (open && !wasOpen) {
+      // 键盘用户先落到「放弃」：默认焦点停在危险动作上时，一次 Enter 就停掉了任务。
+      // 只有当焦点**本来就在这一栏**（用户点了「停止任务」）时才移交；从别处
+      // 抢焦点会把正在打字的用户拽走。
+      if (rootHadFocusRef.current) {
+        rootHadFocusRef.current = false;
+        dismissRef.current?.focus({ preventScroll: true });
+      }
+      return;
+    }
     if (!wasOpen || open) return;
     // 确认区刚被替换掉。只有焦点原本确实在里面时才移动焦点，否则会从
     // 正在打字的 textarea（或别的输入框）里把人拽走。
@@ -130,7 +161,17 @@ export function TraceComposer({
   };
 
   return (
-    <div className="shrink-0 border-t border-line px-3 py-2">
+    <div
+      ref={rootRef}
+      onFocus={() => {
+        rootHadFocusRef.current = true;
+      }}
+      onBlur={(event) => {
+        const next = event.relatedTarget as Node | null;
+        rootHadFocusRef.current = next !== null && rootRef.current?.contains(next) === true;
+      }}
+      className="shrink-0 border-t border-line px-3 py-2"
+    >
       {value.error !== null ? (
         <p role="alert" className="mb-1 text-xs text-danger">
           {value.error}
@@ -193,6 +234,7 @@ export function TraceComposer({
           <div
             ref={confirmRef}
             onFocus={noteFocusInsideConfirm}
+            onBlur={dropFocusInConfirm}
             className="flex max-w-[60%] shrink-0 flex-col items-end gap-1 rounded border border-line bg-panel px-2 py-1.5"
           >
             <span className="text-xs text-fg">
@@ -217,6 +259,7 @@ export function TraceComposer({
               </button>
               <button
                 type="button"
+                ref={dismissRef}
                 disabled={value.confirmPending}
                 onClick={() => {
                   noteFocusInsideConfirm();

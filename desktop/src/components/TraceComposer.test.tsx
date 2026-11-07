@@ -290,6 +290,32 @@ describe("stop", () => {
     expect((screen.getByRole("button", { name: "确认停止" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it("puts initial focus on the harmless choice when the confirmation opens", () => {
+    const confirmation = { token: "t1", taskIds: ["task-a"], deadline: Date.now() + 60_000 };
+    const { rerender } = render(<TraceComposer {...props()} />);
+
+    // 真实路径是用户先点「停止任务」，焦点已经在那一栏里。
+    screen.getByRole("button", { name: "停止任务" }).focus();
+
+    // 键盘用户必须先落在「放弃」上：默认焦点若停在危险动作，一次 Enter 就停掉了任务。
+    rerender(<TraceComposer {...props({ value: snapshot({ confirmation }) })} />);
+
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "放弃" }));
+  });
+
+  it("does not pull focus into the confirmation when it opens from elsewhere", () => {
+    const confirmation = { token: "t1", taskIds: ["task-a"], deadline: Date.now() + 60_000 };
+    const field = document.createElement("input");
+    document.body.append(field);
+    field.focus();
+    const { rerender } = render(<TraceComposer {...props()} />);
+
+    rerender(<TraceComposer {...props({ value: snapshot({ confirmation }) })} />);
+
+    expect(document.activeElement).toBe(field);
+    field.remove();
+  });
+
   it("returns focus to the stop control when the confirmation closes under it", () => {
     const onFallbackFocus = vi.fn();
     const confirmation = { token: "t1", taskIds: ["task-a"], deadline: Date.now() + 60_000 };
@@ -320,6 +346,21 @@ describe("stop", () => {
     rerender(<TraceComposer {...props({ finished: true, onFallbackFocus })} />);
 
     expect(onFallbackFocus).toHaveBeenCalled();
+  });
+
+  it("keeps focus in the textarea after the user moved back to it", () => {
+    const confirmation = { token: "t1", taskIds: ["task-a"], deadline: Date.now() + 60_000 };
+    const { rerender } = render(<TraceComposer {...props()} />);
+
+    screen.getByRole("button", { name: "停止任务" }).focus();
+    rerender(<TraceComposer {...props({ value: snapshot({ confirmation }) })} />);
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "放弃" }));
+
+    // 用户改了主意，回去继续打字：确认区关门时不能再把人拽走。
+    textarea().focus();
+    rerender(<TraceComposer {...props()} />);
+
+    expect(document.activeElement).toBe(textarea());
   });
 
   it("does not steal focus when the confirmation closes and focus is elsewhere", () => {

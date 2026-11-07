@@ -41,3 +41,40 @@ npm run test:browser:stream-live
 - `CHROME_BIN`：Chrome 可执行文件绝对路径。
 
 不调用真实 LLM、sidecar 或生产会话数据，退出时关闭子进程并删除临时 Chrome 配置。
+
+# 子 agent 轨迹面板（真实浏览器验收）
+
+```sh
+cd desktop
+npm run test:browser:subagent-trace
+```
+
+`SubagentTrace` 的几何不能由 jsdom 证明：jsdom 没有布局引擎，`scrollHeight`、
+`clientWidth`、`ResizeObserver` 全是不存在的，横向溢出和「正文还剩多少像素」在
+那里永远是 0。本脚本用与上面两个脚本相同的 Node 原生 WebSocket + CDP 方式，
+在一张真实页面上渲染 **真实的** `ThreadDetailPanel → SubagentTrace →
+TraceTimeline → TraceEvent → TraceComposer` 与项目自己的 `index.css`，然后测：
+
+- 主题 2 × 栏宽 3（260/360/720）× 字号 3（小/标准/大）= **18 种组合**，全部在
+  最小窗口 900×600 下：零整栏横向溢出、主滚动区 ≥120px、消息框与动作可达；
+- 长中文、无空格长路径、Markdown 表格/代码、错误结果、多个子任务、真实空元数据；
+- 渐进窗口：1000 块历史首屏只挂 200、「载入更早」每批 +200、追加不收窄已挂载范围；
+- 阅读锚点：真实滚轮暂停后，追加同块文本 / 展开收起摘要 / 图片加载后变高，
+  锚点偏移误差 ≤2px；滚回底部恢复跟随；
+- 键盘：确认区打开时焦点落在「放弃」，Tab 离开时仍在面板内；
+- reduced-motion、`role="log"` 不是 live region、`aria-expanded`/`aria-controls` 完整；
+- 深/浅主题下**所有**渲染出来的文字都满足 WCAG 对比度下限（小字 4.5:1）。
+
+环境变量：
+
+- `SUBAGENT_TRACE_PORT`：Vite 端口，默认 1449，需空闲。
+- `SUBAGENT_TRACE_DEBUG_PORT`：Chrome CDP 端口，默认 9359，需空闲。
+- `CHROME_BIN`：Chrome 可执行文件绝对路径。
+- `SUBAGENT_TRACE_REPORT`：报告 JSON 路径，默认 `.artifacts/desktop-subagent-trace/report.json`（仓库根，已被 gitignore）。
+
+不调用真实 LLM、sidecar 或生产会话数据；脚本自行启动 Vite 与独立 profile 的
+headless Chrome，退出时先 TERM 后超时 KILL，并删除临时 profile。缺 Chrome 时
+脚本会明确失败，不会退化成 jsdom 的"通过"。
+
+这仍然**不是**原生 WKWebView 真机验收：Chrome 的排版引擎与 WebKit 不同，IME 与
+真实的触控滚动只能人工验证。README 与验收文档必须把两者分开记录。

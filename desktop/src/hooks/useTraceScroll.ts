@@ -65,6 +65,15 @@ export function useTraceScroll(
   const programmaticRef = useRef(false);
   /** 真实滚动意图的序号；程序滚动只在它不变时才保持暂停。 */
   const intentRef = useRef(0);
+  /**
+   * 有一次程序贴底尚未被 scroll 事件消化。
+   *
+   * 只在**确实移动了视口**时才置位：已经贴底时再赋值 `scrollTop` 不会派发
+   * `scroll`，闩锁就永远举着，把用户下一次真实滚动一起吞掉（锚点随之陈旧，
+   * 下一次布局变化就把视口弹回底部——真实 Chrome 里表现为「滚上去约 400ms
+   * 后自己跳回底部」）。所以这里必须与「这次是否真的动了」绑定，不能只用一次
+   * 性 boolean。
+   */
   const pendingFollowRef = useRef(false);
   const entryRef = useRef<HTMLButtonElement | null>(null);
   const infoAnchorRef = useRef<Anchor | null>(null);
@@ -160,13 +169,17 @@ export function useTraceScroll(
     if (!content || typeof ResizeObserver === "undefined") return;
 
     const observer = new ResizeObserver(() => {
-      if (pendingFollowRef.current) return;
       if (stick.isFollowing()) {
-        pendingFollowRef.current = true;
+        const before = stick.ref.current?.scrollTop;
         stick.followIfAtBottom();
+        // 视口本来就在底部：这次贴底是空操作，没有 scroll 事件会来消化闩锁。
+        pendingFollowRef.current = stick.ref.current?.scrollTop !== before;
         setFollowing(true);
         return;
       }
+      // 暂停期间闩锁一定已经失效（没有在途的程序滚动），否则会吞掉锚点恢复后的
+      // 那次 scroll。清掉它，让后续事件照常更新跟随意图。
+      pendingFollowRef.current = false;
       // 锚点取的是变化前缓存的那一份：此刻再量已经晚了。
       const anchor = anchorRef.current;
       markProgrammatic(() => restoreAnchor(anchor));

@@ -145,7 +145,38 @@ function following(): string | undefined {
   return latest?.following === undefined ? undefined : String(latest.following);
 }
 
+/**
+ * `ResizeObserver` stub.
+ *
+ * jsdom has none, so the hook's layout-change branch (the one that either pins to
+ * the bottom or restores the reading anchor) is never exercised — which is how a
+ * latch bug survived a green suite and only showed up in a real browser. Keeping
+ * the callbacks lets a test fire "the panel was resized" at an exact moment.
+ */
+let resizeCallbacks: ResizeObserverCallback[] = [];
+
+class StubResizeObserver {
+  constructor(callback: ResizeObserverCallback) {
+    resizeCallbacks.push(callback);
+  }
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {
+    resizeCallbacks = resizeCallbacks.filter((callback) => callback !== this.callback);
+  }
+  private readonly callback: ResizeObserverCallback | null = null;
+}
+
+/** Fire every registered observer callback, as the browser would after a layout change. */
+function triggerResize(): void {
+  for (const callback of [...resizeCallbacks]) {
+    callback([], {} as ResizeObserver);
+  }
+}
+
 beforeEach(() => {
+  resizeCallbacks = [];
+  vi.stubGlobal("ResizeObserver", StubResizeObserver);
   latest = null;
   box = {
     scrollHeight: 1000,
@@ -161,6 +192,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   restoreGeometry?.();
   restoreGeometry = null;
   vi.restoreAllMocks();
@@ -276,6 +308,32 @@ describe("preserve", () => {
     });
 
     expect(following()).toBe("false");
+  });
+
+  it("keeps the reader's place when a pin produced no scroll event", () => {
+    // Opens already at the bottom: the initial pin is a no-op, so the browser
+    // dispatches no `scroll` for it. A latch that only a scroll event can clear
+    // stays armed and swallows the user's next genuine scroll — the anchor then
+    // stays stale and the next layout change yanks the viewport back to the end.
+    render(<Harness ready />);
+    expect(box.scrollTop).toBe(box.scrollHeight - box.clientHeight);
+
+    act(() => {
+      triggerResize();
+    });
+
+    act(() => {
+      fireEvent.wheel(scroller());
+      box.scrollTop = 400;
+      fireEvent.scroll(scroller());
+    });
+    expect(following()).toBe("false");
+
+    act(() => {
+      triggerResize();
+    });
+
+    expect(box.scrollTop).toBe(400);
   });
 
   it("resumes following after a real scroll intent", () => {
