@@ -395,13 +395,21 @@ cd yi-agent-rs && bash scripts/test_test_tiers.sh
 在 `test-tiers.sh` 的 `usage()` 函数之前插入：
 
 ```bash
+# 校验 crate 名。nextest -p 对拼错的名字不会报错，而是零匹配 → rc=4，
+# 看起来像崩溃。先对齐 workspace 成员，把「名字写错」变成一条明确的错误。
+# 成员列表读失败时直接返回 2（区别于「名字不存在」的 1），避免把环境问题
+# 误报成「这个 crate 不存在」。
 cmd_crate() {
     [ $# -ge 1 ] || usage
     local want="$1" m found=0
     local -a members=() avail=()
+    local member_list
+    if ! member_list="$(workspace_crates)"; then
+        return 2
+    fi
     while IFS= read -r m; do
         [ -n "$m" ] && members+=("$m")
-    done < <(workspace_crates)
+    done <<<"$member_list"
 
     for m in ${members[@]+"${members[@]}"}; do
         [ "$m" = "$want" ] && { found=1; break; }
@@ -437,7 +445,7 @@ cmd_crate() {
 cd yi-agent-rs && bash scripts/test_test_tiers.sh
 ```
 
-预期：`12 passed`，退出码 0。
+预期：`15 passed`，退出码 0。
 
 - [ ] **Step 5: 提交**
 
@@ -598,7 +606,7 @@ cmd_affected() {
 cd yi-agent-rs && bash scripts/test_test_tiers.sh
 ```
 
-预期：`19 passed`，退出码 0。
+预期：`22 passed`，退出码 0。
 
 - [ ] **Step 5: 提交**
 
@@ -751,7 +759,7 @@ cmd_run() {
 cd yi-agent-rs && bash scripts/test_test_tiers.sh
 ```
 
-预期：`23 passed`，退出码 0。
+预期：`26 passed`，退出码 0。
 
 - [ ] **Step 5: 手动验证 check 覆盖 tests/**
 

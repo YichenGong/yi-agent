@@ -116,6 +116,39 @@ cmd_map() {
     printf 'DOCS: %s\n' "${docs[*]:-}"
 }
 
+# 校验 crate 名。nextest -p 对拼错的名字不会报错，而是零匹配 → rc=4，
+# 看起来像崩溃。先对齐 workspace 成员，把「名字写错」变成一条明确的错误。
+# 成员列表读失败时直接返回 2（区别于「名字不存在」的 1），避免把环境问题
+# 误报成「这个 crate 不存在」。
+cmd_crate() {
+    [ $# -ge 1 ] || usage
+    local want="$1" m found=0
+    local -a members=() avail=()
+    local member_list
+    if ! member_list="$(workspace_crates)"; then
+        return 2
+    fi
+    while IFS= read -r m; do
+        [ -n "$m" ] && members+=("$m")
+    done <<<"$member_list"
+
+    for m in ${members[@]+"${members[@]}"}; do
+        [ "$m" = "$want" ] && { found=1; break; }
+    done
+
+    if [ "$found" = "1" ]; then
+        printf 'OK %s\n' "$want"
+        return 0
+    fi
+
+    printf 'error: %s is not a workspace crate\n' "$want" >&2
+    printf 'available crates:\n' >&2
+    for m in ${members[@]+"${members[@]}"}; do
+        printf '  %s\n' "$m" >&2
+    done
+    return 1
+}
+
 usage() {
     cat >&2 <<'EOF'
 usage: test-tiers.sh <command> [args]
@@ -131,6 +164,7 @@ main() {
     [ $# -ge 1 ] || usage
     case "$1" in
         map) cmd_map ;;
+        crate) shift; cmd_crate "$@" ;;
         *) usage ;;
     esac
 }

@@ -94,4 +94,23 @@ rc=$?
 grep -q 'no packages' <<<"$err" || { printf '%s\n' "$err" >&2; fail "error must say no packages"; }
 n=$((n + 1)); pass "fails loudly when workspace reports no members"
 
+# --- crate 子命令 ---
+out="$(WORKSPACE_CRATES="yi-agent-core yi-agent-flags" "$SCRIPT" crate yi-agent-flags 2>&1)"
+[ $? -eq 0 ] || fail "valid crate name rejected"
+grep -q '^OK yi-agent-flags$' <<<"$out" || { printf '%s\n' "$out" >&2; fail "valid crate not acknowledged"; }
+n=$((n + 1)); pass "accepts a real crate name"
+
+WORKSPACE_CRATES="yi-agent-core yi-agent-flags" "$SCRIPT" crate yi-agent-nope >/dev/null 2>&1
+[ $? -eq 1 ] || fail "unknown crate name should exit 1"
+n=$((n + 1)); pass "rejects an unknown crate name with exit 1"
+
+err="$(WORKSPACE_CRATES="yi-agent-core yi-agent-flags" "$SCRIPT" crate yi-agent-nope 2>&1)"
+grep -q 'yi-agent-core' <<<"$err" || { printf '%s\n' "$err" >&2; fail "error did not list available crates"; }
+n=$((n + 1)); pass "lists available crate names on rejection"
+
+# 无参数
+"$SCRIPT" crate >/dev/null 2>&1
+[ $? -eq 2 ] || fail "missing arg should exit 2"
+n=$((n + 1)); pass "missing crate arg exits 2"
+
 printf '\n%d passed\n' "$n"
