@@ -36,12 +36,30 @@ INCLUDE_WORKTREES=0
 EXPLICIT_TARGET=""
 SKIP_DEPS=0
 SKIP_INCREMENTAL=0
+PRUNE_UNITS=0
+MIN_AGE=600
+FORCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply) MODE="apply" ;;
     --include-worktrees) INCLUDE_WORKTREES=1 ;;
     --skip-deps) SKIP_DEPS=1 ;;
     --skip-incremental) SKIP_INCREMENTAL=1 ;;
+    --prune-units)
+      shift
+      PRUNE_UNITS="${1:-}"
+      case "$PRUNE_UNITS" in
+        ''|*[!0-9]*) echo "reclaim-target: --prune-units 需要一个非负整数（得到 '${PRUNE_UNITS:-}'）" >&2; exit 1 ;;
+      esac
+      ;;
+    --min-age)
+      shift
+      MIN_AGE="${1:-}"
+      case "$MIN_AGE" in
+        ''|*[!0-9]*) echo "reclaim-target: --min-age 需要一个非负整数秒数（得到 '${MIN_AGE:-}'）" >&2; exit 1 ;;
+      esac
+      ;;
+    --force) FORCE=1 ;;
     --target) shift; EXPLICIT_TARGET="${1:-}"; [ -n "$EXPLICIT_TARGET" ] || { echo "reclaim-target: --target 需要一个目录参数" >&2; exit 1; } ;;
     -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "reclaim-target: unknown option '$1'（见 --help）" >&2; exit 1 ;;
@@ -163,10 +181,70 @@ print(f"{removed}\t{freed}")
 PY
 }
 
-scan_deps() { # $1 = target root -> "orphan_keys\torphan_files\torphan_bytes\tunref_files\tunref_bytes\ttotal_keys\ttotal_files\tskipped"
-  python3 - "$1" <<'PY'
-import os, subprocess, sys
+# D3：--prune-units=N —— 每个 crate 前缀下只保留 mtime 最新的 N 个单元目录。
+#
+# 为什么默认关闭（spec §7.3 实测）：把 yi_agent_core 的 27 个单元目录删到只剩
+# 1 个后，touch 源码重编要 3.22 s；保留全部 27 个只要 0.85 s。所以这是「用
+# 重编时间换磁盘」的选项，不能默认开。
+#
+# 前缀取法：单元目录名是 <crate_with_underscores>-<hash>，crate 名里的连字符
+# 在目标名里已变成下划线（实测 1097 个目录无一带连字符），所以 rsplit('-', 1)
+# 是安全的。
+prune_units() { # $1 = target dir, $2 = keep N -> "removed_dirs\tfreed_bytes"
+  python3 - "$1" "$2" <<'PY'
+import os, shutil, sys
 root = sys.argv[1]
+keep = int(sys.argv[2])
+removed = freed = 0
+if keep > 0:
+    for prof in sorted(os.listdir(root)):
+        inc = os.path.join(root, prof, "incremental")
+        if not os.path.isdir(inc):
+            continue
+        groups = {}
+        for unit in os.scandir(inc):
+            if not unit.is_dir():
+                continue
+            pre = unit.name.rsplit("-", 1)[0]
+            groups.setdefault(pre, []).append(unit)
+        for pre, units in groups.items():
+            units.sort(key=lambda u: -u.stat().st_mtime)
+            for u in units[keep:]:
+                size = 0
+                for r, _ds, fs in os.walk(u.path):
+                    for f in fs:
+                        try:
+                            size += os.lstat(os.path.join(r, f)).st_size
+                        except OSError:
+                            pass
+                try:
+                    shutil.rmtree(u.path)
+                    removed += 1
+                    freed += size
+                except OSError:
+                    pass
+print(f"{removed}\t{freed}")
+PY
+}
+
+# 锁检测：<target>/<profile>/.cargo-build-lock 被 lsof 命中即认为有编译在跑。
+# 注意文件名：实测存在 .cargo-build-lock 与 .cargo-lock 两个，前者才是编译期
+# 持有的那个；后者是 cargo 的目录级 informational lock。
+has_active_build() { # $1 = target dir
+  local f
+  for f in "$1"/*/.cargo-build-lock; do
+    [ -e "$f" ] || continue
+    if lsof "$f" >/dev/null 2>&1; then return 0; fi
+  done
+  return 1
+}
+
+scan_deps() { # $1 = target root, $2 = min_age -> "orphan_keys\torphan_files\torphan_bytes\tunref_files\tunref_bytes\ttotal_keys\ttotal_files\tskipped"
+  python3 - "$1" "${2:-0}" <<'PY'
+import os, subprocess, sys, time
+root = sys.argv[1]
+min_age = int(sys.argv[2])
+now = time.time()
 deps_dirs = []
 for prof in sorted(os.listdir(root)):
     d = os.path.join(root, prof, "deps")
@@ -186,6 +264,8 @@ for d in deps_dirs:
             elif e.name.endswith(".rcgu.o"):
                 try:
                     st = e.stat(follow_symlinks=False)
+                    if min_age > 0 and now - st.st_mtime < min_age:
+                        continue          # 太新，可能是正在进行的编译
                     objs[e.name] = st.st_size
                 except OSError:
                     pass
@@ -265,10 +345,12 @@ print("\t".join(str(x) for x in aggregate))
 PY
 }
 
-apply_clean() { # $1 = target root -> "removed\tfreed"
-  python3 - "$1" <<'PY'
-import os, subprocess, sys
+apply_clean() { # $1 = target root, $2 = min_age -> "removed\tfreed"
+  python3 - "$1" "${2:-0}" <<'PY'
+import os, subprocess, sys, time
 root = sys.argv[1]
+min_age = int(sys.argv[2])
+now = time.time()
 removed = freed = 0
 for prof in sorted(os.listdir(root)):
     d = os.path.join(root, prof, "deps")
@@ -329,6 +411,8 @@ for prof in sorted(os.listdir(root)):
                 st = e.stat(follow_symlinks=False)
             except OSError:
                 continue
+            if min_age > 0 and now - st.st_mtime < min_age:
+                continue
             key = e.name.split(".")[0]
             if key not in rlibs:
                 victims.append((e.path, st.st_size, st.st_nlink))   # 孤儿：无条件
@@ -347,6 +431,20 @@ for prof in sorted(os.listdir(root)):
 print(f"{removed}\t{freed}")
 PY
 }
+
+# 并发护栏：--apply 且未 --force 时，若任一 target 上有编译持锁就拒绝执行。
+# 这是唯一一种「清理脚本导致构建失败」的路径（删掉刚写出、还没链接的 .o）。
+if [ "$MODE" = "apply" ] && [ "$FORCE" != "1" ]; then
+  for t in "${TARGETS[@]}"; do
+    [ -d "$t" ] || continue
+    if has_active_build "$t"; then
+      say "reclaim-target: 检测到 $(basename "$t") 上有 cargo 正在编译（锁被持有）。"
+      say "               此时删除可能让正在进行的链接失败。"
+      say "               等编译结束，或加 --force 强制执行。"
+      exit 1
+    fi
+  done
+fi
 
 grand_freed=0
 grand_d1_dirs=0
@@ -370,7 +468,7 @@ for t in "${TARGETS[@]}"; do
   # ---- D2: deps 孤儿 + 未被引用的 .o ----
   oc=0; of=0; ob=0; uf=0; ub=0; tk=0; tf=0; skipped=0
   if [ "$SKIP_DEPS" = "0" ]; then
-    line="$(scan_deps "$t" 2>/dev/null)" || { say "!! 扫描失败：$t"; line=$'0\t0\t0\t0\t0\t0\t0\t0'; }
+    line="$(scan_deps "$t" "$MIN_AGE" 2>/dev/null)" || { say "!! 扫描失败：$t"; line=$'0\t0\t0\t0\t0\t0\t0\t0'; }
     IFS=$'\t' read -r oc of ob uf ub tk tf skipped <<<"$line"
     say "   .rcgu.o 文件数  : $tf（属 $tk 个编译单元）"
     say "   孤儿 .o         : $of 个文件 / $oc 个编译单元，$(human "$ob")"
@@ -393,12 +491,20 @@ for t in "${TARGETS[@]}"; do
       grand_d1_dirs=$((grand_d1_dirs + rm1))
     fi
     if [ "$of" -gt 0 ] || [ "$uf" -gt 0 ]; then
-      res="$(apply_clean "$t")" || { say "!! 清理失败：$t"; res=$'0\t0'; }
+      res="$(apply_clean "$t" "$MIN_AGE")" || { say "!! 清理失败：$t"; res=$'0\t0'; }
       IFS=$'\t' read -r rm fr <<<"$res"
       say "   D2 已删除       : $rm 个，回收 $(human "$fr")"
       grand_freed=$((grand_freed + fr))
     fi
-    if [ "$d1_dirs" -eq 0 ] && [ "$of" -eq 0 ] && [ "$uf" -eq 0 ]; then
+    if [ "$PRUNE_UNITS" -gt 0 ]; then
+      res="$(prune_units "$t" "$PRUNE_UNITS")" || { say "!! D3 清理失败：$t"; res=$'0\t0'; }
+      IFS=$'\t' read -r rm3 fr3 <<<"$res"
+      if [ "$rm3" -gt 0 ]; then
+        say "   D3 已删除       : $rm3 个多余单元目录，回收 $(human "$fr3")"
+        grand_freed=$((grand_freed + fr3))
+      fi
+    fi
+    if [ "$d1_dirs" -eq 0 ] && [ "$of" -eq 0 ] && [ "$uf" -eq 0 ] && [ "$PRUNE_UNITS" -eq 0 ]; then
       say "   结论            : 无需清理"
     else
       after="$(du -sm "$t" 2>/dev/null | cut -f1)"
