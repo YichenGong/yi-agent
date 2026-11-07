@@ -1,6 +1,12 @@
+> **执行状态：已完成（2026-11-07）。** 分支 `feat/reclaim-target-d1d4`，7 个提交。
+> 最终自测 **49 passed**（plan 原文预期的 39 是估算，实际实现多覆盖了
+> hyphens/underscore 错配、nlink 计数、--help 泄漏等 10 条）。
+> `just ci` 除 `test` 里 3 个 **base 提交已存在**的失败外，其余 21 门禁全绿；
+> 那 3 个已用纯净 base worktree 复现确认与本次改动无关。
+
 # 编译产物磁盘占用治理 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 让 `target/` 的增长有界——切断 `.o` 的累积源（profile），并给存量提供可验证的回收手段（脚本）。
 
@@ -78,7 +84,7 @@ export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-
 - Produces: 新增 `--skip-deps`（跳过 D2）、`--skip-incremental`（跳过 D1）；扫描输出追加两列
   `<d1_files>\t<d1_bytes>`。默认两者都执行。
 
-- [ ] **Step 1: 先写失败的测试**
+- [x] **Step 1: 先写失败的测试**
 
 在 `test_reclaim_target.sh` 的 `# 参数校验` 段**之前**插入：
 
@@ -115,7 +121,7 @@ bash "$SCRIPT" --apply --target "$tmp" --skip-incremental >/dev/null || fail "--
 n=$((n + 1)); pass "D1 honours --skip-incremental"
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && bash scripts/test_reclaim_target.sh
@@ -123,7 +129,7 @@ cd yi-agent-rs && bash scripts/test_reclaim_target.sh
 
 预期：`FAIL: dry-run does not report incremental`（脚本还没有 D1）。
 
-- [ ] **Step 3: 实现 D1**
+- [x] **Step 3: 实现 D1**
 
 在 `reclaim-target.sh` 里新增两个函数，并接到主循环。
 
@@ -202,7 +208,7 @@ PY
 
 主循环里，扫描后追加两列；`--apply` 时先跑 D1 再跑 D2（顺序无关，但 D1 先能让 D2 的 nlink 统计更准）。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && bash scripts/test_reclaim_target.sh
@@ -210,7 +216,7 @@ cd yi-agent-rs && bash scripts/test_reclaim_target.sh
 
 预期：**`12 passed`**（原有 8 条 + Task 1 新增 4 条）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add yi-agent-rs/scripts/reclaim-target.sh yi-agent-rs/scripts/test_reclaim_target.sh
@@ -230,7 +236,7 @@ git commit -m "feat(build): reclaim stale incremental sessions inside each build
 - Produces: 新增 `--skip-deps`；`scan_target` 的输出改为
   `<orphan_keys>\t<orphan_files>\t<orphan_bytes>\t<unref_files>\t<unref_bytes>\t<total_keys>\t<total_files>`
 
-- [ ] **Step 1: 先写失败的测试**
+- [x] **Step 1: 先写失败的测试**
 
 在 D1 段之后插入。用假 `nm` 桩注入引用集（**不依赖真实 cargo 产物**）：
 
@@ -347,7 +353,7 @@ bash "$SCRIPT" --apply --target "$tmp/t5" >/dev/null || fail "hardlink apply fai
 n=$((n + 1)); pass "D2 deletes a hardlinked .o but spares its external link"
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && bash scripts/test_reclaim_target.sh
@@ -355,7 +361,7 @@ cd yi-agent-rs && bash scripts/test_reclaim_target.sh
 
 预期失败在 `D2 reports unreferenced .o`。
 
-- [ ] **Step 3: 实现 D2**
+- [x] **Step 3: 实现 D2**
 
 **性能事实（实测，写代码前先知道）**：`nm -pa` 扫 deps 下全部 456 个可执行
 文件要 **77.6 秒**。这不是 bug，是必然成本（漏扫一个二进制就会误删它的
@@ -527,7 +533,7 @@ for path, size, nlink in victims:
 `.o` 变成 nlink==1，D2 统计才能体现真实收益。反过来则先删 deps、会话还在，
 统计出来是虚的（虽然最终空间一样）。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && bash scripts/test_reclaim_target.sh
@@ -535,7 +541,7 @@ cd yi-agent-rs && bash scripts/test_reclaim_target.sh
 
 预期：**`26 passed`**（12 + Task 2 新增 14 条）。
 
-- [ ] **Step 5: 在真实主仓库上试跑（dry-run，必须与 spec 数字同量级）**
+- [x] **Step 5: 在真实主仓库上试跑（dry-run，必须与 spec 数字同量级）**
 
 ```bash
 export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
@@ -557,7 +563,7 @@ cd yi-agent-rs && bash scripts/reclaim-target.sh 2>&1 | tail -12
 `.o` 被判为「未引用」），但如果 `referenced` 数目远小于预期，说明 `nm` 扫的
 二进制太少了。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add yi-agent-rs/scripts/reclaim-target.sh yi-agent-rs/scripts/test_reclaim_target.sh
@@ -576,7 +582,7 @@ git commit -m "feat(build): pick deps/.o by N_OSO reference set, not mtime"
 - Consumes: 无
 - Produces: `--prune-units N`（缺省 0 = 不执行）；N>0 时每个 crate 前缀保留最新的 N 个单元目录
 
-- [ ] **Step 1: 先写失败的测试**
+- [x] **Step 1: 先写失败的测试**
 
 ```bash
 # ---- D3: --prune-units=N ----
@@ -597,10 +603,10 @@ n=$((n + 1)); pass "D3 keeps the newest N units"
 n=$((n + 1)); pass "D3 prunes units beyond N"
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
-- [ ] **Step 3: 实现 D3**（`--prune-units` 吃一个整数参数，校验 `N >= 0`；`N=0` 直接跳过）
-- [ ] **Step 4: 跑测试确认通过**（预期 **`29 passed`**：26 + Task 3 新增 3 条）
-- [ ] **Step 5: 提交**
+- [x] **Step 2: 跑测试确认失败**
+- [x] **Step 3: 实现 D3**（`--prune-units` 吃一个整数参数，校验 `N >= 0`；`N=0` 直接跳过）
+- [x] **Step 4: 跑测试确认通过**（实际 **38 passed**：含 Task 3b 的 6 条护栏断言与 1 条非数字校验）
+- [x] **Step 5: 提交**
 
 ```bash
 git commit -m "feat(build): add opt-in --prune-units for surplus build unit dirs"
@@ -618,7 +624,7 @@ git commit -m "feat(build): add opt-in --prune-units for surplus build unit dirs
 链接，被我们删掉就得到 `ld: can't open file` 或玄学重编。这是唯一一种「清理
 脚本导致构建失败」的路径。
 
-- [ ] **Step 1: 先写失败的测试**
+- [x] **Step 1: 先写失败的测试**
 
 ```bash
 # ---- 并发护栏 ----
@@ -661,8 +667,8 @@ PATH="$stub2:$PATH" bash "$SCRIPT" --target "$tmp/t7" --min-age 0 >/dev/null \
 n=$((n + 1)); pass "dry-run ignores the lock check"
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
-- [ ] **Step 3: 实现**
+- [x] **Step 2: 跑测试确认失败**
+- [x] **Step 3: 实现**
 
 ```bash
 # --min-age N：跳过 mtime 在 N 秒以内的候选（默认 600）
@@ -685,13 +691,13 @@ has_active_build() { # $1 = target dir
 `--apply` 且非 `--force` 且 `has_active_build` 为真时，打印原因并 `exit 1`。
 python 侧按 `--min-age` 过滤候选：`if time.time() - st.st_mtime < min_age: skip`。
 
-- [ ] **Step 4: 跑测试确认通过**（预期 **`35 passed`**：29 + Task 3b 新增 6 条）
-- [ ] **Step 5: 提交**
+- [x] **Step 4: 跑测试确认通过**（实际并入 Task 3 一并验证，见上）
+- [x] **Step 5: 提交**
 
 ```bash
 git commit -m "feat(build): guard reclaim against concurrent builds"
 ```
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git commit -m "feat(build): guard reclaim against concurrent builds"
@@ -719,7 +725,7 @@ dSYM            339 个  27.56 GB   其中陈旧 211 个 = 19.85 GB
 （`bin-*` / `test-bin-*` / `test-lib-*` / `lib-*` / `test-integration-test-*`）。
 组内保留 **mtime 最新**的一个，其余连同同名 `.dSYM` 一起删。
 
-- [ ] **Step 1: 先写失败的测试**
+- [x] **Step 1: 先写失败的测试**
 
 ```bash
 # ---- D4: 陈旧二进制 + dSYM ----
@@ -757,9 +763,9 @@ n=$((n + 1)); pass "D4 keeps the newest binary"
 n=$((n + 1)); pass "D4 keeps bin and test-bin of the same crate separately"
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 ```python
 # D4：陈旧二进制 + 同名 .dSYM
@@ -800,9 +806,9 @@ for key, items in groups.items():
 删除 dSYM 是**整目录递归删**（里面是 `Contents/Resources/DWARF/...`），
 与删普通文件走不同分支；计数用递归求和。
 
-- [ ] **Step 4: 跑测试确认通过**（预期 **`39 passed`**：35 + Task 3c 新增 4 条）
+- [x] **Step 4: 跑测试确认通过**（预期 **`39 passed`**：35 + Task 3c 新增 4 条）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git commit -m "feat(build): reclaim stale binaries and their dSYM"
@@ -819,7 +825,7 @@ git commit -m "feat(build): reclaim stale binaries and their dSYM"
 **Files:**
 - Modify: `yi-agent-rs/Cargo.toml:85-125`（只改注释）
 
-- [ ] **Step 1: 替换注释里四处被实测推翻的断言**
+- [x] **Step 1: 替换注释里四处被实测推翻的断言**
 
 | 现有断言 | 实测事实 |
 |---|---|
@@ -828,7 +834,7 @@ git commit -m "feat(build): reclaim stale binaries and their dSYM"
 | 「`.o` 最大 53 MB，37 MB 是 `__DWARF`」 | 平均 172 KiB、中位 40 KiB，53 MB 是离群值 |
 | 「`packed` 保留完整 DWARF，不降级调试」 | 准确，但要补代价：`.dSYM` 占 27.5 GB，且旧 hash 的 dSYM 会累积 |
 
-- [ ] **Step 2: 补一句「为什么选 packed 而不是 off」**
+- [x] **Step 2: 补一句「为什么选 packed 而不是 off」**
 
 注释末尾加：
 
@@ -840,7 +846,7 @@ git commit -m "feat(build): reclaim stale binaries and their dSYM"
 # 用永久的排查能力换一次性 8 GiB，不划算。
 ```
 
-- [ ] **Step 3: 确认没有改到取值**
+- [x] **Step 3: 确认没有改到取值**
 
 ```bash
 cd yi-agent-rs && grep -A1 '^\[profile.dev\]' Cargo.toml
@@ -849,7 +855,7 @@ cd yi-agent-rs && grep -A1 '^\[profile.dev\]' Cargo.toml
 预期仍是 `split-debuginfo = "packed"`。**本次提交不改变任何编译行为**，
 所以不需要重新构建验证。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add yi-agent-rs/Cargo.toml
@@ -873,7 +879,7 @@ plugins/superpowers-kanban/target : 1.1 GB, 9,699 个 .o
 - Modify: `desktop/src-tauri/Cargo.toml`
 - Modify: `plugins/superpowers-kanban/Cargo.toml`
 
-- [ ] **Step 1: 两个文件各追加一段**
+- [x] **Step 1: 两个文件各追加一段**
 
 ```toml
 # 与 yi-agent-rs/Cargo.toml 的 [profile.dev] 保持一致。这是独立构建单元
@@ -884,7 +890,7 @@ plugins/superpowers-kanban/target : 1.1 GB, 9,699 个 .o
 split-debuginfo = "packed"
 ```
 
-- [ ] **Step 2: 验证 plugins 生效**
+- [x] **Step 2: 验证 plugins 生效**
 
 ```bash
 export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
@@ -901,7 +907,7 @@ cd desktop/src-tauri && cargo metadata --format-version 1 --no-deps \
   | python3 -c "import json,sys; d=json.load(sys.stdin); print([p.get('profile') for p in d['packages']])"
 ```
 
-- [ ] **Step 3: 提交**
+- [x] **Step 3: 提交**
 
 ```bash
 git commit -m "perf(build): set split-debuginfo=packed on desktop and plugin crates"
@@ -916,7 +922,7 @@ git commit -m "perf(build): set split-debuginfo=packed on desktop and plugin cra
 - Modify: `docs/project-management/tooling.md`
 - Modify: `CLAUDE.md`
 
-- [ ] **Step 1: `reclaim` 改为变参透传**
+- [x] **Step 1: `reclaim` 改为变参透传**
 
 ```just
 # 用变参（`*flags`）而不是具名参数。实测 just 的具名参数**不能带连字符**
@@ -953,11 +959,11 @@ set -- "${norm[@]}"
 | `just reclaim --apply --prune-units 1` | `--apply --prune-units 1` |
 | `just reclaim --apply --min-age 0` | `--apply --min-age 0` |
 
-- [ ] **Step 2: 重写 recipe 上方注释**
+- [x] **Step 2: 重写 recipe 上方注释**
 
 现有注释说「实测主仓库曾积到 78 万个、135 GiB」「cargo 从不读取这些 `.o`」——前半句是表观值（去重后 19.81 GiB 可单独释放），后半句漏了「`unpacked` 下删了会丢调试信息」。改成 D1/D2/D3 三档说明，并明确 `prune-units` 的重编代价（3.22 s vs 0.85 s）。
 
-- [ ] **Step 3: 重写 `tooling.md` 的条目**
+- [x] **Step 3: 重写 `tooling.md` 的条目**
 
 现有条目里的「`just reclaim` 报告 93.1 GiB 孤儿」「`deps` 仅剩 257 个 `.o`」均已被推翻。新条目必须给出**可复现的判据命令**：
 
@@ -968,11 +974,11 @@ set -- "${norm[@]}"
 - `just reclaim` 预演报告 D1+D2 合并真实可释放 26.17 GiB（按 nlink==1）
 ```
 
-- [ ] **Step 4: 更新 `CLAUDE.md`**
+- [x] **Step 4: 更新 `CLAUDE.md`**
 
 「磁盘占用：`target/` 会无限膨胀」小节补一条：`packed` 单次更费（17.8 G vs 默认 10.4 G），但换来「重编不再累积」——这是选它而不是 `off` 的理由（`off` 会丢光 DWARF）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git commit -m "docs(build): rewrite reclaim guidance around verified numbers"
@@ -982,13 +988,13 @@ git commit -m "docs(build): rewrite reclaim guidance around verified numbers"
 
 ### Task 7: 全量验证
 
-- [ ] **Step 1: 自测**
+- [x] **Step 1: 自测**
 
 ```bash
 cd yi-agent-rs && bash scripts/test_reclaim_target.sh   # 39 passed
 ```
 
-- [ ] **Step 2: `just ci` 全绿**
+- [x] **Step 2: `just ci` 全绿**
 
 ```bash
 cd yi-agent-rs && export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && just ci
@@ -998,7 +1004,7 @@ cd yi-agent-rs && export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.rustup/
 `just ci` 会从零重编，预计 **15~25 分钟**。这是预期的一次性成本，不是卡死。
 若超过 40 分钟，按 `CLAUDE.md` 的锁诊断流程查 `ps ax -o pid=,stat=,command= | grep cargo`。
 
-- [ ] **Step 3: 真机回收验证**
+- [x] **Step 3: 真机回收验证**
 
 ```bash
 cd yi-agent-rs && export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
@@ -1009,7 +1015,7 @@ du -sm target/debug/* | sort -rn | head -3
 
 预期：`deps` + `incremental` 合计下降约 26 GiB。
 
-- [ ] **Step 4: 反复重编不累积（核心验收）**
+- [x] **Step 4: 反复重编不累积（核心验收）**
 
 ```bash
 cd yi-agent-rs && cargo clean -p yi-agent-core
@@ -1022,7 +1028,7 @@ done
 
 预期三行都是 `0`。**只要有一行非 0，说明 profile 没生效，回去查 Task 4 Step 3。**
 
-- [ ] **Step 5: 合并**
+- [x] **Step 5: 合并**
 
 按 `superpowers:finishing-a-development-branch`：在 worktree 里跑完 `cargo fmt --all`、`just ci`，再 `git checkout main && git merge --no-ff docs/build-disk-usage-spec`，合并后删除分支与 worktree。
 
