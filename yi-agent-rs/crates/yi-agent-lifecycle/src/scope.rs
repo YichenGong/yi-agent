@@ -159,6 +159,52 @@ impl ScopeExt for RuntimeScope {
     }
 }
 
+/// The daemon's socket file name inside a socket directory.
+pub const DAEMON_SOCKET_FILE: &str = "runtime.sock";
+
+/// The directory holding both sockets for one runtime.
+///
+/// Always `<instance_home>/sockets/<16 hex>/`, so the path length depends only on
+/// where the instance lives — never on how deep the project is. That is the whole
+/// point: `sun_path` is 103 bytes here, and a deep checkout used to overflow it.
+///
+/// Both inputs are canonicalised because a hash over the raw spelling would make
+/// one directory produce two sockets: macOS's `/var` and `/private/var` are the
+/// same directory, and the launcher and the guardian do not always name it the
+/// same way. Two spellings, two socket directories, guardian binds one and every
+/// client polls the other — the exact timeout this module exists to remove.
+pub fn socket_directory(runtime_dir: &Path, instance_home: &Path) -> PathBuf {
+    canonical_or_self(instance_home)
+        .join("sockets")
+        .join(digest16(runtime_dir))
+}
+
+/// The guardian's control socket under the shared socket directory.
+pub fn guardian_socket(runtime_dir: &Path, instance_home: &Path) -> PathBuf {
+    socket_directory(runtime_dir, instance_home).join(crate::GUARDIAN_SOCKET_FILE)
+}
+
+/// The business daemon's socket under the shared socket directory.
+pub fn daemon_socket(runtime_dir: &Path, instance_home: &Path) -> PathBuf {
+    socket_directory(runtime_dir, instance_home).join(DAEMON_SOCKET_FILE)
+}
+
+/// Sixteen hex characters of the canonical path's SHA-256.
+fn digest16(path: &Path) -> String {
+    let digest = Sha256::digest(canonical_or_self(path).as_os_str().as_encoded_bytes());
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Canonical when possible; the original path otherwise (the directory may not
+/// exist yet on a first start, which is not an error here).
+fn canonical_or_self(path: &Path) -> PathBuf {
+    canonicalize_allowing_missing(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// The runtime directory a project uses.
 ///
 /// `YI_AGENT_RUNTIME_DIR` overrides it, which is what lets a development instance
@@ -255,6 +301,78 @@ impl std::error::Error for SocketPathTooLong {}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_directory_is_independent_of_runtime_dir_depth() {
+        let home = Path::new("/home/alice/.yi-agent");
+        let short = Path::new("/tmp/p/.yi-agent/runtime");
+        let deep = PathBuf::from(format!("/tmp/{}", "x".repeat(600)));
+
+        let one = socket_directory(short, home);
+        let two = socket_directory(&deep, home);
+
+        assert_eq!(
+            one.parent(),
+            two.parent(),
+            "both hashes live under the same sockets/ directory"
+        );
+        assert_ne!(one, two, "different runtimes must not collide");
+    }
+
+    #[test]
+    fn guardian_and_daemon_sockets_share_one_directory() {
+        let runtime = Path::new("/tmp/p/.yi-agent/runtime");
+        let home = Path::new("/home/alice/.yi-agent");
+
+        let dir = socket_directory(runtime, home);
+
+        assert_eq!(
+            guardian_socket(runtime, home),
+            dir.join(crate::GUARDIAN_SOCKET_FILE)
+        );
+        assert_eq!(daemon_socket(runtime, home), dir.join(DAEMON_SOCKET_FILE));
+    }
+
+    #[test]
+    fn the_hash_is_over_the_canonical_runtime_directory() {
+        // Two spellings of one directory must hash the same, or the guardian binds
+        // one socket and every client polls another. A `TempDir` lands under
+        // `/var/folders/...`, whose canonical form is `/private/var/folders/...`.
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let runtime = real.join("project/.yi-agent/runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+
+        let alias = match real.to_str().and_then(|s| s.strip_prefix("/private")) {
+            Some(rest) => PathBuf::from(rest),
+            None => real.clone(),
+        };
+        let alias_runtime = alias.join("project/.yi-agent/runtime");
+        let home = Path::new("/home/alice/.yi-agent");
+
+        assert_eq!(
+            socket_directory(&runtime, home),
+            socket_directory(&alias_runtime, home),
+            "both spellings of one directory must hash to one socket directory"
+        );
+    }
+
+    #[test]
+    fn a_deep_instance_home_produces_a_path_that_still_fits() {
+        let home = Path::new("/home/alice/.yi-agent");
+
+        for len in [200usize, 500, 900] {
+            let deep = PathBuf::from(format!("/work/{}", "d".repeat(len)));
+            let socket = guardian_socket(&deep, home);
+            assert!(
+                socket.as_os_str().len() <= MAX_SOCKET_PATH_BYTES,
+                "guardian socket must fit at workdir len {len}: {} bytes",
+                socket.as_os_str().len()
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
