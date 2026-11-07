@@ -1681,3 +1681,33 @@ describe("anchor restore with windowing", () => {
     expect(mountedIds(container)).toContain("m2999");
   });
 });
+
+describe("active search hit is marked in the mounted window", () => {
+  it("给当前命中的那一个 mark 打 data-search-active", () => {
+    // CSS 靠这个属性把「当前命中」画得比其余命中更实。窗口化后当前命中可能
+    // 根本未挂载，但已挂载时必须标上，否则用户看不出自己在第几个。
+    // 用 userMessage：它走真实的 `HighlightText`，会产出真 `mark`。
+    // agentMessage 在本测试文件里被 mock 成纯 div，没有 mark 可标。
+    const items = [
+      { type: "userMessage", id: "a", text: "needle one" },
+      { type: "userMessage", id: "b", text: "needle two" },
+    ] as Item[];
+    const { container } = render(
+      <ChatView
+        items={items}
+        threadId="t1"
+        query="needle"
+        activeHit={{ itemId: "b", offset: 0 }}
+      />,
+    );
+    const marked = Array.from(container.querySelectorAll("[data-search-active]")).map(
+      (n) => n.textContent,
+    );
+    expect(marked).toEqual(["needle"]);
+    // 被标的是 id=b 那一行里的 mark，不是第一条。
+    const rowB = Array.from(container.querySelectorAll("[data-item-id]")).find(
+      (n) => n.getAttribute("data-item-id") === "b",
+    );
+    expect(rowB?.querySelector("[data-search-active]")).not.toBeNull();
+  });
+});

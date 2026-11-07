@@ -9,6 +9,9 @@ import {
   SEARCH_DEBOUNCE_MS,
 } from "./hooks/useTranscriptSearch";
 import { useEscapeKey } from "./ui/useEscapeKey";
+import { createHeightBook } from "./lib/heightBook";
+import { DEFAULT_LIMITS } from "./lib/transcriptWindow";
+import type { TranscriptWindowApi } from "./hooks/useTranscriptWindow";
 import { useDiffState } from "./hooks/useDiffState";
 import { createNotificationRouter } from "./hooks/useNotificationRouter";
 import { createHandshakeRecovery } from "./hooks/useHandshakeRecovery";
@@ -868,10 +871,30 @@ export default function App() {
   const transcriptRef = useRef<HTMLDivElement>(null);
   const captureTranscriptRef = useRef<(() => void) | null>(null);
 
+  /**
+   * 搜索的估算高度簿记。**独立于** `ChatView` 里那本：搜索只需要「未挂载区间
+   * 大致在哪」，不需要与渲染的容差收敛同步，分开可避免两处互相干扰。
+   */
+  const [searchBook] = useState(() => createHeightBook());
+  /** `ChatView` 回填的窗口 API：搜索跳转要在事件处理器里命令式开窗。 */
+  const transcriptWindowRef = useRef<TranscriptWindowApi | null>(null);
+
   const search = useTranscriptSearch({
     containerRef: transcriptRef,
     open: searchOpen,
     query: searchQuery,
+    // 计数必须覆盖全量历史：窗口化后 DOM 里只有一页。
+    items: current?.session.items ?? [],
+    structuralVersion: current?.session.structuralVersion ?? 0,
+    book: searchBook,
+    // 命中多半不在挂载区，必须请求开窗；`ChatView` 那边负责等待挂载后对位。
+    onJump: (index) => {
+      transcriptWindowRef.current?.requestFocus({
+        index,
+        before: DEFAULT_LIMITS.buffer,
+        after: 3 * DEFAULT_LIMITS.buffer,
+      });
+    },
   });
 
   // 输入防抖：只有停手 120ms 才让 ChatView 重新解析 markdown。
@@ -3144,6 +3167,8 @@ export default function App() {
                         // 「尾部文本」信号恒为空，视口会冻住（真机可复现）。
                         textVersion={current?.session.textVersion ?? 0}
                         query={searchQuery}
+                        windowApiRef={transcriptWindowRef}
+                        activeHit={search.activeHit}
                         anchor={
                           sess.currentId
                             ? sess.anchorFor(sess.currentId)

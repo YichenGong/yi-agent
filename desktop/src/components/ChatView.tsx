@@ -11,6 +11,7 @@ import { itemText } from "../lib/itemText";
 import { createHeightBook } from "../lib/heightBook";
 import { useTranscriptWindow } from "../hooks/useTranscriptWindow";
 import { DEFAULT_LIMITS, type VisibleRange } from "../lib/transcriptWindow";
+import type { TranscriptWindowApi } from "../hooks/useTranscriptWindow";
 import { planCompensation } from "../lib/scrollCompensation";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
@@ -18,6 +19,7 @@ import { HelpCard } from "./HelpCard";
 import { UsageCard } from "./UsageCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { HighlightText } from "./HighlightText";
+import { SEARCH_HIT_SELECTOR } from "../hooks/useTranscriptSearch";
 import { TranscriptPlaceholder } from "./TranscriptPlaceholder";
 
 /**
@@ -414,6 +416,8 @@ export function ChatView({
   syncError = null,
   onRetrySync,
   isRemote = false,
+  windowApiRef,
+  activeHit,
 }: {
   items: (Item | NoticeItem | ReasoningItem)[];
   error?: string | null;
@@ -470,6 +474,18 @@ export function ChatView({
    * 中途的帧可能不含锚点那条消息）与锚点**真的没了**（被删/历史被截断）。
    * 前者要继续等，后者才回退到底部。只靠 DOM 猜不出来。
    */
+  /**
+   * 可选的出口：把窗口 API 交给宿主，供搜索跳转等命令式开窗使用。
+   *
+   * 用 ref 而不是 props 回调：`requestFocus` 的身份必须稳定，且宿主要在
+   * **事件处理器里**调用它，不能靠 props 变化驱动。
+   */
+  windowApiRef?: { current: TranscriptWindowApi | null };
+  /**
+   * 搜索的当前命中。命中多半未挂载（窗口化），所以这里只负责**给已挂载的
+   * 那个 `mark` 打标**；未挂载时由宿主先开窗，挂载后再生效。
+   */
+  activeHit?: { itemId: string; offset: number } | null;
   syncing?: boolean;
   /**
    * 对账失败的原因（`ThreadView.syncError`）。仅 `syncState === "failed"` 时非空。
@@ -551,11 +567,22 @@ export function ChatView({
   // 值，且值恒为 null，等于给 hook 加一条走不通的分支。
   // `requestFocus` 由 Task 10（锚点恢复）与 Task 11（搜索跳转）消费；现在不取，
   // 否则 `noUnusedLocals` 会报错。
-  const { window: win, nudge, requestFocus } = useTranscriptWindow({
+  const windowApi = useTranscriptWindow({
     itemCount: items.length,
     measure: measureVisible,
     book: windowBook,
   });
+  const { window: win, nudge, requestFocus } = windowApi;
+
+  // 宿主拿到的必须是**稳定**对象：它在事件处理器里调用 `requestFocus`，
+  // 每次渲染换新引用会让调用方每次都得重取。
+  useLayoutEffect(() => {
+    if (!windowApiRef) return;
+    windowApiRef.current = windowApi;
+    return () => {
+      windowApiRef.current = null;
+    };
+  }, [windowApiRef, windowApi]);
 
   // **翻页必须由滚动驱动。** 滚动既不改变 `itemCount` 也不改变 `focus`，hook 内部
   // 没有任何 React 依赖会因此变化——不在这里接上滚动事件，窗口会永远停在首屏那
@@ -570,6 +597,26 @@ export function ChatView({
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
   }, [nudge]);
+
+  // 给「当前命中」的那一个 `mark` 打标，CSS 靠它把当前命中画得比其余更实。
+  // 必须在渲染落地后做：`mark` 由 rehype 插件产出，随 query 变化被整体替换，
+  // 存在 state 里的节点引用必然失效，所以每轮都重新找。
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const previous = Array.from(el.querySelectorAll<HTMLElement>("[data-search-active]"));
+    for (const node of previous) node.removeAttribute("data-search-active");
+    if (!activeHit) return;
+    // 只在该条已挂载时才有节点。条内第 offset 个命中 = 该行里的第 offset 个 mark。
+    // 不用属性选择器：id 来自服务端，引号/逗号会破坏语法，且 `CSS.escape`
+    // 在 jsdom 下不存在。扫描一遍更稳（与锚点恢复的做法一致）。
+    const row = Array.from(el.querySelectorAll<HTMLElement>("[data-item-id]")).find(
+      (n) => n.dataset.itemId === activeHit.itemId,
+    );
+    if (!row) return;
+    const marks = row.querySelectorAll<HTMLElement>(SEARCH_HIT_SELECTOR);
+    marks[activeHit.offset]?.setAttribute("data-search-active", "true");
+  }, [activeHit, query, win.start, win.end]);
 
   // 窗口变化会改变内容高度，而 WKWebView **不实现 scroll anchoring**：视口上方多挂
   // 200 条，用户看到的内容就整体位移；从下方卸载则让 `scrollHeight` 变小、
