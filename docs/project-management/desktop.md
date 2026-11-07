@@ -14,6 +14,10 @@
 不受本模块影响：`cargo test -p yi-agent-app-server`（397 个测试）与
 `cargo test -p yi-agent-runtime`（全绿）仍全绿。
 
+## iOS 扫码识别后黑屏修复
+
+- [ ] 有效二维码识别后立即退出相机覆盖层并显示配对进度；稳定真实 `QrScanner` 生命周期，保留无效码连续扫描、单次兑换及旧异步回调隔离 — 已完成调查与 [修复 spec](../superpowers/specs/2026-11-07-ios-qr-recognition-black-screen-design.md)，代码未实现、真机未验收。完成判据：该 spec §6 A01–A14 与 §7 I01–I07；关键回归必须走真实 `PairingScreen` + `QrScanner`，验证 pending 兑换期间覆盖层移除、无新增取流调用，不得仅用 `scan` 接缝判定完成。
+
 ## Managed runtime 默认生产接入
 
 - [ ] 默认生产路径接通 guardian、壳租约与 root 授权，并安全迁移存量 unmanaged runtime — 代码已实现并通过全量门禁（`just ci` 5815/5815、desktop lib 283 + vitest 2300），**但 A15 的真实 GUI 交互未执行**，故本条不勾选。设计与判据见 [接入 spec](../superpowers/specs/2026-11-05-managed-runtime-production-integration-design.md) §4–§8 及 [实施 plan](../superpowers/plans/2026-11-05-managed-runtime-production-integration-impl.md)；逐条证据见 [验收记录](../testing/managed-runtime-production-integration.md)。
