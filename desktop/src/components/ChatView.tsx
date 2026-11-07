@@ -11,6 +11,7 @@ import { itemText } from "../lib/itemText";
 import { createHeightBook } from "../lib/heightBook";
 import { useTranscriptWindow } from "../hooks/useTranscriptWindow";
 import type { VisibleRange } from "../lib/transcriptWindow";
+import { planCompensation } from "../lib/scrollCompensation";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
 import { HelpCard } from "./HelpCard";
@@ -569,6 +570,49 @@ export function ChatView({
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
   }, [nudge]);
+
+  // 窗口变化会改变内容高度，而 WKWebView **不实现 scroll anchoring**：视口上方多挂
+  // 200 条，用户看到的内容就整体位移；从下方卸载则让 `scrollHeight` 变小、
+  // `scrollTop` 被浏览器往下夹，`useStickToBottom` 会把这次位移读成「用户上翻」并
+  // 永久关闭跟随。所以每次窗口变更都要补偿一次。
+  const prevWindowRef = useRef<{ start: number; end: number } | null>(null);
+  const prevHeightRef = useRef<number>(0);
+  useLayoutEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const prev = prevWindowRef.current;
+    const prevHeight = prevHeightRef.current;
+    prevWindowRef.current = { start: win.start, end: win.end };
+    prevHeightRef.current = el.scrollHeight;
+
+    // 首帧没有「上一次」，不需要补偿。
+    if (prev === null || prevHeight === 0) return;
+    if (prev.start === win.start && prev.end === win.end) return;
+
+    // **锚点持有期间由漂移校正独占位置。** `planCompensation` 的差值分支假设
+    // 「高度变化全部发生在视口上方」，对滚动阅读是对的；但锚点恢复后追加的内容
+    // 通常长在锚点**下方**，此时再加差值会把人推走（实测：恢复 1212 后又被加
+    // 1000）。这种情形的位置由下面的锚点校正负责，这里必须让路。
+    if (heldAnchor.current !== null && !userTookOver.current) return;
+
+    const plan = planCompensation({
+      prevScrollHeight: prevHeight,
+      nextScrollHeight: el.scrollHeight,
+      prevViewportHeight: el.clientHeight,
+      scrollTop: el.scrollTop,
+      wasFollowing: isFollowing(),
+    });
+
+    // 先写位置再动跟随状态。两种顺序实测都不会被判成「用户上翻」（补偿总是向下
+    // 移动，`onScroll` 只把向上的位移读成意图），但先写位置能保证 `releaseFollow`
+    // 记录的基线就是补偿后的位置，少一次多余的事件判定。
+    if (Math.abs(el.scrollTop - plan.scrollTop) >= 1) {
+      el.scrollTop = plan.scrollTop;
+      selfScrolling.current = el.scrollTop;
+    }
+    if (plan.follow === "to-bottom") scrollToBottom();
+    else releaseFollow();
+  }, [win.start, win.end, isFollowing, scrollToBottom, releaseFollow]);
 
   // 把挂载区的真实高度写回 `HeightBook`：中位数越准，spacer 越准，分页后的视觉
   // 跳动越小（设计 §2.4 的螺旋收敛）。

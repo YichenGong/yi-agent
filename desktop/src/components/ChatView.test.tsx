@@ -1550,3 +1550,87 @@ describe("capture() only measures the mounted window", () => {
     expect(parseFloat(top.style.height)).toBe(117600);
   });
 });
+
+describe("window change compensates scrollTop", () => {
+  /**
+   * jsdom 不实现布局，`scrollHeight` 恒为 0，因此这里给滚动容器装一对受控的
+   * 几何属性，让补偿逻辑看到「窗口变更前后的真实高度差」。
+   *
+   * 注意两点，都是 jsdom 特有的：
+   * - `scrollTop` 的 setter 必须模拟浏览器的夹取，`useStickToBottom.pin()` 正是
+   *   靠 `scrollTop = scrollHeight` 被夹到真正的底部。
+   * - 几何只能在 `render` 之后安装，于是组件的第一次 layout effect 会把
+   *   `scrollHeight = 0` 记成基线，命中「首帧不补偿」的早退。所以每条用例都要
+   *   先做一次窗口变更（高度不变）把基线建立起来，再改高度做真正的断言。
+   */
+  function installGeometry(
+    el: HTMLElement,
+    state: { scrollHeight: number; clientHeight: number; scrollTop: number },
+  ) {
+    Object.defineProperty(el, "scrollHeight", { get: () => state.scrollHeight, configurable: true });
+    Object.defineProperty(el, "clientHeight", { get: () => state.clientHeight, configurable: true });
+    Object.defineProperty(el, "scrollTop", {
+      get: () => state.scrollTop,
+      set: (v: number) => {
+        const max = Math.max(0, state.scrollHeight - state.clientHeight);
+        state.scrollTop = Math.min(Math.max(0, v), max);
+      },
+      configurable: true,
+    });
+    return state;
+  }
+
+  const rows = (from: number, to: number, sink: Item[]) => {
+    for (let i = from; i < to; i += 1) {
+      sink.push({ type: "agentMessage", id: `m${i}`, text: `row ${i}` } as Item);
+    }
+    return sink;
+  };
+
+  it("区间变化时补偿 scrollTop（跟随中则重新贴底）", () => {
+    const many = rows(0, 3000, []);
+    const { container, rerender } = render(
+      <ChatView items={many} threadId="t1" structuralVersion={1} query="" />,
+    );
+    const scroller = container.querySelector("[data-thread-id]") as HTMLElement;
+    const geo = installGeometry(scroller, { scrollHeight: 10_000, clientHeight: 800, scrollTop: 5_000 });
+
+    // 建立基线（高度不变，差值 0，不写位置），且顺带把窗口挪一次。
+    rerender(<ChatView items={rows(3000, 3060, [...many])} threadId="t1" structuralVersion={2} query="" />);
+    const after = rows(3060, 3120, rows(3000, 3060, [...many]));
+
+    // 真正的窗口变更：上方多挂一页，内容 10000 -> 14000。
+    geo.scrollHeight = 14_000;
+    rerender(<ChatView items={after} threadId="t1" structuralVersion={3} query="" />);
+
+    // 跟随中：视口必须落到新底部 = 14000 - 800，而不是留在 5000。
+    expect(geo.scrollTop).toBe(13_200);
+  });
+
+  it("非跟随（用户在读历史）时按高度差位移，而不是贴底", () => {
+    // 跟随分支会被 `useStickToBottom` 的其它路径顺带满足，钉不住补偿本身。
+    // 只有非跟随状态的差值分支无法由别处代劳，必须单独覆盖。
+    const many = rows(0, 3000, []);
+    const { container, rerender } = render(
+      <ChatView items={many} threadId="t1" structuralVersion={1} query="" />,
+    );
+    const scroller = container.querySelector("[data-thread-id]") as HTMLElement;
+    const geo = installGeometry(scroller, { scrollHeight: 10_000, clientHeight: 800, scrollTop: 5_000 });
+
+    rerender(<ChatView items={rows(3000, 3060, [...many])} threadId="t1" structuralVersion={2} query="" />);
+
+    // 用户上翻。`useStickToBottom.onScroll` 需要**两次**事件才判定上翻：第一次
+    // 建立基线（`prevTop === null` 时只按绝对位置设意图），第二次才比较位移。
+    geo.scrollTop = 8_000;
+    fireEvent.scroll(scroller);
+    geo.scrollTop = 5_000;
+    fireEvent.scroll(scroller);
+
+    const after = rows(3060, 3120, rows(3000, 3060, [...many]));
+    geo.scrollHeight = 14_000;
+    rerender(<ChatView items={after} threadId="t1" structuralVersion={3} query="" />);
+
+    // 补偿后 5000 + 4000 = 9000：既不是留在 5000，也不是贴底 13200。
+    expect(geo.scrollTop).toBe(9_000);
+  });
+});
