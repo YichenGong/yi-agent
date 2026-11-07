@@ -1583,7 +1583,11 @@ impl AgentSupervisor {
             .tasks
             .get(sender)
             .ok_or(MessageDeliveryError::SenderNotFound)?;
-        if enforce_live_sender && sender_task.state().is_terminal() {
+        // Same rule as the recipient side: a container's historical terminal
+        // state says an old execution ended, never that the conversation did.
+        // Reading it as a bare `is_terminal()` refused live sessions their own
+        // mailbox after any turn that settled.
+        if enforce_live_sender && mailbox_is_closed(sender_task, &self.closed_containers) {
             return Err(MessageDeliveryError::SenderTerminal);
         }
         let recipient_task = self
@@ -1591,10 +1595,10 @@ impl AgentSupervisor {
             .get(&recipient)
             .ok_or(MessageDeliveryError::RecipientNotFound)?;
         // A container's historical terminal state is evidence about an old
-        // execution, not "this mailbox is gone". `recipient_is_closed` is the one
-        // rule every delivery path shares, so this cannot drift from the
-        // worker-capability path again.
-        if recipient_is_closed(recipient_task, &self.closed_containers) {
+        // execution, not "this mailbox is gone". `mailbox_is_closed` is the one
+        // rule every delivery path shares, sender and recipient, so this cannot
+        // drift again.
+        if mailbox_is_closed(recipient_task, &self.closed_containers) {
             return Err(MessageDeliveryError::RecipientTerminal);
         }
         let is_parent = self
@@ -1767,7 +1771,7 @@ impl AgentSupervisor {
         // conversation it belongs to has to keep working after that conversation's
         // last *execution* ended, or a restarted session could never receive the
         // work its own children finished.
-        if recipient_is_closed(recipient_task, &self.closed_containers) {
+        if mailbox_is_closed(recipient_task, &self.closed_containers) {
             return Err(MessageDeliveryError::RecipientTerminal);
         }
         let is_parent = sender_task.parent_id.as_ref() == Some(recipient);
@@ -1829,7 +1833,7 @@ impl AgentSupervisor {
             .tasks
             .get(recipient)
             .ok_or(MessageDeliveryError::RecipientNotFound)?;
-        if recipient_is_closed(recipient_task, &self.closed_containers) {
+        if mailbox_is_closed(recipient_task, &self.closed_containers) {
             return Err(MessageDeliveryError::RecipientTerminal);
         }
         Ok(())
@@ -2276,16 +2280,22 @@ pub enum TerminalKind {
 
 /// Whether a recipient's mailbox is closed to new messages.
 ///
-/// One rule for every delivery path: only an `Execution`'s terminal state closes a
-/// mailbox. A container's state describes its last execution, and an explicitly
-/// closed container is that tombstone -- never the historical state.
-fn recipient_is_closed(
-    recipient: &AgentTask,
+/// One rule for every delivery path, senders and recipients alike: only an
+/// `Execution`'s terminal state closes a mailbox. A container's state describes its
+/// last execution, and an explicitly closed container is that tombstone -- never
+/// the historical state.
+///
+/// A container never executes, so reading its `TaskState` as "this conversation is
+/// over" is the execution rule misapplied to a role it does not describe. Only the
+/// close tombstone ends a conversation, so a live session may still message its own
+/// children after a turn that ended in a terminal label.
+fn mailbox_is_closed(
+    task: &AgentTask,
     closed_containers: &std::collections::HashSet<TaskId>,
 ) -> bool {
-    match recipient.role() {
-        TaskRole::Execution => recipient.state().is_terminal(),
-        TaskRole::SessionContainer => closed_containers.contains(&recipient.id),
+    match task.role() {
+        TaskRole::Execution => task.state().is_terminal(),
+        TaskRole::SessionContainer => closed_containers.contains(&task.id),
     }
 }
 
@@ -2599,6 +2609,75 @@ mod tests {
         );
     }
 
+    /// A container whose history says `completed` still SENDS to its own child.
+    ///
+    /// The mirror of [`Self::session_delegation_lifecycle_terminal_container_regains_its_children`].
+    /// A container never runs a worker, so its `TaskState` is only a record of the
+    /// last *execution*; reading it as "this conversation is over" is the execution
+    /// rule misapplied to a role it does not describe. That is what made a live
+    /// session unable to message the children it owns after any turn that ended in a
+    /// terminal label.
+    #[test]
+    fn session_delegation_lifecycle_terminal_container_still_sends_to_its_child() {
+        let (mut supervisor, root, child) = completed_container_with_child();
+        let draft = MailboxMessageDraft::new(
+            root.clone(),
+            child.clone(),
+            MessageKind::UserInstruction(UserInstruction("keep going".into())),
+            None,
+        );
+
+        supervisor
+            .deliver_message(&root, draft, true)
+            .unwrap_or_else(|error| {
+                panic!("a completed-but-open container must still message its child: {error:?}")
+            });
+    }
+
+    /// Closing the container is what ends it, and it must still refuse the sender.
+    ///
+    /// The exemption above is the role plus the absent tombstone, never a blanket
+    /// "containers may always send": a closed conversation must not reach the
+    /// children the close just cancelled.
+    #[test]
+    fn session_delegation_lifecycle_closed_container_cannot_send() {
+        let (mut supervisor, root, child) = completed_container_with_child();
+        supervisor.close_session_container().unwrap();
+        let draft = MailboxMessageDraft::new(
+            root.clone(),
+            child.clone(),
+            MessageKind::UserInstruction(UserInstruction("late work".into())),
+            None,
+        );
+
+        assert_eq!(
+            supervisor.deliver_message(&root, draft, true).unwrap_err(),
+            MessageDeliveryError::SenderTerminal
+        );
+    }
+
+    /// A root hydrated with a historical terminal state, still open, owning one child.
+    fn completed_container_with_child() -> (AgentSupervisor, TaskId, TaskId) {
+        let session = RootSessionId::new();
+        let root = TaskId::new();
+        let mut historical = AgentTask::hydrated_review_task(
+            session,
+            root.clone(),
+            None,
+            super::super::task::TaskDepth::Root,
+            AttemptId::new(),
+            1,
+            TaskState::Completed,
+        );
+        historical
+            .hydrate_session_role(TaskRole::SessionContainer)
+            .unwrap();
+        let mut supervisor =
+            AgentSupervisor::from_hydrated_review_root(historical, "restarted".into());
+        let child = supervisor.spawn(root.clone()).unwrap();
+        (supervisor, root, child)
+    }
+
     /// A container whose history says `completed` still takes reports from its own
     /// child, on the worker-capability path as well as the mailbox path.
     ///
@@ -2644,7 +2723,7 @@ mod tests {
         supervisor.close_session_container().unwrap();
         let closed = supervisor.task(&root).unwrap();
         assert!(
-            recipient_is_closed(closed, &supervisor.closed_containers),
+            mailbox_is_closed(closed, &supervisor.closed_containers),
             "closing the container must close the mailbox even though its persisted \
              state stays `completed`"
         );
