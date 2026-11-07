@@ -135,14 +135,29 @@ nextest 为了枚举用例，会对**每个测试二进制**执行 `--list --for
 本表只用来断言 `rdeps` 的输出条数对得上。若某天数字对不上，说明依赖图变了，
 需人工复核是合理变化还是实现 bug。
 
-### D2：L2 的改动范围默认对比 main，允许 `--since` 覆盖
+### D2：L2 的改动范围默认对比 `merge-base`，允许 `--since` 覆盖
 
 不做「自动猜改动影响面」。理由：猜错的代价是**以为测了其实没测**，比多跑几个 crate 贵得多。
-默认 `git diff main...HEAD`（三点，比两点干净：排除 main 上的新提交），
-`--since <ref>` 可换成任意基准。
 
-若 `git diff` 结果为空（例如在 main 上直接跑），则**报错退出**而不是静默跑 0 个测试。
-静默跑 0 个测试是这个仓库已经出现过两次的失败模式（见 `justfile` 里 `eval` recipe
+**默认基准不是 `main...HEAD`，而是 `$(git merge-base main HEAD)` 的两点 diff。**
+这是实测纠正的一处早期错误设计：
+
+| 命令 | 含未提交改动？ | 混入 main 上他人的提交？ |
+|---|---|---|
+| `git diff main...HEAD`（三点） | **否** | 否 |
+| `git diff main`（两点，对 main） | 是 | **是** |
+| `git diff $(git merge-base main HEAD)` | **是** | 否 |
+
+L2 最常见的用法是「我刚改了点代码，想跑相关测试」——此时改动**还没提交**。
+三点 diff 会返回空，直接触发下面的「空 diff 报错」，把一个正常场景变成报错。
+而直接对 `main` 两点 diff 又会把 main 上别人的提交算进来（实测本仓库当时就多出
+7 个 `subagent/*` 文件，全是另一个会话在 main 上的提交）。
+
+所以默认基准 = `git merge-base main HEAD`，`--since <ref>` 可换成任意基准
+（同样用两点 diff：`git diff --name-only <ref>`）。
+
+若 `git diff` 结果为空，则**报错退出**而不是静默跑 0 个测试。
+静默跑 0 个测试是这个仓库已经出现过的失败模式（见 `justfile` 里 `eval` recipe
 关于「跑了 0 条 case 且退出码 0」的注释）。
 
 ### D3：假红的根因是跨会话并发，不是 spawn-heavy 组的名单不全
@@ -300,7 +315,8 @@ error[E0599]: no method named `execute_test_scalar` found for struct `RuntimeRep
 
 四步：
 
-1. `git diff --name-only <base>...HEAD` 取改动文件
+1. `git diff --name-only $(git merge-base main HEAD)`（或 `--since` 指定 ref）取改动文件——
+   **用两点 diff，不用三点**，否则会漏掉未提交改动（见 D2）
 2. 由路径前缀映射到 workspace crate（`crates/<name>/src/...` → `<name>`）；
    成员列表由 `cargo metadata --no-deps` 读一次得到
 3. 把这些 crate 名拼成 `-E 'rdeps(a) | rdeps(b) | ...'`
@@ -392,6 +408,8 @@ D3 的结论是假红无法在配置层修掉，因此改为**让它在发生时
 | L2 有改动但全映射不到 crate | 打印未映射路径清单，exit 1（不静默跑 0 个测试） |
 | L2 部分映射到 crate | 跑命中的 crate，并额外打印未映射路径 |
 | `cargo metadata` 失败 | 直接透传失败，不吞 |
+| nextest 报 `no tests to run`（rc=4） | **已实测**：nextest 在 0 个用例匹配时退出码是 **4**，不是 0。此情形说明「映射出的 crate 里没有该表达式选中的测试」，属于前述「跑 0 个测试」失败模式，**透传 rc=4 并附一句说明**，不要改写成 0 |
+| 改动路径指向已删除的 crate | 该路径映射不到当前 workspace 成员，并入「未映射路径」清单处理（不要因此 exit 1 拒绝跑其余 crate） |
 
 ## 测试
 
