@@ -58,4 +58,28 @@ out="$(map 'yi-agent-rs/justfile')"
 grep -qx 'UNMAPPED: yi-agent-rs/justfile' <<<"$out" || fail "justfile should be UNMAPPED"
 n=$((n + 1)); pass "treats yi-agent-rs/justfile as UNMAPPED"
 
+# 关键反例：读不到成员列表时必须失败退出，不能把全部路径判成 UNMAPPED 后返回 0。
+# 这是本设计最危险的静默失败：cargo 不可用 → 一个 crate 都匹配不上 → 少测所有东西。
+unset WORKSPACE_CRATES
+err="$(env PATH=/usr/bin:/bin "$SCRIPT" map <<<'yi-agent-rs/crates/yi-agent-core/src/a.rs' 2>&1 >/dev/null)"
+rc=$?
+[ "$rc" -ne 0 ] || { fail "map must fail (not exit 0) when workspace members cannot be read"; }
+grep -q 'cargo' <<<"$err" || { printf '%s\n' "$err" >&2; fail "error must mention cargo"; }
+n=$((n + 1)); pass "fails loudly when workspace members cannot be read"
+
+# 同上，但 cargo 存在而 metadata 失败（模拟损坏的 manifest）
+fakebin="$(mktemp -d)"
+trap 'rm -rf "$fakebin"' EXIT
+cat >"$fakebin/cargo" <<'SH'
+#!/bin/sh
+echo "error: failed to read manifest" >&2
+exit 101
+SH
+chmod +x "$fakebin/cargo"
+err="$(env PATH="$fakebin:/usr/bin:/bin" "$SCRIPT" map <<<'yi-agent-rs/crates/yi-agent-core/src/a.rs' 2>&1 >/dev/null)"
+rc=$?
+[ "$rc" -ne 0 ] || { fail "map must fail when cargo metadata fails"; }
+grep -q 'cargo metadata failed' <<<"$err" || { printf '%s\n' "$err" >&2; fail "error must mention cargo metadata failure"; }
+n=$((n + 1)); pass "fails loudly when cargo metadata fails"
+
 printf '\n%d passed\n' "$n"

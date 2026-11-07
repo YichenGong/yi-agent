@@ -130,6 +130,30 @@ out="$(map 'yi-agent-rs/justfile')"
 grep -qx 'UNMAPPED: yi-agent-rs/justfile' <<<"$out" || fail "justfile should be UNMAPPED"
 n=$((n + 1)); pass "treats yi-agent-rs/justfile as UNMAPPED"
 
+# 关键反例：读不到成员列表时必须失败退出，不能把全部路径判成 UNMAPPED 后返回 0。
+# 这是本设计最危险的静默失败：cargo 不可用 → 一个 crate 都匹配不上 → 少测所有东西。
+unset WORKSPACE_CRATES
+err="$(env PATH=/usr/bin:/bin "$SCRIPT" map <<<'yi-agent-rs/crates/yi-agent-core/src/a.rs' 2>&1 >/dev/null)"
+rc=$?
+[ "$rc" -ne 0 ] || { fail "map must fail (not exit 0) when workspace members cannot be read"; }
+grep -q 'cargo' <<<"$err" || { printf '%s\n' "$err" >&2; fail "error must mention cargo"; }
+n=$((n + 1)); pass "fails loudly when workspace members cannot be read"
+
+# 同上，但 cargo 存在而 metadata 失败（模拟损坏的 manifest）
+fakebin="$(mktemp -d)"
+trap 'rm -rf "$fakebin"' EXIT
+cat >"$fakebin/cargo" <<'SH'
+#!/bin/sh
+echo "error: failed to read manifest" >&2
+exit 101
+SH
+chmod +x "$fakebin/cargo"
+err="$(env PATH="$fakebin:/usr/bin:/bin" "$SCRIPT" map <<<'yi-agent-rs/crates/yi-agent-core/src/a.rs' 2>&1 >/dev/null)"
+rc=$?
+[ "$rc" -ne 0 ] || { fail "map must fail when cargo metadata fails"; }
+grep -q 'cargo metadata failed' <<<"$err" || { printf '%s\n' "$err" >&2; fail "error must mention cargo metadata failure"; }
+n=$((n + 1)); pass "fails loudly when cargo metadata fails"
+
 printf '\n%d passed\n' "$n"
 ```
 
@@ -160,6 +184,10 @@ set -uo pipefail
 # 读 workspace 成员：优先用环境变量（自测注入），否则问 cargo。
 # 必须处理 cwd：从仓库根调用时要指到 yi-agent-rs/Cargo.toml，否则 cargo
 # 找不到 manifest，输出为空 → 所有 crate 都被判成 unmapped（静默全错）。
+#
+# 失败必须显式非零：读不到成员列表时，任何路径都不可能匹配成 crate，
+# 于是全部落进 UNMAPPED 而退出码仍是 0。这是本设计要消除的「静默少测」，
+# 所以这里宁可报错停下，也不能返回空列表。
 workspace_crates() {
     if [ -n "${WORKSPACE_CRATES:-}" ]; then
         printf '%s\n' $WORKSPACE_CRATES
@@ -169,8 +197,34 @@ workspace_crates() {
     if [ ! -f "$manifest" ] && [ -f "yi-agent-rs/Cargo.toml" ]; then
         manifest="yi-agent-rs/Cargo.toml"
     fi
-    cargo metadata --no-deps --format-version 1 --manifest-path "$manifest" 2>/dev/null \
-        | python3 -c 'import json,sys; [print(p["name"]) for p in json.load(sys.stdin)["packages"]]'
+    if ! command -v cargo >/dev/null 2>&1; then
+        printf 'error: cargo not found in PATH; cannot read workspace members\n' >&2
+        printf '       (set WORKSPACE_CRATES="a b c" to override)\n' >&2
+        return 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf 'error: python3 not found in PATH; cannot parse cargo metadata\n' >&2
+        return 1
+    fi
+    local meta
+    if ! meta="$(cargo metadata --no-deps --format-version 1 --manifest-path "$manifest" 2>/dev/null)"; then
+        printf 'error: cargo metadata failed for %s; cannot read workspace members\n' "$manifest" >&2
+        return 1
+    fi
+    local names
+    if ! names="$(printf '%s' "$meta" | python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(3)
+for pkg in doc["packages"]:
+    print(pkg["name"])
+' 2>/dev/null)"; then
+        printf 'error: could not parse cargo metadata output\n' >&2
+        return 1
+    fi
+    printf '%s\n' "$names"
 }
 
 # 判定一条路径属于哪一类。
@@ -182,9 +236,16 @@ workspace_crates() {
 cmd_map() {
     local -a members=() mapped=() unmapped=() docs=()
     local m p rest name is_member
+    # 先收集成员列表并判成败，再消费 stdin。否则读失败会变成「空成员列表」，
+    # 所有路径静默落进 UNMAPPED——看起来成功，实际什么都没测。
+    local member_list
+    if ! member_list="$(workspace_crates)"; then
+        printf 'error: cannot determine workspace members; refusing to classify paths\n' >&2
+        exit 1
+    fi
     while IFS= read -r m; do
         [ -n "$m" ] && members+=("$m")
-    done < <(workspace_crates)
+    done <<<"$member_list"
 
     while IFS= read -r p; do
         [ -z "$p" ] && continue
@@ -249,7 +310,7 @@ main "$@"
 cd yi-agent-rs && chmod +x scripts/test-tiers.sh && bash scripts/test_test_tiers.sh
 ```
 
-预期：输出 8 行 `ok: ...`，最后 `8 passed`，退出码 0。
+预期：输出 10 行 `ok: ...`，最后 `10 passed`，退出码 0。
 
 - [ ] **Step 5: 提交**
 
