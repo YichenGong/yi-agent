@@ -6,8 +6,8 @@ use crate::protocol::{RequestEnvelope, RequestId, RpcError, Scope, ThreadStatus}
 use crate::rpc::{AppState, Flow};
 use crate::server::{
     ThreadCancelOutcome, cancel_thread_children, detach_unused_runtimes, err_response,
-    interrupt_and_wait_for_persist, ok_response, require_thread_id, store_lookup, thread_cwd,
-    worktree_json, write_response,
+    interrupt_and_wait_for_persist, ok_response, require_thread_id, stop_thread_watches,
+    store_lookup, thread_cwd, worktree_json, write_response,
 };
 use crate::session::SessionCommand;
 use serde_json::json;
@@ -156,15 +156,13 @@ pub(crate) async fn handle(
             {
                 root.detach();
             }
-            if let Some(watch) = state.trace_watches.remove(&thread_id) {
-                watch.stop().await;
-            }
-            if let Some(watch) = state.children_watches.remove(&thread_id) {
-                watch.stop().await;
-            }
-            if let Some(watch) = state.process_watches.remove(&thread_id) {
-                watch.stop().await;
-            }
+            stop_thread_watches(
+                &thread_id,
+                state.trace_watches,
+                state.children_watches,
+                state.process_watches,
+            )
+            .await;
             // 视图帧与 thread 同生命周期:帧表按 thread_id 索引,不清理就永久驻留。
             // `thread/view/read` 有 `require_known_thread` 前置检查,故此处不影响
             // 正确性,只是不让已删会话的帧继续占内存。
