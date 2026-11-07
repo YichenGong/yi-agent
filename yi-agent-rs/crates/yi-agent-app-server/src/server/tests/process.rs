@@ -1135,6 +1135,8 @@ async fn trace_unwatch_rpc_preserves_children_watch() {
         let watchman: crate::server::WatchmanInstall = Arc::new(|_, _| Ok(()));
         let unwatchman: crate::server::WatchmanUninstall = Arc::new(|_| Ok(()));
         let build_agent = build_test_agent;
+        // main 引入的托管授权槽位：本测试走内嵌路径，没有 shell 授权。
+        let managed: crate::server::ManagedSlot = Arc::new(StdMutex::new(None));
 
         // 两个兄弟守望者的 task:收 ping 直到 ping 端被丢的循环。本测试持有 ping
         // 端,故它们一直挂着;断言 `!is_finished()` 才与「有没有被 abort」等价。
@@ -1183,6 +1185,7 @@ async fn trace_unwatch_rpc_preserves_children_watch() {
                 pending_activation: &mut pending_activation,
                 runtimes: &runtimes,
                 thread_roots: &thread_roots,
+                managed: &managed,
                 process_watches: &mut process_watches,
                 trace_watches: &mut trace_watches,
                 children_watches: &mut children_watches,
