@@ -43,7 +43,7 @@
       "commands": [
         {
           "kind": "command",
-          "run": "cargo nextest run -p yi-agent-supervisors -E 'test(managed_launch)'",
+          "run": "cargo nextest run -p yi-agent-supervisors -E 'binary(managed_launch)'",
           "cwd": "yi-agent-rs"
         }
       ],

@@ -85,6 +85,11 @@ export function runMatrix(matrix, { cwd = process.cwd(), runner = execFileSync }
     "nextest",
     "run",
     "--no-fail-fast",
+    // 必须和 `just ci` 一样带 --all-features。有些测试辅助 API 挂在
+    // `foreground-test-support` 这类非默认 feature 后面；不带它去编译
+    // 集成测试，测试代码本身就会 E0599（方法不存在）而编译失败——那会被
+    // 读成"实现坏了"，实际只是少给了一个 feature。
+    "--all-features",
     // nextest 的 JSON 需要实验开关；JSON 里字段是稳定的。
     "--message-format",
     "libtest-json",
