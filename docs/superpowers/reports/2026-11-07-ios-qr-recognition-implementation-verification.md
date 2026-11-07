@@ -291,3 +291,76 @@ cd desktop && npm test -- --environment jsdom \
 
 A01、A02、A03、A04、A15、A16（四个分支）、A18；既有 A12 启动错误、ErrorBoundary
 就地收敛、安全区、桌面手输、返回目标断言全部保留并通过。
+
+## Task 4：真实相机集成与宿主回归
+
+改动文件（仅测试）：
+
+- `desktop/src/components/PairingScreen.test.tsx`
+- `desktop/src/App.test.tsx`
+- `docs/project-management/desktop.md`（补证据，条目仍 `[ ]`）
+- 本文件
+
+无生产代码改动（`App.tsx` 未动）。
+
+### 4.1 真实相机集成（A07/A08/A14）
+
+新增独立 describe `real camera integration`：使用真实 `PairingScreen` + 真实
+`QrScanner` + 真实 `startCameraScan`，只替换四个外界边界——`navigator.mediaDevices.getUserMedia`、
+`HTMLMediaElement.play`、`canvas.getContext`（含 `videoWidth/videoHeight`）、`jsQR`。
+不 mock `QrScanner`/`startCameraScan`/`PairingScreen`，也不传 `scan` 接缝。
+
+- A07/A14（`strict=false` / `strict=true`）：进入扫码 → 父组件真实重渲染（新元素引用
+  + 新 `notice`）→ jsQR 命中合法载荷。断言 `redeem` 恰 1 次、`getUserMedia` 调用数与
+  StrictMode 收敛后的 baseline 相同（不重开相机）、dialog 与 `相机预览` 都消失、
+  `配对进度` 文案为 `已识别二维码，正在连接桌面…`、每个 stream 的 track 恰停一次。
+- A08（两种 strict）：先送无效码 → dialog 内可见 `不是有效的配对二维码`，**存活流未被
+  stop**、无新增取流、`redeem` 为 0；再送合法码 → `redeem` 1 次、无新增取流、
+  dialog 消失、无 alert、所有 track 各停一次。
+- 媒体 mock 用 `Object.getOwnPropertyDescriptor` + `defineProperty(configurable)` 安装，
+  `afterEach` 先 `cleanup()` 再恢复 descriptor 与 mocks/timers。
+
+### 4.2 判别性验证（mutation）
+
+临时把 `QrScanner` effect 回退为旧写法（`startCameraScan(video, onText, onError, deps)`，
+依赖 `[onText, onError, deps]`），重跑真实相机测试：
+
+```
+ Failed Tests 4
+ FAIL  A07/A14 pending recognition leaves the camera strict=false
+ FAIL  A07/A14 pending recognition leaves the camera strict=true
+ FAIL  A08 invalid then valid stays in one live stream strict=false
+ FAIL  A08 invalid then valid stays in one live stream strict=true
+      Tests  4 failed | 36 passed (40)
+```
+
+恢复后 40/40 通过。证明这些用例确实在判别「回调刷新重开相机」，不是恒绿。
+
+### 4.3 宿主回归（A13/A16）
+
+在 `App mobile repair path` 内新增：
+
+- A16（`resolve`/`reject` 各一例）：已配对手机进重配页提交 → 进度节点出现 → 点「返回」
+  后晚到的 JSON-RPC 回包被忽略：`localStorage` 保持原字符串、`clients.length` 仍为 1、
+  配对表单不重现、无渲染错误。直接在 `App` 层验证「宿主未卸载时由返回 handler 自身失效」。
+- A13：重配页提交后服务端回 `-32001` → 显示 `配对码无效或已过期，请在桌面重新生成`、
+  进度节点消失、原有 `yi-agent.remote` 字符串不变、`clients.length` 仍为 1。
+- 原有首启成功兑换、失败不落盘、重配成功后重建连接等用例全部保留并通过。
+
+### 4.4 结果
+
+```
+cd desktop && npm test -- --environment jsdom src/components/PairingScreen.test.tsx
+  → 40 passed
+cd desktop && npm test -- --environment jsdom src/App.test.tsx
+  → 279 passed
+cd desktop && npm test
+  → 173 files / 2423 tests passed
+cd desktop && npx tsc --noEmit  → 无输出，exit 0
+```
+
+- `cargo fmt --all` 已执行。
+- 除 `test` 外的全部 `just ci` 门禁 → **rc=0**（`/tmp/ios-qr-task4-gates.log`）。
+- 完整 `just ci` 仍被既有基线测试
+  `yi-agent-app-server server::tests::transport::agent_factory_failure_returns_internal_error`
+  阻塞（main 上同样 3/3 失败），与本任务无关。

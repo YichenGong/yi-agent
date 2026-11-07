@@ -1,5 +1,6 @@
 /** @vitest-environment jsdom */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
 import {
   act,
   cleanup,
@@ -7,6 +8,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import {
   CONNECT_FAILED_TEXT,
@@ -836,4 +838,155 @@ describe("PairingScreen pairing admission", () => {
     );
     expect(screen.queryByRole("dialog", { name: "扫描二维码" })).toBeNull();
   });
+});
+
+
+const qr = vi.hoisted(() => ({ decode: vi.fn() }));
+vi.mock("jsqr", () => ({ default: qr.decode }));
+
+/**
+ * 真实相机路径：只替换 getUserMedia / play / canvas / jsQR 这四个外界边界，
+ * `PairingScreen` 与 `QrScanner` 都是生产组件，`startCameraScan` 也是真的。
+ */
+describe("real camera integration", () => {
+  const streams: Array<{ stop: ReturnType<typeof vi.fn> }> = [];
+  let mediaDevicesBefore: PropertyDescriptor | undefined;
+  const open = vi.fn(async () => {
+    const stop = vi.fn();
+    const stream = { getTracks: () => [{ stop }] } as unknown as MediaStream;
+    streams.push({ stop });
+    return stream;
+  });
+  const recognizing = () =>
+    qr.decode.mockReturnValue({
+      data: `yiagent://pair?v=1&relay=${encodeURIComponent(URL)}&code=ABCD-EFGH`,
+    });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    streams.length = 0;
+    open.mockClear();
+    qr.decode.mockReset();
+    qr.decode.mockReturnValue(null);
+    mediaDevicesBefore = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: open },
+    });
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLVideoElement.prototype, "videoWidth", "get").mockReturnValue(1);
+    vi.spyOn(HTMLVideoElement.prototype, "videoHeight", "get").mockReturnValue(1);
+    const context = {
+      drawImage: vi.fn(),
+      getImageData: () => ({
+        data: new Uint8ClampedArray(4),
+        width: 1,
+        height: 1,
+      }),
+    } as unknown as CanvasRenderingContext2D;
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(context);
+  });
+
+  afterEach(() => {
+    cleanup(); // 先卸载停循环，再恢复 timers/mocks
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    if (mediaDevicesBefore) {
+      Object.defineProperty(navigator, "mediaDevices", mediaDevicesBefore);
+    } else {
+      Reflect.deleteProperty(navigator, "mediaDevices");
+    }
+  });
+
+  it.each([false, true])(
+    "A07/A14 pending recognition leaves the camera strict=%s",
+    async (strict) => {
+      const pending = deferred<typeof PAIRED>();
+      const redeem = vi.fn(() => pending.promise);
+      const element = (
+        <PairingScreen enableScan storage={storages()} redeem={redeem} />
+      );
+      const view = render(strict ? <StrictMode>{element}</StrictMode> : element);
+      fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const baseline = open.mock.calls.length; // StrictMode 重放已收敛
+
+      // 真实父组件重渲染（新元素 + 新 notice），验证回调 identity 变化不重开相机。
+      const changed = (
+        <PairingScreen
+          enableScan
+          storage={storages()}
+          redeem={redeem}
+          notice="普通重渲染"
+        />
+      );
+      view.rerender(strict ? <StrictMode>{changed}</StrictMode> : changed);
+
+      recognizing();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(200);
+      });
+
+      expect(redeem).toHaveBeenCalledTimes(1);
+      expect(open).toHaveBeenCalledTimes(baseline);
+      expect(screen.queryByRole("dialog", { name: "扫描二维码" })).toBeNull();
+      expect(screen.queryByLabelText("相机预览")).toBeNull();
+      expect(
+        screen.getByRole("status", { name: "配对进度" }).textContent,
+      ).toBe("已识别二维码，正在连接桌面…");
+      for (const entry of streams) expect(entry.stop).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        pending.resolve(PAIRED);
+      });
+    },
+  );
+
+  it.each([false, true])(
+    "A08 invalid then valid stays in one live stream strict=%s",
+    async (strict) => {
+      const pending = deferred<typeof PAIRED>();
+      const redeem = vi.fn(() => pending.promise);
+      const element = (
+        <PairingScreen enableScan storage={storages()} redeem={redeem} />
+      );
+      render(strict ? <StrictMode>{element}</StrictMode> : element);
+      fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const baseline = open.mock.calls.length;
+      const live = streams.filter(
+        (entry) => entry.stop.mock.calls.length === 0,
+      );
+      expect(live).toHaveLength(1);
+
+      qr.decode.mockReturnValue({ data: "https://ordinary.test" });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(200);
+      });
+      const dialog = screen.getByRole("dialog", { name: "扫描二维码" });
+      expect(within(dialog).getByRole("alert").textContent).toBe(
+        "不是有效的配对二维码",
+      );
+      // 无效码不得停掉仍在用的流，也不得重新取流。
+      expect(live[0].stop).not.toHaveBeenCalled();
+      expect(open).toHaveBeenCalledTimes(baseline);
+      expect(redeem).not.toHaveBeenCalled();
+
+      recognizing();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(200);
+      });
+      expect(redeem).toHaveBeenCalledTimes(1);
+      expect(open).toHaveBeenCalledTimes(baseline);
+      expect(screen.queryByRole("dialog", { name: "扫描二维码" })).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      for (const entry of streams) expect(entry.stop).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        pending.resolve(PAIRED);
+      });
+    },
+  );
 });
