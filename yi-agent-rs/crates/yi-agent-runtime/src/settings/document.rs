@@ -324,6 +324,10 @@ mod tests {
     ///
     /// 抓的破坏：见到坏分组就提前返回，用户把 `agent` 修好后才发现
     /// `compact.ratio` 也不合法，要存两轮。
+    ///
+    /// `Select` 是唯一会把取值写进 reason 的类型（`validate_value` 的
+    /// `got {text:?}`），所以这里必须显式断言取值缺席：把文档级错误改成透传
+    /// 单字段 reason 时，只查键名的断言仍会通过，用户填的值就进了错误消息。
     #[test]
     fn a_bad_group_and_bad_fields_are_reported_together() {
         let error = validate_document(serde_json::json!({
@@ -337,6 +341,10 @@ mod tests {
         for key in ["agent", "compact.ratio", "tui.notification_method"] {
             assert!(message.contains(key), "{key} missing from {message}");
         }
+        assert!(
+            !message.contains("carrier-pigeon"),
+            "select value leaked into the error: {message}"
+        );
     }
 
     /// 根不是对象时按文档级错误拒绝，且不回显原文。
