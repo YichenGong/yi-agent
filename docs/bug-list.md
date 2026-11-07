@@ -305,3 +305,8 @@
   **定性：并发 flake，非逻辑错误。** 单独跑 **3/3 通过**（14.68s / 14.35s / 14.65s，`cargo test -p yi-agent --test managed_production_integration quitting_one_frontend_leaves_the_others_work_running`），每次远低于用例自己的 60s 预算；只在 `--workspace` 全量并发时命中，属既有 flake 而非本轮改动引入（本轮图片修复未触及 lifecycle/lease/reclaim 任何代码）。
   **触发形状：** 该用例是重型集成测试——会真的拉起 TUI（pty）与 headless 两个前端、两个 mock tool-calling 网关，并按**事实**等待 `await_two_owners_in_journal`（60s 预算）与 `wait_for_reclaim(..., RELEASE_BUDGET)`。全量并发时 guardian 记账与进程回收被其它 5000+ 用例挤占 CPU，等待预算用尽即断言失败。它的失败信息本身已经区分了「TUI 偷了 run 的工作」与「run 自己停了」，所以红的时候看 `failures`/`run_alive` 字段即可判定是不是预算耗尽。
   **未做：** 未改等待预算、未加串行标记。把预算调大只会掩盖问题并拖慢全部 CI；真要收敛应把它挪到独立的串行 profile（`just ci` 之外的重集成入口），那是独立决策，不在本次范围。复现只需全量并发跑几次；定性只需上面那条单跑命令 3/3 通过。
+
+- [ ] P3 `yi-agent-app-server` 全量 lib 测试（1500+ 用例）偶发 1~3 个 ws/turn 用例失败，且每次失败集合不同。
+  **定性：并发 flake，非逻辑错误。** 实测四轮全量（`cargo test -p yi-agent-app-server --lib`）的失败集合互不重叠：`resume_append_rolls_back_only_its_own_placeholder`、`a_failed_append_still_records_the_completion`、`a_pair_code_minted_by_another_instance_redeems_over_the_ws`（同一轮 3 个）→ 只有 `resume_append_rolls_back_only_its_own_placeholder` → 只有 `a_pair_code_is_redeemed_over_the_ws_and_yields_a_usable_token` → 全绿。**失败集合逐轮漂移本身就是并发 flake 的判别证据**：真缺陷会稳定复现同一组。
+  **单跑对照（逐条实测）：** `cargo test -p yi-agent-app-server --lib -- <test_name>` 每条 **3/3 通过**（0.50~0.51s），带与不带继承的 `YI_AGENT_LOCAL_MANAGEMENT` 均通过。ws 用例的失败形态是 `transport error while waiting for the initialize response: Protocol(ResetWithoutClosingHandshake)`（`src/test_support.rs:54`）——握手期间对端连接被重置，典型的高负载下 accept/握手竞态，不是断言逻辑错。
+  **触发形状：** 这些用例都真的开 ws 监听、走完整 initialize 握手或拉起 driver；全量时 1500+ 用例共享线程池，握手窗口被挤占即重置。**未做**：未加串行标记、未调超时。收敛应走独立串行 profile（`just ci` 之外的重集成入口），属独立决策。判定方法：全量红了先看失败集合是否与上一轮相同——相同才值得查代码。
