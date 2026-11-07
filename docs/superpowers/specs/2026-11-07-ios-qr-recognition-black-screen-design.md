@@ -1,7 +1,7 @@
 # iOS 扫码识别后黑屏：生命周期与配对状态修复 spec
 
 - 日期：2026-11-07
-- 状态：完成两轮独立审查及第三轮逐项收口自审，当前无未解决审查意见；代码未实现，真机未验收。实施见 [plan](../plans/2026-11-07-ios-qr-recognition-black-screen-impl.md)，过程见 [审查记录](../reports/2026-11-07-ios-qr-recognition-spec-review.md)。
+- 状态：完成两轮独立审查及第三轮逐项收口自审，当前无未解决审查意见；代码未实现，真机未验收。实施见 [plan](../plans/2026-11-07-ios-qr-recognition-black-screen-impl.md)，过程见 [审查记录](../reports/2026-11-07-ios-qr-recognition-spec-review.md) · [plan 审查记录](../reports/2026-11-07-ios-qr-recognition-plan-review.md)。
 - 调查基线：`88b4d807`。
 - 关联历史：[扫码启动异常与返回按钮修复](./2026-10-18-ios-qr-scan-usability-design.md)。本文处理的是**已经显示相机画面、识别二维码之后**的另一条路径，不撤销历史修复。
 
