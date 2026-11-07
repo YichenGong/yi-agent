@@ -3,6 +3,7 @@ import { type PairedDevice, defaultRedeem } from "../pairing";
 import { parsePairUri } from "../lib/pairUri";
 import type { Scope } from "../lib/generated/Scope";
 import { QrScanner } from "./QrScanner";
+import type { ScanResultHandler } from "../lib/qrScanner";
 import { ErrorBoundary } from "../ui/ErrorBoundary";
 import { isIos } from "../lib/platform";
 import {
@@ -81,7 +82,10 @@ export interface PairingScreenProps {
    * 扫码接缝（测试用）：打开扫描器并把文本/错误回调进来，返回 `stop()`。
    * 缺省时用内建 `QrScanner`（真实相机）。
    */
-  scan?: (onText: (t: string) => void, onError: (e: unknown) => void) => () => void;
+  scan?: (
+    onText: ScanResultHandler,
+    onError: (e: unknown) => void,
+  ) => () => void;
 }
 
 /**
@@ -355,7 +359,7 @@ function ScanHost({
   onError,
 }: {
   scan: NonNullable<PairingScreenProps["scan"]>;
-  onText: (t: string) => void;
+  onText: ScanResultHandler;
   onError: (e: unknown) => void;
 }) {
   const ref = useRef({ onText, onError });

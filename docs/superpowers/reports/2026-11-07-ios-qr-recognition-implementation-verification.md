@@ -105,3 +105,91 @@ cd desktop && npx tsc --noEmit
 - A10/A17 表驱动：stop 后的 get/play rejection 与接受后的 play rejection 均 0 次 `onError`；当前实例的 get/play 失败、play 同步抛错、结果同步抛错均恰好 1 次；停机后 `decode` 计数不再增长。
 
 后续任务（QrScanner 稳定回调、PairingScreen 覆盖层、App 接线、真机验收）的证据请追加在本节之后。
+
+---
+
+## Task 2：稳定真实相机组件与 ScanHost 契约
+
+改动文件：
+
+- `desktop/src/components/QrScanner.tsx`
+- `desktop/src/components/QrScanner.test.tsx`（新建）
+- `desktop/src/components/PairingScreen.tsx`（仅类型与注释，ScanHost 转发逻辑未改）
+- `docs/project-management/desktop.md`（仅补代码门禁阶段证据，条目仍 `[ ]`）
+- 本文件
+
+### 2.1 实现要点
+
+- `QrScannerProps.onText` 改为 `ScanResultHandler`。组件把 `{ onText, onError }` 放进 `latest` ref 并每次渲染刷新，effect 内只传 `(text) => latest.current.onText(text)` / `(error) => latest.current.onError(error)`，依赖数组从 `[onText, onError, deps]` 收成 `[deps]`。
+- 结果：父组件重渲染产生的**新闭包**不再触发 `stop()` + 重新取流；同一实例始终调用最新回调（A05 验证第二次渲染后旧回调 0 次、新回调收到命中文本）。
+- 旧实例的异步失败仍由 Task 1 的实例内 `stopped` 隔离：effect 换 `deps` 时先 `stop()` 旧实例；旧流/旧 `play()` 晚到不会覆盖 `video.srcObject`、不调 `onError`（A11 两条）。
+- `PairingScreenProps.scan` 的 `onText` 与私有 `ScanHost.onText` 改为 `ScanResultHandler`；**ScanHost 的 `(t) => ref.current.onText(t)` 转发与 `useEffect(..., [scan])` 原样保留，没有加入 `active` 终止规则**——该规则与 Task 3 的 boolean handler 原子交付。
+
+### 2.2 RED（新测试，未改实现）
+
+```sh
+cd desktop && npm test -- --environment jsdom src/components/QrScanner.test.tsx
+```
+
+输出（真实）：
+
+```
+ ❯ src/components/QrScanner.test.tsx (3 tests | 1 failed) 19ms
+   × A05 callback refresh does not reopen camera 12ms
+     → expected "spy" to be called 1 times, but got 2 times
+   ✓ A11 old stream cannot overwrite the new scan 4ms
+   ✓ A11 old play cannot overwrite the new scan 3ms
+ Test Files  1 failed (1)
+      Tests  1 failed | 2 passed (3)
+```
+
+A05 红在 `expect(getUserMedia).toHaveBeenCalledTimes(1)`（实际 2）：旧 effect 依赖 `[onText, onError, deps]`，`rerender` 换了 `onText` identity 就停机重开相机。失败是行为断言，不是 import/helper 缺失。
+
+同一时刻用一个临时探针（未提交、运行后删除）量到旧实现的另一半症状：
+
+```
+SCRATCH getUserMedia= 2 trackStop= 1
+```
+
+即旧 effect 在回调刷新时**提前停掉了仍在使用的轨道**，随后才取第二路流。
+
+A11 两条在旧实现上已通过：Task 1 的 `stopped` 早退与 `srcObject` 归属检查已经覆盖了「停后的旧流/旧播放失败」，本任务只是把它钉成组件层回归（用真实 `QrScanner`，不 mock `startCameraScan`）。
+
+### 2.3 GREEN（实现后）
+
+```sh
+cd desktop && npm test -- --environment jsdom src/components/QrScanner.test.tsx
+```
+
+```
+ ✓ src/components/QrScanner.test.tsx (3 tests) 18ms
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+```
+
+定向回归（Task 1 基线 + 本任务）：
+
+```sh
+cd desktop && npm test -- --environment jsdom src/components/QrScanner.test.tsx src/lib/qrScanner.test.ts src/components/PairingScreen.test.tsx
+```
+
+```
+ ✓ src/lib/qrScanner.test.ts (16 tests) 8ms
+ ✓ src/components/QrScanner.test.tsx (3 tests) 18ms
+ ✓ src/components/PairingScreen.test.tsx (22 tests) 225ms
+ Test Files  3 passed (3)
+      Tests  41 passed (41)
+```
+
+类型检查：
+
+```sh
+cd desktop && npx tsc --noEmit
+```
+
+输出为空，退出码 0：旧 `(t: string) => void` 的 `scan` 接缝与被删掉的 `onText` 依赖都仍编译通过。
+
+### 2.4 接缝兼容
+
+- 既有 `PairingScreen` 测试（启动异常回表单不黑屏、安全区 `.scan-overlay-bar`、手输回退、取消、覆盖层内错误提示）全部保留且通过，本次一条未改、未删。
+- `ScanHost` 仍无终止规则：`useEffect(() => scan((t) => ref.current.onText(t), (e) => ref.current.onError(e)), [scan])` 与改动前逐字节一致，仅 `onText` 的类型从内联函数类型换成 `ScanResultHandler`。
