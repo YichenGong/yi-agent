@@ -1666,6 +1666,103 @@ describe("anchor restore with windowing", () => {
     expect(mountedIds(container).length).toBeLessThan(1000);
   });
 
+  it("开窗恢复后，锚点上方内容变高仍会被重新对位", async () => {
+    // 长会话里锚点通常不在首屏挂载区，恢复要先用 `requestFocus` 开窗，锚点行
+    // 才挂得上。`heldAnchor` 因此是在**窗口变更之后**那个 commit 才被写下的；
+    // 漂移校正的 effect 若只依赖 threadId/items.length，就会在
+    // 「heldAnchor 还是 null」的那个 commit 里早退、从此再也建不起观察者——
+    // 位置写对了，但锚点上方图片加载变高后再没人校正（实测停在 1012，应为 1312）。
+    // 这条用例刻意用 300 条、锚点在中段，强制走开窗路径。
+    const tops: Record<string, number> = {};
+    const state = { scrollTop: 0, contentH: 0 };
+    let scroller: HTMLElement | null = null;
+    const PAD = 12;
+    const VIEWPORT = 600;
+    const ROW = 100;
+    const N = 300;
+    const rect = (top: number) =>
+      ({ top, left: 0, bottom: top, right: 0, width: 0, height: 0, x: 0, y: top, toJSON() {} }) as DOMRect;
+    const proto = HTMLElement.prototype as unknown as Record<string, unknown>;
+    const saved = {
+      rect: proto.getBoundingClientRect,
+      sh: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight"),
+      ch: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight"),
+      st: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop"),
+    };
+    proto.getBoundingClientRect = function (this: HTMLElement) {
+      if (this === scroller) return rect(0);
+      return rect(PAD - state.scrollTop + (tops[this.dataset.itemId ?? ""] ?? 0));
+    };
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this === scroller ? state.contentH + PAD * 2 : 0;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this === scroller ? VIEWPORT : 0;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this === scroller ? state.scrollTop : 0;
+      },
+      set(this: HTMLElement, v: number) {
+        if (this !== scroller) return;
+        state.scrollTop = Math.max(0, Math.min(v, state.contentH + PAD * 2 - VIEWPORT));
+      },
+    });
+
+    try {
+      const list: Item[] = Array.from({ length: N }, (_, i) => ({
+        type: "userMessage" as const,
+        id: `a${i}`,
+        text: `m${i}`,
+      }));
+      const rebuild = (firstRowHeight: number) => {
+        for (const k of Object.keys(tops)) delete tops[k];
+        tops.a0 = 0;
+        for (let i = 1; i < N; i++) tops[`a${i}`] = firstRowHeight + (i - 1) * ROW;
+        state.contentH = firstRowHeight + (N - 1) * ROW;
+      };
+      rebuild(ROW);
+
+      const anchorA = { itemId: "a10", offset: 0 };
+      const { container, rerender } = render(
+        <ChatView items={list} threadId="B" anchor={null} />,
+      );
+      scroller = container.firstElementChild as HTMLElement;
+
+      rerender(<ChatView items={list} threadId="A" anchor={anchorA} />);
+      // 开窗走 rAF，锚点行在下一个 commit 才挂上，再等挂载后 effect 对位。
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 200));
+      });
+      // a10 的内容坐标 = py-3(12) + 10*100 = 1012；offset 0 即顶边贴视口顶。
+      expect(state.scrollTop).toBe(PAD + 10 * ROW);
+
+      // 上方图片到达：a0 从 100 变 400，锚点被推下 300px。
+      rebuild(400);
+      rerender(<ChatView items={list} threadId="A" anchor={anchorA} />);
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 400));
+      });
+      expect(state.scrollTop).toBe(PAD + 400 + 9 * ROW);
+    } finally {
+      proto.getBoundingClientRect = saved.rect;
+      for (const [name, desc] of [
+        ["scrollHeight", saved.sh],
+        ["clientHeight", saved.ch],
+        ["scrollTop", saved.st],
+      ] as const) {
+        if (desc) Object.defineProperty(HTMLElement.prototype, name, desc);
+      }
+    }
+  });
+
   it("锚点确实不存在时回退到底部（渲染最后一条）", () => {
     // 与上一条对照：index === -1 是「真的没了」，必须仍然贴底，不能为了
     // 开窗而停在一个无意义的像素上。

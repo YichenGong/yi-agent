@@ -863,7 +863,12 @@ export function ChatView({
       if (poll !== null) window.clearInterval(poll);
       observer?.disconnect();
     };
-  }, [threadId, items.length, syncing]);
+    // `win.start`/`win.end` 必须在依赖里：锚点常常不在首屏挂载区（长会话尤其如此），
+    // `heldAnchor` 是在**窗口变更后**那个 commit 才被写上的，本 effect 若只在
+    // `threadId`/`items.length` 变化时跑，它会在「此时 `heldAnchor` 还是 null」的
+    // commit 里早退、从此再也建不起观察者——恢复位置写对了，但锚点上方内容变高
+    // 后再也没人校正（实测停在 1012，应为 1312）。
+  }, [threadId, items.length, syncing, win.start, win.end]);
 
   useEffect(() => {
     const el = elRef.current;
