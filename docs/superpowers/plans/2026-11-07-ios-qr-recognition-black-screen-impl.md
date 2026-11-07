@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 依据：[修复 spec](../specs/2026-11-07-ios-qr-recognition-black-screen-design.md)；[审查记录](../reports/2026-11-07-ios-qr-recognition-spec-review.md)。计划基线 `a868ed59`；执行时核对文件变化，不盲用旧行号。
+- 依据：[修复 spec](../specs/2026-11-07-ios-qr-recognition-black-screen-design.md)；[spec 审查记录](../reports/2026-11-07-ios-qr-recognition-spec-review.md)；[plan 审查记录](../reports/2026-11-07-ios-qr-recognition-plan-review.md)。本轮计划审查基线 `c37189b3`，扫码生产代码未变；执行时核对文件变化，不盲用旧行号。
 - 本文是待执行计划，所有 checkbox 初始未完成；文中命令、修复测试、回退测试和真机验收均不是本轮已执行证据。
 - `ScanResultHandler = (text: string) => boolean | void`：false 继续，true/undefined 接受并停止；同步契约，不接受 Promise。
 - 保持 `SCAN_INTERVAL_MS = 200`、现有默认取流/画布/jsQR 路径。生产不传 `deps`；测试保持 deps 引用稳定，换引用才能重建实例。
@@ -37,7 +37,7 @@
 | `docs/bug-list.md`、`docs/project-management/desktop.md`、`docs/project-management/README.md` | 同步代码门禁/真机状态、证据链接与计数 |
 | `docs/superpowers/reports/2026-11-07-ios-qr-recognition-implementation-verification.md` | 实施时新建：红绿/回退/门禁/真机去敏证据 |
 
-任务 1 → 2 → 3 → 4 → 5 顺序执行，避免多个写代理同时修改 PairingScreen 文件。每个任务经测试及独立审查再交下一项。task 2 同步 ScanHost 类型，否则 strict 编译会出现 void 透传不完整。
+任务 1 → 2 → 3 → 4 → 5 顺序执行，避免多个写代理同时修改 PairingScreen 文件。每个任务经测试及独立审查再交下一项。Task 2 只同步 ScanHost 类型与现有 ref 转发，**不提前添加 active 终止规则**；Task 3 在 handler 返回 false/true 的同一提交中加入终止规则，避免旧 void 无效码回调被误当作已接收。
 
 ## 执行准备
 
@@ -115,7 +115,55 @@ it("A09 releases late streams without assigning video", async () => {
 });
 ```
 
-增加表驱动 rejection：取流 pending 时 stop→reject；play pending 时 stop→reject；play pending 时 result 接受→reject，均 error=0；当前取流 reject、play 同步 throw/reject、onResult 同步 throw 均 error=1、所有已获取轨道 stop=1，之后 advance 600ms 不再调用。保留已有 void 命中即停及 decoder 单帧抛错继续的测试。
+追加当前/迟到错误的表驱动测试，复用本任务的 deferred、frame、fakeVideo：
+
+```ts
+it.each([
+  ["get-stop-reject", 0], ["play-stop-reject", 0], ["play-accept-reject", 0],
+  ["get-current-reject", 1], ["play-current-reject", 1],
+  ["play-sync-throw", 1], ["result-sync-throw", 1],
+] as const)("A10/A17 %s errors=%s", async (scenario, expectedErrors) => {
+  const pendingStream = deferred<MediaStream>();
+  const pendingPlay = deferred<void>();
+  const trackStop = vi.fn();
+  const stream = { getTracks: () => [{ stop: trackStop }] } as unknown as MediaStream;
+  const error = vi.fn();
+  const decode = vi.fn(() => "hit");
+  const result = vi.fn(() => {
+    if (scenario === "result-sync-throw") throw new Error("result failed");
+    return scenario === "play-accept-reject";
+  });
+  const video = fakeVideo();
+  video.play = vi.fn(() => {
+    if (scenario === "play-sync-throw") throw new Error("play failed");
+    return pendingPlay.promise;
+  });
+  const usesPendingStream = scenario.startsWith("get-");
+  const stop = startCameraScan(video, result, error, {
+    getUserMedia: () => usesPendingStream ? pendingStream.promise : Promise.resolve(stream),
+    grabFrame: () => frame, decode,
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  if (scenario === "get-stop-reject") { stop(); pendingStream.reject(new Error("old get")); }
+  if (scenario === "get-current-reject") pendingStream.reject(new Error("current get"));
+  if (scenario === "play-stop-reject") { stop(); pendingPlay.reject(new Error("old play")); }
+  if (scenario === "play-current-reject") pendingPlay.reject(new Error("current play"));
+  if (scenario === "play-accept-reject") {
+    await vi.advanceTimersByTimeAsync(200);
+    expect(result).toHaveBeenCalledTimes(1);
+    pendingPlay.reject(new Error("accepted scan play"));
+  }
+  await vi.advanceTimersByTimeAsync(400);
+  expect(error).toHaveBeenCalledTimes(expectedErrors);
+  expect(trackStop).toHaveBeenCalledTimes(usesPendingStream ? 0 : 1);
+  const calls = decode.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(600);
+  expect(decode).toHaveBeenCalledTimes(calls);
+  stop();
+});
+```
+
+保留已有 void 命中即停及 decoder 单帧抛错继续的测试。所有新循环在正常结束时 stop，失败用例的 fake timers 在 afterEach 恢复；不把 grabFrame 异常误称为现有 decode 容错。
 
 - [ ] **Step 2：运行并确认红。**
 
@@ -173,7 +221,7 @@ git commit -m "fix: isolate QR scan acceptance and late failures"
 
 **Interfaces:**
 - Consumes：Task 1 的 `ScanResultHandler`、`ScanDeps`、stop。
-- Produces：`QrScannerProps.onText: ScanResultHandler`；`PairingScreenProps.scan?: (onText: ScanResultHandler, onError: (e: unknown) => void) => () => void`。ScanHost 私有，不为测试新增导出；接缝透传返回值、终止后静默。
+- Produces：`QrScannerProps.onText: ScanResultHandler`；`PairingScreenProps.scan?: (onText: ScanResultHandler, onError: (e: unknown) => void) => () => void`。ScanHost 私有，不为测试新增导出；此任务只更新类型与透传，首次终止规则由 Task 3 与 boolean handler 原子交付。
 
 - [ ] **Step 1：写失败测试 A05/A11。** 新文件用 jsdom 文件注解，导入 React、Testing Library、Vitest、真实 QrScanner，禁止 mock startCameraScan：
 
@@ -184,6 +232,12 @@ import { cleanup, render } from "@testing-library/react";
 import { QrScanner } from "./QrScanner";
 import type { ScanDeps } from "../lib/qrScanner";
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
 it("A05 callback refresh does not reopen camera", async () => {
   vi.useFakeTimers();
   vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
@@ -212,7 +266,42 @@ it("A05 callback refresh does not reopen camera", async () => {
 });
 ```
 
-A11 用两个稳定 deps 引用和两个 deferred 流：旧 play pending→换 deps→新流绑定→旧 reject，当前 error=0且 video.srcObject 仍是新流；旧取流迟到 resolve 只释放旧轨道。unmount 后每个流全部 track stop=1。deferred 定义采用 Task 1 给出的完整函数复制到新测试文件。
+A11 在同一新文件追加，不需要修改生产导出：
+
+```tsx
+it.each(["stream", "play"] as const)("A11 old %s cannot overwrite the new scan", async phase => {
+  vi.useFakeTimers();
+  const oldStream = deferred<MediaStream>();
+  const oldPlay = deferred<void>();
+  const oldStop = vi.fn();
+  const newStop = vi.fn();
+  const oldMedia = { getTracks: () => [{ stop: oldStop }] } as unknown as MediaStream;
+  const newMedia = { getTracks: () => [{ stop: newStop }] } as unknown as MediaStream;
+  const play = vi.spyOn(HTMLMediaElement.prototype, "play");
+  if (phase === "play") play.mockReturnValueOnce(oldPlay.promise);
+  play.mockResolvedValue(undefined);
+  const oldDeps: ScanDeps = { getUserMedia: () => phase === "stream" ? oldStream.promise : Promise.resolve(oldMedia), grabFrame: () => null };
+  const newDeps: ScanDeps = { getUserMedia: async () => newMedia, grabFrame: () => null };
+  const oldError = vi.fn();
+  const newError = vi.fn();
+  const view = render(<QrScanner deps={oldDeps} onText={() => false} onError={oldError} />);
+  await vi.advanceTimersByTimeAsync(0);
+  view.rerender(<QrScanner deps={newDeps} onText={() => false} onError={newError} />);
+  await vi.advanceTimersByTimeAsync(0);
+  const video = view.container.querySelector("video")!;
+  expect(video.srcObject).toBe(newMedia);
+  if (phase === "stream") oldStream.resolve(oldMedia);
+  else oldPlay.reject(new Error("old play failed"));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(video.srcObject).toBe(newMedia);
+  expect(oldError).not.toHaveBeenCalled();
+  expect(newError).not.toHaveBeenCalled();
+  expect(oldStop).toHaveBeenCalledTimes(1);
+  expect(newStop).not.toHaveBeenCalled();
+  view.unmount();
+  expect(newStop).toHaveBeenCalledTimes(1);
+});
+```
 
 - [ ] **Step 2：运行确认红。** `(cd desktop && npm test -- --environment jsdom src/components/QrScanner.test.tsx)`；旧回调 effect 使取流=2、旧 track 被提前停止。
 - [ ] **Step 3：实现 ref 转发与接缝终止规则。**
@@ -228,30 +317,14 @@ useEffect(() => {
     error => latest.current.onError(error), deps);
 }, [deps]);
 // PairingScreen：导入同一结果类型，更新 scan 和 ScanHost.onText。
-// ScanHost 保留 ref.current 刷新，effect 改成：
-useEffect(() => {
-  let active = true;
-  const stop = scan(text => {
-    if (!active) return true;
-    try {
-      const accepted = ref.current.onText(text);
-      if (accepted !== false) active = false;
-      return accepted;
-    } catch (error) {
-      active = false;
-      ref.current.onError(error);
-      return true;
-    }
-  }, error => {
-    if (!active) return;
-    active = false;
-    ref.current.onError(error);
-  });
-  return () => { active = false; stop(); };
-}, [scan]);
+// 此时保留 ScanHost 既有转发，不加入 active；旧 handler 仍返回 void。
+useEffect(() => scan(
+  text => ref.current.onText(text),
+  error => ref.current.onError(error),
+), [scan]);
 ```
 
-同步 scan throw 仍由既有 ErrorBoundary 捕获。scan 在返回 stop 前同步给结果也必须先关闭 active，不为此引入定时等待。
+此任务不改变 ScanHost 对无效码/迟到消息的既有行为；Task 3 的 handler 与 active 规则必须一起改。
 
 - [ ] **Step 4：绿与接缝兼容。** 跑 QrScanner、qrScanner、PairingScreen 定向测试和 tsc；旧 void 接缝编译通过，false/true 的 PairingScreen 业务测试在任务 3 加入，不能删现有启动异常/安全区测试。
 - [ ] **Step 5：更新实施验证报告、desktop 证据链接；fmt/just ci 后提交。**
@@ -283,8 +356,11 @@ it("A01 accepted QR removes overlay while redeem is pending", async () => {
   render(<PairingScreen enableScan scan={scan} redeem={redeem}
     storage={storages()} notice="已被桌面移除" />);
   fireEvent.click(screen.getByRole("button", { name: "扫码" }));
-  act(() => { expect(emit(`yiagent://pair?v=1&relay=${encodeURIComponent(URL)}&code=ABCD-EFGH`)).toBe(true); });
+  let accepted: boolean | void = undefined;
+  act(() => { accepted = emit(`yiagent://pair?v=1&relay=${encodeURIComponent(URL)}&code=ABCD-EFGH`); });
+  // 先检查用户可见行为，使旧实现因覆盖层残留而红，而非先被 undefined 返回值截断。
   expect(screen.queryByRole("dialog", { name: "扫描二维码" })).toBeNull();
+  expect(accepted).toBe(true);
   expect(screen.getByRole("status", { name: "配对进度" }).textContent)
     .toBe("已识别二维码，正在连接桌面…");
   expect(screen.getByLabelText<HTMLInputElement>("服务器地址").value).toBe(URL);
@@ -295,30 +371,71 @@ it("A01 accepted QR removes overlay while redeem is pending", async () => {
 });
 ```
 
-表驱动 A16 明确返回/卸载后的默认成功和失败：
+表驱动 A16 明确返回/卸载后的默认成功和失败：**四个分支全部必测，不得仅保留 unmount 分支**；返回且宿主暂未卸载证明返回 handler 本身失效，直接卸载后挂新页证明独立的 cleanup 边界。
 
 ```tsx
-it.each(["resolve", "reject"] as const)("A16 late %s after return cannot replace config", async outcome => {
-  const storage = storages({ [REMOTE_STORAGE_KEY]: "old-config-exact-bytes" });
+const leaveCases = [
+  ["return-without-unmount", "resolve"],
+  ["return-without-unmount", "reject"],
+  ["unmount-new-page", "resolve"],
+  ["unmount-new-page", "reject"],
+] as const;
+it.each(leaveCases)("A16 %s ignores late %s", async (leave, outcome) => {
+  const oldRaw = JSON.stringify({ url: URL, token: "yia_old", scope: "observe", projects: [] }, null, 2);
+  const storage = storages({ [REMOTE_STORAGE_KEY]: oldRaw });
+  expect(storedRemoteConfig(storage)?.token).toBe("yia_old");
   const pending = deferred<typeof PAIRED>();
   const onPaired = vi.fn();
   const onCancel = vi.fn();
   const view = render(<PairingScreen enableScan={false} storage={storage}
     redeem={() => pending.promise} onPaired={onPaired} onCancel={onCancel} />);
-  fill(fields());
-  fireEvent.click(fields().submit);
+  const f = fields(); // busy 后按钮名变为“配对中…”，不能再调用只查“配对”的 fields()
+  fill(f);
+  fireEvent.click(f.submit);
   expect(screen.getByText("返回不会撤销已发出的配对请求")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "返回" }));
-  expect(onCancel).toHaveBeenCalledTimes(1);
-  view.unmount();
-  render(<PairingScreen storage={storage} enableScan={false} />);
+  if (leave === "return-without-unmount") {
+    fireEvent.click(screen.getByRole("button", { name: "返回" }));
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    // 宿主尚未卸载：必须由返回 handler 自身失效，不能靠 cleanup 掩盖错误。
+  } else {
+    view.unmount();
+    render(<PairingScreen storage={storage} enableScan={false} />);
+  }
   await act(async () => {
     if (outcome === "resolve") pending.resolve(PAIRED);
     else pending.reject(new Error("old request failed"));
   });
-  expect(storage.getItem(REMOTE_STORAGE_KEY)).toBe("old-config-exact-bytes");
+  expect(storage.getItem(REMOTE_STORAGE_KEY)).toBe(oldRaw);
   expect(onPaired).not.toHaveBeenCalled();
   expect(screen.queryByRole("alert")).toBeNull();
+});
+```
+
+A02 的准入必须另测同一 act 内直接提交表单，不能只通过已终止的 ScanHost 测试：
+
+```tsx
+it("A02 synchronous manual submit admission survives stale busy closure", async () => {
+  const pending = deferred<typeof PAIRED>();
+  const redeem = vi.fn(() => pending.promise);
+  render(<PairingScreen enableScan storage={storages()} redeem={redeem} />);
+  const f = fields();
+  fill(f);
+  const form = screen.getByRole("form", { name: "配对" });
+  act(() => {
+    fireEvent.submit(form);
+    fireEvent.submit(form); // 同一 React 批次，busy 闭包尚未提交
+    fireEvent.change(f.url, { target: { value: "wss://other.test/ws" } });
+    fireEvent.change(f.code, { target: { value: "ZZZZ-YYYY" } });
+    fireEvent.change(f.name, { target: { value: "other phone" } });
+  });
+  expect(redeem).toHaveBeenCalledTimes(1);
+  expect([f.url.value, f.code.value, f.name.value]).toEqual([URL, "ABCD-EFGH", "我的 iPhone"]);
+  expect([f.url.disabled, f.code.disabled, f.name.disabled]).toEqual([true, true, true]);
+  fireEvent.submit(form); // pending 全周期仍不得重新准入
+  expect(redeem).toHaveBeenCalledTimes(1);
+  expect(screen.queryByRole("button", { name: "扫码" })).toBeNull();
+  await act(async () => { pending.reject(new Error("offline")); });
+  expect([f.url.disabled, f.code.disabled, f.name.disabled]).toEqual([false, false, false]);
 });
 ```
 
@@ -397,6 +514,33 @@ const handleScanError = () => {
 };
 ```
 
+同一任务修改 `ScanHost` effect，保留其最新回调 ref：
+
+```tsx
+useEffect(() => {
+  let active = true;
+  const stop = scan(text => {
+    if (!active) return true;
+    try {
+      const accepted = ref.current.onText(text);
+      if (accepted !== false) active = false;
+      return accepted;
+    } catch (error) {
+      active = false;
+      ref.current.onError(error);
+      return true;
+    }
+  }, error => {
+    if (!active) return;
+    active = false;
+    ref.current.onError(error);
+  });
+  return () => { active = false; stop(); };
+}, [scan]);
+```
+
+同步 scan throw 仍由既有 ErrorBoundary 捕获。scan 在返回 stop 前同步给结果也必须先关闭 active；非法码 false 必须继续转发。
+
 submit 改同步 preventDefault + `if (!canSubmit || attempt.current || !mounted.current) return; runRedeem(trimmedUrl, trimmedCode, "manual")`。扫码打开按钮先检查 mounted/attempt，再设 scanActive=true、清 error、setScanning(true)；扫描返回先 scanActive=false 再 setScanning(false)。重配返回先 invalidate、mounted=false，再 onCancel，不清已有 storage。
 
 三输入均增加 `disabled={busy}`；onChange 分别用 `if (mounted.current && !attempt.current) setUrl/setCode/setDeviceName(e.target.value)`。覆盖层条件 `scanning && !busy`；保留安全区/边界样式。表单新增：
@@ -436,6 +580,7 @@ const qr = vi.hoisted(() => ({ decode: vi.fn() }));
 vi.mock("jsqr", () => ({ default: qr.decode }));
 describe("real camera integration", () => {
   const streams: Array<{ stop: ReturnType<typeof vi.fn>; stream: MediaStream }> = [];
+  let mediaDevicesBefore: PropertyDescriptor | undefined;
   const open = vi.fn(async () => {
     const stop = vi.fn();
     const stream = { getTracks: () => [{ stop }] } as unknown as MediaStream;
@@ -445,9 +590,9 @@ describe("real camera integration", () => {
   beforeEach(() => {
     vi.useFakeTimers(); streams.length = 0; open.mockClear(); qr.decode.mockReset();
     qr.decode.mockReturnValue(null);
-    vi.stubGlobal("navigator", {
-      userAgent: navigator.userAgent,
-      mediaDevices: { getUserMedia: open },
+    mediaDevicesBefore = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true, value: { getUserMedia: open },
     });
     vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
     vi.spyOn(HTMLVideoElement.prototype, "videoWidth", "get").mockReturnValue(1);
@@ -459,7 +604,9 @@ describe("real camera integration", () => {
   });
   afterEach(() => {
     cleanup(); // 先停循环/卸载，再恢复 mocks/timers
-    vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals();
+    vi.useRealTimers(); vi.restoreAllMocks();
+    if (mediaDevicesBefore) Object.defineProperty(navigator, "mediaDevices", mediaDevicesBefore);
+    else Reflect.deleteProperty(navigator, "mediaDevices");
   });
   it.each([false, true])("A07/A14 pending recognition strict=%s", async strict => {
     const pending = deferred<typeof PAIRED>();
@@ -481,10 +628,35 @@ describe("real camera integration", () => {
       .toBe("已识别二维码，正在连接桌面…");
     for (const entry of streams) expect(entry.stop).toHaveBeenCalledTimes(1);
   });
+  it.each([false, true])("A08 invalid then valid stays in one live stream strict=%s", async strict => {
+    const pending = deferred<typeof PAIRED>();
+    const redeem = vi.fn(() => pending.promise);
+    const element = <PairingScreen enableScan storage={storages()} redeem={redeem} />;
+    render(strict ? <StrictMode>{element}</StrictMode> : element);
+    fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    const baseline = open.mock.calls.length;
+    const live = streams.filter(entry => entry.stop.mock.calls.length === 0);
+    expect(live).toHaveLength(1);
+    qr.decode.mockReturnValue({ data: "https://ordinary.test" });
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    const dialog = screen.getByRole("dialog", { name: "扫描二维码" });
+    expect(within(dialog).getByRole("alert").textContent).toBe("不是有效的配对二维码");
+    expect(live[0].stop).not.toHaveBeenCalled();
+    expect(open).toHaveBeenCalledTimes(baseline);
+    expect(redeem).not.toHaveBeenCalled();
+    qr.decode.mockReturnValue({ data: `yiagent://pair?v=1&relay=${encodeURIComponent(URL)}&code=ABCD-EFGH` });
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    expect(redeem).toHaveBeenCalledTimes(1);
+    expect(open).toHaveBeenCalledTimes(baseline);
+    expect(screen.queryByRole("dialog", { name: "扫描二维码" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    for (const entry of streams) expect(entry.stop).toHaveBeenCalledTimes(1);
+  });
 });
 ```
 
-A14 的 rerender 使用新 notice/element 引用以真实触发父 render，不能只用同一 element 让 React bail out；变更 notice 后仍按上述 baseline 断言。A08 解码首帧 `{data:"https://ordinary.test"}`→error 在 dialog 内可见、open=baseline且存活 track 未 stop；下一帧改有效 URI→只兑换一次、旧错误消失、overlay 移除。在 StrictMode 版本区分已释放的废弃流和最新存活流，不断言初始 open 必须=1。
+A14 的 rerender 使用新 notice/element 引用以真实触发父 render，不能只用同一 element 让 React bail out；变更 notice 后仍按上述 baseline 断言。A08 只断言最新存活流在无效码后未停止，不能误把 StrictMode 已释放的废弃流算成回归。
 
 - [ ] **Step 2：验证判别性红。** 因实现已到位，新集成应先绿；使用 Task 5 临时回退 A07 完整旧行为，确认此真实测试红后恢复。不以任务 3 的 scan 接缝测试代替这里的红证据。
 - [ ] **Step 3：宿主精确回归 A13/A16。** 保留首启 describe 中已有 `pairs over the relay by redeeming on a frame, then connects` 与 `reports a failed redemption without persisting a config`，它们分别验证首启成功切宿主与失败保留表单；在 mobile repair describe 添加以下完整用例，复用同作用域的 pairedPhone/settle：
@@ -583,7 +755,13 @@ git diff --check
 
 全部 exit=0 方可写“代码门禁通过”。若 CI 卡住先按 CLAUDE.md 查 cargo 持锁进程/测试运行阶段，不并发启动第二套全量 cargo；若门禁失败先修复再重跑，不以定向绿替代。
 
-- [ ] **Step 4：交付验收包与 I01–I07。** 使用包含修复 commit 的前端 dist，`(cd desktop && npm run build && npm run ios:build)`；签名/设备安装沿用仓库既有 iOS 工程，不本轮引入 bundle 改造。记录源码 commit、实际 App version/build、iPhone/iPad 型号、iOS、授权状态、直连/中继。
+- [ ] **Step 4：交付验收包与 I01–I07。** worktree 不包含被忽略的 `src-tauri/binaries`，`src-tauri/build.rs` 又需要可执行 sidecar 读取 build id；先使用现有构建脚本准备**本 worktree 的 host sidecar**，不用主目录旧二进制冒充修复源码。再构建实际前端与 iOS 包：
+
+```sh
+(cd desktop && npm run sidecar:release && npm run build && npm run ios:build)
+```
+
+sidecar 脚本会按 rustc host triple 填充 binaries 并验证 identity。这里不新增 iOS sidecar运行能力；仅满足现有构建输入。`ios:build` 会同步三处版本文件，完成后检查 `git diff -- desktop/src-tauri`：只允许既有版本同步的预期改动，其他工程/签名变动不得混入修复提交。签名/设备安装沿用仓库既有 iOS 工程。记录源码 commit、实际 App version/build、iPhone/iPad 型号、iOS、授权状态、直连/中继。
 
 执行 spec §7 的七条操作：正常中继；可控 3 秒慢响应；过期/离线/网络失败；普通码→合法码；返回再扫 5 次；重配 pending 返回/晚成功；直连与首启。分别记录可见状态、相机指示释放、配置是否保留、去敏日志/录像位置。每条有 pass/fail；未具备设备则写“未验收”，不虚构通过、不阻止仅代码门禁合并。若仍黑屏记录返回是否消失/发生阶段/WebContent 日志，另查独立根因。
 
