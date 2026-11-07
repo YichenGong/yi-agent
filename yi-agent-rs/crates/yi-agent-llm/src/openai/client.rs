@@ -1,6 +1,7 @@
 //! OpenaiProvider and Provider trait implementation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -147,7 +148,7 @@ impl OpenaiProvider {
             timeout,
             api_style,
             reasoning_effort: opts.reasoning_effort,
-            channel_cache: Arc::new(Mutex::new(HashMap::new())),
+            channel_cache: crate::openai::channel::channel_cache(),
             effort_reject_cache: Arc::new(Mutex::new(HashSet::new())),
         })
     }

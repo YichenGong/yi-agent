@@ -144,3 +144,57 @@ async fn two_providers_share_one_connection() {
         "two providers with the same base_url and timeout must share one connection"
     );
 }
+
+/// 通道判定必须跨 provider 共享：同一 gateway 的能力不会因为换了会话而变。
+/// 否则每个新会话都要先吃一次 `/responses` 404 才回退 chat，多付一个 RTT。
+#[tokio::test]
+async fn channel_detection_is_shared_across_providers() {
+    let chat_sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let server = ConnCounter::start(vec![
+        // `/responses` 故意不配置 → 服务端回 404 空 body，正是
+        // `looks_like_missing_route` 认的「路由不存在」。
+        ("/v1/chat/completions", 200, Body::Sse(chat_sse.to_string())),
+    ])
+    .await;
+    let base = format!("{}/v1", server.uri());
+
+    use futures::StreamExt;
+    use yi_agent_core::{GenParams, Message, Provider, ProviderRequest};
+
+    let request = || ProviderRequest {
+        model: "test-model".into(),
+        system: None,
+        messages: vec![Message::user("ping")],
+        tools: Vec::new(),
+        params: GenParams {
+            max_tokens: Some(8),
+            ..Default::default()
+        },
+    };
+
+    for _ in 0..2 {
+        let provider = OpenaiProvider::new(OpenaiProviderOpts {
+            base_url: Some(base.clone()),
+            api_key: Some("k".into()),
+            timeout: Some(Duration::from_secs(5)),
+            api_style: Some("auto".into()),
+            ..Default::default()
+        })
+        .expect("provider construction");
+
+        let mut stream = provider.call_stream(request()).await.expect("stream ok");
+        while stream.next().await.is_some() {}
+    }
+
+    assert_eq!(
+        server.path_hits("/v1/responses"),
+        1,
+        "the /responses probe must run once per process, not once per provider"
+    );
+    assert_eq!(server.path_hits("/v1/chat/completions"), 2);
+    assert_eq!(
+        server.accepts(),
+        1,
+        "same base_url and timeout must still share one connection"
+    );
+}
