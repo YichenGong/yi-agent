@@ -33,6 +33,17 @@
   --diff-add-fg: #6ee7b7;
   --diff-del-bg: rgb(239 68 68 / 0.15);
   --diff-del-fg: #fca5a5;
+  /*
+   * 子 agent 轨迹的语义强调色。
+   *
+   * 只给**状态点**和错误边框用；文字本身仍用 `fg`/`fg-muted`，因为强调色一旦
+   * 兼作正文会在浅色底上失读。这里的取值是为了在各自底色上达到 4.5:1（浅色主题
+   * 取深色阶），真实对比度由 Task 11 的浏览器验收复核。
+   */
+  --trace-success: #34d399;
+  --trace-warning: #fbbf24;
+  --trace-danger: #f87171;
+  --trace-info: #7dd3fc;
 }
 
 [data-theme="light"] {
@@ -48,6 +59,10 @@
   /* 只有前景换深色阶；底色沿用上方那套半透明叠加。 */
   --diff-add-fg: #047857;
   --diff-del-fg: #b91c1c;
+  --trace-success: #047857;
+  --trace-warning: #b45309;
+  --trace-danger: #b91c1c;
+  --trace-info: #0369a1;
 }
 
 /* 把 token 暴露成 Tailwind 颜色工具类：bg-surface / text-fg / border-line … */
@@ -65,6 +80,10 @@
   --color-diff-add-fg: var(--diff-add-fg);
   --color-diff-del-bg: var(--diff-del-bg);
   --color-diff-del-fg: var(--diff-del-fg);
+  --color-trace-success: var(--trace-success);
+  --color-trace-warning: var(--trace-warning);
+  --color-trace-danger: var(--trace-danger);
+  --color-trace-info: var(--trace-info);
 }
 
 /*
@@ -128,6 +147,43 @@ html[data-font-scale="small"] {
 }
 html[data-font-scale="large"] {
   --font-scale: 1.125; /* 正文 16 → 18px */
+}
+
+/*
+ * 子 agent 轨迹：窄栏里的正文。
+ *
+ * 轨迹要挤在右栏（桌面 288px、扣掉 padding 更少）里，而 `.prose` 是为主对话那
+ * 一整列准备的：长 URL、没有空格的 token、宽表格都会把栏撑开，出现横向滚动条，
+ * 于是整块正文被推得只剩一半可读。这里只**收窄**边界，不改排版参数——字号、
+ * 行高仍跟随 `html[data-font-scale]` 的 `--text-base`，否则两个面板的字会不一样大。
+ *
+ * 规则一律限定在 `.subagent-trace` 下：主对话的 `.prose` 逐字节不受影响。
+ */
+.subagent-trace {
+  min-width: 0;
+  overflow-x: hidden;
+}
+.subagent-trace .trace-prose {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.subagent-trace .trace-prose .prose {
+  font-size: inherit;
+  line-height: inherit;
+  min-width: 0;
+}
+.subagent-trace .trace-prose img {
+  max-width: 100%;
+  height: auto;
+}
+.subagent-trace .trace-prose pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.subagent-trace .trace-prose table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 /*

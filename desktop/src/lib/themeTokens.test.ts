@@ -53,6 +53,17 @@ describe("theme tokens", () => {
     }
     // 亮色主题必须重指同一批 token，否则「切主题」只是半个换肤。
     expect(css).toMatch(/\[data-theme="light"\]\s*\{/);
+
+    // 轨迹强调色：四个语义名都要有深/浅两套取值，且在 @theme 里暴露成工具类。
+    for (const tone of ["success", "warning", "danger", "info"]) {
+      expect(css).toContain(`--trace-${tone}:`);
+      expect(css).toContain(`--color-trace-${tone}:`);
+    }
+    const lightBlock = css.slice(css.indexOf('[data-theme="light"]'));
+    const lightValues = lightBlock.slice(0, lightBlock.indexOf("}"));
+    for (const tone of ["success", "warning", "danger", "info"]) {
+      expect(lightValues, `浅色主题缺少 --trace-${tone}`).toContain(`--trace-${tone}:`);
+    }
   });
 
   it("uses no literal Tailwind neutral scale in components", () => {
