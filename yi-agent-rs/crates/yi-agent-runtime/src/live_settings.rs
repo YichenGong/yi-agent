@@ -320,6 +320,14 @@ impl LiveSettings {
         instance
     }
 
+    /// The normalized absolute path this instance is bound to.
+    ///
+    /// Read-only: callers that need to report the path (the settings RPC) must
+    /// not be able to retarget a shared instance, since the registry keys on it.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// 一次完整的刷新事务：gate 覆盖 open → 有界读 → 校验 → 发布。
     ///
     /// 运行期 I/O / 校验错误只产生降级快照，绝不升级成任务取消。

@@ -289,6 +289,100 @@ pub fn help_text(target: Option<&str>) -> String {
     }
 }
 
+/// Handle to the process-wide live settings, as the TUI sees it.
+///
+/// Wrapped rather than used directly so [`TuiConfigSnapshot`] can keep deriving
+/// `PartialEq`/`Eq` (the binding holds `Arc`s and deliberately has no `PartialEq`).
+/// Equality compares *identity*: two snapshots carrying the same instance are
+/// equal, and a test comparing a snapshot to itself still works.
+#[derive(Clone)]
+pub struct TuiLiveSettings {
+    binding: yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding,
+}
+
+impl TuiLiveSettings {
+    pub fn new(binding: yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding) -> Self {
+        Self { binding }
+    }
+
+    /// Current effective values plus the origin of each one.
+    ///
+    /// Read at *render* time, never cached: `/config` must show what a save just
+    /// changed, not what the process saw at start-up.
+    fn view(&self) -> TuiLiveView {
+        let snapshot = self.binding.live.refresh();
+        let effective = self.binding.sources.resolve(&snapshot.settings);
+        TuiLiveView {
+            revision: snapshot.revision.clone(),
+            degraded: snapshot.health.state
+                == yi_agent_runtime::live_settings::HealthState::Degraded,
+            health_code: snapshot.health.code.clone(),
+            invalid_keys: snapshot.health.invalid_keys.clone(),
+            max_turns: effective.values.get("agent.max_turns").cloned(),
+            compact_ratio: effective.values.get("compact.ratio").cloned(),
+            notifications: effective.values.get("tui.notifications").cloned(),
+            terminal_title: effective.values.get("tui.terminal_title").cloned(),
+            sources: effective
+                .sources
+                .iter()
+                .map(|(key, source)| (key.clone(), source_name(*source)))
+                .collect(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TuiLiveSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 只报"有绑定"，绝不显示取值（提示词可能在里面）。
+        formatter.write_str("TuiLiveSettings")
+    }
+}
+
+impl PartialEq for TuiLiveSettings {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.binding.live, &other.binding.live)
+    }
+}
+
+impl Eq for TuiLiveSettings {}
+
+/// 一次渲染时读到的动态快照。
+struct TuiLiveView {
+    revision: String,
+    degraded: bool,
+    health_code: Option<String>,
+    invalid_keys: Vec<String>,
+    max_turns: Option<serde_json::Value>,
+    compact_ratio: Option<serde_json::Value>,
+    notifications: Option<serde_json::Value>,
+    terminal_title: Option<serde_json::Value>,
+    sources: std::collections::BTreeMap<String, &'static str>,
+}
+
+fn source_name(source: yi_agent_runtime::live_settings::sources::ValueSource) -> &'static str {
+    use yi_agent_runtime::live_settings::sources::ValueSource;
+    match source {
+        ValueSource::Override => "override",
+        ValueSource::Environment => "environment",
+        ValueSource::Settings => "settings",
+        ValueSource::Default => "default",
+    }
+}
+
+impl TuiLiveView {
+    /// 一个字段的 `值（来源）`。值缺失时只报来源，不臆造默认值。
+    fn item(&self, key: &str, value: Option<&serde_json::Value>) -> String {
+        let source = self.sources.get(key).copied().unwrap_or("default");
+        match value {
+            Some(serde_json::Value::Null) | None => format!("默认（{source}）"),
+            Some(value) => match value {
+                serde_json::Value::String(text) => format!("{text}（{source}）"),
+                other => format!("{other}（{source}）"),
+            },
+        }
+    }
+}
+
 /// Read-only, secret-free view of the running session's configuration.
 ///
 /// Assembled once in `main.rs` from `RuntimeConfig` / `AgentConfig` / the MCP
@@ -327,6 +421,8 @@ pub struct TuiConfigSnapshot {
     pub title_status: String,
     /// 终端拒绝启用焦点事件时为真；此时 `unfocused` 实际退化为 `always`。
     pub focus_degraded: bool,
+    /// 进程级运行期设置句柄。`None` 表示这是个不消费热更新的宿主（旧行为）。
+    pub live: Option<TuiLiveSettings>,
 }
 
 impl TuiConfigSnapshot {
@@ -356,6 +452,44 @@ impl TuiConfigSnapshot {
             },
             self.notification_condition,
         ) + &format!("\n  terminal title: {}", self.title_status)
+            + &self.render_live()
+    }
+
+    /// 运行期设置的当前有效值与来源。
+    ///
+    /// 只有持有绑定时才出现：没有绑定的宿主没有热更新，多印一段"当前值"会
+    /// 让用户以为保存会立即改变它。值在渲染时读，因此保存后再次 `/config`
+    /// 立刻看到新值。**不**打印设置文件原文（提示词属于用户内容）。
+    fn render_live(&self) -> String {
+        let Some(handle) = &self.live else {
+            return String::new();
+        };
+        let view = handle.view();
+        let revision = view
+            .revision
+            .get(..12)
+            .unwrap_or(view.revision.as_str())
+            .to_string();
+        let mut text = format!(
+            "\n\n  运行期设置（revision {revision}）:\n    适用: 下一个安全执行点，无需重启\n    max_turns: {}\n    compact ratio: {}\n    通知: {}\n    标题: {}",
+            view.item("agent.max_turns", view.max_turns.as_ref()),
+            view.item("compact.ratio", view.compact_ratio.as_ref()),
+            view.item("tui.notifications", view.notifications.as_ref()),
+            view.item("tui.terminal_title", view.terminal_title.as_ref()),
+        );
+        if view.degraded {
+            // 说清"当前用的是回退值"，并给出要修的键名——不给值。
+            let keys = if view.invalid_keys.is_empty() {
+                "未知".to_string()
+            } else {
+                view.invalid_keys.join(", ")
+            };
+            text.push_str(&format!(
+                "\n    配置读取异常（{}）: 当前使用最后有效值/启动回退值，新设置尚不能保证生效；需修复: {keys}",
+                view.health_code.as_deref().unwrap_or("unknown")
+            ));
+        }
+        text
     }
 }
 
@@ -1299,6 +1433,7 @@ mod tests {
             terminal_title: true,
             title_status: "on".into(),
             focus_degraded: false,
+            live: None,
         };
         let text = snap.render("claude-sonnet-4-5");
         assert!(text.contains("anthropic"));
@@ -1327,6 +1462,123 @@ mod tests {
         assert!(!text.to_lowercase().contains("api_key"));
         assert!(!text.to_lowercase().contains("api-key"));
     }
+    /// `/config` 必须显示保存后的**新**值，而不是启动快照。
+    #[test]
+    fn config_renders_live_values_after_a_save() {
+        use yi_agent_runtime::live_settings::LiveSettings;
+        use yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding;
+        use yi_agent_runtime::live_settings::sources::FrozenRuntimeSources;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let binding = RuntimeSettingsBinding {
+            live: LiveSettings::shared(dir.path().join("settings.json")),
+            sources: std::sync::Arc::new(FrozenRuntimeSources::default()),
+        };
+        binding
+            .live
+            .commit(
+                &serde_json::json!({ "agent.max_turns": 123 }),
+                yi_agent_runtime::settings::store::PatchMode::ReplaceProvided,
+            )
+            .unwrap();
+
+        let mut snap = snapshot_without_live();
+        snap.live = Some(TuiLiveSettings::new(binding));
+        let text = snap.render("claude-sonnet-4-5");
+
+        assert!(text.contains("运行期设置"), "{text}");
+        assert!(text.contains("max_turns: 123（settings）"), "{text}");
+        assert!(text.contains("下一个安全执行点"), "{text}");
+        // 未在文件里设置时显示代码默认值及其来源，而不是空。
+        assert!(text.contains("compact ratio: 80（default）"), "{text}");
+    }
+
+    /// 显式启动来源遮蔽时，`/config` 要显示覆盖来源，而不是文件里的值。
+    #[test]
+    fn config_shows_a_host_override_instead_of_the_file_value() {
+        use yi_agent_runtime::live_settings::LiveSettings;
+        use yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding;
+        use yi_agent_runtime::live_settings::sources::{FrozenRuntimeSources, ValueSource};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let binding = RuntimeSettingsBinding {
+            live: LiveSettings::shared(dir.path().join("settings.json")),
+            sources: std::sync::Arc::new(FrozenRuntimeSources::from_pairs(&[(
+                "agent.max_turns",
+                serde_json::json!(7),
+                ValueSource::Override,
+            )])),
+        };
+        binding
+            .live
+            .commit(
+                &serde_json::json!({ "agent.max_turns": 123 }),
+                yi_agent_runtime::settings::store::PatchMode::ReplaceProvided,
+            )
+            .unwrap();
+
+        let mut snap = snapshot_without_live();
+        snap.live = Some(TuiLiveSettings::new(binding));
+        let text = snap.render("m");
+        assert!(text.contains("max_turns: 7（override）"), "{text}");
+        assert!(!text.contains("max_turns: 123"), "{text}");
+    }
+
+    /// 降级时说明当前用的是回退值并列出要修的键名，不回显任何取值。
+    #[test]
+    fn config_reports_degraded_health_without_echoing_values() {
+        use yi_agent_runtime::live_settings::LiveSettings;
+        use yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding;
+        use yi_agent_runtime::live_settings::sources::FrozenRuntimeSources;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"agent":{"max_turns":"TUI-SECRET"}}"#,
+        )
+        .unwrap();
+        let binding = RuntimeSettingsBinding {
+            live: LiveSettings::shared(dir.path().join("settings.json")),
+            sources: std::sync::Arc::new(FrozenRuntimeSources::default()),
+        };
+        let mut snap = snapshot_without_live();
+        snap.live = Some(TuiLiveSettings::new(binding));
+        let text = snap.render("m");
+        assert!(text.contains("配置读取异常"), "{text}");
+        assert!(text.contains("agent.max_turns"), "{text}");
+        assert!(!text.contains("TUI-SECRET"), "leaked: {text}");
+    }
+
+    /// 没有绑定的宿主不显示这一段：多印"当前值"会让用户以为保存立即生效。
+    #[test]
+    fn config_without_a_binding_omits_the_live_block() {
+        let text = snapshot_without_live().render("m");
+        assert!(!text.contains("运行期设置"), "{text}");
+    }
+
+    fn snapshot_without_live() -> TuiConfigSnapshot {
+        TuiConfigSnapshot {
+            provider: "anthropic".into(),
+            model_injected: false,
+            workdir: std::path::PathBuf::from("/tmp/proj"),
+            sandbox: "workspace-write".into(),
+            yolo: false,
+            max_turns: 200,
+            compact_threshold: 160_000,
+            mcp_master: true,
+            runtime_preference: "ask".into(),
+            runtime_preference_path: std::path::PathBuf::from("/tmp/proj/.y"),
+            notifications: true,
+            notification_method: "auto".into(),
+            notification_condition: "unfocused".into(),
+            effective_backend: "bel".into(),
+            terminal_title: true,
+            title_status: "on".into(),
+            focus_degraded: false,
+            live: None,
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: std::env::var("PROPTEST_CASES")

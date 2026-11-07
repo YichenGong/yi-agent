@@ -550,7 +550,7 @@ pub(crate) struct Harness {
     pub(crate) _models_dir: tempfile::TempDir,
     pub(crate) resident_dir: tempfile::TempDir,
     pairing: Arc<PairingState>,
-    hub: Arc<crate::broadcast::Broadcaster>,
+    pub(crate) hub: Arc<crate::broadcast::Broadcaster>,
     pub(crate) watchman_calls: WatchmanCalls,
     /// 调用方没指定 workdir 时由 Harness 生成的隔离目录。
     ///
@@ -730,6 +730,44 @@ impl Harness {
         )
     }
 
+    /// Harness whose server holds a live-settings binding.
+    ///
+    /// `settings/read` and `settings/write` then go through the shared instance
+    /// (the production path) instead of the stateless file facade, which is what
+    /// the `settings/changed` notification and the policy/origin fields are
+    /// only observable through.
+    pub(crate) async fn with_live_settings(
+        binding: yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding,
+    ) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_scope_watchman_live(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            Scope::Admin,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            None,
+            Some(binding),
+        )
+    }
+
     pub(crate) async fn with_watchman(
         cfg: RuntimeConfig,
         install: WatchmanInstall,
@@ -811,6 +849,45 @@ impl Harness {
         // 旁支注册表:注入后 `side/*` 走替身 resolver,不读真实项目目录。
         // `None` 时 `serve()` 按本进程实例家目录自建(生产路径)。
         side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
+    ) -> Self
+    where
+        F: Fn(
+                Option<yi_agent_core::Session>,
+                &std::path::Path,
+                crate::thread_store::ThreadMode,
+            ) -> anyhow::Result<BuiltAgent>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::with_config_scope_watchman_live(
+            cfg,
+            build,
+            permission_timeout,
+            scope,
+            install,
+            uninstall,
+            calls,
+            lead_agent_enabled,
+            side_registry,
+            None,
+        )
+    }
+
+    // 10 个参数:上面那组再叠一个 live-settings 注入。与既有的 9 参版分成两个
+    // 函数而不是全仓改签名:只有真正要观察热更新的用例才关心这个入口。
+    #[allow(clippy::too_many_arguments)]
+    fn with_config_scope_watchman_live<F>(
+        cfg: RuntimeConfig,
+        build: F,
+        permission_timeout: Duration,
+        scope: Scope,
+        install: WatchmanInstall,
+        uninstall: WatchmanUninstall,
+        calls: WatchmanCalls,
+        lead_agent_enabled: bool,
+        side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
+        live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
     ) -> Self
     where
         F: Fn(
@@ -917,8 +994,8 @@ impl Harness {
                 models_path: models_dir.path().join("models.json"),
                 websearch_path: models_dir.path().join("websearch.json"),
                 settings_path: models_dir.path().join("settings.json"),
-                // 这些用例不涉运行期设置：静态装配。
-                live_settings: None,
+                // 默认静态装配；`with_live_settings` 才注入共享实例。
+                live_settings: live_settings.clone(),
                 // harness 默认关（= stable 行为）；`with_lead_flag(true)` 打开的
                 // 那个构造器会把这个值换成 true。
                 lead_agent_enabled,
@@ -2943,6 +3020,8 @@ mod model_settings;
 mod plugin_theme;
 #[cfg(test)]
 mod process;
+#[cfg(test)]
+mod runtime_settings;
 mod runtime_status;
 #[cfg(test)]
 mod side;

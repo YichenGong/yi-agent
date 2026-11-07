@@ -55,6 +55,19 @@ pub(crate) async fn handle(
                 }
                 None => ok_response(id, state.cfg.redacted_view()),
             };
+            // A live host restates the plan's runtime tunables from the current
+            // effective values and reports where each one comes from. Without a
+            // binding the historic redacted view is returned untouched.
+            let response = match state.live_settings {
+                Some(binding) => {
+                    let mut response = response;
+                    if let Some(view) = response.result.as_mut() {
+                        crate::settings_rpc::annotate_live_config_view(view, binding);
+                    }
+                    response
+                }
+                None => response,
+            };
             write_response(state.hub, state.client, response).await?;
         }
         "ui/settings/read" => {
@@ -106,7 +119,13 @@ pub(crate) async fn handle(
             .await?;
         }
         "settings/read" => {
-            let value = crate::settings_rpc::read_value(state.settings_path);
+            // With a live binding the answer carries revision/health/policy for
+            // every field; without one (a caller that never assembled a runtime)
+            // the historic shape is returned unchanged rather than fabricated.
+            let value = match state.live_settings.as_ref() {
+                Some(binding) => crate::settings_rpc::read_live_value(binding),
+                None => crate::settings_rpc::read_value(state.settings_path),
+            };
             write_response(state.hub, state.client, ok_response(id, value)).await?;
         }
         "settings/write" => {
@@ -129,12 +148,53 @@ pub(crate) async fn handle(
                 .unwrap_or(serde_json::Value::Null);
             // 受管写入在阻塞线程池里执行：等实例写锁是同步睡眠，直接在本
             // async 任务里做会占住 reactor（`main` 循环也就发不出别的响应）。
-            let result =
-                crate::settings_rpc::write_value_async(state.settings_path.to_path_buf(), patch)
-                    .await;
+            //
+            // With a live binding the commit goes through the shared instance so
+            // every attached conversation resolves the new values at its next
+            // safe point. Without one there is nothing to share, and the write
+            // is the plain file commit it always was.
+            let result = match state.live_settings.cloned() {
+                Some(binding) => crate::settings_rpc::write_live_value_async(binding, patch).await,
+                None => {
+                    crate::settings_rpc::write_value_async(state.settings_path.to_path_buf(), patch)
+                        .await
+                }
+            };
             match result {
                 Ok(value) => {
-                    write_response(state.hub, state.client, ok_response(id, value)).await?
+                    // Response first: the receipt describes a commit that already
+                    // happened. A notification failure must not turn it into an
+                    // error the user would retry.
+                    let changed_keys: Vec<String> = value
+                        .get("changed_keys")
+                        .and_then(|v| v.as_array())
+                        .map(|keys| {
+                            keys.iter()
+                                .filter_map(|k| k.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let revision = value
+                        .get("revision")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    write_response(state.hub, state.client, ok_response(id, value)).await?;
+                    if let Some(revision) = revision
+                        && (!changed_keys.is_empty() || state.live_settings.is_some())
+                    {
+                        // Empty `changed_keys` is meaningful: it says "the record
+                        // may have changed (health, say) but no logical value
+                        // did", which is exactly what a client needs to know to
+                        // re-read rather than to resync its drafts.
+                        let _ = write_notification(
+                            state.hub,
+                            &Notification::SettingsChanged {
+                                revision,
+                                changed_keys,
+                            },
+                        )
+                        .await;
+                    }
                 }
                 Err(error) => {
                     write_response(

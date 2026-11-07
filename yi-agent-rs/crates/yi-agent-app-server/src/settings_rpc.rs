@@ -8,6 +8,10 @@
 use std::path::Path;
 
 use serde_json::{Value, json};
+use yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding;
+use yi_agent_runtime::live_settings::sources::ValueSource;
+use yi_agent_runtime::settings::document::{ApplyPolicy, apply_policy};
+use yi_agent_runtime::settings::store::PatchMode;
 use yi_agent_runtime::settings::{self, FieldSpec, FieldType, SettingsError};
 
 use crate::protocol::{RpcError, Scope};
@@ -40,6 +44,245 @@ pub fn read_value(path: &Path) -> Value {
         "fields": fields,
         "path": path.display().to_string(),
     })
+}
+
+/// Capability version of the live-settings protocol.
+///
+/// Absent means "this server predates live settings": a client must then show
+/// only "saved", never promise that running conversations will adopt the change.
+pub const LIVE_APPLY_VERSION: u32 = 1;
+
+/// `settings/read` for a live binding: the historic `fields`/`path` shape plus
+/// revision, health and per-field host context.
+///
+/// Everything added is additive. Old clients keep reading `fields` and `path`
+/// unchanged; new clients only trust the live fields when
+/// `live_apply_version` is present.
+///
+/// `host_value`/`host_source` describe the *host default context*, not any
+/// running conversation's effective value: a conversation may be narrower
+/// because of its own recorded baseline, and the UI must not read this as "what
+/// my session is doing right now".
+pub fn read_live_value(binding: &RuntimeSettingsBinding) -> Value {
+    let path = binding.live.path().to_path_buf();
+    let snapshot = binding.live.refresh();
+    let effective = binding.sources.resolve(&snapshot.settings);
+
+    let mut value = read_value(&path);
+    let fields: Vec<Value> = settings::FIELDS
+        .iter()
+        .map(|spec| {
+            let source = effective.sources.get(spec.key).copied();
+            json!({
+                "key": spec.key,
+                "group": spec.group,
+                "label": spec.label,
+                "type": type_name(spec.field_type),
+                "value": current_value(&snapshot.settings, spec),
+                "default": spec.default_display,
+                "description": spec.description,
+                "options": spec.options,
+                "min": spec.min,
+                "max": spec.max,
+                "apply_policy": apply_policy_name(spec.key),
+                // The effective default for this process, which may be a frozen
+                // CLI/env value or a field default rather than the file's value.
+                "host_value": effective.values.get(spec.key).cloned().unwrap_or(Value::Null),
+                "host_source": host_source_name(source),
+            })
+        })
+        .collect();
+
+    if let Some(object) = value.as_object_mut() {
+        object.insert("fields".into(), Value::Array(fields));
+        object.insert("live_apply_version".into(), json!(LIVE_APPLY_VERSION));
+        object.insert("revision".into(), json!(snapshot.revision));
+        object.insert(
+            "snapshot_origin".into(),
+            json!(snapshot_origin_name(snapshot.origin)),
+        );
+        object.insert(
+            "health".into(),
+            json!({
+                "state": match snapshot.health.state {
+                    yi_agent_runtime::live_settings::HealthState::Healthy => "healthy",
+                    yi_agent_runtime::live_settings::HealthState::Degraded => "degraded",
+                },
+                // Only categories and key names. A code that echoed a value
+                // would put user content (a prompt, say) into diagnostics.
+                "code": snapshot.health.code,
+                "invalid_keys": snapshot.health.invalid_keys,
+            }),
+        );
+    }
+    value
+}
+
+/// `settings/write` for a live binding: commit through the shared instance so
+/// every conversation sees the new values, then describe the receipt.
+///
+/// Synchronous for the same reason as [`write_value`]: the caller must run it
+/// off the reactor. Returning the receipt lets the caller build the response
+/// *before* any broadcast, so a failing notification can never turn a committed
+/// save into an error the user would retry.
+pub fn write_live_value(
+    binding: &RuntimeSettingsBinding,
+    patch: &Value,
+) -> Result<Value, SettingsError> {
+    let receipt = binding.live.commit(patch, PatchMode::ReplaceProvided)?;
+    let overridden: Vec<Value> = receipt
+        .changed_keys
+        .iter()
+        .filter_map(|key| {
+            binding
+                .sources
+                .resolve(&receipt.settings)
+                .sources
+                .get(key)
+                .copied()
+                .filter(|source| matches!(source, ValueSource::Override | ValueSource::Environment))
+                .map(|source| {
+                    json!({
+                        "key": key,
+                        "source": match source {
+                            ValueSource::Override => "override",
+                            ValueSource::Environment => "environment",
+                            // resolve() only reports these two as host-level;
+                            // settings/default come from the file itself.
+                            _ => "override",
+                        },
+                    })
+                })
+        })
+        .collect();
+    let policies: serde_json::Map<String, Value> = receipt
+        .apply_policy
+        .iter()
+        .map(|(key, policy)| (key.clone(), json!(policy_name(*policy))))
+        .collect();
+
+    Ok(json!({
+        "ok": true,
+        "live_apply_version": LIVE_APPLY_VERSION,
+        "revision": receipt.revision,
+        "changed_keys": receipt.changed_keys,
+        "apply_policy": policies,
+        "overridden_keys": overridden,
+    }))
+}
+
+/// The `config/read` keys that mirror a live runtime scalar one-for-one.
+///
+/// Deliberately short. `compact_threshold` is *derived* from the session's own
+/// context length and the live ratio, so replacing it from the host context
+/// would describe a different session; `sandbox` and the model/provider fields
+/// are session permissions/identity and must not be restated from host defaults
+/// (spec §7 诊断: 会话权限/模型不因该展示刷新改变).
+const CONFIG_VIEW_LIVE_KEYS: [&str; 3] =
+    ["max_turns", "max_resident_subagents", "max_direct_children"];
+
+/// The live key each `config/read` key mirrors.
+fn config_view_source_key(key: &str) -> Option<&'static str> {
+    match key {
+        "max_turns" => Some("agent.max_turns"),
+        "max_resident_subagents" => Some("agent.max_resident_subagents"),
+        "max_direct_children" => Some("agent.max_direct_children"),
+        _ => None,
+    }
+}
+
+/// Stamp a `config/read` view with the live settings context.
+///
+/// Two separate things, and conflating them would mislead a client:
+///
+/// 1. The three runtime tunables are replaced with the host's *current* effective
+///    values, because they are consumed live — a card showing the start-up value
+///    would be stale the moment the user saves.
+/// 2. Everything else gains a `live_apply` block describing revision, health and
+///    each key's source, so a client can say "currently overridden by
+///    `--max-turns`" instead of silently showing a value that will not apply.
+///
+/// Nothing here changes any conversation's permissions or model: this is a
+/// read-only restatement for diagnostics.
+pub fn annotate_live_config_view(view: &mut Value, binding: &RuntimeSettingsBinding) {
+    let snapshot = binding.live.refresh();
+    let effective = binding.sources.resolve(&snapshot.settings);
+
+    if let Some(object) = view.as_object_mut() {
+        for key in CONFIG_VIEW_LIVE_KEYS {
+            let Some(source_key) = config_view_source_key(key) else {
+                continue;
+            };
+            let Some(value) = effective.values.get(source_key) else {
+                continue;
+            };
+            if let Some(slot) = object.get_mut(key) {
+                *slot = value.clone();
+            }
+        }
+
+        let sources: serde_json::Map<String, Value> = CONFIG_VIEW_LIVE_KEYS
+            .iter()
+            .filter_map(|key| {
+                let source_key = config_view_source_key(key)?;
+                let source = effective.sources.get(source_key).copied()?;
+                Some(((*key).to_string(), json!(host_source_name(Some(source)))))
+            })
+            .collect();
+
+        object.insert(
+            "live_apply".into(),
+            json!({
+                "live_apply_version": LIVE_APPLY_VERSION,
+                "revision": snapshot.revision,
+                "snapshot_origin": snapshot_origin_name(snapshot.origin),
+                "health": {
+                    "state": match snapshot.health.state {
+                        yi_agent_runtime::live_settings::HealthState::Healthy => "healthy",
+                        yi_agent_runtime::live_settings::HealthState::Degraded => "degraded",
+                    },
+                    "code": snapshot.health.code,
+                    "invalid_keys": snapshot.health.invalid_keys,
+                },
+                "sources": sources,
+            }),
+        );
+    }
+}
+
+pub fn apply_policy_name(key: &str) -> &'static str {
+    match apply_policy(key) {
+        Some(ApplyPolicy::NextSession) => "next_session",
+        // Unknown keys cannot reach here (FIELDS is authoritative), and the safe
+        // reading of "not a next-session item" is the live one.
+        Some(ApplyPolicy::NextSafePoint) | None => "next_safe_point",
+    }
+}
+
+fn policy_name(policy: ApplyPolicy) -> &'static str {
+    match policy {
+        ApplyPolicy::NextSafePoint => "next_safe_point",
+        ApplyPolicy::NextSession => "next_session",
+    }
+}
+
+fn host_source_name(source: Option<ValueSource>) -> &'static str {
+    match source {
+        Some(ValueSource::Override) => "override",
+        Some(ValueSource::Environment) => "environment",
+        Some(ValueSource::Settings) => "settings",
+        Some(ValueSource::Default) => "default",
+        None => "default",
+    }
+}
+
+fn snapshot_origin_name(origin: yi_agent_runtime::live_settings::SnapshotOrigin) -> &'static str {
+    use yi_agent_runtime::live_settings::SnapshotOrigin;
+    match origin {
+        SnapshotOrigin::Current => "current",
+        SnapshotOrigin::LastKnownGood => "last_known_good",
+        SnapshotOrigin::StartupFallback => "startup_fallback",
+    }
 }
 
 /// 从已加载的 `Settings` 里取某个字段的 JSON 值；`None` → `null`。
@@ -90,6 +333,24 @@ fn type_name(field_type: FieldType) -> &'static str {
 pub fn write_value(path: &Path, patch: &Value) -> Result<Value, SettingsError> {
     settings::write_to(path, patch)?;
     Ok(json!({"ok": true}))
+}
+
+/// The live counterpart of [`write_value_async`]: commit through the shared
+/// instance off the reactor, then report the receipt.
+///
+/// The receipt is returned rather than broadcast from here so the caller can
+/// write the response first. A committed save must never be reported as a
+/// failure because a notification could not be delivered.
+pub async fn write_live_value_async(
+    binding: RuntimeSettingsBinding,
+    patch: Value,
+) -> Result<Value, SettingsError> {
+    match tokio::task::spawn_blocking(move || write_live_value(&binding, &patch)).await {
+        Ok(result) => result,
+        Err(error) => Err(SettingsError::Io(format!(
+            "settings write task failed: {error}"
+        ))),
+    }
 }
 
 /// RPC 入口使用的异步外壳：把受管写入整个搬到阻塞线程池。
@@ -220,6 +481,245 @@ mod tests {
             .await
             .expect_err("the write must still be waiting when the timer fires");
         release.await.unwrap();
+    }
+
+    fn live_binding(dir: &tempfile::TempDir) -> RuntimeSettingsBinding {
+        RuntimeSettingsBinding {
+            live: yi_agent_runtime::live_settings::LiveSettings::shared(
+                dir.path().join("settings.json"),
+            ),
+            sources: std::sync::Arc::new(
+                yi_agent_runtime::live_settings::sources::FrozenRuntimeSources::default(),
+            ),
+        }
+    }
+
+    #[test]
+    fn a_live_read_reports_capability_origin_and_health() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let binding = live_binding(&dir);
+        let view = read_live_value(&binding);
+        assert_eq!(view["live_apply_version"], 1);
+        assert_eq!(view["snapshot_origin"], "current");
+        assert_eq!(view["health"]["state"], "healthy");
+        assert_eq!(view["health"]["code"], Value::Null);
+        assert_eq!(view["health"]["invalid_keys"], json!([]));
+        // The historic shape is untouched, so old clients keep working.
+        assert!(view["path"].is_string());
+        assert!(view["fields"].is_array());
+    }
+
+    #[test]
+    fn a_live_write_reports_policy_and_changed_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let binding = live_binding(&dir);
+        let saved =
+            write_live_value(&binding, &json!({"agent.max_turns": 41})).expect("valid patch");
+        assert_eq!(saved["ok"], true);
+        assert_eq!(saved["live_apply_version"], 1);
+        assert_eq!(saved["changed_keys"], json!(["agent.max_turns"]));
+        assert_eq!(saved["apply_policy"]["agent.max_turns"], "next_safe_point");
+        assert!(saved["revision"].is_string());
+        assert_eq!(saved["overridden_keys"], json!([]));
+    }
+
+    #[test]
+    fn startup_sandbox_is_a_next_session_item() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let binding = live_binding(&dir);
+        let saved = write_live_value(&binding, &json!({"startup.sandbox": "read-only"})).unwrap();
+        assert_eq!(saved["apply_policy"]["startup.sandbox"], "next_session");
+        let view = read_live_value(&binding);
+        let field = view["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["key"] == "startup.sandbox")
+            .expect("the field is listed");
+        assert_eq!(field["apply_policy"], "next_session");
+    }
+
+    #[test]
+    fn every_field_reports_a_policy_and_a_host_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let binding = live_binding(&dir);
+        let view = read_live_value(&binding);
+        for field in view["fields"].as_array().unwrap() {
+            assert!(
+                matches!(
+                    field["apply_policy"].as_str(),
+                    Some("next_safe_point" | "next_session")
+                ),
+                "{field:?}"
+            );
+            assert!(
+                matches!(
+                    field["host_source"].as_str(),
+                    Some("override" | "environment" | "settings" | "default")
+                ),
+                "{field:?}"
+            );
+            // A field default always exists, so the host context is never null
+            // for a number/text/select field except `system_prompt`'s null.
+            assert!(field.get("host_value").is_some(), "{field:?}");
+        }
+    }
+
+    /// A frozen CLI/env value must be reported as the host default *and* as an
+    /// override for the changed key — without exposing the value in diagnostics.
+    #[test]
+    fn a_host_override_shadows_the_file_value() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let binding =
+            RuntimeSettingsBinding {
+                live: yi_agent_runtime::live_settings::LiveSettings::shared(
+                    dir.path().join("settings.json"),
+                ),
+                sources: std::sync::Arc::new(
+                    yi_agent_runtime::live_settings::sources::FrozenRuntimeSources::from_pairs(&[
+                        ("agent.max_turns", json!(7), ValueSource::Environment),
+                    ]),
+                ),
+            };
+        let view = read_live_value(&binding);
+        let field = view["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["key"] == "agent.max_turns")
+            .unwrap();
+        assert_eq!(field["host_value"], 7);
+        assert_eq!(field["host_source"], "environment");
+
+        let saved = write_live_value(&binding, &json!({"agent.max_turns": 41})).unwrap();
+        assert_eq!(
+            saved["overridden_keys"],
+            json!([{"key": "agent.max_turns", "source": "environment"}])
+        );
+    }
+
+    #[test]
+    fn an_invalid_patch_writes_nothing_and_reports_no_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let binding = live_binding(&dir);
+        write_live_value(&binding, &json!({"agent.max_turns": 5})).unwrap();
+        let before = read_live_value(&binding)["revision"].clone();
+
+        let error = write_live_value(
+            &binding,
+            &json!({"agent.max_turns": 6, "agent.max_direct_children": -1}),
+        )
+        .expect_err("one invalid key must reject the whole patch");
+        assert!(!error.to_string().contains("USER-SECRET"));
+
+        // The good key in the same batch must not have landed: validation is
+        // whole-patch, so a partial write would contradict "zero write".
+        let after = read_live_value(&binding);
+        assert_eq!(
+            after["revision"], before,
+            "a rejected patch must not commit"
+        );
+        let field = after["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["key"] == "agent.max_turns")
+            .unwrap();
+        assert_eq!(field["value"], 5);
+    }
+
+    /// Health diagnostics carry key names and a category, never a value. A
+    /// corrupt document whose text contains user content must not leak it.
+    #[test]
+    fn degraded_health_reports_no_settings_values() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"max_turns":"USER-SECRET","system_prompt":"USER-SECRET"}}"#,
+        )
+        .unwrap();
+        let binding = live_binding(&dir);
+        let view = read_live_value(&binding);
+        assert_eq!(view["health"]["state"], "degraded");
+        // Only the health sub-object must be value-free. `fields[].value` is the
+        // settings content the client renders, so it may of course contain it.
+        let health = view["health"].to_string();
+        assert!(
+            !health.contains("USER-SECRET"),
+            "health diagnostics must not echo values: {health}"
+        );
+        assert_eq!(view["health"]["code"], "invalid_document");
+        assert_eq!(view["health"]["invalid_keys"], json!(["agent.max_turns"]));
+    }
+
+    /// 错误里绝不能出现设置取值。spec §9：不把设置值拼进错误或日志。
+    ///
+    /// `Corrupt` 的 reason 来自 `serde_json` 的定位信息（行/列），`Io` 来自
+    /// `std::io`。两者都不带原文；这条测试把该保证钉住，防止有人为了"更好
+    /// 的报错"把文档内容拼进去。
+    #[test]
+    fn write_errors_never_echo_setting_values() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{\"agent\": {\"max_turns\": \"VALUE-SECRET\"}").unwrap();
+        let binding = live_binding(&dir);
+        let error = write_live_value(&binding, &json!({"agent.max_turns": 3}))
+            .expect_err("an unparseable document must refuse the write");
+        let rpc = write_error(error);
+        let rendered = serde_json::json!({
+            "message": rpc.message,
+            "data": rpc.data,
+        })
+        .to_string();
+        assert!(
+            !rendered.contains("VALUE-SECRET"),
+            "error leaked a value: {rendered}"
+        );
+
+        // 非法值同理：只带键名与原因分类，不带用户填的原文。
+        let error = write_live_value(&binding, &json!({"agent.max_turns": "NOT-A-NUMBER"}))
+            .expect_err("a wrong type must be rejected");
+        let rpc = write_error(error);
+        let rendered = serde_json::json!({"message": rpc.message, "data": rpc.data}).to_string();
+        assert!(
+            !rendered.contains("NOT-A-NUMBER"),
+            "error leaked: {rendered}"
+        );
+    }
+
+    /// 每个错误类别都有稳定的 `data.code`，UI 据此内联提示而不是弹整页错误。
+    #[test]
+    fn every_error_class_has_a_stable_code() {
+        let cases = [
+            (
+                SettingsError::InvalidSetting {
+                    key: "agent.max_turns".into(),
+                    reason: "out of range".into(),
+                },
+                "invalid_setting",
+                -32602,
+            ),
+            (
+                SettingsError::Corrupt("bad json".into()),
+                "settings_corrupt",
+                -32603,
+            ),
+            (
+                SettingsError::InvalidDocument {
+                    keys: vec!["agent.max_turns".into()],
+                },
+                "invalid_document",
+                -32602,
+            ),
+            (SettingsError::LockTimeout, "settings_lock_timeout", -32603),
+            (SettingsError::TooLarge, "settings_too_large", -32602),
+        ];
+        for (error, code, rpc_code) in cases {
+            let rpc = write_error(error);
+            assert_eq!(rpc.data.as_ref().unwrap()["code"], code);
+            assert_eq!(rpc.code, rpc_code, "{code}");
+        }
     }
 
     #[test]

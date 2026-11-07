@@ -1757,6 +1757,7 @@ fn run_agent_with_seed(cli: Cli, seed: Option<ResumeSeed>) -> Result<()> {
         mcp,
         seed,
         live_settings,
+        Some(settings_binding),
     )
 }
 
@@ -2612,6 +2613,9 @@ fn run_tui_agent(
     mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
     seed: Option<ResumeSeed>,
     live_settings: Option<yi_agent_core::live_settings::SharedSettingsSource>,
+    // `/config` 要展示**当前**有效值与来源，所以这里需要绑定本身，而不是
+    // 只有 agent 用的窄 source。
+    settings_binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -2748,6 +2752,9 @@ fn run_tui_agent(
                     .to_string()
             },
             focus_degraded: false,
+            live: settings_binding
+                .clone()
+                .map(crate::tui::slash::TuiLiveSettings::new),
         };
 
         // 会话存储：resume/fork 用调用方已打开的那份（它已持锁），

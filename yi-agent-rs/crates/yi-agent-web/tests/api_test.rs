@@ -380,3 +380,98 @@ async fn body_text(response: axum::response::Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
 }
+
+/// 手机端保存必须与桌面端走**同一个提交点**：经共享实例提交后，桌面那一侧的
+/// 读者（watch 订阅者）立刻看到新值。直接用 `settings::write_to` 也能写对文件，
+/// 但不会唤醒已登记的实例，热更新就会"文件变了、运行中的会话不知道"。
+#[tokio::test]
+async fn put_config_publishes_to_the_shared_live_instance() {
+    use yi_agent_runtime::live_settings::LiveSettings;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    // 先登记实例，模拟桌面/app-server 已经持有同一个文件。
+    let live = LiveSettings::shared(path.clone());
+    let mut changes = live.subscribe();
+
+    let response = app(path.clone())
+        .oneshot(
+            Request::put("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"updates":[{"key":"agent.max_turns","value":"321"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // 旧成功形状不变（只有 ok:true），前端无需改动。
+    let body = body_json(response).await;
+    assert_eq!(body, serde_json::json!({ "ok": true }));
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), changes.changed())
+        .await
+        .expect("the shared instance must be woken by a web save")
+        .expect("the watch channel is alive");
+    assert_eq!(live.refresh().settings.agent.max_turns, Some(321));
+}
+
+/// 旧 GET 形状必须逐字保留：`groups[].vars[].source` 是手机端"默认/已设置"
+/// 标记的唯一来源，加字段可以，删字段会让老页面静默把所有行显示成默认。
+#[tokio::test]
+async fn get_config_keeps_the_legacy_group_and_var_shape() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, r#"{"agent":{"max_turns":500}}"#).unwrap();
+
+    let value = body_json(
+        app(path)
+            .oneshot(Request::get("/api/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert!(value["path"].is_string());
+    let groups = value["groups"].as_array().expect("groups array");
+    let agent = groups.iter().find(|g| g["name"] == "agent").unwrap();
+    let var = agent["vars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["key"] == "agent.max_turns")
+        .unwrap();
+    for field in [
+        "key", "label", "value", "default", "type", "group", "source",
+    ] {
+        assert!(var.get(field).is_some(), "missing {field}: {var}");
+    }
+}
+
+/// GET 报告健康状态；诊断只给类别与键名，不回显用户内容。
+#[tokio::test]
+async fn get_config_reports_degraded_health_without_echoing_values() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(
+        &path,
+        r#"{"agent":{"max_turns":"WEB-SECRET","system_prompt":"WEB-SECRET"}}"#,
+    )
+    .unwrap();
+
+    let value = body_json(
+        app(path)
+            .oneshot(Request::get("/api/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(value["live_apply_version"], 1);
+    assert_eq!(value["health"]["state"], "degraded");
+    let health = value["health"].to_string();
+    assert!(!health.contains("WEB-SECRET"), "health leaked: {health}");
+    // 旧形状仍在：降级不能让页面变成空白。
+    assert!(value["groups"].as_array().is_some_and(|g| !g.is_empty()));
+}

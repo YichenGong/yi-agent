@@ -61,11 +61,36 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
         groups.push(json!({ "name": group, "vars": vars }));
     }
 
+    // Additive metadata, never a replacement. The phone UI reads `groups` and
+    // `vars[].source`; those stay exactly as they were. The live block only lets
+    // a new client say "configuration is degraded" or "this host serves live
+    // settings", instead of silently rendering stale-looking values.
+    let live = yi_agent_runtime::live_settings::LiveSettings::shared(state.settings_path.clone());
+    let snapshot = live.refresh();
+    let health = json!({
+        "state": match snapshot.health.state {
+            yi_agent_runtime::live_settings::HealthState::Healthy => "healthy",
+            yi_agent_runtime::live_settings::HealthState::Degraded => "degraded",
+        },
+        "code": snapshot.health.code,
+        "invalid_keys": snapshot.health.invalid_keys,
+    });
+
     (
         axum::http::StatusCode::OK,
         Json(json!({
             "groups": groups,
             "path": state.settings_path.display().to_string(),
+            "live_apply_version": 1,
+            "revision": snapshot.revision,
+            "snapshot_origin": match snapshot.origin {
+                yi_agent_runtime::live_settings::SnapshotOrigin::Current => "current",
+                yi_agent_runtime::live_settings::SnapshotOrigin::LastKnownGood => "last_known_good",
+                yi_agent_runtime::live_settings::SnapshotOrigin::StartupFallback => {
+                    "startup_fallback"
+                }
+            },
+            "health": health,
         })),
     )
 }

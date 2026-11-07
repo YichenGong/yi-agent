@@ -760,7 +760,7 @@ fn wider_host_does_not_expand_saved_read_only() {
 
 **Interfaces:** `settings_rpc::read_live_value(binding: &RuntimeSettingsBinding) -> Value`、`write_live_value(binding: &RuntimeSettingsBinding, patch: &Value) -> Result<Value, SettingsError>`；RPC生产路径调用新接口，旧path函数可保留测试facade但不得成为漏通知写入口。JSON形状完全按spec§8.1；settings/changed `{revision,changed_keys}`。host值只表示宿主默认装配上下文。
 
-- [ ] **Step 1: 写失败测试。** settings_rpc.rs新增：
+- [x] **Step 1: 写失败测试。** settings_rpc.rs新增：
 
 ```rust
 let view = read_live_value(&binding);
@@ -775,8 +775,8 @@ assert_eq!(saved["ok"], true);
 
 binding在测试用Task3 shared临时路径+空FrozenRuntimeSources构造。再测试 host override 遮蔽、default/null保留、startup策略next_session、degraded/LKG读取、错误不含USER-SECRET。真实RPC测试验证非法patch整批零通知、提交后广播失败不把响应变成未保存。
 
-- [ ] **Step 2: RED。** Run `cargo test -p yi-agent-app-server --lib settings_rpc` 和 `cargo test -p yi-agent-app-server --lib runtime_settings`。旧响应缺capability/策略处失败。
-- [ ] **Step 3: 最小实现。** 输入patch不变，扩展read/write输出按spec逐键构造；apply_policy/overridden_keys只覆盖changed_keys。errors扩展锁超时/超限、多键非法，保留旧invalid_setting/settings_corrupt稳定分类；无值错误message。RPC/web异步处理用 `tokio::task::spawn_blocking` 调用同步commit，传owned binding/patch，不在reactor里等5秒锁。响应receipt在提交前就可计算好，rename后缓存/广播失败不能触发错误回滚。
+- [x] **Step 2: RED。** Run `cargo test -p yi-agent-app-server --lib settings_rpc` 和 `cargo test -p yi-agent-app-server --lib runtime_settings`。旧响应缺capability/策略处失败。
+- [x] **Step 3: 最小实现。** 输入patch不变，扩展read/write输出按spec逐键构造；apply_policy/overridden_keys只覆盖changed_keys。errors扩展锁超时/超限、多键非法，保留旧invalid_setting/settings_corrupt稳定分类；无值错误message。RPC/web异步处理用 `tokio::task::spawn_blocking` 调用同步commit，传owned binding/patch，不在reactor里等5秒锁。响应receipt在提交前就可计算好，rename后缓存/广播失败不能触发错误回滚。
 
 ```rust
 let receipt = binding.live.commit(patch, PatchMode::ReplaceProvided)?;
@@ -787,8 +787,8 @@ let policies: std::collections::BTreeMap<_, _> = receipt.changed_keys.iter()
 
 通知只入hub队列；空changed不发逻辑事件、health变化可同revision空keys失效。跨进程观察通知在Task11。config/read与/config只替换本spec字段当前host值/来源，其他字段沿原脱敏逻辑；不以此修改任何会话权限。web GET保留旧groups/vars形状，可增health/capability不删旧字段，PUT保留旧成功形状并可加元数据。
 
-- [ ] **Step 4: GREEN。** Run上述app-server两组测试、`cargo test -p yi-agent-web`、`cargo test -p yi-agent --bin yi-agent`；以旧请求fixture和新响应fixture验证向后兼容。若新增导出DTO涉及bindings，执行仓库现有绑定生成/检查入口，不手改生成TS。
-- [ ] **Step 5: 文档/门禁/提交。** message `feat: report live settings policies and health over rpc`。
+- [x] **Step 4: GREEN。** Run上述app-server两组测试、`cargo test -p yi-agent-web`、`cargo test -p yi-agent --bin yi-agent`；以旧请求fixture和新响应fixture验证向后兼容。若新增导出DTO涉及bindings，执行仓库现有绑定生成/检查入口，不手改生成TS。
+- [x] **Step 5: 文档/门禁/提交。** message `feat: report live settings policies and health over rpc`。
 
 ## Task 11: 主动观察器、电源、TUI标题/通知和排队唤醒
 

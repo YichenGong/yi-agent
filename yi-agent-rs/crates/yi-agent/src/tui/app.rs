@@ -442,6 +442,7 @@ fn snapshot_for_tests() -> TuiConfigSnapshot {
         terminal_title: true,
         title_status: "on".into(),
         focus_degraded: false,
+        live: None,
     }
 }
 

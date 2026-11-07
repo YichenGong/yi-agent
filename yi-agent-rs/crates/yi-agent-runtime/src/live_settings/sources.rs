@@ -305,9 +305,18 @@ impl FrozenRuntimeSources {
         self.values.get(key)
     }
 
-    /// 测试专用：直接构造固定来源表，避免并行 `set_var` 互相污染。
-    #[cfg(test)]
-    pub(crate) fn from_pairs(pairs: &[(&str, Value, ValueSource)]) -> Self {
+    /// Build a frozen table directly.
+    ///
+    /// Production code obtains this from [`FrozenRuntimeSources::capture`],
+    /// which validates. This constructor exists so callers in *other* crates
+    /// (the app-server settings RPC tests) can inject a known override without
+    /// mutating the real process environment, which parallel tests share.
+    ///
+    /// It does **not** validate: the runtime's own tests build deliberately
+    /// malformed tables here to exercise [`FrozenRuntimeSources::validate`], and
+    /// asserting would make those tests unfalsifiable. Callers assembling a
+    /// table that will actually be used must call `validate()` themselves.
+    pub fn from_pairs(pairs: &[(&str, Value, ValueSource)]) -> Self {
         let values = pairs
             .iter()
             .map(|(key, value, source)| {
