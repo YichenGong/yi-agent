@@ -25,8 +25,38 @@ lint:
 # nextest 不跑 doctest，但本仓库 doctest 数为 0（2026-11-01 实测 14 个 crate 全 0），
 # 故无需补 `cargo test --doc`。若将来引入可执行 doctest，必须加回。
 test:
+    bash scripts/test-tiers.sh concurrency
     cargo nextest --version
     cargo nextest run --all-features --workspace --profile ci
+
+# === 分级测试入口（见 docs/superpowers/plans/2026-11-07-graded-test-tiers.md） ===
+#
+# L0 类型检查：不产出测试二进制，因此不触发 nextest 的 --list 探测开销。
+# 用 --all-targets 是必须的：默认不检查 tests/，而本仓有 108 个集成测试 target。
+# 注意 L0 不承诺秒级——它比 L1 快，仅此而已。
+check-fast:
+    bash scripts/test-tiers.sh check
+
+# L1 单 crate 测试。--all-features 不能省：yi-agent-store 的
+# foreground-test-support feature 门控了测试辅助方法，漏掉会直接编译失败。
+test-crate crate:
+    bash scripts/test-tiers.sh crate {{crate}}
+    cargo nextest run --all-features -p {{crate}} --profile ci
+
+# L2 改动相关的 crate：由 git diff 推断，再交给 nextest 的 rdeps() 扩展到反向依赖。
+# 默认基准是 merge-base 的两点 diff（含未提交改动）。
+# 用法：just test-affected            （对比 merge-base main HEAD）
+#       just test-affected origin/main （对比指定 ref）
+test-affected since="":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    expr="$(bash scripts/test-tiers.sh affected {{since}})" || exit $?
+    if [ -z "$expr" ]; then
+        # 例如纯文档改动：affected 已说明「no tests needed」并 exit 0
+        exit 0
+    fi
+    echo "nextest -E '$expr'"
+    bash scripts/test-tiers.sh run "$expr"
 
 # 构建（debug）
 build:
@@ -218,7 +248,7 @@ audit-deps-check:
 nightly-workflow-check:
     bash ../scripts/test_nightly_workflow.sh
 
-ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check plugin-release-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check msrv-check eval-baseline-check nightly-workflow-check audit-deps-check reclaim-check audit
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check plugin-release-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check msrv-check eval-baseline-check nightly-workflow-check audit-deps-check reclaim-check affected-check audit
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`
@@ -623,3 +653,9 @@ reclaim apply="" worktrees="": reclaim-check
 # 两种错误都不报错、只能靠断言发现。
 reclaim-check:
     bash scripts/test_reclaim_target.sh
+
+# test-tiers.sh 的判据自测（假 git 输出驱动，不编译、秒级）。
+# 进 ci 的理由同 reclaim-check：判据写宽会把 desktop/ 当 crate 跑，
+# 写窄会静默少测——两种都不报错，只能靠断言发现。
+affected-check:
+    bash scripts/test_test_tiers.sh
