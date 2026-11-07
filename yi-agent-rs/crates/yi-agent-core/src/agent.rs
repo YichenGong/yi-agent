@@ -10,6 +10,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::live_settings::AgentSettingsSource;
 use crate::message::{ContentBlock, Message, Role};
 use crate::provider::{
     GenParams, NoticeLevel, Provider, ProviderError, ProviderEvent, ProviderRequest, ReasoningKind,
@@ -180,6 +181,9 @@ pub struct Agent {
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
     decision_rx: Option<DecisionRx>,
     provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
+    /// Optional narrow live-settings source. `None` keeps the historical static
+    /// `AgentConfig` behaviour byte-for-byte.
+    live_settings: Option<Arc<dyn AgentSettingsSource>>,
     /// Interjection inbox shared with the spawned `run_loop`, so a test (or a
     /// caller holding an `InboxHandle`) can deliver without a live `&Agent`.
     /// Only present while a run is active.
@@ -475,6 +479,12 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error("provider turn admission failed: {0}")]
     ProviderTurnAdmission(String),
+    /// The bound live-settings source could not produce a snapshot for this
+    /// operation. Carries only a stable code: never a prompt, key or raw
+    /// settings text. Recoverable: the run stops at this safe point instead of
+    /// issuing a request with unknown settings.
+    #[error("live settings unavailable: {0}")]
+    LiveSettings(&'static str),
     #[error("compaction error: {0}")]
     Compact(#[from] crate::compact::CompactError),
     /// A side run refused to grow: the per-side text/binary budget is spent.
@@ -494,6 +504,7 @@ impl Agent {
             permission_checker: None,
             decision_rx: None,
             provider_turn_gate: None,
+            live_settings: None,
             inbox: None,
             tool_call_tokens: ToolCallTokens::default(),
         }
@@ -528,6 +539,22 @@ impl Agent {
     pub fn with_provider_turn_gate(mut self, gate: Arc<dyn ProviderTurnGate>) -> Self {
         self.provider_turn_gate = Some(gate);
         self
+    }
+
+    /// Attach a narrow live-settings source consumed at provider operation
+    /// boundaries.
+    ///
+    /// This only binds the source. It does not swap the session, the tools or
+    /// the provider, and it does not change `AgentConfig`: a static run keeps
+    /// using the config, while the next normal THINK re-reads the source after
+    /// its first admission. Passing `None` restores static behaviour.
+    pub fn set_live_settings(&mut self, source: Option<Arc<dyn AgentSettingsSource>>) {
+        self.live_settings = source;
+    }
+
+    /// The live-settings source currently bound to this agent, if any.
+    pub fn live_settings_source(&self) -> Option<Arc<dyn AgentSettingsSource>> {
+        self.live_settings.clone()
     }
 
     /// Attach a permission checker and decision channel for tool gating.
@@ -752,6 +779,9 @@ impl Agent {
         let permission_checker = self.permission_checker.clone();
         let decision_rx = self.decision_rx.clone();
         let provider_turn_gate = self.provider_turn_gate.clone();
+        // Clone the source before the loop owns it; `set_live_settings` after a
+        // run started must not retroactively change that run's binding.
+        let live_settings = self.live_settings.clone();
         // Clone before the loop owns it: the `Agent` keeps its handle so
         // `interject()` works even after the stream has been moved away.
         let inbox = self.inbox.clone();
@@ -786,6 +816,7 @@ impl Agent {
                 permission_checker,
                 decision_rx,
                 provider_turn_gate,
+                live_settings,
                 inbox,
                 tool_call_tokens,
                 loop_children,
@@ -1127,34 +1158,26 @@ async fn think_phase(
     config: &AgentConfig,
     cancel_token: &CancellationToken,
     provider_turn_gate: &Option<Arc<dyn ProviderTurnGate>>,
+    live_settings: &Option<Arc<dyn AgentSettingsSource>>,
     messages: &mut Vec<Message>,
     turn: u32,
     payload_leases: &mut Vec<crate::run_budget::BudgetLease>,
 ) -> ThinkOutcome {
     // 1. THINK
     //
+    // The semantic request for this operation is built exactly once, and only
+    // after the first provider admission has succeeded: waiting for admission
+    // is not "the model operation has started", so a save that lands during
+    // that wait must still be honoured. Every transport retry below re-acquires
+    // admission (a fresh lease) but reuses this same request snapshot — a retry
+    // resends the original semantic request, it does not rebuild the prompt.
+    //
     // 关闭跨轮保留时，剥离**历史轮**的思考块，仅保留最后一条 assistant（当前
     // 工具循环）的——轮内硬保证：本轮的凭证必须回传，否则 Anthropic 的
     // signature 校验会失败。剥离只作用于**请求副本**：session 自身（落盘/展示
     // 的权威）在默认路径下原样保留，故 `preserve_thinking` 为默认 `true` 时
     // 请求体逐字不变（零回归）。
-    let request_messages = if config.preserve_thinking {
-        messages.clone()
-    } else {
-        crate::thinking::strip_thinking_except_last_assistant(messages)
-    };
-    let req = ProviderRequest {
-        model: config.model.clone(),
-        system: config.system_prompt.clone(),
-        messages: request_messages,
-        tools: tools.schemas(),
-        params: config.gen_params.clone(),
-    };
-    // Emit a heuristic prefill estimate so the status bar shows activity
-    // before the provider returns real usage (OpenAI-compatible APIs only
-    // send usage at stream end).
-    let prefill_estimate = estimate_prefill_tokens(&req);
-    let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
+    let mut operation: Option<ProviderRequest> = None;
 
     // Retry loop for a transiently failed THINK attempt. Two families are
     // retried: an idle stall / request deadline that ended the *stream*, and
@@ -1165,6 +1188,8 @@ async fn think_phase(
     // attempt's partial content is never committed to the session.
     let mut stall_retries: u16 = 0;
     let (content, end, last_usage, frag_leases) = loop {
+        // One admission per attempt. Attempt 1 therefore takes exactly one
+        // lease (it is not acquired a second time just to build the request).
         let provider_turn_lease = match provider_turn_gate {
             Some(gate) => match tokio::select! {
                 lease = gate.acquire() => lease,
@@ -1184,6 +1209,47 @@ async fn think_phase(
             },
             None => None,
         };
+
+        // Safe point: admission above has completed for this operation, so a
+        // settings save that raced the wait is visible here. A source failure
+        // is a controlled, recoverable stop: the lease drops with this scope
+        // and no request is built from unknown settings.
+        if operation.is_none() {
+            let live_snapshot = match live_settings {
+                Some(source) => match source.snapshot() {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        let _ = tx
+                            .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
+                            .await;
+                        return ThinkOutcome::Stopped;
+                    }
+                },
+                None => None,
+            };
+            let effective = merge_static_and_live(config, live_snapshot.as_ref());
+            let request_messages = if effective.preserve_thinking {
+                messages.clone()
+            } else {
+                crate::thinking::strip_thinking_except_last_assistant(messages)
+            };
+            let request = ProviderRequest {
+                model: effective.model.clone(),
+                system: effective.system_prompt.clone(),
+                messages: request_messages,
+                tools: tools.schemas(),
+                params: effective.gen_params.clone(),
+            };
+            // Emit a heuristic prefill estimate so the status bar shows
+            // activity before the provider returns real usage
+            // (OpenAI-compatible APIs only send usage at stream end).
+            let prefill_estimate = estimate_prefill_tokens(&request);
+            let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
+            operation = Some(request);
+        }
+        let req = operation
+            .as_ref()
+            .expect("operation snapshot is built after the first admission");
 
         let stream = tokio::select! {
             result = provider.call_stream(req.clone()) => match result {
@@ -1228,7 +1294,8 @@ async fn think_phase(
                                 return ThinkOutcome::Stopped; // Receiver dropped, stop the loop
                             }
                             // Release the turn lease before sleeping: a retry
-                            // backoff must not hold provider capacity.
+                            // backoff must not hold provider capacity. The
+                            // retry takes a fresh lease but keeps `operation`.
                             drop(provider_turn_lease);
                             tokio::select! {
                                 _ = tokio::time::sleep(delay) => {}
@@ -1289,7 +1356,8 @@ async fn think_phase(
         };
 
         // Release the turn lease before sleeping: a retry backoff must not
-        // hold provider capacity.
+        // hold provider capacity. The retry takes a fresh lease but keeps the
+        // original operation snapshot.
         drop(provider_turn_lease);
 
         // Two transient modes are retryable: an idle stall and a request
@@ -1778,6 +1846,7 @@ async fn run_loop(
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
     decision_rx: Option<DecisionRx>,
     provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
+    live_settings: Option<Arc<dyn AgentSettingsSource>>,
     inbox: Option<InboxHandle>,
     tool_call_tokens: ToolCallTokens,
     children: crate::managed_run::ChildTasks,
@@ -1878,6 +1947,7 @@ async fn run_loop(
             &config,
             &cancel_token,
             &provider_turn_gate,
+            &live_settings,
             &mut messages,
             turn,
             &mut payload_leases,
@@ -2180,6 +2250,29 @@ fn estimate_tokens(text: &str) -> u32 {
     (ascii as f32 / 4.0 + non_ascii as f32 / 1.5) as u32
 }
 
+/// Combine the static configuration with one live operation snapshot.
+///
+/// Only the five fields the snapshot owns are overridden. Model selection,
+/// generation parameters and the retry policy stay on `AgentConfig`: live
+/// settings must not rebuild the provider or silently change retry budgets.
+/// A `None` snapshot returns the static config unchanged, which is what keeps
+/// source-less agents byte-identical to the historical behaviour.
+fn merge_static_and_live(
+    config: &AgentConfig,
+    live: Option<&crate::live_settings::LiveAgentSnapshot>,
+) -> AgentConfig {
+    let Some(live) = live else {
+        return config.clone();
+    };
+    let mut effective = config.clone();
+    effective.system_prompt = live.system_prompt.clone();
+    effective.max_turns = live.max_turns;
+    effective.compact_threshold = live.compact_threshold;
+    effective.compact_user_budget_tokens = live.compact_user_budget_tokens;
+    effective.compact_tool_budget_tokens = live.compact_tool_budget_tokens;
+    effective
+}
+
 /// Estimate prefill tokens from the full request (system + tools + all messages).
 fn estimate_prefill_tokens(req: &crate::provider::ProviderRequest) -> u32 {
     let mut total = req.system.as_deref().map(estimate_tokens).unwrap_or(0);
@@ -2220,6 +2313,88 @@ fn estimate_prefill_tokens(req: &crate::provider::ProviderRequest) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::live_settings::LiveAgentSnapshot;
+
+    /// The merge owns exactly five fields. Model, generation parameters and the
+    /// retry policy must survive untouched: live settings cannot rebuild the
+    /// provider or silently move the retry budget (Task 5 owns turn/compact
+    /// consumption, this task owns the snapshot-to-request boundary).
+    #[test]
+    fn merge_static_and_live_overrides_exactly_the_five_live_fields() {
+        let static_config = super::AgentConfig {
+            model: "static-model".into(),
+            system_prompt: Some("static-prompt".into()),
+            max_turns: Some(7),
+            compact_threshold: Some(1),
+            compact_user_budget_tokens: 2,
+            compact_tool_budget_tokens: 3,
+            provider_error_retry_limit: 2,
+            think_stall_retry_limit: 1,
+            gen_params: crate::provider::GenParams {
+                temperature: Some(0.25),
+                max_tokens: Some(1234),
+                ..Default::default()
+            },
+            ..super::AgentConfig::default()
+        };
+
+        let live = LiveAgentSnapshot {
+            revision: "rev".into(),
+            max_turns: Some(50),
+            compact_threshold: Some(60_000),
+            compact_user_budget_tokens: 11_000,
+            compact_tool_budget_tokens: 9_000,
+            system_prompt: Some("live-prompt".into()),
+        };
+
+        let merged = super::merge_static_and_live(&static_config, Some(&live));
+
+        assert_eq!(merged.system_prompt.as_deref(), Some("live-prompt"));
+        assert_eq!(merged.max_turns, Some(50));
+        assert_eq!(merged.compact_threshold, Some(60_000));
+        assert_eq!(merged.compact_user_budget_tokens, 11_000);
+        assert_eq!(merged.compact_tool_budget_tokens, 9_000);
+
+        assert_eq!(merged.model, "static-model");
+        assert_eq!(merged.provider_error_retry_limit, 2);
+        assert_eq!(merged.think_stall_retry_limit, 1);
+        assert_eq!(merged.gen_params, static_config.gen_params);
+        assert_eq!(merged.preserve_thinking, static_config.preserve_thinking);
+    }
+
+    /// `None` must be a pure clone: the static agent's request stays identical.
+    #[test]
+    fn merge_without_live_snapshot_is_the_static_config() {
+        let static_config = super::AgentConfig::default();
+        let merged = super::merge_static_and_live(&static_config, None);
+        assert_eq!(merged.system_prompt, static_config.system_prompt);
+        assert_eq!(merged.max_turns, static_config.max_turns);
+        assert_eq!(merged.model, static_config.model);
+    }
+
+    /// `None` inside a present snapshot means "resolved to no user segment",
+    /// not "keep the static value": the runtime already applied the full
+    /// override > env > settings > default chain.
+    #[test]
+    fn live_snapshot_none_prompt_clears_the_static_prompt() {
+        let static_config = super::AgentConfig {
+            system_prompt: Some("static-prompt".into()),
+            ..super::AgentConfig::default()
+        };
+        let live = LiveAgentSnapshot {
+            revision: "rev".into(),
+            max_turns: None,
+            compact_threshold: None,
+            compact_user_budget_tokens: 1,
+            compact_tool_budget_tokens: 1,
+            system_prompt: None,
+        };
+        let merged = super::merge_static_and_live(&static_config, Some(&live));
+        assert_eq!(merged.system_prompt, None);
+        assert_eq!(merged.max_turns, None);
+        assert_eq!(merged.compact_threshold, None);
+    }
+
     use super::*;
     use crate::message::{Message, Role};
     use crate::permission::{Decision, PermissionKind};

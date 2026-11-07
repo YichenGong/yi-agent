@@ -665,6 +665,9 @@ fn provider_retry_failure(error: &AgentError) -> Option<RetryFailure> {
         AgentError::Provider(ProviderError::Stream(_)) => Some(RetryFailure::ProviderStream),
         AgentError::Provider(ProviderError::Auth(_) | ProviderError::InvalidRequest(_))
         | AgentError::ProviderTurnAdmission(_)
+        // A failed settings snapshot is a controlled stop, not a transport
+        // condition: resending the same operation would only fail the same way.
+        | AgentError::LiveSettings(_)
         | AgentError::Compact(_)
         | AgentError::Budget(_) => None,
     }

@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod autonomy;
 pub mod compact;
+pub mod live_settings;
 pub mod managed_run;
 pub mod message;
 pub mod permission;
@@ -24,6 +25,9 @@ pub use agent::{
 pub use compact::{
     CompactError, CompactionPlan, DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
     DEFAULT_COMPACT_USER_BUDGET_TOKENS, compact_session,
+};
+pub use live_settings::{
+    AgentSettingsSource, LiveAgentSnapshot, LiveSettingsError, SharedSettingsSource,
 };
 pub use managed_run::{
     BudgetedAgentEvent, ManagedAgentRun, ManagedRunControl, ManagedRunLimits, TrackedAgentRun,
