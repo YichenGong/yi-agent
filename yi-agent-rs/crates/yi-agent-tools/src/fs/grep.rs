@@ -109,9 +109,14 @@ impl Tool for GrepTool {
         let base_for_scan = base.clone();
         let roots = self.ctx.roots().to_vec();
         let glob_for_scan = glob_pattern.clone();
-        let deadline = walk::deadline_from_now();
 
         let joined = tokio::task::spawn_blocking(move || {
+            // Design §4.9: the 10 s bound must be taken *and* enforced inside
+            // this closure. Taking it before `spawn_blocking` would charge the
+            // queueing delay to the scan budget, so a saturated blocking pool
+            // could report truncation after less than 10 s of real work. Do not
+            // hoist this back out of the closure.
+            let deadline = walk::deadline_from_now();
             grep_search(
                 &base_for_scan,
                 &re,
