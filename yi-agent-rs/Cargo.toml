@@ -79,3 +79,47 @@ uuid = { version = "1", features = ["v4"] }
 
 # 测试工具
 proptest = "1"
+
+# =============================================================================
+# 编译产物磁盘占用（2026-11-07 实测；设计见
+# docs/superpowers/specs/2026-11-07-build-disk-usage-design.md）
+# =============================================================================
+#
+# 症状：主仓库 target/debug 涨到 122 GB，其中 deps/ 有 78 万个 `*.rcgu.o`
+# 合计 135 GB，而这些 `.o` 对应的 rlib 只剩 2501 个——1149 个编译单元成了
+# 孤儿（rlib 已被新 hash 覆盖，`.o` 永不回收），单这一项 93 GB。
+#
+# 根因两条，缺一不可：
+#
+# 1) macOS 上 dev profile 默认 `split-debuginfo = "unpacked"`：rustc 把每个
+#    CGU 的 DWARF 留在 `deps/<crate>-<hash>.<mid>.<idx>.rcgu.o` 里，等链接期
+#    再合并。实测最大的单个 `.o` 有 53 MB，其中 37 MB 是 `__debug_str` /
+#    `__debug_info`。cargo 只在**重编同一个编译单元**时覆盖同名文件，而
+#    文件名带 hash（随依赖图/feature 变化），旧 hash 的 `.o` 就成了永久
+#    垃圾。实测：`find target/debug/deps -name '*.rcgu.o' -delete` 之后
+#    `cargo build` 1.6 秒完成、不触发重编，证明确实不需要它们。
+#
+# 2) dev profile 默认 `codegen-units = 256`：一个大 crate 最多切成 256 个
+#    CGU，每个 CGU 一个 `.o`。实测 `yi_agent` 单 crate 累计出过 88,703 个
+#    `.o`（52 个不同 hash），`yi_agent_app_server` 的 `.o` 累计占 62 GB。
+#
+# 改成 `packed` 后 rustc 把 DWARF 直接打包进 rlib，`deps/` 不再落 `.o`。
+# 单 crate 冷编对照（同一 commit，独立 target 目录）：
+#
+#   默认 unpacked，`cargo build`          → 462 个 `.o`，deps 929 MB
+#   packed，`cargo build`                 → 0 个 `.o`，  deps 895 MB
+#   默认 unpacked，`cargo test --no-run`  → 3485 个 `.o`
+#   packed，`cargo test --no-run`         → 0 个 `.o`
+#
+# 关键收益不在单次体积（只省 4%），而在**重编不再累积**：默认配置下改一个
+# crate 会新增一整批新 hash 的 `.o` 且旧的不删（实测一次重编 462 → 718），
+# packed 下反复重编 `.o` 恒为 0、目录大小不增长。
+#
+# 没有选 `debug = "line-tables-only"`：实测只省 20%，且不消除 `.o` 的累积
+# 问题，属于用调试体验换小钱。这里保留完整 DWARF，断点/变量查看不降级；
+# 代价是 dylib 会额外产出 `.dSYM`（比等量 `.o` 小两个数量级）。
+#
+# 只作用于 dev / test（test 继承 dev，实测单写 [profile.dev] 已覆盖
+# `cargo test --no-run`），release 不受影响。
+[profile.dev]
+split-debuginfo = "packed"
