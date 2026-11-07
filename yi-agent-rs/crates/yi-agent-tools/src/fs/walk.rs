@@ -389,6 +389,7 @@ mod tests {
     }
 
     /// `glob` 也要能穿过符号链接，否则链接进来的源码整条消失。
+    #[cfg(unix)]
     #[test]
     fn match_targets_mode_follows_symlinked_files() {
         let tmp = TempDir::new().unwrap();
@@ -408,6 +409,7 @@ mod tests {
     /// `FILES` 是 `grep` 的策略：不跟随符号链接。旧 `WalkDir` 也不跟随，
     /// 所以这是 parity，而不是新行为；这条测试钉住它，免得有人把两个策略
     /// 合成一个后 grep 开始跟着链接读到根目录之外。
+    #[cfg(unix)]
     #[test]
     fn files_mode_does_not_follow_symlinks() {
         let tmp = TempDir::new().unwrap();
@@ -433,6 +435,7 @@ mod tests {
     /// `MATCH_TARGETS`（follow_links = true）解析链接时 `fs::metadata` 失败，
     /// 该条目以 `Err` 形式产出，被 walker 跳过。这里把「跳过且不中断整趟遍历」
     /// 钉成明确契约：断链本身不可读，报告它只会让调用方读到错误。
+    #[cfg(unix)]
     #[test]
     fn a_broken_symlink_is_skipped_without_aborting_the_walk() {
         let tmp = TempDir::new().unwrap();
@@ -456,6 +459,7 @@ mod tests {
     }
 
     /// 自引用链接不得让遍历打转或报错退出。
+    #[cfg(unix)]
     #[test]
     fn follow_links_survives_a_symlink_loop() {
         let tmp = TempDir::new().unwrap();

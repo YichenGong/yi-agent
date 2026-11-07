@@ -163,10 +163,19 @@ fn is_binary(path: &std::path::Path) -> bool {
     buf[..n].contains(&0)
 }
 
+/// The number of bytes available to rendered entries.
+///
+/// The reserved tail covers BOTH notices: an entry-count truncation and a
+/// deadline truncation are independent and can be reported together, so
+/// reserving only one of them would let the result exceed `MAX_OUTPUT_BYTES`
+/// (by exactly `DEADLINE_NOTICE.len()`, i.e. 77 bytes).
+fn content_budget() -> usize {
+    MAX_OUTPUT_BYTES - TRUNCATION_NOTICE.len() - DEADLINE_NOTICE.len()
+}
+
 /// Appends one rendered result line only when both context-safety budgets allow it.
 fn append_entry(output: &mut String, entry_count: &mut usize, entry: String) -> bool {
-    let content_budget = MAX_OUTPUT_BYTES - TRUNCATION_NOTICE.len();
-    if *entry_count >= MAX_OUTPUT_ENTRIES || output.len() + entry.len() > content_budget {
+    if *entry_count >= MAX_OUTPUT_ENTRIES || output.len() + entry.len() > content_budget() {
         return false;
     }
 
@@ -569,6 +578,33 @@ mod tests {
         assert!(
             output.contains("[scan stopped after 10s:"),
             "the user must be told the scan was cut short, got: {output}"
+        );
+    }
+
+    /// 两条提示互相独立、可以同时出现，且同时出现时仍不得越过输出预算。
+    ///
+    /// 这是纯算术测试，不依赖计时也不依赖贪心填充：预算函数预留的尾部必须
+    /// 同时覆盖「条目截断」与「deadline 截断」两条提示。改动前只预留了一条
+    /// （76 B），两条一起出现时总长会到 32845 字节，越过 32 KiB 上限 77 字节。
+    ///
+    /// 不能靠「过期 deadline + 大量匹配」构造：deadline 在遍历第一项之前就
+    /// 过期时 walker 一条路径都不返回，因此根本不产生条目截断（实测确认，
+    /// 那样的测试只能覆盖到其中一条提示）。
+    #[test]
+    fn both_notices_fit_inside_the_output_budget() {
+        let budget = content_budget();
+
+        // 一整块内容用满预算，再补上生产代码在循环结束后无条件追加的两条提示。
+        let total = budget + TRUNCATION_NOTICE.len() + DEADLINE_NOTICE.len();
+
+        assert_eq!(
+            total, MAX_OUTPUT_BYTES,
+            "the reserved tail must cover both notices exactly, \
+             otherwise a full result overflows or wastes budget"
+        );
+        assert!(
+            total <= MAX_OUTPUT_BYTES,
+            "content plus both notices must fit in {MAX_OUTPUT_BYTES} bytes, got {total}"
         );
     }
 }
