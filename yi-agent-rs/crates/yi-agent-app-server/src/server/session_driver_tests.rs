@@ -63,6 +63,9 @@ impl FakeDaemon {
         let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(&project);
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).unwrap();
+        // The socket sits under `<instance_home>/sockets/<16 hex>/`, which nothing
+        // here creates; the real daemon does it immediately before binding.
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
         let query_project = project.clone();
 

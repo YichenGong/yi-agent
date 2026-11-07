@@ -77,6 +77,29 @@ mod tests {
         instance_home_from(override_value.map(AsRef::as_ref), home)
     }
 
+    /// `lifecycle::scope` 复刻了一份 `.yi-agent` 归一化（`store` 依赖它，反向不行）。
+    /// 这条断言让两份实现不会漂移：归一化一旦不一致，同一个 `YI_AGENT_HOME`
+    /// 就会在两侧解析出不同实例目录，socket 与 claim 也随之分裂。
+    #[test]
+    fn the_lifecycle_copy_of_the_instance_home_rule_agrees_with_this_one() {
+        for (override_value, home) in [
+            (Some(OsStr::new("/tmp/dev-a")), Some(Path::new("/Users/me"))),
+            (
+                Some(OsStr::new("/tmp/dev-a/.yi-agent")),
+                Some(Path::new("/Users/me")),
+            ),
+            (Some(OsStr::new("")), Some(Path::new("/Users/me"))),
+            (None, Some(Path::new("/Users/me"))),
+            (None, None),
+        ] {
+            assert_eq!(
+                from(override_value, home),
+                yi_agent_lifecycle::scope::instance_home_from_env(override_value, home),
+                "override={override_value:?} home={home:?}"
+            );
+        }
+    }
+
     #[test]
     fn defaults_to_dot_yi_agent_under_home() {
         assert_eq!(

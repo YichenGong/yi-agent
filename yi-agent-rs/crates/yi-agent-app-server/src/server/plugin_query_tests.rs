@@ -22,6 +22,11 @@ pub(super) fn fake_daemon(
     let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).unwrap();
     let seen = Arc::new(StdMutex::new(serde_json::Value::Null));
     let captured = Arc::clone(&seen);
+    // The socket lives at `<instance_home>/sockets/<16 hex>/runtime.sock`; nothing
+    // else creates that directory, and the real daemon does so immediately before
+    // binding. A fake that skipped it would fail with ENOENT instead of testing the
+    // forwarding it exists for.
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let listener = UnixListener::bind(&socket).unwrap();
     let handle = std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
