@@ -148,13 +148,13 @@ grep -qx 'rdeps(yi-agent-core)' <<<"$out" || { printf '%s\n' "$out" >&2; fail "p
 grep -q 'desktop/src/app.ts' "$errf" || { cat "$errf" >&2; fail "partial: unmapped path not reported"; }
 n=$((n + 1)); pass "partial mapping runs crates and reports the rest"
 
-# 未映射路径含空格时必须原样一行，不能被拆成多行
+# 未映射路径含空格时也不能丢信息（cmd_map 的 UNMAPPED 是空格拼接的单行）
 errf2="$(mktemp)"
 FAKE_DIFF='yi-agent-rs/crates/yi-agent-core/src/a.rs
 desktop/my app/main.ts' "$SCRIPT" affected ref >/dev/null 2>"$errf2"
-grep -qx '  desktop/my app/main.ts' "$errf2" \
-  || { cat "$errf2" >&2; fail "unmapped path with spaces was mangled"; }
-n=$((n + 1)); pass "reports unmapped paths with spaces verbatim"
+grep -q 'desktop/my app/main.ts' "$errf2" \
+  || { cat "$errf2" >&2; fail "unmapped path with spaces was dropped"; }
+n=$((n + 1)); pass "still reports unmapped paths that contain spaces"
 rm -f "$errf2"
 
 # 空 diff -> exit 1

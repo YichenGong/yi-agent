@@ -201,10 +201,10 @@ cmd_affected() {
 
     if [ -n "$unmapped" ]; then
         printf 'warning: these paths are not covered by test-affected:\n' >&2
-        # 逐行读而不是 ${unmapped} 直接展开：git 输出的路径可以含空格。
-        while IFS= read -r p; do
-            [ -n "$p" ] && printf '  %s\n' "$p" >&2
-        done <<<"$unmapped"
+        # cmd_map 的 UNMAPPED 是空格拼接的单行（spec 定义的三行格式），所以这里
+        # 整行输出。含空格的路径在这里无法与分隔符区分，但它只用于提示，不参与
+        # 判定，不影响实际跑哪些 crate。
+        printf '  %s\n' "$unmapped" >&2
         printf 'note: run `just test` if your change is not reachable from a crate.\n' >&2
     fi
 
