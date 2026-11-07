@@ -85,39 +85,57 @@ proptest = "1"
 # docs/superpowers/specs/2026-11-07-build-disk-usage-design.md）
 # =============================================================================
 #
-# 症状：主仓库 target/debug 涨到 122 GB，其中 deps/ 有 78 万个 `*.rcgu.o`
-# 合计 135 GB，而这些 `.o` 对应的 rlib 只剩 2501 个——1149 个编译单元成了
-# 孤儿（rlib 已被新 hash 覆盖，`.o` 永不回收），单这一项 93 GB。
+# 症状：主仓库 target/debug 曾涨到 122 GB。2026-11-07 20:40 的一次实测快照
+# （未按 inode 去重）：`*.rcgu.o` 268,571 个占 47.1 GB，`.rlib` 3,517 个占
+# 30.7 GB，dSYM 339 个占 27.6 GB（陈旧 19.8 GB），二进制 574 个占 13.0 GB
+# （陈旧 10.6 GB），`.rmeta` 8,780 个占 7.2 GB，合计 127.1 GB。
+#
+# 注意这些绝对值会随构建历史大幅变化，不要当成阈值；判据一律用前后对比。
 #
 # 根因两条，缺一不可：
 #
 # 1) macOS 上 dev profile 默认 `split-debuginfo = "unpacked"`：rustc 把每个
 #    CGU 的 DWARF 留在 `deps/<crate>-<hash>.<mid>.<idx>.rcgu.o` 里，等链接期
-#    再合并。实测最大的单个 `.o` 有 53 MB，其中 37 MB 是 `__debug_str` /
-#    `__debug_info`。cargo 只在**重编同一个编译单元**时覆盖同名文件，而
-#    文件名带 hash（随依赖图/feature 变化），旧 hash 的 `.o` 就成了永久
-#    垃圾。实测：`find target/debug/deps -name '*.rcgu.o' -delete` 之后
+#    再合并。cargo 只在**重编同一个编译单元**时覆盖同名文件，而文件名带
+#    hash（随依赖图/feature 变化），旧 hash 的 `.o` 就成了永久垃圾。
+#
+#    单个 `.o` 的体积分布很不均匀：实测 268,571 个平均 172 KiB、中位 40 KiB，
+#    最大的离群值 53 MB（其中 37 MB 是 `__debug_str` / `__debug_info`）。
+#    别用那个 53 MB 做估算，它会严重高估。
+#
+#    实测：`find target/debug/deps -name '*.rcgu.o' -delete` 之后
 #    `cargo build` 1.6 秒完成、不触发重编，证明确实不需要它们。
 #
 # 2) dev profile 默认 `codegen-units = 256`：一个大 crate 最多切成 256 个
 #    CGU，每个 CGU 一个 `.o`。实测 `yi_agent` 单 crate 累计出过 88,703 个
-#    `.o`（52 个不同 hash），`yi_agent_app_server` 的 `.o` 累计占 62 GB。
+#    `.o`（52 个不同 hash）。
 #
 # 改成 `packed` 后 rustc 把 DWARF 直接打包进 rlib，`deps/` 不再落 `.o`。
-# 单 crate 冷编对照（同一 commit，独立 target 目录）：
+# 同一 commit、独立 target 目录的全量冷编对照（`--all-features`）：
 #
-#   默认 unpacked，`cargo build`          → 462 个 `.o`，deps 929 MB
-#   packed，`cargo build`                 → 0 个 `.o`，  deps 895 MB
-#   默认 unpacked，`cargo test --no-run`  → 3485 个 `.o`
+#   默认 unpacked，`cargo build`          → 18,024 个 `.o`
+#   packed，`cargo build`                 → 0 个 `.o`
+#   默认 unpacked，`cargo test --no-run`  → 更多 `.o`
 #   packed，`cargo test --no-run`         → 0 个 `.o`
 #
-# 关键收益不在单次体积（只省 4%），而在**重编不再累积**：默认配置下改一个
-# crate 会新增一整批新 hash 的 `.o` 且旧的不删（实测一次重编 462 → 718），
-# packed 下反复重编 `.o` 恒为 0、目录大小不增长。
+# 关键收益**不在单次体积**——单次反而更大（全新 target 实测：packed 17.8 GB
+# vs 默认 10.4 GB，因为 DWARF 从散落的 `.o` 挪进了 rlib 并额外产出 dSYM）。
+# 收益在**重编不再累积**：默认配置下改一个 crate 就新增一整批新 hash 的 `.o`
+# 且旧的不删，packed 下反复重编 `.o` 恒为 0、deps 不再被 `.o` 撑大。
+# 再加 `CARGO_INCREMENTAL=1` 实测仍为 0 个 `.o`，累积源确已切断。
 #
 # 没有选 `debug = "line-tables-only"`：实测只省 20%，且不消除 `.o` 的累积
-# 问题，属于用调试体验换小钱。这里保留完整 DWARF，断点/变量查看不降级；
-# 代价是 dylib 会额外产出 `.dSYM`（比等量 `.o` 小两个数量级）。
+# 问题，属于用调试体验换小钱。这里保留完整 DWARF，断点/变量查看不降级。
+#
+# 保留完整 DWARF 的代价要说清：`.dSYM` 会累积，且量级不小 —— 实测 339 个
+# dSYM 合计 27.6 GB，其中陈旧 19.8 GB。dSYM 与二进制同名、按 hash 分组，
+# 所以由 scripts/reclaim-target.sh 的 D4 一并回收（见该脚本注释）。
+#
+# 为什么不再考虑 `split-debuginfo = "off"`（2026-11-07 复核）：
+# off 能让单次构建再降到 9.9 GiB，但实测 off 下 DWARF 函数数为 0，
+# lldb 只能看地址、看不了变量。而"无限累积"这个真痛点已由 packed 解决
+# （全新 target 下 cargo build / cargo test 均产 0 个 `.o`，反复重编也恒为 0）。
+# 用永久的排查能力换一次性 8 GiB，不划算。
 #
 # 只作用于 dev / test（test 继承 dev，实测单写 [profile.dev] 已覆盖
 # `cargo test --no-run`），release 不受影响。
