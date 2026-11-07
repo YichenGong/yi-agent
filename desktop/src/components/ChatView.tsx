@@ -10,7 +10,7 @@ import { useThrottledText } from "../lib/useThrottledText";
 import { itemText } from "../lib/itemText";
 import { createHeightBook } from "../lib/heightBook";
 import { useTranscriptWindow } from "../hooks/useTranscriptWindow";
-import type { VisibleRange } from "../lib/transcriptWindow";
+import { DEFAULT_LIMITS, type VisibleRange } from "../lib/transcriptWindow";
 import { planCompensation } from "../lib/scrollCompensation";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
@@ -551,7 +551,7 @@ export function ChatView({
   // 值，且值恒为 null，等于给 hook 加一条走不通的分支。
   // `requestFocus` 由 Task 10（锚点恢复）与 Task 11（搜索跳转）消费；现在不取，
   // 否则 `noUnusedLocals` 会报错。
-  const { window: win, nudge } = useTranscriptWindow({
+  const { window: win, nudge, requestFocus } = useTranscriptWindow({
     itemCount: items.length,
     measure: measureVisible,
     book: windowBook,
@@ -650,6 +650,8 @@ export function ChatView({
   const userTookOver = useRef(false);
   /** 上一次由**我们**写入的 `scrollTop`；用于识别它自己触发的 scroll 事件。 */
   const selfScrolling = useRef<number | null>(null);
+  /** 已在数据层找到 index、等 `requestFocus` 开的那一窗渲染落地的锚点。 */
+  const pendingAnchorRef = useRef<ViewAnchor | null>(null);
   useLayoutEffect(() => {
     // 恢复状态属于本次访问，而不是上一次成功恢复的会话。
     // A→尚未恢复的 B→A 同样必须重新对位，不能被旧 restoredFor 短路。
@@ -657,10 +659,9 @@ export function ChatView({
     heldAnchor.current = null;
     userTookOver.current = false;
     selfScrolling.current = null;
+    pendingAnchorRef.current = null;
   }, [threadId]);
   useLayoutEffect(() => {
-    const el = elRef.current;
-    if (!el) return;
     if (restoredFor.current === threadId) return;
     // `null` = 离开时贴底，`undefined` = 从没记过：两者都走既有的"到底"，
     // 由下面的跟随分支负责，这里不重复做。
@@ -668,13 +669,11 @@ export function ChatView({
       restoredFor.current = threadId;
       return;
     }
-    releaseFollow();
-    // 不用 `[data-item-id="..."]` 选择器：id 来自服务端，逗号/引号都会破坏
-    // 选择器语法，且 `CSS.escape` 在 jsdom 下不存在。扫描一遍更稳。
-    const target = Array.from(el.querySelectorAll<HTMLElement>("[data-item-id]")).find(
-      (node) => node.dataset.itemId === anchor.itemId,
-    );
-    if (!target) {
+
+    // 第一步：在**数据层**找 index。不能按 DOM 找——窗口化后锚点通常不在挂载区，
+    // 按 DOM 找不到会被误判成「锚点真的没了」而静默跳到底部，这正是要消除的退化。
+    const index = items.findIndex((it) => it.id === anchor.itemId);
+    if (index === -1) {
       // 内容还在补齐：回放分帧到达，此刻可能只收到了前几帧（不含锚点那条）。
       // 不锁定，等内容继续到达再试。
       if (syncing || items.length === 0) return;
@@ -684,16 +683,36 @@ export function ChatView({
       scrollToBottom();
       return;
     }
+
+    // 第二步：开窗把锚点包进挂载区。用 limits 表达，不写字面量。
+    requestFocus({ index, before: DEFAULT_LIMITS.buffer, after: 3 * DEFAULT_LIMITS.buffer });
+    releaseFollow();
+    // 第三步：**不在这里写 scrollTop**。锚点此刻还没挂载，`querySelector` 仍找
+    // 不到它；等下面的「锚点已挂载」effect 在对的位置接手。
+    pendingAnchorRef.current = anchor;
+    // `items.length` 是"可恢复的时机"：冷会话回放是**分帧**到达的，而生产环境下
+    // `anchor` 是 Map 里的同一个对象（引用恒定）。只依赖 `anchor` 会让这个 effect
+    // 在内容真正出现时不再重跑，恢复永远补不上（实测停在 2424 而非 1200）。
+  }, [threadId, anchor, items.length, syncing, scrollToBottom, releaseFollow, items, requestFocus]);
+
+  // 锚点进入挂载区之后再对位。窗口化之前这里可以同步做完（全部条目都在 DOM），
+  // 现在必须等 `requestFocus` 开的那一窗渲染落地。
+  useEffect(() => {
+    const el = elRef.current;
+    const pending = pendingAnchorRef.current;
+    if (!el || !pending || restoredFor.current === threadId) return;
+    // 不用 `[data-item-id="..."]` 选择器：id 来自服务端，逗号/引号都会破坏
+    // 选择器语法，且 `CSS.escape` 在 jsdom 下不存在。扫描一遍更稳。
+    const row = Array.from(el.querySelectorAll<HTMLElement>("[data-item-id]")).find(
+      (n) => n.dataset.itemId === pending.itemId,
+    );
+    if (!row) return;
     const base = el.getBoundingClientRect().top - el.scrollTop;
     const next = restoreScrollTop(
-      { id: anchor.itemId, top: target.getBoundingClientRect().top - base },
-      anchor,
+      { id: pending.itemId, top: row.getBoundingClientRect().top - base },
+      pending,
     );
-    if (next === null) {
-      restoredFor.current = threadId;
-      scrollToBottom();
-      return;
-    }
+    if (next === null) return;
     // 锚消息已到达，但其后的回放内容可能还不足以容纳原视口偏移。
     // 此时写入会被夹到临时底部，scroll 采集再把旧锚点抹成 null。
     if (syncing && next > el.scrollHeight - el.clientHeight + 1) return;
@@ -706,13 +725,11 @@ export function ChatView({
     selfScrolling.current = el.scrollTop;
     restoredFor.current = threadId;
     // 记住"这一行应该在视口顶"，供下方的漂移校正使用。
-    heldAnchor.current = anchor;
+    heldAnchor.current = pending;
+    pendingAnchorRef.current = null;
     // 恢复完立刻放弃跟随，否则下一条 delta 会把人拽回底部。
     releaseFollow();
-    // `items.length` 是"可恢复的时机"：冷会话回放是**分帧**到达的，而生产环境下
-    // `anchor` 是 Map 里的同一个对象（引用恒定）。只依赖 `anchor` 会让这个 effect
-    // 在内容真正出现时不再重跑，恢复永远补不上（实测停在 2424 而非 1200）。
-  }, [threadId, anchor, items.length, syncing, scrollToBottom, releaseFollow]);
+  }, [threadId, win.start, win.end, items.length, syncing, releaseFollow]);
 
   // 恢复之后，锚点**上方**的内容还可能改变高度：图片是异步读出来的
   // （`BubbleImage` 在拿到 url 之前返回 null，高度 0），工具卡/推理块也可能

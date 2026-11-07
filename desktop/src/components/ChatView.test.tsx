@@ -1634,3 +1634,50 @@ describe("window change compensates scrollTop", () => {
     expect(geo.scrollTop).toBe(9_000);
   });
 });
+
+describe("anchor restore with windowing", () => {
+  const threeThousand = () =>
+    Array.from({ length: 3000 }, (_, i) => ({
+      type: "agentMessage",
+      id: `m${i}`,
+      text: `row ${i}`,
+    })) as Item[];
+
+  const mountedIds = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll("[data-item-id]")).map((n) =>
+      n.getAttribute("data-item-id"),
+    );
+
+  it("锚点在未挂载区间时先开窗把它挂出来，而不是跳到底部", async () => {
+    // 窗口化后首屏只有末尾 60 条，`m500` 不在 DOM 里。按 DOM 查找会找不到，
+    // 旧逻辑据此判定「锚点真的没了」并跳到底部——这就是要消除的退化。
+    const { container } = render(
+      <ChatView
+        items={threeThousand()}
+        threadId="t1"
+        structuralVersion={1}
+        query=""
+        anchor={{ itemId: "m500", offset: 0 }}
+      />,
+    );
+    // 开窗走 rAF（hook 的 recompute 每帧最多一次），必须等它落地。
+    await waitFor(() => expect(mountedIds(container)).toContain("m500"));
+    // 开窗而不是全量挂载：锚点周围一页 + buffer，总数远小于 3000。
+    expect(mountedIds(container).length).toBeLessThan(1000);
+  });
+
+  it("锚点确实不存在时回退到底部（渲染最后一条）", () => {
+    // 与上一条对照：index === -1 是「真的没了」，必须仍然贴底，不能为了
+    // 开窗而停在一个无意义的像素上。
+    const { container } = render(
+      <ChatView
+        items={threeThousand()}
+        threadId="t1"
+        structuralVersion={1}
+        query=""
+        anchor={{ itemId: "gone", offset: 0 }}
+      />,
+    );
+    expect(mountedIds(container)).toContain("m2999");
+  });
+});
