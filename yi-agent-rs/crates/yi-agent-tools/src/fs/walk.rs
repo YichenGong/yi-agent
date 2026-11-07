@@ -470,4 +470,56 @@ mod tests {
             "the real file must still be found, got {files:?}"
         );
     }
+
+    /// 真实仓库实测：不进 CI（`#[ignore]`），手动跑 `--ignored`。
+    ///
+    /// 判据是机制性的：走完整个仓库根不超过 deadline，且结果里一个
+    /// `target/` 路径都没有。它不依赖模型行为，所以可以作为回归基线。
+    #[test]
+    #[ignore = "measures the real repository; run with --ignored"]
+    fn real_repository_walk_skips_build_output_within_the_deadline() {
+        // crates/yi-agent-tools -> yi-agent-rs -> 仓库根
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repo root above crates/yi-agent-tools")
+            .to_path_buf();
+
+        let started = Instant::now();
+        let outcome = walk(&repo_root, FILES);
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome.truncated, Truncated::No),
+            "the whole repository must finish inside the 10s deadline, took {elapsed:?}"
+        );
+        assert!(
+            !outcome
+                .paths
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == "target")),
+            "target/ must never be walked ({} paths, {elapsed:?})",
+            outcome.paths.len()
+        );
+        assert!(
+            !outcome
+                .paths
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == ".git")),
+            ".git/ must never be walked"
+        );
+        assert!(
+            outcome
+                .paths
+                .iter()
+                .any(|p| p.ends_with("yi-agent-rs/Cargo.toml")),
+            "real source files must still be found"
+        );
+
+        eprintln!(
+            "walk {} -> {} files in {elapsed:?}",
+            repo_root.display(),
+            outcome.paths.len()
+        );
+    }
 }
