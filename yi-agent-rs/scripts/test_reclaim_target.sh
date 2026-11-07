@@ -351,6 +351,17 @@ n=$((n + 1)); pass "D4 matches fingerprint hashes across hyphen/underscore name 
 [ -x "$d10/my_crate-$h_new" ] || fail "D4 deleted the newest binary in hyphen/underscore case"
 n=$((n + 1)); pass "D4 keeps the newest binary in hyphen/underscore case"
 
+# --help 必须干净：不能把脚本实现泄出来（曾因 sed 行号多取一行把
+# `set -uo pipefail` 也打出来），且必须覆盖全部参数。
+h="$(bash "$SCRIPT" --help 2>&1)" || fail "--help exited nonzero"
+grep -q "set -uo\|pipefail" <<<"$h" && fail "--help leaks script source"
+n=$((n + 1)); pass "--help does not leak script source"
+for flag in --apply --include-worktrees --target --skip-incremental --skip-deps \
+            --prune-units --min-age --force; do
+  grep -q -- "$flag" <<<"$h" || fail "--help omits $flag"
+done
+n=$((n + 1)); pass "--help documents every accepted option"
+
 # 参数校验。
 bash "$SCRIPT" --bogus >/dev/null 2>&1 && fail "accepted an unknown option"
 n=$((n + 1)); pass "rejects unknown options"

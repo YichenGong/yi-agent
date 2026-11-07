@@ -10,8 +10,9 @@
 #   带 hash，hash 随依赖图 / feature 组合变化，于是**旧 hash 的 `.o` 永久残留**：
 #   cargo 重编同 hash 的单元会覆盖同名文件，但换 hash 后就再也不碰旧文件。
 #
-#     主仓库实测：782,793 个 `.o` / 135 GB，对应 rlib 只有 2501 个，
-#     其中 1149 个编译单元是孤儿（占 93 GB）。
+#   主仓库实测快照（20:40，未按 inode 去重）：`.rcgu.o` 268,571 个 47.1 GB、
+#   `.rlib` 3,517 个 30.7 GB、dSYM 339 个 27.6 GB（陈旧 19.8 GB）、二进制
+#   574 个 13.0 GB（陈旧 10.6 GB）。绝对值随构建历史大幅变化，不要当阈值。
 #
 #   安全性的证据（实测，不是推断）：`find target/debug/deps -name '*.rcgu.o'
 #   -delete` 之后 `cargo build -p yi-agent-tools` **1.6 秒完成且不触发重编**。
@@ -21,14 +22,25 @@
 # 注意：这个脚本本身不是必需的修复。`[profile.dev] split-debuginfo = "packed"`
 # 让新构建不再产生 `.o`；本脚本负责清理历史上已经堆积的存量。
 #
-# 用法：
-#   bash scripts/reclaim-target.sh              # 预演（默认，只报告不删）
-#   bash scripts/reclaim-target.sh --apply      # 真的删
-#   bash scripts/reclaim-target.sh --apply --include-worktrees
-#                                              # 同时清 .worktrees/* 的 target
-#   bash scripts/reclaim-target.sh --target DIR # 只清指定 target 目录
+# 四项判据：
+#   D1 旧增量会话 —— incremental/ 下每个单元目录只留最新会话
+#   D2 孤儿与未被引用 `.o` —— 无同名 rlib 即孤儿；否则按二进制 N_OSO 引用集判定
+#   D3 `--prune-units=N` —— 每个 crate 只留最新 N 个单元目录（默认关：
+#                           实测 27→1 会让重编从 0.85s 变 3.22s）
+#   D4 陈旧二进制与 dSYM —— 同一 (crate, 目标类型) 只留最新一个
 #
-# 退出码：0 = 正常（预演或清理成功）；1 = 有参数错误。
+# 用法：
+#   bash scripts/reclaim-target.sh                 # 预演（默认，只报告不删）
+#   bash scripts/reclaim-target.sh --apply         # 真的删
+#   --include-worktrees     同时清 .worktrees/* 的 target
+#   --target DIR            只清指定 target 目录
+#   --skip-incremental      跳过 D1
+#   --skip-deps             跳过 D2 与 D4
+#   --prune-units N         启用 D3，每个 crate 留最新 N 个单元目录
+#   --min-age N             跳过 mtime 在 N 秒以内的候选（默认 600）
+#   --force                 编译锁被持有时仍执行
+#
+# 退出码：0 = 正常（预演或清理成功）；1 = 有参数错误或被并发护栏拦下。
 set -uo pipefail
 
 MODE="dry-run"
@@ -61,7 +73,10 @@ while [ $# -gt 0 ]; do
       ;;
     --force) FORCE=1 ;;
     --target) shift; EXPLICIT_TARGET="${1:-}"; [ -n "$EXPLICIT_TARGET" ] || { echo "reclaim-target: --target 需要一个目录参数" >&2; exit 1; } ;;
-    -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)
+      # 打印文件头注释块（到 `set -uo pipefail` 之前），去掉行首 "# "
+      awk 'NR > 1 { if ($0 !~ /^#/) exit; print }' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
     *) echo "reclaim-target: unknown option '$1'（见 --help）" >&2; exit 1 ;;
   esac
   shift
