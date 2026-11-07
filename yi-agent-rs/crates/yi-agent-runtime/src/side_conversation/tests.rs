@@ -218,6 +218,51 @@ fn side_prompt_ends_with_the_fixed_policy_and_is_read_only() {
     );
 }
 
+/// A side keeps the configured catalog budget even when the directory is far
+/// larger: it must never inherit another role's "include everything" decision.
+#[test]
+fn side_prompt_truncates_an_oversized_catalog_without_prompting() {
+    let mut cfg = crate::config::sample_config_for_side_test();
+    let dir = tempfile::tempdir().unwrap();
+    cfg.workdir = dir.path().to_path_buf();
+    cfg.skills_catalog_budget = 400;
+
+    let skills_root = dir.path().join("skills");
+    for index in 0..20 {
+        let skill = skills_root.join(format!("s{index:02}"));
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: s{index:02}\ndescription: {}\n---\nbody",
+                "x".repeat(600)
+            ),
+        )
+        .unwrap();
+    }
+
+    let roots = vec![(skills_root, yi_agent_skills::SkillScope::User)];
+    let prompts = crate::live_settings::prompt::LivePromptComposer::new(
+        &cfg,
+        crate::live_settings::prompt::PromptRole::Side,
+        Some(Arc::new(yi_agent_skills::SkillsService::new(roots))),
+        crate::live_settings::prompt::InitialCatalogPolicy::Bounded,
+    )
+    .unwrap()
+    .render(
+        cfg.system_prompt.as_deref(),
+        400,
+        crate::live_settings::sources::ValueSource::Settings,
+    )
+    .unwrap()
+    .expect("a prompt");
+    assert!(
+        !prompts.contains("s19"),
+        "an oversized catalog must be truncated, not included whole"
+    );
+    assert!(prompts.ends_with(yi_agent_core::SIDE_SYSTEM_POLICY));
+}
+
 // ---------------------------------------------------------------------------
 // the fixed registry
 // ---------------------------------------------------------------------------

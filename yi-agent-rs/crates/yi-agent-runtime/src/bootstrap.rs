@@ -45,27 +45,54 @@ pub fn build_provider(cfg: &RuntimeConfig) -> Result<Arc<dyn yi_agent_core::Prov
 /// 都重扫 skill 根目录并重渲染 catalog。catalog 未变化时输出逐字节相同,因此
 /// 不会破坏 provider 的 prompt cache。
 pub struct SkillsCatalogHandle {
-    service: Arc<yi_agent_skills::SkillsService>,
-    base_prompt: Option<String>,
+    /// The single prompt-composition entry point. The handle deliberately keeps
+    /// no second copy of the base prompt or the budget: two sources of truth is
+    /// exactly how a refresh used to overwrite a just-saved value.
+    composer: Arc<crate::live_settings::prompt::LivePromptComposer>,
     /// `None` = 不截断(启动时用户选择了"纳入全部")。
     budget: Option<usize>,
+    /// The user segment the handle was assembled with, used when the caller has
+    /// no live value to pass (static/test paths).
+    user_prompt: Option<String>,
+    /// The budget source the static assembly resolved; it is reported as-is so
+    /// a caller that later adopts the live path keeps the same provenance.
+    budget_source: crate::live_settings::sources::ValueSource,
 }
 
 impl SkillsCatalogHandle {
     /// Re-scan the skill roots and rebuild the system prompt.
     pub fn current_system_prompt(&self) -> Option<String> {
-        let _ = self.service.refresh();
-        let catalog = match self.budget {
-            Some(budget) => self.service.render_catalog(budget),
-            None => self.service.render_catalog(usize::MAX),
-        };
-        if catalog.is_empty() {
-            return self.base_prompt.clone();
+        self.render_with(self.user_prompt.as_deref(), self.budget_source)
+    }
+
+    /// Rebuild the prompt from caller-provided live values.
+    ///
+    /// This is what a host uses between turns: the composer owns the stable
+    /// context and the catalog, so only the user segment and the budget travel
+    /// through here. A render failure yields `None` rather than silently
+    /// reusing the previous user segment.
+    pub fn render_with(
+        &self,
+        user_prompt: Option<&str>,
+        budget_source: crate::live_settings::sources::ValueSource,
+    ) -> Option<String> {
+        let budget = self.budget.unwrap_or(usize::MAX);
+        match self.composer.render(user_prompt, budget, budget_source) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                tracing::warn!(code = error.code, "prompt render failed");
+                None
+            }
         }
-        match &self.base_prompt {
-            Some(base) => Some(format!("{base}\n\n{catalog}")),
-            None => Some(catalog),
-        }
+    }
+
+    /// The composer this handle renders through.
+    ///
+    /// Hosts that must keep live settings attached pass this to
+    /// `RuntimeSettingsBinding::agent_source` so the prompt and the other
+    /// runtime fields are derived at one safe point.
+    pub fn composer(&self) -> &Arc<crate::live_settings::prompt::LivePromptComposer> {
+        &self.composer
     }
 
     #[cfg(test)]
@@ -74,10 +101,24 @@ impl SkillsCatalogHandle {
         base_prompt: Option<String>,
         budget: Option<usize>,
     ) -> Self {
+        let mut cfg = crate::config::sample_config();
+        // The test fixture supplies the base prompt as the user segment; no
+        // project instructions or catalog ordering surprises are wanted here.
+        cfg.workdir = std::env::temp_dir();
+        let composer = Arc::new(
+            crate::live_settings::prompt::LivePromptComposer::new(
+                &cfg,
+                crate::live_settings::prompt::PromptRole::Normal,
+                Some(service),
+                crate::live_settings::prompt::InitialCatalogPolicy::Bounded,
+            )
+            .expect("composer"),
+        );
         Self {
-            service,
-            base_prompt,
+            composer,
             budget,
+            user_prompt: base_prompt,
+            budget_source: crate::live_settings::sources::ValueSource::Settings,
         }
     }
 }
@@ -551,7 +592,7 @@ pub fn load_permission_checker_with_roots(
 /// never wrote instructions) and yields `None`; any other I/O failure is logged
 /// and treated as absent, because project instructions must never be able to
 /// take down the agent.
-fn load_project_instructions(workdir: &Path) -> Option<String> {
+pub(crate) fn load_project_instructions(workdir: &Path) -> Option<String> {
     let path = workdir.join("AGENTS.md");
     match std::fs::read_to_string(&path) {
         Ok(contents) => Some(contents),
@@ -578,17 +619,12 @@ fn load_project_instructions(workdir: &Path) -> Option<String> {
 /// without a `workdir` argument and the feature stayed gone. The tests below
 /// exist to make that loss impossible to repeat unnoticed.
 fn resolve_system_prompt(user: Option<String>, workdir: &Path) -> Option<String> {
-    let mut base = yi_agent_core::AgentConfig::default_system_prompt();
-    if let Some(user) = user {
-        base.push_str("\n\nUser-provided instructions:\n");
-        base.push_str(&user);
-    }
-    if let Some(instructions) = load_project_instructions(workdir) {
-        base.push_str("\n\nProject instructions (AGENTS.md):\n");
-        base.push_str(&instructions);
-    }
-    let today = chrono::Local::now().format("%Y-%m-%d");
-    Some(format!("{base}\n\nCurrent date: {today}"))
+    // One implementation lives in the composer; this keeps the historical
+    // name for callers that assemble a prompt without a live source.
+    Some(crate::live_settings::prompt::base_prompt(
+        user.as_deref(),
+        workdir,
+    ))
 }
 
 /// Set up the skills service: install bundled system skills, build roots, snapshot.
@@ -638,10 +674,27 @@ fn build_catalog_handle(
         cfg.skills_catalog_budget,
         cfg.skills_catalog_budget_explicit,
     );
+    // This handle is the **static** assembly path: it has no live budget, so an
+    // "include all" choice degenerates to an unlimited bounded render and there
+    // is nothing to revoke. The live path (a per-session `AgentSettingsSource`)
+    // owns the selection-time binding described in the spec.
+    let composer = crate::live_settings::prompt::LivePromptComposer::new(
+        cfg,
+        crate::live_settings::prompt::PromptRole::Normal,
+        Some(service),
+        crate::live_settings::prompt::InitialCatalogPolicy::Bounded,
+    )
+    .ok()?;
     Some(SkillsCatalogHandle {
-        service,
-        base_prompt: resolve_system_prompt(cfg.system_prompt.clone(), &cfg.workdir),
+        composer: Arc::new(composer),
         budget,
+        user_prompt: cfg.system_prompt.clone(),
+        budget_source: if cfg.skills_catalog_budget_explicit {
+            // An explicit CLI flag is a real fixed source, not a settings value.
+            crate::live_settings::sources::ValueSource::Override
+        } else {
+            crate::live_settings::sources::ValueSource::Settings
+        },
     })
 }
 
@@ -678,18 +731,6 @@ fn resolve_skills_roots(
         (skills_root, yi_agent_skills::SkillScope::User),
         (system_root, yi_agent_skills::SkillScope::System),
     ])
-}
-
-/// Side-conversation budget policy: never prompt, always truncate to the
-/// configured budget.
-///
-/// The normal path may ask the user on a TTY whether to include the full
-/// catalog; a side conversation is created off the RPC/UI main loop, so it must
-/// resolve non-interactively. A truncated catalog is byte-identical to what a
-/// piped (non-TTY) parent would get, so the side never inherits a *wider*
-/// catalog than its parent.
-fn resolve_side_catalog_budget(total: usize, budget: usize) -> usize {
-    if total <= budget { usize::MAX } else { budget }
 }
 
 /// Resolve the effective configuration for a side conversation.
@@ -730,48 +771,34 @@ pub fn resolve_side_config(
 /// Resolve the side conversation's system prompt: inherited prompt, then the
 /// fixed side policy at the very end.
 ///
-/// The inherited part reuses [`resolve_system_prompt`]'s exact ordering
-/// (default → user → project AGENTS.md → date), so a side is prompted like its
-/// parent. The skills catalog is resolved **read-only**: `SkillsService` scans
-/// and renders, but this path never calls `install_system_skills`, never asks
-/// the user, never installs a refresh handle and never executes a skill.
+/// The inherited part goes through the same [`LivePromptComposer`] as a normal
+/// session, so the segment order (default → user → project AGENTS.md → date →
+/// catalog) and the catalog rendering have exactly one implementation. The
+/// catalog is resolved **read-only**: `SkillsService` scans and renders, but this
+/// path never calls `install_system_skills`, never asks the user, never installs
+/// a refresh handle and never executes a skill.
 ///
-/// The side policy is appended last and is therefore not displaceable by a
-/// later skills refresh (there is none on this path).
+/// The side policy is appended by the composer as the very last block and is
+/// therefore not displaceable by a later skills refresh.
+///
+/// [`LivePromptComposer`]: crate::live_settings::prompt::LivePromptComposer
 pub fn resolve_side_prompt(cfg: &RuntimeConfig) -> Result<Option<String>> {
-    let base = resolve_system_prompt(cfg.system_prompt.clone(), &cfg.workdir);
-    let inherited = match resolve_skills_roots(cfg) {
-        Some(roots) => {
-            let service = yi_agent_skills::SkillsService::new(roots);
-            // A discovery failure is non-fatal, exactly as in the normal path:
-            // the side then simply has no catalog.
-            match service.snapshot() {
-                Ok(_) => {
-                    let total = service.full_catalog_size();
-                    let budget = resolve_side_catalog_budget(total, cfg.skills_catalog_budget);
-                    let catalog = if budget == usize::MAX {
-                        service.render_catalog(usize::MAX)
-                    } else {
-                        service.render_catalog(budget)
-                    };
-                    match (base, catalog.is_empty()) {
-                        (Some(base), false) => Some(format!("{base}\n\n{catalog}")),
-                        (Some(base), true) => Some(base),
-                        (None, false) => Some(catalog),
-                        (None, true) => None,
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!("side skills discovery failed: {error}");
-                    base
-                }
-            }
-        }
-        None => base,
-    };
-    Ok(Some(yi_agent_core::side_system_prompt(
-        inherited.as_deref(),
-    )))
+    let skills =
+        resolve_skills_roots(cfg).map(|roots| Arc::new(yi_agent_skills::SkillsService::new(roots)));
+    let composer = crate::live_settings::prompt::LivePromptComposer::new(
+        cfg,
+        crate::live_settings::prompt::PromptRole::Side,
+        skills,
+        // A side never inherits another role's "include all" decision; the
+        // composer enforces that too, but pass the honest policy here.
+        crate::live_settings::prompt::InitialCatalogPolicy::Bounded,
+    )?;
+    let prompt = composer.render(
+        cfg.system_prompt.as_deref(),
+        cfg.skills_catalog_budget,
+        crate::live_settings::sources::ValueSource::Settings,
+    )?;
+    Ok(prompt)
 }
 
 fn is_interactive() -> bool {

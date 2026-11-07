@@ -20,6 +20,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub mod binding;
+pub mod prompt;
 pub mod sources;
 
 use crate::settings::document::validate_document;
