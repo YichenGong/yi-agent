@@ -2154,6 +2154,10 @@ fn run_headless(
                 &workdir,
                 &model,
                 yi_agent_app_server::thread_store::ThreadMode::Normal,
+                // The sandbox this conversation starts under, recorded with it:
+                // a later settings change must not re-open it wider.
+                config.sandbox,
+                config.sandbox_promotable,
             ) {
                 Ok(store) => Some(store),
                 Err(e) => {
@@ -2795,6 +2799,8 @@ fn run_tui_agent(
                         &snapshot_workdir,
                         &model,
                         mode,
+                        config.sandbox,
+                        config.sandbox_promotable,
                     ) {
                         Ok(store) => Some(Arc::new(store)),
                         Err(e) => {
@@ -3820,6 +3826,8 @@ mod tests {
             dir.path(),
             "m",
             yi_agent_app_server::thread_store::ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
         )
         .unwrap();
         store
@@ -3855,6 +3863,8 @@ mod tests {
             dir.path(),
             "m",
             yi_agent_app_server::thread_store::ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
         )
         .unwrap();
         assert!(

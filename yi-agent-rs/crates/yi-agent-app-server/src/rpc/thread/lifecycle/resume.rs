@@ -66,7 +66,11 @@ pub(crate) async fn handle(
             )
             .await;
 
-            let loaded = match thread_store.load(&thread_id) {
+            // Strict activation read: a meta that exists but cannot be parsed
+            // must refuse to run tools, not silently rebuild into a conversation
+            // whose sandbox record is gone. Listing still uses the tolerant
+            // `load`; this path is the one that grants tool access.
+            let loaded = match thread_store.load_for_activation(&thread_id) {
                 Ok(Some(l)) => l,
                 Ok(None) => {
                     write_response(
@@ -98,6 +102,10 @@ pub(crate) async fn handle(
                 loaded.meta.cwd.clone()
             };
 
+            // Captured before the messages move into the session: this decides whether a
+            // missing baseline is "never ran" (safe to adopt today's default) or "ran under
+            // unrecorded values" (must fall back to read-only).
+            let has_history = !loaded.messages.is_empty();
             let mut session = yi_agent_core::Session::new();
             // 恢复上次用量,使 auto-compact 在 resume 后的首轮即生效。
             if let Some(u) = &loaded.usage {
@@ -165,6 +173,38 @@ pub(crate) async fn handle(
             // 初始状态,而不必等一次广播。
             let preserve_thinking = built.agent.config().preserve_thinking;
             let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(Path::new(&cwd));
+            // This conversation's sandbox comes from its own record, never from
+            // today's defaults: `state.cfg.sandbox` is what *new* conversations
+            // start with, and applying it here would silently widen a session
+            // resumed after an unrelated settings change.
+            let resolved_baseline = crate::session_sandbox::resolve_activation_baseline(
+                loaded.meta.sandbox_baseline,
+                None,
+                None,
+                crate::session_sandbox::SandboxBaseline::from_parts(
+                    state.cfg.sandbox,
+                    state.cfg.sandbox_promotable,
+                ),
+                has_history,
+            );
+            if let Some(warning) = resolved_baseline.warning {
+                tracing::warn!(
+                    thread_id,
+                    ?warning,
+                    "sandbox baseline resolved without full evidence"
+                );
+            }
+            // Persist the decision so this conversation stops looking like "no
+            // evidence". A failure here is only a warning: the in-memory
+            // baseline below is what this run uses, and refusing to open the
+            // conversation over a failed bookkeeping write would turn a
+            // degraded record into an outage.
+            if resolved_baseline.should_persist()
+                && let Err(error) =
+                    thread_store.set_sandbox_baseline(&thread_id, resolved_baseline.baseline)
+            {
+                tracing::warn!(thread_id, %error, "could not persist the resolved sandbox baseline");
+            }
             let activation = attach_delegation(
                 state.runtimes,
                 state.thread_roots,
@@ -190,6 +230,7 @@ pub(crate) async fn handle(
                 // 重开时沿用同一口径（空集），与 `thread/start` 一致。
                 Vec::new(),
                 state.live_settings,
+                Some(resolved_baseline.baseline),
                 built,
             );
             let BuiltAgent {

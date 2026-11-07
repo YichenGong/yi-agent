@@ -167,6 +167,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -779,6 +780,177 @@ async fn thread_compact_reports_failure_without_breaking_the_connection() {
 /// YoloSwitch` 的映射由 `bootstrap.rs::interactive_yolo_config_starts_switch_on`
 /// 钉死;此处只钉死「app-server 侧 resume 读了持久化模式并透传」这一契约
 /// (server 内存中的 switch 不可从外部观测,故用记录型工厂观察传参)。
+/// A conversation recorded as read-only must stay read-only, even when the
+/// process default has since been widened.
+///
+/// This is the whole point of the baseline record: startup settings configure
+/// *new* conversations, so changing them must not retroactively re-open a
+/// conversation the user started in a narrow sandbox.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_keeps_a_recorded_baseline_instead_of_todays_default() {
+    use crate::thread_store::ThreadStore;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    // Today's default is the widest; only the recorded baseline may decide.
+    cfg.sandbox = yi_agent_tools::SandboxMode::DangerFullAccess;
+    cfg.sandbox_promotable = true;
+
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    // Rewrite the persisted baseline as if it had been created read-only.
+    let store = ThreadStore::new(dir.path());
+    store
+        .set_sandbox_baseline(
+            &tid,
+            crate::session_sandbox::SandboxBaseline::new("read-only", false).unwrap(),
+        )
+        .unwrap()
+        .then_some(())
+        .expect("the meta must exist after thread/start");
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let mut resumed = false;
+    for _ in 0..8 {
+        let v = h.read_value().await;
+        if v.get("id") == Some(&serde_json::json!(4)) {
+            assert_eq!(v["result"]["thread_id"], tid);
+            resumed = true;
+            break;
+        }
+    }
+    assert!(resumed, "thread/resume must respond");
+
+    let after = store
+        .read_meta_for_activation(&tid)
+        .unwrap()
+        .expect("meta still exists");
+    let baseline = after.sandbox_baseline.expect("the baseline must survive");
+    assert_eq!(
+        baseline.mode,
+        yi_agent_tools::SandboxMode::ReadOnly,
+        "resume must not replace the record with today's default"
+    );
+    assert!(!baseline.promotable, "read-only is never promotable");
+    h.shutdown().await;
+}
+
+/// A pre-baseline conversation with real history has no record of what its
+/// tools ran under, so resume must not assume today's (possibly wider) default.
+/// It falls back to read-only and writes that decision down, so the question is
+/// asked once rather than on every open.
+#[tokio::test(flavor = "multi_thread")]
+async fn resuming_legacy_history_without_a_baseline_falls_back_to_read_only() {
+    use crate::thread_store::ThreadStore;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    cfg.sandbox = yi_agent_tools::SandboxMode::DangerFullAccess;
+    cfg.sandbox_promotable = true;
+
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    // One real turn, then strip the baseline: this is exactly the shape of a
+    // meta written before the field existed.
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"first"}}]}}}}"#
+    ))
+    .await;
+    loop {
+        let v = h.read_value().await;
+        if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+            break;
+        }
+    }
+
+    let store = ThreadStore::new(dir.path());
+    let meta_path = store.meta_path(&tid);
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    raw.as_object_mut().unwrap().remove("sandbox_baseline");
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+    assert_eq!(
+        store
+            .read_meta_for_activation(&tid)
+            .unwrap()
+            .unwrap()
+            .sandbox_baseline,
+        None,
+        "the setup must really remove the field"
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let mut resumed = false;
+    for _ in 0..8 {
+        let v = h.read_value().await;
+        if v.get("id") == Some(&serde_json::json!(4)) {
+            resumed = true;
+            break;
+        }
+    }
+    assert!(resumed, "thread/resume must respond");
+
+    let baseline = store
+        .read_meta_for_activation(&tid)
+        .unwrap()
+        .unwrap()
+        .sandbox_baseline
+        .expect("the conservative floor must be persisted");
+    assert_eq!(baseline.mode, yi_agent_tools::SandboxMode::ReadOnly);
+    assert!(!baseline.promotable);
+    h.shutdown().await;
+}
+
+/// A corrupt baseline is not "old history": it is a claim the server cannot
+/// honor, and opening it to run tools would mean guessing the sandbox.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_refuses_a_corrupt_baseline() {
+    use crate::thread_store::ThreadStore;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    let store = ThreadStore::new(dir.path());
+    let meta_path = store.meta_path(&tid);
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    raw["sandbox_baseline"] = serde_json::json!({"mode": "god-mode", "promotable": true});
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let mut answered = None;
+    for _ in 0..8 {
+        let v = h.read_value().await;
+        if v.get("id") == Some(&serde_json::json!(4)) {
+            answered = Some(v);
+            break;
+        }
+    }
+    let v = answered.expect("thread/resume must answer even when it refuses");
+    assert!(
+        v.get("error").is_some(),
+        "a corrupt baseline must be refused, not guessed: {v}"
+    );
+    h.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn resume_passes_persisted_mode_to_factory() {
     use crate::thread_store::{ThreadMode, ThreadStore};
@@ -1997,6 +2169,7 @@ async fn kanban_observation_plain_rpc_resume_is_discovered() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
             extra_roots: Vec::new(),
             role: None,
         })

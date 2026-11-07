@@ -54,7 +54,18 @@ impl TuiSessionStore {
     ///
     /// 不建 meta 的话 `--last` 永远看不到终端建的会话；不持锁的话等于给别的
     /// 进程留了后门。两件事必须一起做。
-    pub fn create_new(workdir: &Path, model: &str, mode: ThreadMode) -> std::io::Result<Self> {
+    /// Create a new conversation and record the sandbox it runs under.
+    ///
+    /// The baseline is written here, not derived later: this is the only moment
+    /// the invoking configuration is known to be the one the conversation
+    /// actually started with.
+    pub fn create_new(
+        workdir: &Path,
+        model: &str,
+        mode: ThreadMode,
+        sandbox: yi_agent_tools::SandboxMode,
+        sandbox_promotable: bool,
+    ) -> std::io::Result<Self> {
         let store = ThreadStore::new(workdir);
         let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
         let now = now_millis();
@@ -81,6 +92,12 @@ impl TuiSessionStore {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: Some(
+                yi_agent_app_server::session_sandbox::SandboxBaseline::from_parts(
+                    sandbox,
+                    sandbox_promotable,
+                ),
+            ),
         };
         store.create(&meta)?;
         let lock = acquire_thread_lock(store.root(), &thread_id)
@@ -276,8 +293,14 @@ mod tests {
     #[test]
     fn create_new_writes_meta_and_holds_lock() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store =
-            TuiSessionStore::create_new(dir.path(), "claude-test", ThreadMode::Normal).unwrap();
+        let store = TuiSessionStore::create_new(
+            dir.path(),
+            "claude-test",
+            ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        )
+        .unwrap();
         assert!(store.thread_id().starts_with("thread-"));
 
         // meta 必须已落盘，否则 `--last` 看不到终端建的会话
@@ -300,7 +323,14 @@ mod tests {
     #[test]
     fn append_then_reopen_restores_items_and_messages() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        let store = TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        )
+        .unwrap();
         let id = store.thread_id().to_string();
 
         let items = vec![Item::UserMessage {
@@ -327,7 +357,14 @@ mod tests {
     #[test]
     fn clear_empties_the_log_but_keeps_the_meta() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        let store = TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        )
+        .unwrap();
         let id = store.thread_id().to_string();
         store
             .append_turn(
@@ -359,7 +396,14 @@ mod tests {
     #[test]
     fn second_open_of_same_thread_is_busy() {
         let dir = tempfile::TempDir::new().unwrap();
-        let first = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        let first = TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        )
+        .unwrap();
         let id = first.thread_id().to_string();
         let lock_path = dir
             .path()
@@ -441,7 +485,14 @@ mod tests {
     #[test]
     fn compact_replaces_messages_without_adding_items() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        let store = TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        )
+        .unwrap();
 
         store
             .append_turn(
@@ -482,7 +533,14 @@ mod tests {
         use yi_agent_core::ContentBlock;
 
         let dir = tempfile::TempDir::new().unwrap();
-        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        let store = TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        )
+        .unwrap();
 
         // 一轮正常的问答 + 一条「assistant 发了 tool_use 但没结果」的半轮。
         let messages = vec![
@@ -524,7 +582,14 @@ mod tests {
     #[test]
     fn load_for_replay_returns_items_and_pending_flag() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        let store = TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        )
+        .unwrap();
         store
             .append_turn(
                 &[Item::UserMessage {
@@ -549,7 +614,14 @@ mod tests {
     #[test]
     fn a_fresh_session_has_nothing_to_resume() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        let store = TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        )
+        .unwrap();
         assert!(
             !store.has_resumable_content().unwrap(),
             "刚建的空会话不该提示 resume"
@@ -559,7 +631,14 @@ mod tests {
     #[test]
     fn a_session_with_a_turn_is_resumable() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        let store = TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        )
+        .unwrap();
         store
             .append_turn(
                 &[Item::UserMessage {
@@ -582,7 +661,14 @@ mod tests {
     #[test]
     fn a_compact_only_session_is_still_resumable() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        let store = TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        )
+        .unwrap();
         // /compact 的落盘形态：items 为空，但 messages 有压缩后的上下文。
         store
             .compact(&[Message {
@@ -599,7 +685,14 @@ mod tests {
     #[test]
     fn a_cleared_session_has_nothing_to_resume() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        let store = TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        )
+        .unwrap();
         store
             .append_turn(
                 &[Item::UserMessage {

@@ -1487,6 +1487,7 @@ fn resume_meta(
         anchor_sha: Some("deadbeef".into()),
         last_read_at: 0,
         last_completed_at: 0,
+        sandbox_baseline: None,
         forked_from: None,
     };
     meta.extra_roots = Vec::new();

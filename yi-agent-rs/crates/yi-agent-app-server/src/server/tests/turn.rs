@@ -944,6 +944,7 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -1060,6 +1061,7 @@ async fn a_turn_while_off_persists_without_credentials() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -1163,6 +1165,7 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -1957,6 +1960,7 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -2074,6 +2078,7 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
             extra_roots: Vec::new(),
             role: None,
         })

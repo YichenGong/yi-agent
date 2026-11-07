@@ -75,6 +75,7 @@ fn only_the_lead_sees_the_memory_tools() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
             role: None,
             tag: None,
             extra_roots: Vec::new(),
@@ -210,6 +211,7 @@ fn only_the_lead_sees_the_view_tools() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
         })
         .expect("a plain meta must persist");
     // 正臂走生产的组长落盘路径,而不是手搓一个 role 字段。
@@ -1213,6 +1215,7 @@ async fn a_lead_thread_never_calls_the_title_model_even_without_a_title() {
                 last_read_at: 0,
                 last_completed_at: 0,
                 forked_from: None,
+                sandbox_baseline: None,
                 extra_roots: Vec::new(),
                 role: Some(crate::thread_store::LEAD_ROLE.into()),
             })
@@ -1687,6 +1690,7 @@ fn the_lead_does_not_get_ask_lead() {
         last_read_at: 0,
         last_completed_at: 0,
         forked_from: None,
+        sandbox_baseline: None,
     };
     store.create(&plain).expect("a plain meta must persist");
     let plain_names = build("thread-plain").registry.names();

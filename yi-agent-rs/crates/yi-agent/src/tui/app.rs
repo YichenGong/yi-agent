@@ -7757,6 +7757,8 @@ mod tests {
             project.path(),
             "test-model",
             yi_agent_app_server::thread_store::ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
         )
         .unwrap();
         let thread_id = store.thread_id().to_string();

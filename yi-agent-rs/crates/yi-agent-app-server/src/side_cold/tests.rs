@@ -40,6 +40,7 @@ fn meta(id: &str) -> ThreadMeta {
         last_read_at: 0,
         last_completed_at: 0,
         forked_from: None,
+        sandbox_baseline: None,
     }
 }
 

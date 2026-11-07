@@ -1653,7 +1653,9 @@ fn write_meta(
         anchor_sha: None,
         last_read_at: 0,
         last_completed_at: 0,
+        sandbox_baseline: None,
         forked_from: None,
+
         extra_roots: Vec::new(),
         role: None,
     };
@@ -1686,6 +1688,7 @@ fn write_lead_meta(dir: &Path, id: &str) {
         last_read_at: 0,
         last_completed_at: 0,
         forked_from: None,
+        sandbox_baseline: None,
     };
     crate::thread_store::ThreadStore::new(dir)
         .create(&meta)

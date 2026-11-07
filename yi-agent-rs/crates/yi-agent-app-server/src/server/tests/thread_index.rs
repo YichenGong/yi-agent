@@ -2988,6 +2988,7 @@ async fn writer_lock_refuses_a_second_writer_on_the_same_thread() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
         })
         .unwrap();
 

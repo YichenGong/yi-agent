@@ -137,6 +137,7 @@ mod tests {
                     last_read_at: 0,
                     last_completed_at: 0,
                     forked_from: None,
+                    sandbox_baseline: None,
                 })
                 .unwrap();
         }
@@ -211,6 +212,7 @@ mod tests {
                     last_read_at: 0,
                     last_completed_at: 0,
                     forked_from: None,
+                    sandbox_baseline: None,
                 })
                 .unwrap();
         }
@@ -247,6 +249,7 @@ mod tests {
                 last_read_at: 0,
                 last_completed_at: 0,
                 forked_from: None,
+                sandbox_baseline: None,
             })
             .unwrap();
         assert!(

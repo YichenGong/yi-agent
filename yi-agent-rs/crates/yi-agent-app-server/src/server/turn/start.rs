@@ -95,6 +95,12 @@ pub(crate) async fn start_thread_core(
     // 取值口径不变：仍是「建 meta 时取 HEAD」（此后 HEAD 随会话推进）。
     let anchor_sha = crate::git_diff::session_anchor(std::path::Path::new(cwd));
 
+    // The baseline is computed once and used twice: recorded in the meta below,
+    // and applied to the tool surface via `attach_delegation`. Two separate
+    // derivations could disagree if configuration changed between them.
+    let sandbox_baseline =
+        crate::session_sandbox::SandboxBaseline::from_parts(cfg.sandbox, cfg.sandbox_promotable);
+
     // 委派是可选能力:项目 runtime 起不来就保留原 agent,只记 trace。
     // 接线刻意放在这里(而非 `threads` 守卫之内),避免与其可变借用冲突。
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(Path::new(cwd));
@@ -120,6 +126,7 @@ pub(crate) async fn start_thread_core(
         lead_agent_enabled,
         extra_session_env,
         live_settings,
+        Some(sandbox_baseline),
         built,
     );
     let BuiltAgent {
@@ -168,6 +175,13 @@ pub(crate) async fn start_thread_core(
             .map(|p| p.to_string_lossy().to_string())
             .collect(),
         role: None,
+        // The sandbox this conversation is being created under, recorded now
+        // because the very same values also configure the tool surface and the
+        // delegation child budget a few lines below. Persisting them here keeps
+        // "what this conversation may do" and "what the meta says it may do"
+        // from drifting apart, and gives a later resume an authority that does
+        // not depend on whatever the settings happen to say that day.
+        sandbox_baseline: Some(sandbox_baseline),
         content_epoch: 0,
         last_item_id: None,
         anchor_sha,

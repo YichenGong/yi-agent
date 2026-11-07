@@ -639,6 +639,9 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         Vec::new(),
         // 这些用例不涉运行期设置：静态装配。
         None,
+        // These cases exercise root reuse, not sandbox resolution; `None` keeps
+        // the configured defaults from `cfg`.
+        None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
     let second = attach_delegation(
@@ -665,6 +668,9 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         Vec::new(),
         // 这些用例不涉运行期设置：静态装配。
         None,
+        // These cases exercise root reuse, not sandbox resolution; `None` keeps
+        // the configured defaults from `cfg`.
+        None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
 
@@ -680,6 +686,72 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         .root_task_id()
         .expect("thread b root is attached");
     assert_ne!(a, b, "two conversations must not share one root");
+}
+
+/// The sandbox a conversation runs under comes from its own baseline, not from
+/// `cfg.sandbox`.
+///
+/// `cfg.sandbox` is the default for *new* conversations. Re-opening an old one
+/// after a settings change must not silently promote it, so `attach_delegation`
+/// takes the resolved baseline explicitly and applies it to a per-call copy of
+/// the config. This drives the real wiring: `cfg` here is left at
+/// `workspace-write` while the conversation's baseline says `read-only`, and the
+/// registry's `bash` must follow the baseline.
+#[test]
+fn a_read_only_baseline_wins_over_todays_default_sandbox() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+    // The process default is the widest of the three; only the baseline may
+    // decide, so this difference is what the assertion below detects.
+    cfg.sandbox = yi_agent_tools::SandboxMode::WorkspaceWrite;
+    assert!(cfg.sandbox_promotable);
+
+    let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+    let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
+    let cwd = cfg.workdir.to_string_lossy().to_string();
+    let baseline =
+        crate::session_sandbox::SandboxBaseline::new("read-only", false).expect("valid mode");
+
+    let activation = attach_delegation(
+        &runtimes,
+        &thread_roots,
+        runtime.path(),
+        &isolated_models_path(runtime.path()),
+        &cfg,
+        &cwd,
+        "thread-read-only",
+        &test_theme(),
+        &crate::git_diff_tool::GitDiffHandle::new(),
+        Vec::new(),
+        &crate::lead::LeadInbox::new(),
+        &crate::lead::LeadReplies::new(),
+        &crate::lead_control::LeadControlInbox::new(),
+        &crate::lead_control::LeadControlReplies::new(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        Some(baseline),
+        build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
+    );
+    let registry = activation.built.agent.tools();
+    let bash = registry.get("bash").expect("bash is registered");
+    assert_eq!(
+        bash.sandbox_mode(),
+        Some("read-only"),
+        "the conversation's own baseline must win over cfg.sandbox"
+    );
+    // And the shared config must be untouched: it belongs to every other
+    // conversation in this process.
+    assert_eq!(
+        cfg.sandbox,
+        yi_agent_tools::SandboxMode::WorkspaceWrite,
+        "attaching one conversation must not rewrite the shared config"
+    );
+    assert!(cfg.sandbox_promotable, "nor its promotable flag");
 }
 
 /// A runtime whose daemon died (its owning terminal was closed, say) must

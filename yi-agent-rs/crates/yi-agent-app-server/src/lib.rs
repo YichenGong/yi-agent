@@ -35,6 +35,7 @@ pub mod runtime_status;
 pub mod server;
 pub mod session;
 pub(crate) mod session_driver;
+pub mod session_sandbox;
 pub mod settings_rpc;
 pub mod settings_store;
 pub mod shell_authorization;

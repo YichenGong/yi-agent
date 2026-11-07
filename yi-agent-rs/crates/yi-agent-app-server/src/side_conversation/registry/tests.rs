@@ -41,6 +41,7 @@ fn meta(id: &str, cwd: &std::path::Path) -> crate::thread_store::ThreadMeta {
         last_read_at: 0,
         last_completed_at: 0,
         forked_from: None,
+        sandbox_baseline: None,
     }
 }
 

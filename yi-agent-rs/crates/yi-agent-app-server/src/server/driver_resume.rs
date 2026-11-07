@@ -185,6 +185,10 @@ where
             .filter(|path| path.is_dir())
             .collect();
 
+        // Captured before the messages move into the session: this decides whether a
+        // missing baseline is "never ran" (safe to adopt today's default) or "ran under
+        // unrecorded values" (must fall back to read-only).
+        let has_history = !loaded.messages.is_empty();
         let mut session = yi_agent_core::Session::new();
         // 恢复上次用量,使 auto-compact 在恢复后的首轮即生效(与 RPC resume 同源)。
         if let Some(usage) = &loaded.usage {
@@ -211,6 +215,36 @@ where
 
         let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(Path::new(&cwd));
         let hub = Arc::clone(self.hub);
+        // Resolve the sandbox from this conversation's own record, never from
+        // `self.cfg.sandbox` (today's default for new conversations). This path
+        // restores a conversation that is not in `threads` yet, so there is no
+        // live controller to consult: the persisted baseline is the evidence,
+        // and a pre-baseline meta with real history falls back to read-only.
+        let resolved_baseline = crate::session_sandbox::resolve_activation_baseline(
+            loaded.meta.sandbox_baseline,
+            None,
+            None,
+            crate::session_sandbox::SandboxBaseline::from_parts(
+                self.cfg.sandbox,
+                self.cfg.sandbox_promotable,
+            ),
+            has_history,
+        );
+        if let Some(warning) = resolved_baseline.warning {
+            tracing::warn!(
+                thread_id,
+                ?warning,
+                "sandbox baseline resolved without full evidence"
+            );
+        }
+        // Same policy as the RPC resume path: record the decision, but never
+        // fail the restore because recording it failed.
+        if resolved_baseline.should_persist()
+            && let Err(error) = store.set_sandbox_baseline(thread_id, resolved_baseline.baseline)
+        {
+            tracing::warn!(thread_id, %error, "could not persist the resolved sandbox baseline");
+        }
+        let sandbox_baseline = Some(resolved_baseline.baseline);
         let activation = attach_delegation(
             self.runtimes,
             self.thread_roots,
@@ -232,6 +266,7 @@ where
             Some(self.lead_agent_enabled),
             env.clone(),
             self.live_settings,
+            sandbox_baseline,
             built,
         );
         // spec §5.1:冷装配必须在**实际构造 bash 工具**时应用 env;装配失败就

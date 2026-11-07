@@ -9,8 +9,14 @@ use crate::error::ToolsError;
 ///
 /// These names intentionally match Codex's public sandbox modes. Restricted
 /// modes deny network access and fail closed when the host has no backend.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+/// Serialized form is the same kebab-case label as [`SandboxMode::as_str`] and
+/// the CLI, so a persisted baseline reads the way the user sees it. One mapping,
+/// not a second vocabulary that could drift from [`crate::SandboxMode::as_str`].
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum, serde::Serialize, serde::Deserialize,
+)]
 #[value(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub enum SandboxMode {
     ReadOnly,
     #[default]
@@ -53,6 +59,19 @@ impl SandboxController {
             base,
             promotable,
         }
+    }
+
+    /// The construction-time baseline as `(mode, promotable)`.
+    ///
+    /// Read-only accessor, deliberately not a setter: the baseline is what the
+    /// user authorized for a conversation, so it may be *read* when a resume
+    /// needs trustworthy evidence, but nothing at runtime may retune it. A
+    /// caller that needs a different baseline must build a new controller.
+    ///
+    /// `promotable` here is already normalized against read-only by
+    /// [`SandboxController::new`], so the pair is always self-consistent.
+    pub fn baseline(&self) -> (SandboxMode, bool) {
+        (self.base, self.promotable)
     }
 
     pub fn effective(&self) -> SandboxMode {
