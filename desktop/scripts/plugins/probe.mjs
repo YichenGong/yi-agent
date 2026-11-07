@@ -88,6 +88,9 @@ function parseArgs(argv) {
   }
 
   if (!output) throw new Error("--output <path> is required");
+  if (app !== null && app.trim() === "") {
+    throw new Error("--app needs a non-empty path");
+  }
   if (!suite) throw new Error("--suite needs a non-empty value");
 
   return {
@@ -268,7 +271,10 @@ async function runProbe(options) {
     return 2;
   }
 
-  const targetDirectoryPath = targetDirectory();
+  // 只有没给 --app 时才需要问 cargo 要 target 目录。无条件调用会让 --app
+  // 名义上"绕开目录推导"、实际仍硬依赖 cargo 在 PATH 里（实测缺 cargo 时
+  // 直接 spawnSync cargo ENOENT，--app 完全不起作用）。
+  const targetDirectoryPath = options.app === null ? targetDirectory() : null;
   const { bundle, executable } = resolveBundle(targetDirectoryPath, options.app);
   const executableSha256 = sha256File(executable);
   const bundleSha256 = sha256Tree(bundle);

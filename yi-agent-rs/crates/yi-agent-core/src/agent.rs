@@ -5289,6 +5289,19 @@ mod tests {
     }
 
     #[test]
+    fn default_system_prompt_asks_for_a_single_reconnaissance_pass() {
+        let prompt = AgentConfig::default_system_prompt();
+        assert!(
+            prompt.contains("Reconnoitre before editing"),
+            "prompt must name the reconnaissance rule so a reviewer can find it"
+        );
+        assert!(
+            prompt.contains("Do not explore one file per turn"),
+            "prompt must forbid the one-file-per-turn pattern it is replacing"
+        );
+    }
+
+    #[test]
     fn agent_config_default_uses_default_system_prompt() {
         let config = AgentConfig::default();
         assert_eq!(

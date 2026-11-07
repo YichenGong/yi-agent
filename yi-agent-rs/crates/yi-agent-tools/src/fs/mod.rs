@@ -5,6 +5,7 @@ pub mod path_util;
 pub mod read;
 pub mod read_document;
 pub mod view_image;
+pub(crate) mod walk;
 pub mod write;
 
 pub use edit::EditTool;

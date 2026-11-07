@@ -4065,10 +4065,13 @@ mod tests {
             !add.is_error,
             "child sandbox must start Git staging: {add:?}"
         );
+        // The result now leads with a `cwd:` line, so the exit status can no
+        // longer be checked with `starts_with`; `contains` also keeps working
+        // for the refusals below, where exit is non-zero.
         assert!(
             matches!(
                 add.content.as_slice(),
-                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+                [yi_agent_core::ContentBlock::Text(output)] if output.contains("exit: 0\n")
             ),
             "child sandbox must permit its Git index writes: {add:?}"
         );
@@ -4084,7 +4087,7 @@ mod tests {
         assert!(
             matches!(
                 commit.content.as_slice(),
-                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+                [yi_agent_core::ContentBlock::Text(output)] if output.contains("exit: 0\n")
             ),
             "child sandbox must permit Git commit metadata writes: {commit:?}"
         );
@@ -4335,7 +4338,7 @@ mod tests {
         assert!(
             matches!(
                 linked_write.content.as_slice(),
-                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+                [yi_agent_core::ContentBlock::Text(output)] if output.contains("exit: 0\n")
             ),
             "the shell sandbox must let a child write its inherited roots: {linked_write:?}"
         );
@@ -4348,7 +4351,7 @@ mod tests {
         assert!(
             !matches!(
                 outsider_write.content.as_slice(),
-                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+                [yi_agent_core::ContentBlock::Text(output)] if output.contains("exit: 0\n")
             ),
             "the shell sandbox must still refuse paths outside every root: {outsider_write:?}"
         );
@@ -4412,7 +4415,7 @@ mod tests {
         assert!(
             matches!(
                 add.content.as_slice(),
-                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+                [yi_agent_core::ContentBlock::Text(output)] if output.contains("exit: 0\n")
             ),
             "the shell sandbox must keep the git roots writable: {add:?}"
         );

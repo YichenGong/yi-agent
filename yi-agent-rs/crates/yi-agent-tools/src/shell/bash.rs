@@ -91,7 +91,7 @@ impl Tool for BashTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "The bash command to execute" },
+                "command": { "type": "string", "description": "The command to execute. Runs in the session working directory, which persists across calls (a successful standalone `cd` changes it for later calls). Every result starts with a `cwd:` line showing the directory after this command." },
                 "timeout": { "type": "integer", "description": "Optional timeout in seconds (legacy hard timeout)", "default": 120 },
                 "expected_timeout_sec": {
                     "type": "integer",
@@ -532,7 +532,8 @@ impl Tool for BashTool {
 
         if timed_out {
             ToolResult::error(format!(
-                "command timeout after {}s\nstdout:\n{}\nstderr:\n{}",
+                "cwd: {}\ncommand timeout after {}s\nstdout:\n{}\nstderr:\n{}",
+                cwd.display(),
                 args.timeout.unwrap_or(DEFAULT_TIMEOUT),
                 stdout_text,
                 stderr_text,
@@ -547,8 +548,11 @@ impl Tool for BashTool {
                 self.ctx.set_cwd(new_cwd);
             }
             ToolResult::text(format!(
-                "exit: {}\nstdout:\n{}\nstderr:\n{}",
-                exit, stdout_text, stderr_text,
+                "cwd: {}\nexit: {}\nstdout:\n{}\nstderr:\n{}",
+                self.ctx.cwd().display(),
+                exit,
+                stdout_text,
+                stderr_text,
             ))
         }
     }
@@ -744,6 +748,13 @@ mod tests {
 
     fn make_tool(tmp: &TempDir) -> BashTool {
         BashTool::new(Arc::new(ToolsContext::new(tmp.path().to_path_buf())))
+    }
+
+    fn text_result(result: &ToolResult) -> &str {
+        match &result.content[0] {
+            yi_agent_core::ContentBlock::Text(text) => text,
+            _ => panic!("expected a text result"),
+        }
     }
 
     #[tokio::test]
@@ -1363,5 +1374,80 @@ mod tests {
         } else {
             panic!("expected text block");
         }
+    }
+
+    #[tokio::test]
+    async fn result_leads_with_the_current_directory() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+
+        let result = tool.call(serde_json::json!({"command": "true"})).await;
+
+        let text = text_result(&result);
+        // 不要 canonicalize：`ToolsContext::new` 存的是 `tmp.path()` 原样，
+        // 而 macOS 上 TempDir 的 `/var/folders/...` 与 canonicalize 后的
+        // `/private/var/folders/...` 不是同一个字符串，断言会必然失败。
+        let expected = format!("cwd: {}\n", tmp.path().display());
+        assert!(
+            text.starts_with(&expected),
+            "result must lead with the cwd line, expected prefix {expected:?}, got: {text}"
+        );
+        assert!(
+            text.contains("exit: 0"),
+            "exit line must survive, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cwd_line_follows_a_successful_cd() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        let tool = make_tool(&tmp);
+
+        let after_cd = tool.call(serde_json::json!({"command": "cd sub"})).await;
+        let text = text_result(&after_cd);
+        assert!(
+            text.contains("cwd: ") && text.contains("/sub"),
+            "the cd must be visible immediately, got: {text}"
+        );
+
+        let next = tool.call(serde_json::json!({"command": "pwd"})).await;
+        let next_text = text_result(&next);
+        assert!(
+            next_text.contains("/sub"),
+            "the directory must persist across calls, got: {next_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cwd_line_is_present_on_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+
+        let result = tool
+            // 与既有 `bash_timeout_kills` 同样的形状：sleep 10 + timeout 1。
+            .call(serde_json::json!({"command": "sleep 10", "timeout": 1}))
+            .await;
+
+        let text = text_result(&result);
+        // `ToolResult::error` 会再加一个 `error: ` 前缀，所以这里不是
+        // `starts_with("cwd: ")`。
+        assert!(
+            text.starts_with("error: cwd: "),
+            "the timeout result must still show the cwd, got: {text}"
+        );
+        assert!(text.contains("command timeout after 1s"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn cwd_line_is_present_on_nonzero_exit() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+
+        let result = tool.call(serde_json::json!({"command": "exit 1"})).await;
+
+        let text = text_result(&result);
+        assert!(text.starts_with("cwd: "), "got: {text}");
+        assert!(text.contains("exit: 1"), "got: {text}");
     }
 }

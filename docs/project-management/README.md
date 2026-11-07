@@ -9,9 +9,9 @@
 
 | 模块 | 完成 / 总计 | 详情 |
 |---|---|---|
-| yi-agent-core | 27 / 28 | [详情](./yi-agent-core.md) |
+| yi-agent-core | 29 / 30 | [详情](./yi-agent-core.md) |
 | yi-agent-llm | 12 / 15 | [详情](./yi-agent-llm.md) |
-| yi-agent-tools | 24 / 24 | [详情](./yi-agent-tools.md) |
+| yi-agent-tools | 28 / 28 | [详情](./yi-agent-tools.md) |
 | yi-agent-skills | 9 / 9 | [详情](./yi-agent-skills.md) |
 | yi-agent-tui | 46 / 48 | [详情](./yi-agent-tui.md) · [旁问修复 spec](../superpowers/specs/2026-11-05-side-conversation-repair-design.md) |
 | yi-agent-run | 11 / 11 | [详情](./yi-agent-run.md) |

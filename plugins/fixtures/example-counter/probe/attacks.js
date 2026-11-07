@@ -335,22 +335,57 @@ function crossFrameReplayDenied() {
 }
 
 // §4.7 —— 有界大量分配：只制造有限压力，绝不试图耗尽机器内存。
-function allocBurstIsBounded() {
+//
+// 这条判据要证明的是**故障边界**，不是内存配额。spec 明确写了首版不承诺
+// 恶意资源耗尽下的硬 CPU/内存配额，所以断言不检查「被限到多少」，而是检查
+// 分配冲击之后容器**是否还活着、是否还能和宿主通信**。
+//
+// 之所以要有 post-condition：早先这里是恒真的（分配成功 return true，分配
+// 失败也 return true），等于什么都没验。现在分配之后再要一次宿主状态，
+// 拿不到就判失败——页面被打死或与宿主断链时，这条必须红。
+async function allocBurstIsBounded() {
   const chunks = [];
   const chunkBytes = 1024 * 1024;
+  let allocated = 0;
+  let allocationError = null;
   try {
     for (let index = 0; index < 32; index += 1) {
       const chunk = new Uint8Array(chunkBytes);
       chunk.fill(index & 0xff);
       chunks.push(chunk);
+      allocated = index + 1;
     }
   } catch (error) {
-    chunks.length = 0;
-    return [true, [`bounded allocation stopped early: ${String(error).slice(0, 60)}`]];
+    // 分配被拒（OOM 保护生效）本身是可接受的边界行为，但它只是证据，
+    // 不是结论——结论看下面的存活检查。
+    allocationError = String(error).slice(0, 60);
   }
-  const held = chunks.length;
+  const held = allocated;
   chunks.length = 0;
-  return [true, [`allocated a bounded ${held} MiB burst, then released it`]];
+
+  const evidence = [
+    allocationError
+      ? `bounded allocation stopped early after ${held} MiB: ${allocationError}`
+      : `allocated a bounded ${held} MiB burst, then released it`,
+  ];
+
+  // post-condition：冲击之后页面必须仍能与宿主通信。拿不到状态说明容器
+  // 被打死或通道失效——这正是这条判据要抓的失败。
+  const state = await hostState();
+  if (!state) {
+    return [false, [...evidence, "the page could not reach the host after the burst"]];
+  }
+  evidence.push(`the page still reached the host after the burst (generation ${state.generation})`);
+
+  // 冲击不应导致容器被重建：generation 变了说明分配把容器打挂了，
+  // 靠重建才活下来——那是恢复能力，不是「有界」。
+  if (typeof state.generation === "number" && state.generation >= 2) {
+    return [
+      false,
+      [...evidence, `the container had to be rebuilt by the burst (generation ${state.generation})`],
+    ];
+  }
+  return [true, evidence];
 }
 
 // §4.6 —— 正常路径：中文输入、键盘/焦点、滚动、主题令牌与尺寸。
@@ -437,7 +472,7 @@ async function runFirstPass() {
   await report("implicit_exfiltration_denied", ...(await implicitExfiltrationDenied()));
   await report("frame_impersonation_denied", ...frameImpersonationDenied());
   await report("cross_frame_replay_denied", ...crossFrameReplayDenied());
-  await report("alloc_burst_is_bounded", ...allocBurstIsBounded());
+  await report("alloc_burst_is_bounded", ...(await allocBurstIsBounded()));
   enterBlockingPhase();
 }
 

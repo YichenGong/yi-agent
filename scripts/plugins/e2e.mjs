@@ -230,6 +230,15 @@ export function verdictFor({ caseSpec, outcome, capabilities = {}, executorUnsup
 
 /// 一条用例被判成 unsupported 时给人看的理由。
 export function unsupportedReason(caseSpec) {
+  // 用例可以声明一块**已实现之外**的缺口。它和 `unsupportedWithout` 的区别是
+  // 性质：unsupportedWithout 是「这台机器没这个条件，补上就能验」，
+  // permanentGap 是「代码里还没有这段，给什么条件都验不过」。
+  //
+  // A17 就是后者：远程资产拉取与离线缓存的 `FetchRequest` 只有定义、零调用点。
+  // 之前它只用通用文案报「没有远端主机」，读起来像补台机器就能过——那是把
+  // 功能缺口说成环境限制，正好是这种报告最不该犯的错。
+  const gap = caseSpec.permanentGap;
+  if (typeof gap === "string" && gap.trim() !== "") return gap;
   const without = caseSpec.unsupportedWithout;
   if (without === "remote") {
     return "no remote host was provided; a loopback peer cannot prove cross-machine behaviour";
@@ -344,6 +353,7 @@ export function runCommand(
     runner = execFileSync,
     env = process.env,
     commandCwd = null,
+    unsupportedExitCodes = null,
   } = {},
 ) {
   const parsed = parseCommand(raw);
@@ -365,8 +375,25 @@ export function runCommand(
   } catch (error) {
     const stdout = String(error?.stdout ?? "");
     const stderr = String(error?.stderr ?? "");
-    // 非零退出码但进程跑起来了：这是货真价实的失败。
     const exitCode = error?.status;
+    // 命令可以显式声明「这个退出码代表这台机器不支持，不是实现失败」。
+    // 探针在非 macOS 上返回 2 并明说 "no launcher adapter exists"；把它一律
+    // 记成 fail，等于把环境限制说成产品缺陷，与探针自己的声明矛盾。
+    if (typeof exitCode === "number" && Array.isArray(unsupportedExitCodes)) {
+      if (unsupportedExitCodes.includes(exitCode)) {
+        return {
+          outcome: "missing",
+          exitCode,
+          reason:
+            stderr.trim() ||
+            `command reported exit ${exitCode} as unsupported on this machine`,
+          stdout,
+          stderr,
+          command: raw,
+        };
+      }
+    }
+    // 非零退出码但进程跑起来了：这是货真价实的失败。
     if (typeof exitCode === "number") {
       return { outcome: "fail", exitCode, stdout, stderr, command: raw };
     }
@@ -553,6 +580,7 @@ export function runCase(caseSpec, options = {}) {
       result = runCommand(command.run, {
         ...options,
         commandCwd: command.cwd ?? null,
+        unsupportedExitCodes: command.unsupportedExitCodes ?? null,
       });
       memo.set(key, result);
     }
