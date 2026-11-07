@@ -16,19 +16,21 @@
 
 ```
 $ du -sh .
-209G    .
+209G    .                     ← 整仓库
 124G    yi-agent-rs/target
- 68G    .worktrees
+ 68G    .worktrees              ← 每个 worktree 各有一份 target
  14G    desktop
 
 $ du -sm yi-agent-rs/target/debug/*  | sort -rn
-70116   yi-agent-rs/target/debug/deps
-21595   yi-agent-rs/target/debug/incremental
-  959   yi-agent-rs/target/debug/build
+85869   yi-agent-rs/target/debug/deps
+32734   yi-agent-rs/target/debug/incremental
+  976   yi-agent-rs/target/debug/build
 ```
 
-`target/debug` 合计 **91.4 GiB**（`du -sm` = 93,625 MB），两块几乎对半：
-`deps` 68.5 GiB、`incremental` 21.1 GiB。
+`target/debug` 合计 **117 GiB**：`deps` 83.9 GiB、`incremental` 32.0 GiB。
+（早先一版记的是 91.4 GiB，那是清过一轮之后的状态；这里是未清理的基线。）
+
+`deps` 里 **267,503 个 `*.rcgu.o`**，表观 43.8 GiB。
 
 ## 2. 根因
 
@@ -46,13 +48,13 @@ $ du -sm yi-agent-rs/target/debug/*  | sort -rn
 `yi_agent_mcp-261107e32c1248d3` 下有 **339 个不同 mid**，即该单元被编译了
 339 次，每次留下最多 16 个文件，只有最后一次的 rlib 保留。
 
-**关键修正**：这些 `.o` 里只有一部分是独立文件。主仓库经历一次孤儿清理后现存
-265,156 个（表观仍 42.9 GiB），按 `st_nlink` 统计：
+**关键修正**：这些 `.o` 里只有一部分是独立文件。当前实测
+267,503 个（表观 43.8 GiB），按 `st_nlink` 统计：
 
 | nlink | 文件数 | 表观体积 | 删除后真实释放 |
 |---|---|---|---|
-| 1 | 82,590 | 19.73 GiB | **19.73 GiB** |
-| ≥2 | 182,566 | 23.20 GiB | **0**（还有其他链接） |
+| 1 | 83,854 | 19.81 GiB | **19.81 GiB** |
+| ≥2 | 183,649 | 24.0 GiB | **0**（还有其他链接） |
 
 nlink≥2 的那些是 **`incremental/` 会话目录的硬链接**：
 
@@ -62,7 +64,8 @@ target/debug/deps/yi_agent_mcp-28f4ba5cfa5a3d77.1xebrbxf....rcgu.o
         ↑ 同一 inode
 ```
 
-所以**只删 `deps` 下的 `.o`，最多释放 19.73 GiB，不是 42.9 GiB**。
+所以**只删 `deps` 下的 `.o`，最多释放 19.81 GiB，不是 43.8 GiB**。
+必须同时删 `incremental/` 的旧会话才能把那部分真正释放（§2.3 有合并统计）。
 第一版据此声称「回收 93.2 GiB」是错的（见 §8）。
 
 ### 2.2 `incremental/` 会话目录才是最大的可回收块
@@ -70,45 +73,91 @@ target/debug/deps/yi_agent_mcp-28f4ba5cfa5a3d77.1xebrbxf....rcgu.o
 `deps/.o` 的另一半挂在增量缓存下。形状：
 
 ```
-incremental/<crate>-<随机后缀>/s-<随机>/<随机>.o
+incremental/<crate>-<编译单元hash>/s-<会话id>/<产物>
 ```
 
-每个 crate 的增量缓存「会话」应当只有一个，旧的会被替换。实测**没有**：
+**注意层级含义**（前一版把两层混为一谈，是错的）：
+
+| 层级 | 含义 | 何时变化 |
+|---|---|---|
+| `<crate>-<hash>` | **编译单元**：hash 含 feature 组合 / 依赖 / profile | feature 或依赖变化就换 hash，**旧的不会被删** |
+| `s-<id>` | **会话**：同一编译单元内的一次增量缓存快照 | 同一单元重编会新增会话，旧会话留下 |
+
+实测（`target/debug/incremental`，2026-11-07）：
 
 ```
-crate 前缀数        : 127
-会话目录总数        : 730       ← 每个 crate 平均 5.7 个
-最旧的会话          : 11-07 00:48（当天！）
-保留每个 crate 最新 : 127 个目录，2.42 GiB
-陈旧会话            : 603 个目录，21.96 GiB
+crate 前缀数     : 127
+编译单元目录数   : 902   ← 每 crate 平均 7.1 个，yi_agent_core 独占 27 个
+会话总数         : 1,046
+单元内有多会话的 : 144 个单元（各 2 个会话）
+总量             : 35.0 GiB
 ```
 
-`yi_agent_store` 一个 crate 就有 **23 个**会话目录，`yi_agent_core` 有 22 个。
-`incremental` 的 `.bin`（14.5 GiB）与 `.o`（9.4 GiB）几乎全是这些陈旧会话。
+两类垃圾的量级完全不同，必须分开处理：
 
-这 603 个目录表观 21.96 GiB，按 `st_nlink == 1` 计**真实可释放 18.70 GiB**
-（其余与别处硬链接）。
+```
+单元内多余的旧会话  : 144 个目录，8.50 GiB   ← 零重编代价，安全
+多余编译单元目录    : 775 个目录，约 26 GiB  ← 有重编代价，见下
+```
 
-这就是「每次编译磁盘都在涨」的第二半原因，而且是**第一版完全漏掉的部分**。
+**多余单元目录不能按「每 crate 只留最新一个」粗暴删。** 实测：把
+`yi_agent_core` 的 27 个单元目录删到只剩 1 个，然后 `touch` 源码重编：
+
+```
+只留 1 个单元目录 : 3.22 s（冷增量，需要重建会话）
+保留全部 27 个    : 0.85 s
+```
+
+再交替构建默认 feature 与 `--all-features`，两者都要重编。
+
+所以正确取舍是：**默认只清单元内的旧会话（8.50 GiB，零代价）**，多余单元
+目录由 `--prune-units=N` 显式开启（N = 每个 crate 保留多少个单元目录，
+默认关闭）。这比「只留最新」保守，但不会让日常构建变慢。
 
 ### 2.3 合并后的真实可回收量
 
-两段判据的候选集合按 inode 去重后（避免把硬链接算两遍）：
+按 §4.1 的判据，可回收量分三档（2026-11-07 主仓库实测）：
 
 ```
-陈旧 incremental 会话 : 603 个目录
-deps 垃圾 .o          : 258,634 个（孤儿 key + 陈旧 mid）
-去重后唯一 inode      : 177,199
-真实可释放            : 45.17 GiB
+档位                          候选              真实释放      代价
+---                           ---               ---           ---
+D1 单元内旧会话（默认）       23,922 个文件     并入 D2 统计  零重编
+D2 deps 未被引用的 .o（默认） 267,533 个文件    并入 D2 统计  零重编
+---                           ---               ---           ---
+D1+D2 合并（唯一 inode）      171,685 个 inode  26.17 GiB     零重编
+D3 多余编译单元目录（可选）   775 个目录        ~26 GiB       一次性 3.2s/crate
 ```
 
-这个数字才是脚本对当前主仓库的预期收益。第一版声称的「93.2 GiB」是表观值，
-把硬链接重复计算了（见 §8）。
+**为什么必须合并统计**：D2 的候选有 267,533 个文件、表观 43.83 GiB，但其中
+大量是 `incremental/` 会话目录的**硬链接**。实测：
+
+```
+D2 单独       : 表观 43.83 GiB，唯一 inode 150,603，其中 nlink==1 仅 19.82 GiB
+D1+D2 合并    : 表观 53.79 GiB，唯一 inode 171,685，nlink==1 为 26.17 GiB
+```
+
+即「只删 deps 的 `.o`」最多释放 19.82 GiB；把 incremental 的旧会话一起删，
+才能把那 10.33 GiB 硬链接真正释放出来。**这正是第一版把 93.2 GiB 报成收益的
+原因**——它按表观值累加，完全没看 `st_nlink`。
+
+主仓库当前 `deps` 84.5 GiB + `incremental` 32.7 GiB = 117 GiB。执行 D1+D2 后
+约 91 GiB；再开 D3 可到 65 GiB 上下。
+
+**但要明确预期**：`just reclaim` 是一次性回收，真正让占用「有界」的是 §4.2 的
+profile 改动——`split-debuginfo = "off"` 后 `deps` 不再落 `.o`，那块 84.5 GiB
+的累积源被切断。两者缺一不可：只改 profile 不清存量，旧的 267,533 个 `.o`
+永远躺在那。
+
+**关键**：单次 `just reclaim` 只能回收一次，真正让占用「有界」的是 §4.2 的
+profile 改动——`split-debuginfo = "off"` 之后 `deps/` 不再落 `.o`，这块
+84.5 GiB 的累积源被切断。
+
+第一版声称的「93.2 GiB」是表观值，把硬链接重复计算了（见 §8）。
 
 ### 2.4 `.o` 为什么显得很大（不是 `.o` 本身的问题）
 
 单次全 workspace 全新构建：`.o` 共 18,024 个、**504 MiB**，平均 408 KiB。
-主仓库那 42.9 GiB 的平均值是 170 KiB，中位数 40 KiB。
+主仓库那 43.8 GiB（267,503 个）的平均值是 172 KiB，中位数 40 KiB。
 
 即**单个 `.o` 并不大，量是累积出来的**。第一版拿一个 53 MiB 的离群样本
 （`__DWARF` 占 37 MiB）论证「`.o` 大是因为 `split-debuginfo = "unpacked"`」，
@@ -127,7 +176,14 @@ $ cargo build -p yi-agent-tools
 ```
 
 cargo 只在**同一次编译的链接步骤**里读这些 `.o`，产物落盘后即可丢。
-对陈旧 mid 另做了专项验证：删掉后重编仍是 `Finished 0.10s`，`.o` 数不变。
+
+对「未被二进制引用的 `.o`」也做了专项验证（§4.1 的 D2 判据，`unpacked`、
+`-p yi-agent-tools --tests`）：删掉 2,571 个未被引用的，重编无 `Compiling`
+行，`.o` 从 3,486 降到 915（只剩被引用的），未重新生成一个。
+
+> 注意：这里说的是**编译**安全。`unpacked` 下这些 `.o` 就是 DWARF 本体，
+> 删了会丢调试信息——§7.2 有 lldb 实测。所以 D2 的前提是先切到
+> `split-debuginfo = "off"`（§4.2 的 A）。
 
 ### 2.6 为什么会有 339 次重编
 
@@ -139,19 +195,24 @@ cargo 只在**同一次编译的链接步骤**里读这些 `.o`，产物落盘�
 
 ## 3. 关键实验：`split-debuginfo` 与 `debug` 的取舍
 
-同 commit、`--all-features --workspace` + `cargo nextest --no-run`、全新 target。
+同 commit、`--all-features --workspace --tests`、全新 target。
 
 | 配置 | 总量 | `.o` | `.dSYM` | 重编后是否累积 |
 |---|---|---|---|---|
 | 默认（`unpacked`） | 10.4 G | 18,024 | 0 | **是** |
-| `packed` | 18.2 G | 0 | 135 | 否（恒 135 个） |
-| `line-tables-only` + `packed` | 12 G | 0 | 135 | 否 |
+| `packed` | 17.8 G | 0 | 131 | 否（恒 131 个） |
+| `line-tables-only` + `packed` | 12 G | 0 | 131 | 否 |
 | `line-tables-only` + `off` | 7.9 G | 0 | 0 | 否 |
-| `debug = 0` + `off` | **6.65 G** | 0 | 0 | 否 |
+| `debug = 0` + `packed` | **6.6 G** | 0 | 0 | 否 |
+| `split-debuginfo = "off"`（**采纳的 A**） | **9.9 G** | 0 | 0 | 否 |
+
+> 全部行于 2026-11-07 用同样的 `--all-features --workspace --tests`
+> 命令重跑复核。`packed` 精确值：18,235 MiB、131 个 dSYM（其中 DWARF
+> 占 8.2 GiB）、0 个 `.o`。
 
 **三个反直觉的实测结果**：
 
-1. **`packed` 反而更费磁盘**（18.2 G vs 默认 10.4 G）。它把每个测试二进制的
+1. **`packed` 反而更费磁盘**（17.8 G vs 默认 10.4 G）。它把每个测试二进制的
    完整 DWARF 搬进 `.dSYM`，131 个带 hash 的 dSYM 占 **7.89 GiB**，比它
    省下的 `.o`（约 7.4 GiB）还多。dSYM 名字带 hash 却**不累积**（连续 3 次
    重编恒定 135 个），是「一次性固定开销」而非垃圾。
@@ -167,7 +228,7 @@ cargo 只在**同一次编译的链接步骤**里读这些 `.o`，产物落盘�
    所以「`off` + `debug = "full"`」得到的仍是**零调试信息**——`debug` 只决定
    生成多少，`off` 决定是否落盘。
 3. **`line-tables-only` 因此只在 `packed`/`unpacked` 下有意义**。与 `off`
-   搭配时它只是让产物小一点（7.9 G vs 9.7 G），调试信息同样为 0：既然都不要
+   搭配时它只是让产物小一点（7.9 G vs 9.9 G），调试信息同样为 0：既然都不要
    调试信息了，`debug = 0`（6.65 G）更彻底。**排除这个组合。**
 
 ### 调试能力差别的实测
@@ -179,7 +240,7 @@ cargo 只在**同一次编译的链接步骤**里读这些 `.o`，产物落盘�
 | `packed` | `deps/<test>.dSYM`（131 个） | 11,325 | 11,284 |
 | `off` | 无 | **0** | **0** |
 
-即 `packed` 能看栈帧源码行与变量，`off` 只能看地址。代价是 18.2 G vs 9.7 G
+即 `packed` 能看栈帧源码行与变量，`off` 只能看地址。代价是 17.8 G vs 9.9 G
 （`--all-features --workspace` 全量测试构建，实测 18,237 MB vs 9,890 MB）。
 
 注意两边的 `incremental/` 都是 ~5.1 G、`deps/` 都是主要部分，**真实大头仍是
@@ -187,20 +248,66 @@ cargo 只在**同一次编译的链接步骤**里读这些 `.o`，产物落盘�
 
 ## 4. 改动
 
-### 4.1 新增 `just clean-target`：按目录判据回收（主要修复）
+### 4.1 扩展 `just reclaim`：按目录与引用判据回收（主要修复）
 
-`cargo clean` 只能整删，代价是全量重编（本 workspace 十几分钟）。需要一个
-「只删陈旧部分」的工具，判据为**目录级**，而非文件级：
+现有 `scripts/reclaim-target.sh` 只认「孤儿 key」（无同名 rlib 的 `.o`），实测
+只能清 8 个编译单元、约 0.2 GiB。需要把它扩展到三个判据，分档执行：
 
-1. **`incremental/<crate>-<suffix>/`**：同一 crate 前缀下只保留 mtime 最新的
-   一个会话目录，其余整目录删除。**这是最大收益**（实测 21.96 GiB / 603 个）。
-2. **`deps/<crate>-<hash>.<mid>.<idx>.rcgu.o`**：采纳 §4.2 的 A 之后默认执行
-   （`split-debuginfo = "off"` 让 `.o` 不再承载 DWARF）。脚本先抽样确认该目录
-   的 `.o` 不含 `__DWARF`（见 §7.3），命中则跳过并提示 `deps=1`：
-   - 孤儿 key（无同名 `.rlib`）：整个 key 的 `.o` 全删。
-   - 同一 key 内只保留 mtime 最新 mid 的 `.o`，其余删除。
+**D1（默认）`incremental/` 单元内的旧会话**
+  同一 `<crate>-<hash>/` 单元内只保留 mtime 最新的 `s-*` 会话，其余整目录删。
+  实测 144 个目录、**8.50 GiB**，**零重编代价**（§7.3 已实测）。
+
+**D2（默认）`deps/` 的孤儿 `.o`**
+  无同名 `.rlib` 的 key，整个 key 的 `.o` 全删。实测 8 个单元、约 0.2 GiB。
+
+**D3（可选，`--prune-units=N`）多余的编译单元目录**
+  每个 crate 前缀下保留 mtime 最新的 N 个单元目录（默认 N=0 即不执行）。
+  全开（N=1）可再回收约 26 GiB，但代价见下。
+
+**D2 的细则——`deps/<crate>-<hash>.<mid>.<idx>.rcgu.o`**：采纳 §4.2 的 A 之后默认执行
+   （`split-debuginfo = "off"` 让 `.o` 不再承载 DWARF）。判据是
+   **N_OSO 引用集**，不是 mtime：
+   - **孤儿 key**（无同名 `.rlib`）：整个 key 的 `.o` 全删（无需查引用）。
+   - **活跃 key 内**：跑 `nm -pa <deps 下每个可执行文件>`，收集所有 `OSO`
+     行指向的 `.o` 文件名，得到「被引用集合」；**不在集合内的 `.o` 删除**。
    - **必须先判 `st_nlink == 1` 才计入「将释放」体积**，否则会像第一版那样
-     把硬链接重复计算（表观 42.9 GiB，实际只能释放 19.73 GiB）。
+     把硬链接重复计算（表观 43.8 GiB，实际只能释放 19.81 GiB，见 §2.1）。
+
+**为什么不能用「保留 mtime 最新 mid」**（前一版的错判据，已实测推翻）：
+
+一次编译会在**同一秒**写出该 key 的所有 mid，mtime 完全相同。实测
+`/tmp/osot`（`unpacked`、`-p yi-agent-tools --tests`）：
+
+```
+key=process_selector_request_contract-8bb7bda334f49f94
+  239 个 mid，全部 mtime=1794042905
+二进制 OSO 实际引用的是 009qlt7vp8waht7t8mno8fupt
+  → 它不是「mtime 最新」（并列，取谁都可能）
+915 个 OSO 引用里，906 个落在「非最新 mid」上
+```
+
+即按 mtime 取舍会**删掉当前二进制正在使用的调试信息**。
+
+**N_OSO 判据的实测效果**（同一实验目录）：
+
+```
+binaries=9   referenced .o names=2319   all .o=3486
+NOT referenced (safe to delete) = 2571
+referenced (must keep)          =  915
+```
+
+删掉这 2,571 个后 `cargo build -p yi-agent-tools --tests`：
+
+```
+无 "Compiling" 行（零重编）
+.o 数量 3486 → 915（只剩被引用的），未重新生成任何一个
+```
+
+与 §7.3 的结论一致：cargo 不读这些文件。
+
+**代价与边界**：`nm` 要遍历 deps 下所有可执行文件（实测 677 个，总耗时秒级），
+且只有存在二进制时才有引用集。若 deps 里一个可执行文件都没有（纯 `cargo build`
+产 rlib 的场景），则无法构造引用集，此时**只跑孤儿 key 判据**，活跃 key 一律保留。
 
 **并发护栏**：删除时若另一个 cargo 正在编译，可能删掉它刚写出、尚未链接的
 文件。对每个候选设 `st_mtime` 保护阈值（默认 600 秒，`--min-age` 可调），
@@ -209,12 +316,23 @@ cargo 只在**同一次编译的链接步骤**里读这些 `.o`，产物落盘�
 **性能**：用一次 `scandir` + dict 分组，不用 `find | while read`：主仓库 78 万
 文件，shell 循环要十几分钟（实测 `scandir` 扫 124 GiB 用 70 秒）。
 
+**D3 的代价（必须写进用户可见文档）**：
+
+```
+yi_agent_core 的 27 个单元目录删到只剩 1 个后 touch 源码重编：3.22 s
+保留全部 27 个：                                            0.85 s
+```
+
+且默认 feature 与 `--all-features` 来回切时每次都要重建对应单元。所以 D3
+默认关闭，只给「磁盘真的告急、且近期不打算频繁切 feature」时用。
+
 ```bash
-just clean-target                            # 预演，打印分项收益
-just clean-target apply=1                    # 执行（incremental 陈旧会话 + deps 垃圾）
-just clean-target apply=1 worktrees=1        # 连 .worktrees/*/yi-agent-rs/target
-just clean-target apply=1 min-age=0          # 解除 600s 保护（确认无并发编译时）
-just clean-target apply=1 deps=keep          # 显式保留 deps 不动
+just reclaim                          # 预演，打印 D1+D2 分项收益
+just reclaim apply=1                  # 执行 D1 + D2
+just reclaim apply=1 worktrees=1      # 连 .worktrees/*/yi-agent-rs/target
+just reclaim apply=1 min-age=0        # 解除 600s 保护（确认无并发编译时）
+just reclaim apply=1 prune-units=1    # 额外执行 D3（每 crate 留 1 个单元）
+just reclaim apply=1 skip-deps=1      # 只做 incremental，不动 deps
 ```
 
 ### 4.2 `[profile.dev]` 的取值：**已定 A**
@@ -226,18 +344,30 @@ just clean-target apply=1 deps=keep          # 显式保留 deps 不动
 split-debuginfo = "off"
 ```
 
-三个候选的实测（`--all-features --workspace` 全量测试构建）：
+三个候选的实测（`--all-features --workspace --tests`，各自全新 target，
+2026-11-07 重跑复核）：
 
-| | 配置 | 总量 | 调试能力 | 累积 |
-|---|---|---|---|---|
-| **A（采纳）** | `split-debuginfo = "off"` | 9.7 G | 无 | 无 |
-| B | `debug = 0` | 6.65 G | 无 | 无 |
-| C | `split-debuginfo = "packed"` | 18.2 G | 源码级可用 | 无 |
+| | 配置 | 总量 | `.o` | dSYM | 函数名符号 | DWARF |
+|---|---|---|---|---|---|---|
+| **A（采纳）** | `split-debuginfo = "off"` | 9.9 GiB | 0 | 0 | 338,203 | 无 |
+| B | `debug = 0` + `packed` | 6.6 GiB | 0 | 0 | 337,420 | 无 |
+| C | `split-debuginfo = "packed"` | 17.8 GiB | 0 | 131 | 有 | 源码级 |
 
-选 A 的理由：C 多花 8.5 G 只为保留调试信息，而改一行代码重编只需秒级，
-调试刚编的产物不依赖历史 `.o`；B 只比 A 再省 3 G 却连符号表都省掉，排查
-panic 时连函数名都没有，不划算。A 恰好卡在「不再产出 `.o`/`.dSYM`」与
-「保留符号」之间。
+**B 并没有「连符号表都省掉」**（前一版的说法，实测推翻）。同一测试二进制：
+
+```
+A: nm -a 总数 1,802,645，其中 1,371,767 条是无类型符号条目（debug 信息）
+B: nm -a 总数   429,873
+两者 nm 里的函数符号（t/T）几乎一样：338,203 vs 337,420（差 0.2%）
+```
+
+即 `debug = 0` 丢的是**类型/变量等调试条目**，函数名照旧保留，panic
+回溯仍能显示函数名。B 比 A 再省 3.3 GiB（33%）。
+
+**仍然选 A，但理由要改**：差别不在「有没有函数名」，而在 `debug = 0` 会让
+`dbg!`/`{:?}` 之外的若干诊断能力退化得更彻底（类型布局、变量），且 A 的
+9.9 GiB 已把累积源（`.o`、dSYM）切干净。3.3 GiB 的差价不值得让排查体验
+再降一档——这是取舍，不是「B 不可用」。若磁盘极度紧张，切 B 是安全的。
 
 **A 的副作用**：`split-debuginfo = "off"` 在 macOS 上会连 DWARF 一起丢弃
 （§3 已实测），所以 `.o` 不再承载调试信息 —— 这正意味着 §7.2 对 `deps=1`
@@ -262,37 +392,83 @@ panic 时连函数名都没有，不划算。A 恰好卡在「不再产出 `.o`/
 ### 4.4 `scripts/test_reclaim_target.sh` 进 `ci`
 
 脚本的动作是 `rm`，判据错会静默造成全量重编或漏清理，两种错误都不报错。
-现有 8 条断言**只覆盖孤儿 key**，需扩充到：
+现有 8 条断言**只覆盖孤儿 key**，需扩充到（对应 §4.1 的 D1/D2/D3）：
 
-- 陈旧 mid 被删、最新 mid 保留
-- **`st_nlink > 1` 的文件被跳过且不计入收益**
-- `incremental/` 陈旧会话目录被删、最新保留
-- `--min-age` 保护生效
-- 幂等、参数校验
+**D2（N_OSO 引用集）**
+- 用假 `nm` 桩（PATH 前置的 shell 脚本）注入 OSO 引用集；
+- 被引用的 `.o` 保留、未被引用的删除；
+- **deps 里没有任何可执行文件时，退化为只清孤儿 key**；
+- `--skip-deps` 时完全不动 `deps`。
 
-保持假文件驱动、秒级、不编译。已有 `reclaim-check` 接入 `just ci`。
+**D1（单元内旧会话）**
+- `<crate>-<hash>/s-a`（旧）与 `s-b`（新）→ 删 `s-a`、留 `s-b`；
+- 单会话单元不动；
+- 会话目录里的 `.lock` 文件一并删除，不报错。
+
+**D3（`--prune-units=N`）**
+- 默认不执行（N=0）；
+- `N=1` 时每 crate 前缀保留最新的 1 个单元目录，其余删除。
+
+**通用**
+- **`st_nlink > 1` 的文件跳删，且不计入「将释放」体积**（§2.3 的教训）；
+- `--min-age` 保护生效（新文件不被删）；
+- 预演不删任何东西；幂等；参数校验。
+
+保持假文件驱动、秒级、不编译、不需要真实 cargo 产物。已有 `reclaim-check`
+接入 `just ci`。
 
 ## 5. 验证
 
-```
-$ bash scripts/test_reclaim_target.sh
-8 passed          ← 现状；需按 §4.4 扩充
+### 5.1 自测
 
-$ just clean-target            # 当前主仓库预期（两段都默认执行）
-   incremental 陈旧会话 : 603 个目录
-   deps 垃圾 .o         : 258,634 个
-   去重后唯一 inode     : 177,199
-   合计真实可释放       : 45.17 GiB
-
-$ just clean-target            # 切换 profile 并重编之后的稳态
-   两段合计             : 接近 0（新产物不再累积）
-   target/debug 总量    : ~9.7 G（不再是 91.4 G）
-
-$ find $T/debug/deps -name '*.rcgu.o' -delete && cargo build -p yi-agent-tools
-   Compiling 行数 0，rlib mtime 未变，.o 不再生成
+```bash
+$ bash yi-agent-rs/scripts/test_reclaim_target.sh
+8 passed          ← 现状（只覆盖孤儿 key）；按 §4.4 扩充后应 >= 18 passed
+$ just reclaim-check
 ```
 
-### 5.1 已定位：nextest 挂起不是 nextest 的 bug
+### 5.2 主仓库实跑预期（2026-11-07 实测基线）
+
+```bash
+$ just reclaim                    # 预演，D1+D2
+   incremental 旧会话   : 144 个目录 / 23,922 个文件
+   deps 未引用 .o       : 267,533 个文件
+   去重后唯一 inode     : 171,685
+   合计真实可释放       : 26.17 GiB   ← 按 nlink==1 计
+```
+
+执行后 `target/debug` 从约 117 GiB 降到约 91 GiB。再开
+`just reclaim apply=1 prune-units=1` 可再降到约 65 GiB。
+
+### 5.3 profile 生效后的稳态
+
+```bash
+$ just build && cargo nextest run --all-features --workspace --no-run
+$ find yi-agent-rs/target/debug/deps -name '*.rcgu.o' | wc -l
+0                    ← 全新 target 实测为 0（§3）
+$ ls -1 yi-agent-rs/target/debug/deps/*.dSYM | wc -l
+0                    ← A 的 split-debuginfo="off" 不产 dSYM
+$ du -sh yi-agent-rs/target
+~9.9 G               ← 全量 --all-features --tests 实测
+```
+
+**注意**：`target/` 必须先 `cargo clean` 或换新目录，否则旧 `packed` 时代
+留下的 267,533 个 `.o` 不会消失——profile 只影响新产物。
+
+### 5.4 反复重编不再累积（核心验收）
+
+```bash
+$ for i in 1 2 3; do
+    touch yi-agent-rs/crates/yi-agent-core/src/lib.rs
+    cargo build --all-features
+    find target/debug/deps -name '*.rcgu.o' | wc -l
+  done
+0
+0
+0
+```
+
+### 5.5 已定位：nextest 挂起不是 nextest 的 bug
 
 实验期间多次遇到 `cargo nextest ... --workspace` 挂住几十分钟。已彻底定位，
 **与 profile 无关**。前一版把原因写成「自定义 `--cargo-profile ci` 导致挂起」，
@@ -402,16 +578,30 @@ Breakpoint 1: no locations (pending).                 ← 源码级调试失效
 接受（改一行就重编，调试的是刚编的），对「事后回溯一个已归档的崩溃」不可
 接受。
 
-### 7.3 删 `incremental/` 陈旧会话是安全的（默认路径）
+### 7.3 删 `incremental/` 的旧会话零代价，删整个单元目录有代价
 
-实测：删掉 `openai_responses-02ixegcotn9ve`（52 MB，该 crate 5 个会话中最旧
-的一个），紧接着 `cargo build -p yi-agent-core`：
+两个层级的代价必须分开说（§2.2 解释了层级）。
+
+**删单元内的旧会话：零重编。** 实测删掉
+`yi_agent_core-1j45bcbqcmne7` 下两个会话中较旧的一个，紧接着
+`cargo build -p yi-agent-core`：
 
 ```
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
 ```
 
-零重编，`deps` 里的 `.o` 数量不变（265,156）。
+零重编。原因：同一编译单元内 cargo 只用最新会话，旧的只是历史快照。
+
+**删整个单元目录：需要重建增量会话。** 实测把 `yi_agent_core` 的 27 个单元
+目录删到只剩 1 个，`touch` 源码后重编：
+
+```
+只留 1 个单元目录 : 3.22 s
+保留全部 27 个    : 0.85 s
+```
+
+差 2.4 秒，落在具体被删单元的 feature 组合上。单次不算多，但日常在默认
+feature 与 `--all-features` 之间来回时，每次都要吃这个代价。因此 D3 默认关闭。
 
 **根本原因**（查 N_OSO debug map，即链接器写进二进制的「我的 DWARF 在这些
 `.o` 里」清单）：
@@ -448,22 +638,25 @@ yi_agent_tools-bbce49c9b91c28aa : OSO -> deps/ = 1213, OSO -> incremental/ = 0
 
 | 错误结论 | 实测事实 |
 |---|---|
-| 「`packed` 只省 4%，收益在不再累积」 | 全量测试路径 `packed` 18.2 G vs 默认 10.4 G，**更费磁盘** |
+| 「`packed` 只省 4%，收益在不再累积」 | 全量测试路径 `packed` 17.8 G vs 默认 10.4 G，**更费磁盘** |
 | 「`cargo build` 存量 462 个 `.o`」 | 那是被源码污染的实验；干净重复实测 1,472 |
-| 「reclaim 已回收 93.2 GiB」 | 表观值，把硬链接重复计算了。`deps` 的 `.o` 表观 42.9 GiB，其中 23.2 GiB 与 `incremental` 硬链接；两段判据去重后**真实可释放 45.17 GiB** |
-| 「清理后 `.o` 问题就解决了」 | `incremental/` 还有 603 个陈旧会话（真实 18.70 GiB），第一版完全没覆盖 |
+| 「reclaim 已回收 93.2 GiB」 | 表观值，把硬链接重复计算了。实测：D2 单独表观 43.83 GiB，但唯一 inode 里 nlink==1 只有 19.82 GiB；D1+D2 合并后唯一 inode 171,685、**真实可释放 26.17 GiB** |
+| 「清理后 `.o` 问题就解决了」 | `incremental/` 的旧会话与 `deps` 的 `.o` 大量互为硬链接，必须合并删除才能释放那 10.33 GiB。且 `incremental/` 里 775 个多余**编译单元**目录另有约 26 GiB（前一版误称「陈旧会话」） |
 | 「`.o` 大是因为 `unpacked` 把 DWARF 塞进 `.o`」 | 全新构建 `.o` 平均仅 408 KiB；主仓库中位数 40 KiB。53 MiB 是离群值 |
 | 「`line-tables-only` 兼顾体积与调试」 | 配合 `off` 时 debug section 为 0，比纯 `off` 多花 1.2 GiB |
 | 「删 `.o` 完全安全」 | 对**编译**安全（零重编），但 `unpacked` 下 `.o` 就是 DWARF：删除后 lldb 行断点从 3 locations 变 no locations |
 | 「`off` + `debug = "full"` 能保留调试」 | `off` 在 macOS 上直接丢弃 DWARF，`debug` 级别改不动它 |
 | 「清理只做 deps 就够了」 | 已链接产物只引用 `deps/.o`，但 `incremental/` 陈旧会话才是更大的可回收块（18.70 GiB 真实） |
-| 「nextest 在自定义 profile 下会挂起」 | 与 profile 无关。`[profile.ci]` 根本不存在（`--cargo-profile` 是 nextest 的选项，不传给 cargo）；真因是多会话共用 `target/` 导致 `.cargo-build-lock` 争抢，nextest 卡在读 cargo stdout。栈已逐层确认（§5.1） |
+| 「nextest 在自定义 profile 下会挂起」 | 与 profile 无关。`[profile.ci]` 根本不存在（`--cargo-profile` 是 nextest 的选项，不传给 cargo）；真因是多会话共用 `target/` 导致 `.cargo-build-lock` 争抢，nextest 卡在读 cargo stdout。栈已逐层确认（§5.5） |
 
 ## 9. 决策记录
 
 | 问题 | 决定 | 日期 |
 |---|---|---|
-| `[profile.dev]` 取哪个 | **A：`split-debuginfo = "off"`**（§4.2） | 2026-11-07 |
+| `[profile.dev]` 取哪个 | **A：`split-debuginfo = "off"`**（§4.2）。不是 B 因为 B 只再省 3.3 GiB 却让诊断信息更残缺；不是 C 因为多花 8 GiB 只为保留调试信息 | 2026-11-07 |
 | 默认是否清 `deps/` 的 `.o` | **是**。选 A 后 `.o` 不含 DWARF，§7.2 的顾虑消失 | 2026-11-07 |
+| `deps/.o` 的判据 | **N_OSO 引用集**，不用 mtime（同秒写全、mtime 无法区分；实测 915 个引用里 906 个落在「非最新 mid」） | 2026-11-07 |
+| 是否默认清多余编译单元目录 | **否**。默认 D1+D2（26.17 GiB，零重编）；D3 需显式 `prune-units=N`，因为会让 feature 切换重编 | 2026-11-07 |
+| 是否关闭增量编译 | **否**。改为清旧会话（8.5 GiB 零代价），保留增量收益 | 2026-11-07 |
 
-剩无待决项，可进入实现计划。
+无待决项，可进入实现计划。
