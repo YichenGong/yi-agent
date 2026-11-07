@@ -136,17 +136,23 @@ pub fn run() {
         .build(context)
         .expect("error while building tauri application");
 
-    // Two policies run on every platform:
+    // Two desktop policies, applied on every run-loop event:
     //
     // * Closing the main window hides it instead of quitting, so the app keeps
     //   running in the Dock like every other Mac app. `Reopen` (the Dock click)
     //   only exists on macOS.
     // * A real quit (`Cmd+Q`, Dock → Quit, or the framework's own exit) first
     //   releases every project's runtime lease, in parallel, under one budget.
-    //   The drain is platform-independent: other platforms exit for real.
+    //
+    // Both belong to the desktop shell: iOS has no sidecar, no runtime leases
+    // (`runtime_lifecycle` is `cfg(desktop)`) and no window to hide, so the
+    // callback stays empty there and the framework handles the event alone.
     app.run(|app, event| {
+        #[cfg(desktop)]
         runtime_lifecycle::handle_run_event(app, &event);
         #[cfg(target_os = "macos")]
         window::handle_run_event(app, &event);
+        #[cfg(not(desktop))]
+        let _ = (app, event);
     });
 }

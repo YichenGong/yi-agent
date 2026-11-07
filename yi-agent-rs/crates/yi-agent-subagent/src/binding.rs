@@ -484,7 +484,11 @@ pub fn is_liveness_error(error: &IpcError) -> bool {
                 | std::io::ErrorKind::BrokenPipe
                 | std::io::ErrorKind::NotConnected
                 | std::io::ErrorKind::UnexpectedEof
+                // A read deadline is the peer saying "no reply yet". macOS
+                // reports it as `EAGAIN`, Linux as `TimedOut`; without both the
+                // self-heal path never ran for a timeout on macOS.
                 | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
         ),
         IpcError::TruncatedFrame { .. } => true,
         _ => false,
@@ -555,6 +559,42 @@ mod tests {
     #[test]
     fn a_frame_too_large_is_not_a_liveness_error() {
         assert!(!is_liveness_error(&IpcError::FrameTooLarge));
+    }
+
+    /// A read deadline is the transport telling us "no reply yet".
+    ///
+    /// macOS reports it as `EAGAIN` (`WouldBlock`), Linux may report `TimedOut`,
+    /// and neither used to count as a liveness failure -- so the self-heal path
+    /// that repairs a dead runtime and retries an idempotent request never ran
+    /// for a timeout on macOS.
+    #[test]
+    fn a_read_deadline_is_a_liveness_error() {
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::UnexpectedEof,
+        ] {
+            let error = IpcError::Io(IoError::new(kind, "no reply"));
+            assert!(is_liveness_error(&error), "{kind:?} must self-heal");
+        }
+    }
+
+    /// A timeout is *ambiguous*, never "the request never left".
+    ///
+    /// `never_left_the_client` decides whether a single-shot write may be resent
+    /// after a repair. A deadline fires on the read side, so the daemon may have
+    /// applied the request already; treating it as "never delivered" would let a
+    /// spawn happen twice.
+    #[test]
+    fn a_timeout_does_not_prove_the_request_never_left() {
+        for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock] {
+            let error = IpcError::Io(IoError::new(kind, "no reply"));
+            assert!(is_liveness_error(&error));
+            assert!(
+                !crate::thread_root::never_left_the_client_for_test(&error),
+                "{kind:?} must stay on the ambiguous side"
+            );
+        }
     }
 
     /// 陈旧 root 的判据：daemon 明确说「这个 session / root 我不认识」。

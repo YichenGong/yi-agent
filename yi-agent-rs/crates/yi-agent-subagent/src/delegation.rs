@@ -84,12 +84,13 @@ impl DelegationFailure {
     pub fn from_client(error: SessionClientError) -> Self {
         match error {
             SessionClientError::Rejected(failure) => Self::Refused(failure),
-            // Both transport kinds mean "no usable runtime" to a host that only
-            // reports why it could not prepare; the distinction matters to the
-            // recovery logic above, not to the model.
-            SessionClientError::Transport(message) | SessionClientError::Connect(message) => {
-                Self::Unavailable(message)
-            }
+            // All the non-decision kinds mean "no usable runtime right now" to a
+            // host that only reports why it could not prepare. A deadline is
+            // included: nothing was decided, and the recovery logic above is the
+            // layer that acts on the difference.
+            SessionClientError::Transport(message)
+            | SessionClientError::Timeout(message)
+            | SessionClientError::Connect(message) => Self::Unavailable(message),
             SessionClientError::Protocol(message) => Self::Unavailable(message),
         }
     }
@@ -553,6 +554,34 @@ mod tests {
                 "{ambiguous:?} may already have been applied; it must not be re-sent"
             );
         }
+    }
+
+    /// A deadline is not a transport fault, and it is not "never delivered".
+    ///
+    /// A `wait_agent` that blocks for two minutes is *supposed* to be quiet, so
+    /// the client's own deadline firing says only "not finished yet". It told
+    /// the model "the daemon is unavailable" instead, and the literal
+    /// "Resource temporarily unavailable (os error 35)" leaked through because
+    /// `IpcError::Io` is transparent.
+    #[test]
+    fn a_deadline_is_reported_as_a_timeout_not_a_dead_daemon() {
+        let timeout = SessionClientError::Timeout(
+            "the daemon did not answer within 135s (it may still be working)".into(),
+        );
+        assert!(timeout.is_timeout(), "a deadline must be recognisable");
+        assert!(
+            !timeout.never_reached_a_daemon(),
+            "the request was written; the daemon may already have applied it"
+        );
+        let text = timeout.to_string();
+        assert!(
+            text.contains("timed out"),
+            "the reason must say the wait expired: {text}"
+        );
+        assert!(
+            !text.contains("unavailable") && !text.contains("os error"),
+            "an expired wait is not a dead daemon: {text}"
+        );
     }
 
     /// A guardian's refusal is a decision, not a missing feature.

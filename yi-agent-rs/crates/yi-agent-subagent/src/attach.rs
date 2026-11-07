@@ -423,8 +423,16 @@ pub fn probe_runtime(socket_path: &std::path::Path) -> RuntimeProbe {
     }
 }
 
-/// Whether a connect failure means "no live daemon", as opposed to "we were not
-/// allowed to find out".
+/// Whether a *connect* failure means "no live daemon", as opposed to "we were
+/// not allowed to find out".
+///
+/// Only errors that can come out of `connect`/the very first read of a socket
+/// that never had a peer belong here. `TimedOut`/`WouldBlock` must not: an
+/// expired read deadline proves the peer *accepted* the connection and then
+/// stayed quiet, which is a busy daemon, not a dead one. The client normalises
+/// macOS `EAGAIN` into `TimedOut`, so listing it here made a slow probe report
+/// `Dead` -- and `ensure_owned_runtime` answers `Dead` by starting a
+/// replacement daemon.
 fn is_dead_io(error: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     matches!(
@@ -436,7 +444,6 @@ fn is_dead_io(error: &std::io::Error) -> bool {
             | ErrorKind::BrokenPipe
             | ErrorKind::NotConnected
             | ErrorKind::UnexpectedEof
-            | ErrorKind::TimedOut
     )
 }
 
@@ -946,6 +953,34 @@ mod tests {
             project_runtime_directory(std::path::Path::new("/tmp/project-a")),
             project_runtime_directory(std::path::Path::new("/tmp/project-b")),
         );
+    }
+
+    /// A read deadline is not proof the daemon died.
+    ///
+    /// `probe_runtime` sends `Status` and waits for the reply. A read deadline
+    /// firing means the connection was *accepted* and then stayed quiet: the
+    /// daemon is alive and busy, which is the opposite of dead. Classifying it
+    /// as `Dead` is not a harmless label -- `ensure_owned_runtime` answers `Dead`
+    /// by starting a replacement daemon, which would tear the runtime out from
+    /// under a delegation that is still running.
+    ///
+    /// The client now normalises a socket read deadline into `TimedOut` on every
+    /// platform (macOS says `EAGAIN`), so `TimedOut` must not appear here.
+    #[test]
+    fn a_read_deadline_does_not_prove_a_daemon_is_dead() {
+        use std::io::ErrorKind;
+        for alive_but_slow in [ErrorKind::TimedOut, ErrorKind::WouldBlock] {
+            assert!(
+                !super::is_dead_io(&std::io::Error::from(alive_but_slow)),
+                "{alive_but_slow:?} means the peer accepted and then went quiet"
+            );
+        }
+        for unreachable in [ErrorKind::NotFound, ErrorKind::ConnectionRefused] {
+            assert!(
+                super::is_dead_io(&std::io::Error::from(unreachable)),
+                "{unreachable:?} means nobody is listening"
+            );
+        }
     }
 
     /// Nothing is listening: the socket path does not resolve to a live daemon,

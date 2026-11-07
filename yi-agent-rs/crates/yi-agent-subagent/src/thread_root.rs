@@ -41,7 +41,8 @@ fn never_left_the_client(error: &yi_agent_store::ipc::IpcError) -> bool {
         // Only the errors a `connect` on a unix socket can produce before the request
         // is written. `ConnectionReset` / `ConnectionAborted` look similar but may
         // happen *during* a write that already reached the peer, so they stay on the
-        // ambiguous side. `TimedOut` and `UnexpectedEof` are read-side by construction.
+        // ambiguous side. `TimedOut` / `WouldBlock` / `UnexpectedEof` are read-side by
+        // construction: the request was written, so its outcome is unknown.
         IpcError::Io(io) => matches!(
             io.kind(),
             std::io::ErrorKind::NotFound
@@ -50,6 +51,16 @@ fn never_left_the_client(error: &yi_agent_store::ipc::IpcError) -> bool {
         ),
         _ => false,
     }
+}
+
+/// [`never_left_the_client`] for tests that only need this classification.
+///
+/// Exposed rather than duplicated so the "a timeout is ambiguous" rule is
+/// asserted against the real predicate: if a read deadline ever starts counting
+/// as "never delivered", a single-shot write would be resent after a repair.
+#[doc(hidden)]
+pub fn never_left_the_client_for_test(error: &yi_agent_store::ipc::IpcError) -> bool {
+    never_left_the_client(error)
 }
 
 /// 一条请求能否在身份层失败后被重发。
