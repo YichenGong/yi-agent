@@ -167,7 +167,7 @@ export function MessageInput({
    */
   conversationKey?: string;
 }) {
-  const [sending, setSending] = useState(false);
+  const [inflightKeys, setInflightKeys] = useState<readonly string[]>([]);
   // Latch: whether the popup should currently be offered. Escape clears it to
   // dismiss; typing re-arms it from the text's own shape (see onChange).
   const [popupOpen, setPopupOpen] = useState(false);
@@ -181,29 +181,33 @@ export function MessageInput({
   // thread happens to be visible when the request resolves.
   const latestDraft = useRef({ threadId, value });
   latestDraft.current = { threadId, value };
-  const submitting = useRef(false);
   /**
-   * 提交锁归属哪条会话。
+   * 在途提交的会话集合（既是「别重复发」的锁，也是 Send 置灰的依据）。
    *
-   * 一次提交的 `finally` 必须只清掉**它自己那条会话**的锁。否则：用户提交 A，
-   * 立刻切到 B 并提交，A 的回包落地时会把 B 的锁也解开——同一条消息就可能在
-   * 服务端被受理两次（spec §5.2「双击或重复 Enter 不重复发送」）。
+   * 必须是**按会话**的：本组件在所有会话之间复用同一个实例，一个全局布尔会让
+   * 甲会话的长请求（`/compact` 要调一次 provider 生成摘要、可以持续十几秒，且
+   * 客户端侧没有超时）把乙会话的 Send 一起冻住——现象就是「一个会话压缩，全局
+   * 都发不出消息」。
    *
-   * 旁支用 store 的收据管清稿，所以这里只负责「别重复发」这一件事。
+   * 集合同时解决了配对问题：`finally` 用**提交时捕获的** key 解锁，而不是用
+   * 回调那一刻的 `conversationKey`。否则用户在一次提交在途时切走，回包落地的
+   * 解锁会因为 key 不匹配而变成空操作，那条会话就被永久锁死了。
    */
-  const lockOwner = useRef<string | null>(null);
-  const holdsLock = () => submitting.current && lockOwner.current === conversationKey;
-  const takeLock = (): boolean => {
-    if (holdsLock()) return false;
-    submitting.current = true;
-    lockOwner.current = conversationKey;
+  const inflight = useRef(new Set<string>());
+  const enterInflight = (key: string): boolean => {
+    if (inflight.current.has(key)) return false;
+    inflight.current.add(key);
+    setInflightKeys([...inflight.current]);
     return true;
   };
-  const releaseLock = () => {
-    if (lockOwner.current !== conversationKey) return;
-    submitting.current = false;
-    lockOwner.current = null;
+  const leaveInflight = (key: string) => {
+    if (!inflight.current.delete(key)) return;
+    setInflightKeys([...inflight.current]);
   };
+  /** 当前会话是否有一次提交还没回包。只影响它自己的 Send。 */
+  const sending = inflightKeys.includes(conversationKey);
+  const takeLock = (): string | null => (enterInflight(conversationKey) ? conversationKey : null);
+  const releaseLock = (owner: string) => leaveInflight(owner);
   const clearSubmittedDraft = (submittedText: string) => {
     if (latestDraft.current.threadId === threadId && latestDraft.current.value === submittedText) {
       onDraftChange("", threadId);
@@ -269,14 +273,13 @@ export function MessageInput({
    */
   const handleSideSend = async () => {
     if (!text.trim() || disabled || onSubmitSide === null) return;
-    if (!takeLock()) return;
+    const owner = takeLock();
+    if (owner === null) return;
     const submitted = text;
-    setSending(true);
     try {
       await onSubmitSide(submitted);
     } finally {
-      releaseLock();
-      setSending(false);
+      releaseLock(owner);
     }
   };
 
@@ -284,16 +287,15 @@ export function MessageInput({
     // 附件本身就是一条消息：只要有文字**或**至少一个附件就可以发；两者都空时
     // 才拦住（空 turn 没有意义）。
     if ((!text.trim() && attachments.length === 0) || disabled) return;
-    if (!takeLock()) return;
-    setSending(true);
+    const owner = takeLock();
+    if (owner === null) return;
     try {
       const ok = await onSend(text);
       // Only discard the draft once the send was actually accepted; otherwise
       // the user's text would be lost on a rejected turn/start.
       if (ok) clearSubmittedDraft(text);
     } finally {
-      releaseLock();
-      setSending(false);
+      releaseLock(owner);
     }
   };
 
@@ -305,16 +307,15 @@ export function MessageInput({
    */
   const runSlash = async (name: string, args: string | null) => {
     if (disabled) return;
-    if (!takeLock()) return;
-    setSending(true);
+    const owner = takeLock();
+    if (owner === null) return;
     try {
       if (await onSlashCommand(name, args)) {
         clearSubmittedDraft(text);
         setPopupOpen(false);
       }
     } finally {
-      releaseLock();
-      setSending(false);
+      releaseLock(owner);
     }
   };
 
@@ -331,8 +332,8 @@ export function MessageInput({
       if (await onSideCommand?.(command)) clearSubmittedDraft(text);
       return;
     }
-    if (!takeLock()) return;
-    setSending(true);
+    const owner = takeLock();
+    if (owner === null) return;
     try {
       // `command` 分支（help/config/usage）也必须走 `onSideCommand`：它读的是
       // 旁支固定的脱敏配置与旁支自己的用量。转给 `onSlashCommand` 会把父的
@@ -343,8 +344,7 @@ export function MessageInput({
         setPopupOpen(false);
       }
     } finally {
-      releaseLock();
-      setSending(false);
+      releaseLock(owner);
     }
   };
 

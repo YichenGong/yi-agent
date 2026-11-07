@@ -601,7 +601,11 @@ export function useSideConversationController(
       const current = activeRef.current;
       bumpNavigation();
       entryIntent.current = null;
-      if (current !== null && current.kind === "main") return;
+      // 已经在主视图里也必须把 `parentId` 换成刚选中的那条：主视图的这个字段
+      // 就是「当前会话」的身份，输入框的会话键由它派生。提前返回会让切会话后
+      // 身份停在旧值——两条会话于是共用一个键，一次在途提交/长请求就能锁住
+      // 另一条的 Send。
+      if (current !== null && current.kind === "main" && current.parentId === parentId) return;
       setActiveBoth({ kind: "main", hostKey: binding.key, parentId });
     },
     [setActiveBoth, bumpNavigation],
