@@ -2132,14 +2132,37 @@ impl Guardian {
         deadline: &Deadline,
     ) -> io::Result<std::os::unix::net::UnixListener> {
         use std::os::unix::fs::FileTypeExt;
-        // Resolved through the lifecycle crate so this agrees with every client, and
-        // so an over-long path moves out of the runtime directory instead of failing
-        // `bind` with an error whose text never reaches a user (this process's stderr
-        // is discarded by the launcher).
-        let path = yi_agent_lifecycle::scope::control_socket(&self.scope.runtime_dir).map_err(
-            |too_long| io::Error::new(io::ErrorKind::InvalidInput, too_long.to_string()),
-        )?;
+        // Resolved from the scope this guardian already carries, not from the
+        // environment: the guardian *is* the authority on which instance it serves,
+        // and re-reading `YI_AGENT_HOME` here would let a stray variable in the
+        // launcher's environment bind a socket none of its clients look for.
+        let path = yi_agent_lifecycle::scope::guardian_socket(
+            &self.scope.runtime_dir,
+            &self.scope.instance_home,
+        );
+        if path.as_os_str().len() > yi_agent_lifecycle::scope::MAX_SOCKET_PATH_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the guardian control socket would be {} bytes, over the {}-byte sun_path limit: {}",
+                    path.as_os_str().len(),
+                    yi_agent_lifecycle::scope::MAX_SOCKET_PATH_BYTES,
+                    path.display()
+                ),
+            ));
+        }
         std::fs::create_dir_all(&self.scope.runtime_dir)?;
+        // The socket directory is new with this layout and nothing else creates it;
+        // without it `bind` fails with ENOENT, which names neither the directory nor
+        // the reason. This process's stderr is discarded by the launcher, so the error
+        // must be reported by the caller, not inferred later from a timeout.
+        if let Some(socket_dir) = path.parent() {
+            std::fs::create_dir_all(socket_dir)?;
+            std::fs::set_permissions(
+                socket_dir,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )?;
+        }
         if let Ok(metadata) = std::fs::symlink_metadata(&path) {
             if !metadata.file_type().is_socket() {
                 return Err(io::Error::new(

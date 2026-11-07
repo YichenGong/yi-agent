@@ -227,7 +227,11 @@ pub fn interpret(
 /// lifecycle crate owns the `sun_path` fallback, and a second copy of that rule here
 /// would eventually disagree with the one the guardian binds.
 pub fn control_path(scope: &RuntimeScope) -> PathBuf {
-    yi_agent_lifecycle::scope::control_path(&scope.runtime_dir)
+    // Derived from the scope, never from the environment. The guardian binds from the
+    // `YI_AGENT_INSTANCE_HOME` this process handed it, so a launcher that resolved the
+    // path some other way would probe a socket nobody binds -- and report the failure
+    // as a 30-second timeout instead of a path.
+    yi_agent_lifecycle::scope::guardian_socket(&scope.runtime_dir, &scope.instance_home)
 }
 
 /// Brings a runtime up (or reports why it cannot) using the real process,
