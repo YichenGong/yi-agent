@@ -271,9 +271,15 @@ export function PairingScreen({
   };
 
   const cancel = () => {
-    // 先失效再通知宿主：宿主可能在 `onCancel` 里立刻卸载本组件。
+    // 先失效再通知宿主：宿主可能在 `onCancel` 里立刻卸载本组件，晚到的结果
+    // 因此既不能落盘也不能跳转。
+    //
+    // 只失效本次尝试，不把 `mounted` 永久置 false：宿主未必立刻卸载（例如它
+    // 只是切走再切回同一个实例）。同时收掉进度：已放弃的兑换不该继续显示
+    // 「正在连接桌面…」，否则同一实例再挂回来时表单会永久停在 busy。
     invalidate();
-    mounted.current = false;
+    setBusy(false);
+    setScanning(false);
     onCancel?.();
   };
 

@@ -772,6 +772,9 @@ describe("PairingScreen pairing admission", () => {
         fireEvent.click(screen.getByRole("button", { name: "返回" }));
         expect(onCancel).toHaveBeenCalledTimes(1);
         // 宿主尚未卸载：必须由返回 handler 自身失效，不能靠 cleanup 掩盖。
+        // 同时表单必须恢复可用——否则同一实例被重新展示时永久停在 busy。
+        expect(screen.queryByRole("status", { name: "配对进度" })).toBeNull();
+        expect(f.submit.disabled).toBe(false);
       } else {
         view.unmount();
         render(<PairingScreen storage={storage} enableScan={false} />);

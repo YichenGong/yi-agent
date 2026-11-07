@@ -483,3 +483,19 @@ Task 1 审查提出的三项 Minor 中，两项可低成本收尾，已在最终
 
 第三项（`srcObject` 归属清理）在 Task 2 的 A11 中已有跨实例方向覆盖，本次补齐本实例
 正路径。此改动后前端全量 `npm test` = **2424 passed**，`npx tsc --noEmit` 干净。
+
+## 整分支审查：返回后的可复用性
+
+审查发现 `cancel()` 原先同时把 `mounted.current = false`，这超出了 spec §4.5
+（「使当前尝试失效」）。若宿主在 `onCancel` 里没有立刻卸载本组件（例如只是切走再
+切回同一实例），`runRedeem` 的首行守卫会让表单再也无法提交——一个不可恢复的死界面。
+
+已改为：`cancel()` 只 `invalidate()` 本次尝试，并把 `busy`/`scanning` 收敛回表单态，
+不永久关闭 `mounted`。晚到结果仍被 `current.active === false` 与
+`attempt.current !== current` 双重拦下。
+
+判别性：把这两行收尾删掉后，A16 的 `return-without-unmount` 两个分支变红
+（`Failed Tests 2`）；恢复后 40/40 通过。
+另在 A16 返回分支补了两条断言：进度节点消失、提交按钮重新可用。
+
+前端全量 `npm test` = **2424 passed**，`npx tsc --noEmit` 干净。
