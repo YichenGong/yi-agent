@@ -33,7 +33,7 @@ req2 tcp=0.000s tls=0.000s ttfb=0.249s
 
 ### 结构性原因
 
-`yi-agent-rs/crates/yi-agent-app-server/src/server/runtime_binding.rs:126`
+`yi-agent-rs/crates/yi-agent-app-server/src/server/runtime_binding.rs:144`
 的 `production_factory` 每构建一个会话就调一次 `bootstrap_agent` →
 `build_provider`，而 `OpenaiProvider::new` / `AnthropicProvider::new` 每次
 都调 `reqwest::Client::builder()...build()`，得到一个**独立的连接池**。
@@ -47,10 +47,10 @@ req2 tcp=0.000s tls=0.000s ttfb=0.249s
 
 ### 附带缺陷：通道缓存的作用域与注释不符
 
-`yi-agent-rs/crates/yi-agent-llm/src/openai/channel.rs:16` 的类型别名上写着
-「结果按 base_url 缓存（进程内共享）」，但
-`openai/client.rs:151` 实际是每个 provider 各自
-`Arc::new(Mutex::new(HashMap::new()))`。
+`yi-agent-rs/crates/yi-agent-llm/src/openai/client.rs:84` 的字段注释写着
+「网关能力判定缓存(`base_url` → 实际通道),**进程内共享**」，但
+`client.rs:151` 实际是每个 provider 各自
+`Arc::new(Mutex::new(HashMap::new()))`——注释描述的作用域与实现不符。
 
 后果：`api_style` 为 `null` 的条目（例如 `HORIZON-OG-Luna`）在**每个新会话**
 都要先打一次 `/responses` 拿到 404 才退回 chat，多付一个完整 RTT。实测那次
@@ -100,43 +100,58 @@ pub fn shared_client(
     timeout: Duration,
 ) -> Result<reqwest::Client, reqwest::Error> {
     let key = (base_url.to_string(), timeout);
-    if let Some(client) = clients()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-    {
-        return Ok(client.clone());
+
+    if let Some(client) = lookup(&key) {
+        return Ok(client);
     }
 
-    // 构建在锁外进行：`Client::builder().build()` 会初始化 TLS 后端，不该
-    // 让其它线程在这个锁上排队。
+    // 构建放在锁外：`build()` 会初始化 TLS 后端，不该让其它线程排队等它。
+    // `build()` 是同步的，此处没有 await 点，故不存在「持 std 锁跨 await」
+    // 的问题——真正的风险是并发重复构建，由下面的二次检查处理。
     let client = reqwest::Client::builder()
         .connect_timeout(timeout)
         .read_timeout(timeout)
         .build()?;
 
+    // 二次检查（双检锁）：并发首次调用时可能都构建出了 client。若先到者已经
+    // 写入，必须**丢弃自己刚构建的那个**并返回先到者——否则两个调用各自持有
+    // 独立连接池，永久失去复用，也永远无法满足「只建立一条连接」这个核心
+    // 不变量。丢弃一个 `Client` 只释放一个空池，代价远小于失去复用。
+    let mut guard = clients().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard.entry(key).or_insert(client);
+    Ok(entry.clone())
+}
+
+fn lookup(key: &ClientKey) -> Option<reqwest::Client> {
     clients()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(key, client.clone());
-    Ok(client)
+        .get(key)
+        .cloned()
 }
 ```
 
 要点说明：
 
-- **`Client` 的 clone 是廉价的**：`reqwest::Client` 内部是 `Arc`，clone 共享同一个
-  连接池。返回 owned 值而不是引用，避免在所有调用点引入生命周期。
+- **`Client` 的 clone 是廉价的**：已核实 `reqwest` 0.12.28 的
+  `#[derive(Clone)] pub struct Client { inner: Arc<ClientRef> }`，连接池在
+  `ClientRef.hyper` 内，clone 共享同一份池。返回 owned 值而不是引用，避免在所有
+  调用点引入生命周期。
+- **双检锁是为了保住不变量，不是为了省一次构建**：单层「锁内查 + 锁外构建 +
+  锁内插入」在并发首次调用时会互相覆盖，后写入者替换先写入者，两个调用方各自
+  拿到不同池。`entry().or_insert()` 保证任何时刻同一个键只对应一个池。
 - **锁用 `unwrap_or_else(|e| e.into_inner())`**：与本仓既有惯例一致（见
   `yi-agent-core/src/permission.rs:154`、`yi-agent-skills/src/service.rs:119`）。
   缓存表被 poison 不应让整个进程失去 HTTP 能力。
-- **构建在锁外**：`build()` 可能触发 TLS 后端初始化，持锁构建会让并发调用串行。
-  代价是极端并发下可能重复构建一次并覆盖写入——无害（两个 client 都可用），
-  且比串行化所有会话启动便宜。
 - **不加任何 `pool_*` 参数**：保持 `reqwest` 默认（`pool_idle_timeout = 90s`）。
   90s 空闲回收是有保护作用的——网关与 NAT 常在 60–120s 掐掉空闲 TCP，池里留着
   已被对端关闭的连接，复用时先撞 broken pipe 再重连，反而更慢。共享之后这条连接
   在正常对话中持续被使用，根本不会空闲到 90s。
+
+  已核实 `reqwest` 0.12.28 的默认值还包括 `tcp_keepalive = 15s` 与
+  `pool_max_idle_per_host = usize::MAX`（`async_impl/client.rs:298-303`）。
+  15s 的 TCP keepalive 探测能在连接真被中间设备掐断时尽早发现，这进一步说明
+  无需手动调参。
 
 ### 2. 两个 provider 改为取共享 client
 
@@ -160,15 +175,19 @@ let client = crate::http::shared_client(&base_url, timeout)
 错误类型与文案保持逐字一致，调用方行为不变。
 
 注意 `base_url` 必须在构造 client **之前**完成解析（`unwrap_or_else` 默认值 +
-`trim_end_matches('/')`），因为它是缓存键的一部分。现有代码已经是这个顺序，
-不需要调整。
+`trim_end_matches('/')`），因为它是缓存键的一部分。现有代码已经是这个顺序
+（`openai/client.rs:120`、`anthropic/client.rs:74`），不需要调整。
 
-**键用归一化后的 `base_url`**：`https://x/v1` 与 `https://x/v1/` 归一化后是同一个
-键，避免尾斜杠造成两份额外的池。
+**归一化只在 provider 构造处做一次，`shared_client` 不做。**
+`https://x/v1` 与 `https://x/v1/` 因为已被 `trim_end_matches('/')` 处理，到达
+`shared_client` 时必然相同，自然命中同一个键。不在 `shared_client` 里再 trim 一次
+的理由：两处归一化必须永远保持一致，而它们一旦分叉就会产生「看起来同键、实际
+两份额外池」的静默问题。单一职责点更安全。测试 3 用契约测试锁住这个决定。
 
 ### 3. `ChannelCache` 提升到进程级
 
-`openai/channel.rs` 的注释与实现已经不一致，本次让实现追上注释。
+`openai/client.rs:84` 的字段注释宣称「进程内共享」，而实现是每 provider 一份。
+本次让实现追上这条注释。
 
 把 `ChannelCache` 从「每个 provider 一个新表」改为进程级单表：
 
@@ -186,17 +205,29 @@ pub fn channel_cache() -> ChannelCache {
 构造处由 `Arc::new(Mutex::new(HashMap::new()))` 改为 `channel_cache()`。
 `resolve_channel` / `cache_channel` 的调用形态（`.lock()`）不需要改。
 
+**编译期连带影响（实现时必须处理，否则 `just ci` 的 clippy `-D warnings` 会红）**：
+改动后 `client.rs:3` 的 `HashMap` 不再被使用（它原本只服务于
+`channel_cache` 的构造），成为未使用导入；`Arc` 仍被 `effort_reject_cache`
+使用，不受影响。导入需收紧为 `use std::collections::HashSet;`。
+`OpenaiProvider` 的 `Debug` 实现是手写的且未列出 `channel_cache` 字段
+（`client.rs:90-99`），因此字段换类型不会影响它。
+
 **作用域风险与处理**：进程级表意味着「base_url 不支持 `/responses`」这个判定
 跨会话共享。这正是想要的——同一 gateway 的能力不会因为换了会话而变化。但测试
 里多个 wiremock server 各有独立 `base_url`，天然隔离；同一测试内复用一个
 `base_url` 且期望不同通道时需要注意，见「测试」一节。
 
-`effort_reject_cache` **保持每 provider 一份**：它的键里含 `model`，且语义是
-「这个模型在这个通道上拒绝过 effort」，与通道探测是两件事，本次不动。
+`effort_reject_cache` **保持每 provider 一份**，本次不动。理由要写清楚，否则
+它看起来像是漏改：它的键是 `(base_url, model, channel)`，语义是「这个模型在这个
+通道上拒绝过 effort」。跨 provider 共享它是**可以**省一次失败重投的（新会话不该
+重试一个已知被拒的档位），但那属于「effort 能力判定」的独立议题——本次只解决
+连接握手与通道探测，不把两件事绑在一起，免得将来调 effort 语义时被连接池的
+改动边界拖住。已在「不改动的部分」与后续议题中记录。
 
 ### 4. 不改动的部分
 
-- `probe.rs:70` 与 `probe.rs:154`：探测是「跑一次就扔」的短命对象，共享池收益
+- `probe.rs:71`（`probe_effort`）与 `probe.rs:154`（`detect_openai_channel`）：
+  探测是「跑一次就扔」的短命对象，共享池收益
   接近零；而且探测用的是整轮 cap 的 timeout，与正式对话语义不同。留待单独议题。
 - `yi-agent-tools/src/web/fetch.rs`、`bocha.rs`：抓网页/搜索，与 LLM 无关。
 - `bootstrap.rs`、`onboarding.rs` 等调用方：`build_provider` 的签名与语义不变，
@@ -221,34 +252,65 @@ pub fn channel_cache() -> ChannelCache {
 - **构建 client 失败**：不写入缓存，原样返回 `reqwest::Error`，由各 provider 映射成
   `ProviderError::Network(...)`，文案与今天一致。
 - **缓存表被 poison**：用 `into_inner()` 继续使用，不 panic、不降级为无缓存。
-- **并发首次调用**：可能在锁外各自构建一次，后写入者覆盖先写入者。两个 client 都
-  完全可用，且只在进程启动的最初几毫秒可能发生；不引入双检锁的复杂度。
+- **并发首次调用**：双检锁保证同一个键只留下一个池。并发时可能都构建一次，但
+  `entry().or_insert()` 让先写入者胜出，后到者丢弃自己的 `Client` 并返回先到者，
+  因此**所有调用方最终共享同一个池**。丢弃一个空池的代价是释放一次内存分配，
+  远小于失去连接复用。
 
 ## 测试
 
 `reqwest::Client` 的内部连接池无法从外部直接比较（没有 `PtrEq` 之类的出口），
 所以「是否复用」必须靠**可观测的连接数**来断言，而不是比较对象相等。
 
-为此新增一个测试辅助：`tests/common/conn_counter.rs`，用 `std::net::TcpListener`
-在后台线程跑一个极简 HTTP/1.1 keep-alive 服务，**记录 `accept()` 被调用了几次**。
+为此新增一个测试辅助：`tests/common/conn_counter.rs`，在后台跑一个极简 HTTP/1.1
+keep-alive 服务，**记录 `accept()` 被调用了几次**。
 
-选择裸 `TcpListener` 而不是 wiremock 的理由：wiremock 不暴露连接计数，而
-「只建立了一条连接」正是本次要验证的核心事实，必须能直接观测。裸 TCP 也避免了
-引入新依赖——用 `std` 的线程与监听套接字即可，不需要给 `tokio` 加 `net` feature。
+选择裸 TCP 而不是 wiremock 的理由：wiremock 不暴露连接计数（已核实 0.6.5 没有
+相关 API），而「只建立了一条连接」正是本次要验证的核心事实，必须能直接观测。
 
-该辅助服务对每个请求返回固定的 `Content-Length` 与 `Connection: keep-alive`，
-使客户端确实可以复用连接；同时累计路径计数，供 `ChannelCache` 测试使用。
+**实现用 `tokio::net::TcpListener`，不用 `std::net::TcpListener` + 线程**：
+本仓 `integration.rs:638` 与 `:706` 已有同样的先例（tokio TCP + 手写 HTTP 响应），
+配套的 `drain_request`（`integration.rs:596`）负责读完请求头与 body。
+tokio 版本便于在 `#[tokio::test]` 内运行，不必引入线程与跨线程计数。
+`tokio` 的 `net`、`io-util` feature 需补进 dev-dependencies
+（现有只有 `macros` / `rt-multi-thread`）。
+
+**必须复用 `drain_request` 的做法**：`integration.rs:592-595` 的注释记录了一个
+真实踩坑——若在关闭 socket 时仍有未读的入站数据，内核会发 RST，**截断已写出的
+响应体**，`reqwest` 会报解码错误而所有事件其实都已送达。计数服务若不读请求体
+（provider 每次 POST 都带 JSON body），同样会遇到这个 RST 截断，表现为难以
+归因的 `StreamError`。所以每个请求都必须「读头 + 按 `content-length` 读完 body」
+再回响应。
+
+响应格式必须**严格合法**，否则客户端不会复用连接：
+`HTTP/1.1 200 OK` + `content-length: N` + `\[empty line\]` + 恰好 N 字节 body。
+**不用 chunked**：裸 socket 手写 chunked 极易出错，而 `Content-Length` 已足以让
+一条 HTTP/1.1 连接保持可复用。响应体按 SSE 构造（`content-type: text/event-stream`，
+body 为 `data: {...}\n\ndata: [DONE]\n\n`），因为 `Provider::call()` 会
+`accumulate_stream`，要求流中出现 `finish_reason` 或 `[DONE]` 才正常结束
+（见 `openai/stream.rs:145`）；body 不合法会让测试以 `StreamError` 失败，
+掩盖真正要验证的连接复用。
+
+服务端需按顺序处理同一连接上的**多个**请求（keep-alive 语义），并把每个请求的
+`路径 → 次数` 记进共享计数表。
 
 ### 单元测试（`yi-agent-llm` 内）
 
 1. **同键复用连接（核心不变量）**：对同一 `(base_url, timeout)` 调两次
-   `shared_client`，各发一个请求，断言服务端 `accept()` 计数 == 1。
-   这是整次改动的根本目的，必须可执行验证。
+   `shared_client`，两个 client 各发一个请求，断言服务端 `accept()` 计数 == 1。
+   无法直接断言「两个 `Client` 指向同一池」——`reqwest::Client` 没有暴露内部的
+   `Arc<ClientRef>`，确实只能靠连接层的行为断言。这是整次改动的根本目的，
+   必须是可执行的验证。
 2. **不同 timeout 不复用**：`shared_client(url, 15s)` 与 `shared_client(url, 300s)`
    各发一个请求，断言 `accept()` 计数 == 2（两个键 → 两个池 → 两条连接）。
-3. **`base_url` 归一化**：以 `https://host/v1` 与 `https://host/v1/` 调
-   `shared_client`（传入前已 `trim_end_matches('/')`），断言命中同一个键——
-   即两条请求只产生 1 次 `accept()`。
+3. **归一化由调用方负责，`shared_client` 不做归一化**：这是一条**契约测试**，
+   不是行为测试。断言 `shared_client("http://h/v1", t)` 与
+   `shared_client("http://h/v1/", t)` 得到的是**两个不同键**（因此两条连接）。
+   这样写的原因：归一化发生在 provider 的 `new()` 里（`trim_end_matches('/')`），
+   到不了 `shared_client`。若反过来让 `shared_client` 也 trim，就会有两处归一化
+   逻辑必须永远保持一致——把职责留在唯一的入口（provider 构造）更好。
+   本测试的作用是**锁住这个设计决定**：将来有人想在 `shared_client` 里"顺手"
+   加归一化，这条测试会失败并提示先统一职责。
 4. **不同 `base_url` 互不干扰**：两个计数服务，各自的 client 请求只打到自己的
    服务（各自的 `accept()` 计数各自 +1，不串）。
 
@@ -260,33 +322,50 @@ pub fn channel_cache() -> ChannelCache {
    这条同时证明了「`api_key` 不在缓存键里是安全的」——不同密钥的请求确实走了
    同一条连接。
 6. **`ChannelCache` 跨 provider 共享**：用同一 `base_url` 构造两个 `api_style = Auto`
-   的 provider，第一个触发通道探测（`/responses` 返回 404），第二个发请求时
-   **不再打 `/responses`**。断言计数服务上 `/responses` 的路径计数 == 1，
-   `/chat/completions` == 2。
+   的 provider，第一个触发通道探测，第二个发请求时**不再打 `/responses`**。
+   断言计数服务上 `/responses` 的路径计数 == 1，`/chat/completions` == 2。
+
+   探测能被识别为「路由缺失」的前提是 404 **且 body 为空**
+   （`channel.rs:20` 的 `looks_like_missing_route`）；若 404 带 JSON body，
+   会被判成真实错误而不是回退信号。计数服务对 `/responses` 必须返回
+   `404` + 空 body + `content-length: 0`。
 
 ### 回归
 
-- 现有 `yi-agent-llm` 的 wiremock 测试全部保持通过。特别注意
-  `openai_integration.rs` 里依赖通道探测的用例：`ChannelCache` 变成进程级后，
-- **端口复用会让测试假通过**（进程级缓存引入的新隐患，必须显式防御）：
-  wiremock 的 `MockServer::start()` 拿的是 OS 随机端口，进程退出后该端口可能被
-  下一次测试重新分配。若某次测试的 `(base_url, timeout)` 与之前某次**完全相同**
-  （host 都是 `127.0.0.1`，端口偶然撞上，timeout 都是 300s），共享 client 会命中
-  一条已经死掉的连接池，测试就会以难解释的方式失败或（更糟）假通过。
+现有 `yi-agent-llm` 的 wiremock 测试必须全部保持通过。进程级缓存引入两个新的
+测试间耦合，都要显式处理：
 
-  **缓解**：不依赖端口随机性，而是让**每个测试用例的 `base_url` 在缓存键上天然
-  唯一**。做法是在 `base_url` 的**路径**里追加一个进程内唯一的测试段，例如
-  `{server.uri()}/v1/t{n}`，并让 wiremock 的 matcher 用 `path_regex("^/v1/t\d+/")`
-  而不是精确路径。这样缓存键不同（不会撞到别的用例的池），路由也仍然匹配。
+**（a）端口复用会让测试假通过。** wiremock 的 `MockServer::start()` 拿的是 OS
+随机端口；进程退出后该端口可能被下一次测试重新分配。若某次测试的
+`(base_url, timeout)` 与之前某次完全相同（host 都是 `127.0.0.1`、端口偶然撞上、
+timeout 都是 300s），共享 client 会命中一条已经死掉的连接池，测试就会以难解释的
+方式失败，或更糟——假通过。
 
-  不用查询串（`?t=n`）的原因：`base_url` 会被直接拼成
-  `format!("{base}{path}")`，带查询串时拼出的是 `...?t=1/chat/completions`，
-  路径解析错乱。查询串会污染拼接，不能用来做隔离。
+缓解不依赖端口随机性，而是让每个用例的 `base_url` 在缓存键上天然唯一：在
+`base_url` 的**路径**里追加一个进程内唯一的测试段，例如 `{server.uri()}/v1/t{n}`，
+wiremock 的 matcher 用 `path_regex("^/v1/t\\d+/")` 而不是精确路径。缓存键不同，
+路由仍然匹配。
 
-  这条规则只在测试里使用，生产代码不引入任何测试专用分支。
+不用查询串（`?t=n`）的原因：`base_url` 会被直接拼成 `format!("{base}{path}")`，
+带查询串时拼出的是 `...?t=1/chat/completions`，路径会解析错乱。
 
-  另外，`ChannelCache` 是多线程共享的 `HashMap`，测试并行执行时同一 `base_url`
-  的判定会互相覆盖。上面那条「`base_url` 天然唯一」的规则同时解决了这个问题。
+这一规则只在测试里使用，生产代码不引入任何测试专用分支。
+
+**（b）`ChannelCache` 跨用例串味。** 它就是一张进程级 `HashMap<String, Channel>`，
+测试并行执行时同一 `base_url` 的判定会互相覆盖。上面「`base_url` 天然唯一」的
+规则同时解决这个问题。
+
+**已核实的现状**（决定了改动量）：`provider_contract.rs` 显式传
+`api_style: Some("chat")`，绕过了 `Auto` 探测；`integration.rs` 的两处用
+`timeout: 400ms`，与其它用例的 `5s` / `30s` 天然分键。因此这些现有测试**不需要**
+改，只有新增测试要遵守上面的唯一 `base_url` 规则。
+
+**SSE 格式差异**：辅助计数服务要分别满足两个 provider 的终止条件——
+OpenAI chat 认 `data: [DONE]`（`openai/stream.rs:145`）或
+`finish_reason`；Anthropic 认 `event: message_stop`
+（`anthropic/stream.rs:265`）。辅助服务按请求路径
+（`/chat/completions`、`/v1/messages`、`/responses`）返回对应格式，
+否则测试会以 `StreamError` 失败而不是验证连接复用。
 
 ## 实现顺序（TDD）
 
