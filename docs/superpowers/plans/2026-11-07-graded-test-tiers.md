@@ -154,6 +154,18 @@ rc=$?
 grep -q 'cargo metadata failed' <<<"$err" || { printf '%s\n' "$err" >&2; fail "error must mention cargo metadata failure"; }
 n=$((n + 1)); pass "fails loudly when cargo metadata fails"
 
+# 同上，但 metadata 成功却报告零个 package（空 workspace / 输出被截断）
+cat >"$fakebin/cargo" <<'SH'
+#!/bin/sh
+echo '{"packages":[]}'
+SH
+chmod +x "$fakebin/cargo"
+err="$(env PATH="$fakebin:/usr/bin:/bin" "$SCRIPT" map <<<'yi-agent-rs/crates/yi-agent-core/src/a.rs' 2>&1 >/dev/null)"
+rc=$?
+[ "$rc" -ne 0 ] || { fail "map must fail when workspace has no members"; }
+grep -q 'no packages' <<<"$err" || { printf '%s\n' "$err" >&2; fail "error must say no packages"; }
+n=$((n + 1)); pass "fails loudly when workspace reports no members"
+
 printf '\n%d passed\n' "$n"
 ```
 
@@ -222,6 +234,12 @@ for pkg in doc["packages"]:
     print(pkg["name"])
 ' 2>/dev/null)"; then
         printf 'error: could not parse cargo metadata output\n' >&2
+        return 1
+    fi
+    # 解析成功但一个成员都没有：同样是「空成员列表 → 全部判 unmapped」。
+    # 正常 workspace 不会这样，但把这条路堵死才谈得上「读不到就报错」。
+    if [ -z "$names" ]; then
+        printf 'error: cargo metadata reported no packages for %s\n' "$manifest" >&2
         return 1
     fi
     printf '%s\n' "$names"
@@ -310,7 +328,7 @@ main "$@"
 cd yi-agent-rs && chmod +x scripts/test-tiers.sh && bash scripts/test_test_tiers.sh
 ```
 
-预期：输出 10 行 `ok: ...`，最后 `10 passed`，退出码 0。
+预期：输出 11 行 `ok: ...`，最后 `11 passed`，退出码 0。
 
 - [ ] **Step 5: 提交**
 

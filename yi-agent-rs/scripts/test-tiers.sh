@@ -52,6 +52,12 @@ for pkg in doc["packages"]:
         printf 'error: could not parse cargo metadata output\n' >&2
         return 1
     fi
+    # 解析成功但一个成员都没有：同样是「空成员列表 → 全部判 unmapped」。
+    # 正常 workspace 不会这样，但把这条路堵死才谈得上「读不到就报错」。
+    if [ -z "$names" ]; then
+        printf 'error: cargo metadata reported no packages for %s\n' "$manifest" >&2
+        return 1
+    fi
     printf '%s\n' "$names"
 }
 
