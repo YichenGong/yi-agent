@@ -32,6 +32,8 @@ yi-agent 的 Web 配置管理界面。通过 axum Web 服务器提供内嵌 HTML
   - 判据：`cargo test -p yi-agent-web --test api_test put_config_does_not_materialize_unset_fields`
 - [x] 单字段非法值返回 400 且整份不落盘，避免把别的字段一起写坏
   - 判据：`cargo test -p yi-agent-web --test api_test put_config_rejects_an_invalid_value_with_400`
+  - 运行参数即时生效（Task 2/14，交叉引用 `yi-agent-runtime.md` 同一项，**不重复计数**）：`api.rs::put_config`（`src/api.rs:153`）把 `settings::write_to` 放进 `spawn_blocking`，提交等实例写锁（最多 5 秒）时不再占住 async reactor；响应体、`invalid_document` / `settings_lock_timeout` / `settings_too_large` 错误码与状态码均未变。
+    - 判据：`cargo test -p yi-agent-web` → 11 passed、0 failed（日志 `.superpowers/sdd/2026-11-04-runtime-settings-live-apply-impl/logs/green-runtime-web.log`）
 - [x] 读取区分「未设置」与「设为默认值」：`value` 为 `null` 时同时给出 `default`，前端才画得出「未设置 · 默认 X」
   - 判据：`cargo test -p yi-agent-web --test api_test get_config_reports_null_for_unset_and_default_source`
 - [x] 删除「真实 LLM 测试」面板（职能由「设置 → 模型」+ `model/probe` 覆盖）— `assets/index.html` 移除该面板，相关路由一并删除

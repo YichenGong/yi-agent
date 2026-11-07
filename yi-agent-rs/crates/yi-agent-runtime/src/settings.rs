@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 pub mod document;
+pub mod store;
 
 /// 解析一行 `.env`，口径与 `dotenvy` 对齐。
 ///
@@ -803,115 +804,23 @@ pub fn write(patch: &serde_json::Value) -> Result<(), SettingsError> {
 /// 部分更新：`patch` 的键是点路径（`agent.max_turns`），值为 `null` 或 `""`
 /// 表示删除该键、回退默认。
 ///
+/// 这是 [`store::commit_patch`] 的兼容外壳：所有写入共享同一把实例写锁、同一次
+/// 持锁重读和同一个 `rename` 提交点，这里只丢弃回执。**不要再写第二个原子写
+/// 实现**——迁移、RPC 与 web 表单都经这里或 `commit_patch`。
+///
 /// **读-改-写，不是重建**：文件里的未知顶层键原样保留。这是 `env_file::write`
 /// 一号缺陷（保存时删掉不认识的键）的直接修复。
+///
+/// 与旧实现的差别（有意收紧，见 spec §8）：持锁重读后对**完整候选**做严格
+/// 校验。文件里既有的非法已知字段若未被本次 patch 修好，整批拒绝并列出键名，
+/// 而不是把坏候选保存成成功；反之，一次把所有坏字段都修好的 patch 可以正常
+/// 落盘。
 pub fn write_to(path: &Path, patch: &serde_json::Value) -> Result<(), SettingsError> {
-    let patch = patch
-        .as_object()
-        .ok_or_else(|| SettingsError::InvalidSetting {
-            key: "<root>".to_string(),
-            reason: "patch must be a JSON object".to_string(),
-        })?;
-
-    // 全部校验先做完：任何一项失败都零写入。
-    let mut ops: Vec<(&'static FieldSpec, Option<serde_json::Value>)> = Vec::new();
-    for (key, value) in patch {
-        let spec = find_spec(key).ok_or_else(|| SettingsError::InvalidSetting {
-            key: key.clone(),
-            reason: "unknown setting".to_string(),
-        })?;
-        ops.push((spec, validate_value(spec, value)?));
-    }
-
-    // 读底：文件存在却读不出来 → 拒绝覆盖（与 `save_catalog_to` 同一守卫）。
-    let mut object = match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|value| value.as_object().cloned())
-            .ok_or_else(|| {
-                SettingsError::Corrupt(format!(
-                    "{} exists but is not a readable JSON object",
-                    path.display()
-                ))
-            })?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
-        Err(error) => return Err(SettingsError::Io(error.to_string())),
-    };
-
-    for (spec, value) in ops {
-        apply_op(&mut object, spec.key, value);
-    }
-
-    // 跨字段：远端窗口不得长于宽限窗口。`validate_value` 是逐字段无状态的，
-    // 做不了这个判断，只能在这里做。
-    //
-    // 必须基于**合并后的完整对象**：用户可能只 patch 一个键（例如只把宽限改小），
-    // 此时远端窗口的生效值来自文件里的旧值。
-    //
-    // 但**不能**在这里调 `normalized()`：它自带的倒挂回落会把倒挂值清成 None，
-    // 于是下面的比较永远为假、任何倒挂都不会被拒绝。改为对两个字段各自做
-    // 单字段钳制（`within` 按 FieldSpec.min/max 判界），越界即当默认。
-    let merged_value = serde_json::Value::Object(object.clone());
-    let merged = match serde_json::from_value::<Settings>(merged_value) {
-        Ok(settings) => settings,
-        Err(error) => {
-            // `write_to` 只校验过「顶层是对象」，内层可能是结构性的坏
-            // （比如 `"agent": 5`）。这与「文件存在却读不出来 → 拒绝覆盖」
-            // 的守卫同向：宁可不写，也不把坏文件当默认值覆盖掉。
-            return Err(SettingsError::Corrupt(format!(
-                "the merged settings would not deserialize: {error}"
-            )));
-        }
-    };
-
-    // 只钳制、不做倒挂回落——否则本次要检查的倒挂会先被清掉。
-    // 不复用 `power_windows_minutes`：它要一个完整的 `&Settings`，
-    // 而这里手上只有两个 Option。直接算等价。
-    let grace_minutes = merged
-        .power
-        .idle_grace_minutes
-        .filter(|&value| within("power.idle_grace_minutes", value))
-        .unwrap_or(POWER_IDLE_GRACE_MINUTES_DEFAULT);
-    let remote_minutes = merged
-        .power
-        .remote_touch_minutes
-        .filter(|&value| within("power.remote_touch_minutes", value))
-        .unwrap_or(POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
-
-    // 只在本次 patch 触碰了这两个键时才拒绝。否则文件里既有的倒挂会让用户
-    // 连改 `agent.max_turns` 都失败——那是把人锁在文件外面。文件里的既有
-    // 倒挂由加载侧的 `normalized()` 静默回落并 warn，不影响写入。
-    let touches_power_windows = patch.contains_key("power.idle_grace_minutes")
-        || patch.contains_key("power.remote_touch_minutes");
-    if touches_power_windows && remote_minutes > grace_minutes {
-        return Err(SettingsError::InvalidSetting {
-            key: "power.remote_touch_minutes".to_string(),
-            reason: format!(
-                "must not exceed power.idle_grace_minutes \
-                 (the remote window {remote_minutes} is longer than the grace \
-                 {grace_minutes}, which would make the grace ineffective on battery)"
-            ),
-        });
-    }
-
-    // 删掉只剩空壳的分组对象，避免留下 {"agent":{}} 这种噪音。
-    for group in ["agent", "compact", "startup", "tui", "power"] {
-        if object
-            .get(group)
-            .and_then(|value| value.as_object())
-            .is_some_and(|inner| inner.is_empty())
-        {
-            object.remove(group);
-        }
-    }
-
-    let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
-        .map_err(|error| SettingsError::Io(error.to_string()))?;
-    write_atomically(path, &text).map_err(|error| SettingsError::Io(error.to_string()))
+    store::commit_patch(path, patch, store::PatchMode::ReplaceProvided).map(|_| ())
 }
 
 /// 校验单个值；`Ok(None)` 表示「删键」。
-fn validate_value(
+pub(super) fn validate_value(
     spec: &'static FieldSpec,
     value: &serde_json::Value,
 ) -> Result<Option<serde_json::Value>, SettingsError> {
@@ -973,7 +882,7 @@ fn validate_value(
 }
 
 /// 把一个点路径键套进顶层对象。`None` 表示删键。
-fn apply_op(
+pub(super) fn apply_op(
     object: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
     value: Option<serde_json::Value>,
@@ -998,42 +907,6 @@ fn apply_op(
             }
         }
     }
-}
-
-/// 临时文件 + `rename` + `0600`，与 `models.rs` 的 `save_catalog_to` 同一套。
-fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!("settings.json.{}.{}.tmp", std::process::id(), seq));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(text.as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&tmp, text)?;
-    }
-    std::fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1899,38 +1772,43 @@ malformed line
         let before = std::fs::read(&path).unwrap();
 
         // 只 patch 宽限（5 → 60 会合法；这里相反：把宽限压到 2，远端 5 就倒挂了）。
+        //
+        // 统一入口对完整候选做严格文档校验，跨字段错误因此报成
+        // `InvalidDocument`（点名远端窗口），而不是单字段的 `InvalidSetting`：
+        // 倒挂不是某个字段自身越界，而是两个字段合起来非法。
         let patch = serde_json::json!({"power.idle_grace_minutes": 2});
         let error = write_to(&path, &patch).unwrap_err();
         match error {
-            SettingsError::InvalidSetting { key, reason } => {
-                assert_eq!(key, "power.remote_touch_minutes");
-                assert!(
-                    reason.contains("must not exceed"),
-                    "reason should explain the cross-field rule, got {reason}"
-                );
+            SettingsError::InvalidDocument { keys } => {
+                assert_eq!(keys, vec!["power.remote_touch_minutes".to_string()]);
             }
-            other => panic!("expected InvalidSetting, got {other:?}"),
+            other => panic!("expected InvalidDocument, got {other:?}"),
         }
 
         let after = std::fs::read(&path).unwrap();
         assert_eq!(after, before, "a rejected write must not touch the file");
     }
 
-    /// 旧键不会因为「保存了别的字段」而消失——这是预期行为，不是 bug。
-    /// `write_to` 只对 patch 里出现的键调 `apply_op`，其余原样保留。
+    /// 一次无关写入会把旧别名规范化到新键——值不丢，旧键不残留。
+    ///
+    /// 统一入口写的是 `validate_document` 的规范原文，所以「只改别的字段」也会
+    /// 顺手把 `agent.prevent_idle_sleep` 搬到 `power.prevent_idle_sleep`。这是
+    /// 有意的收紧：旧键留着会让清空新键时旧值复活（见 store 的回归用例）。
     #[test]
-    fn migrate_legacy_key_stays_on_disk_after_other_writes() {
+    fn an_unrelated_write_normalises_the_legacy_alias() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_json(&dir, r#"{"agent":{"prevent_idle_sleep":"false"}}"#);
         write_to(&path, &serde_json::json!({"power.idle_grace_minutes": 30})).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["power"]["prevent_idle_sleep"], "false");
+        assert_eq!(value["power"]["idle_grace_minutes"], 30);
         assert!(
-            text.contains("agent"),
-            "the legacy key must survive an unrelated write, got {text}"
+            value.get("agent").is_none(),
+            "the emptied legacy group must be pruned, got {text}"
         );
-        assert!(text.contains("prevent_idle_sleep"), "got {text}");
-        // 而新值确实写进去了。
-        assert!(text.contains("idle_grace_minutes"), "got {text}");
+        // 迁移后的语义没有丢：开关仍是关。
+        assert!(!prevent_idle_sleep_enabled(&load_from(&path)));
     }
 
     /// 迁移结果可重放：把迁好的 Settings 整份写回，再读一次必须相等。
@@ -1977,26 +1855,51 @@ malformed line
         assert_eq!(remote, POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
     }
 
-    /// 文件里已有一对倒挂的手改值（宽限 5、远端 30）时，改**无关**字段
-    /// 仍须成功。否则用户手改坏了一对值之后就再也存不进任何设置——
-    /// 那是把人锁在文件外面。倒挂本身由加载侧 `normalized()` 回落。
+    /// 文件里已有一对倒挂的手改值（宽限 5、远端 30）时，写**无关**字段也被拒：
+    /// 统一入口不允许把未修复的非法候选保存成成功，但错误点名要修的键，用户
+    /// 因此能一次修好，而不是被锁在文件外面。
     #[test]
-    fn an_unrelated_write_succeeds_despite_an_inverted_pair_on_disk() {
+    fn an_unrelated_write_is_rejected_until_the_inverted_pair_is_repaired() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_json(
             &dir,
             r#"{"power":{"idle_grace_minutes":5,"remote_touch_minutes":30}}"#,
         );
-        write_to(&path, &serde_json::json!({"agent.max_turns": 123})).unwrap();
+        let before = std::fs::read(&path).unwrap();
 
-        let text = std::fs::read_to_string(&path).unwrap();
+        let error = write_to(&path, &serde_json::json!({"agent.max_turns": 123})).unwrap_err();
         assert!(
-            text.contains("123"),
-            "the unrelated write must land, got {text}"
+            matches!(&error, SettingsError::InvalidDocument { keys } if keys == &vec!["power.remote_touch_minutes".to_string()]),
+            "the unrepaired candidate must be rejected with the key to fix, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a rejected write must not touch the file"
+        );
+
+        // 同一次 patch 里把这对窗口一起修好即可落盘——用户不会被锁在文件外面。
+        write_to(
+            &path,
+            &serde_json::json!({
+                "agent.max_turns": 123,
+                "power.idle_grace_minutes": 30,
+                "power.remote_touch_minutes": 5,
+            }),
+        )
+        .unwrap();
+        let settings = load_from(&path);
+        assert_eq!(settings.agent.max_turns, Some(123));
+        assert_eq!(
+            (
+                settings.power.idle_grace_minutes,
+                settings.power.remote_touch_minutes
+            ),
+            (Some(30), Some(5))
         );
     }
 
-    /// 但触碰这对窗口就被拒——哪怕只是其中一个键。
+    /// 只把宽限压小（远端窗口保持不变）造成的倒挂同样被拒，且零写入。
     #[test]
     fn touching_an_inverted_pair_is_still_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2007,7 +1910,11 @@ malformed line
         let error =
             write_to(&path, &serde_json::json!({"power.idle_grace_minutes": 2})).unwrap_err();
         assert!(
-            matches!(error, SettingsError::InvalidSetting { .. }),
+            matches!(
+                &error,
+                SettingsError::InvalidDocument { keys }
+                    if keys == &vec!["power.remote_touch_minutes".to_string()]
+            ),
             "touching the inverted pair must be rejected, got {error:?}"
         );
     }

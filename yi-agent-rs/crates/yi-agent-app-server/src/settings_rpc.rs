@@ -84,9 +84,28 @@ fn type_name(field_type: FieldType) -> &'static str {
 }
 
 /// `settings/write` 的响应。校验失败时零写入。
+///
+/// 同步版本；异步调用方必须走 [`write_value_async`]，否则等实例写锁（最多 5 秒）
+/// 会直接占住 reactor 线程。
 pub fn write_value(path: &Path, patch: &Value) -> Result<Value, SettingsError> {
     settings::write_to(path, patch)?;
     Ok(json!({"ok": true}))
+}
+
+/// RPC 入口使用的异步外壳：把受管写入整个搬到阻塞线程池。
+///
+/// 写锁等待是同步睡眠，不能直接跑在 async 任务里。`spawn_blocking` 的 join
+/// 失败（panic / 运行时关闭）翻成受控 `Io` 错误，而不是让请求静默消失。
+pub async fn write_value_async(
+    path: std::path::PathBuf,
+    patch: Value,
+) -> Result<Value, SettingsError> {
+    match tokio::task::spawn_blocking(move || write_value(&path, &patch)).await {
+        Ok(result) => result,
+        Err(error) => Err(SettingsError::Io(format!(
+            "settings write task failed: {error}"
+        ))),
+    }
 }
 
 /// 把 `SettingsError` 翻成 RPC 错误。`invalid_setting` 是稳定词汇，UI 据此
@@ -160,6 +179,47 @@ mod tests {
                 spec.key
             );
         }
+    }
+
+    /// 受管写入必须真的离开 reactor：等 `flock` 期间定时器仍能按时触发。
+    ///
+    /// 抓的破坏：把 `write_value` 直接 `.await` 在 async 任务里。在单线程
+    /// runtime 上，5 秒的同步等锁会卡住整个 reactor，这个 50ms 定时器就只能
+    /// 在写之后才跑。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_write_runs_off_the_reactor() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        write_value(&path, &json!({"agent.max_turns": 1})).unwrap();
+
+        let lock = path.with_file_name(".settings.json.lock");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        let rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "the test must own the lock: {rc}");
+
+        // 在阻塞线程池里持有 flock 150ms 后释放：写请求会在这段窗口里等锁。
+        let release = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+
+        let write = tokio::spawn(write_value_async(
+            path.clone(),
+            json!({"agent.max_turns": 2}),
+        ));
+        // 定时器必须在写入完成之前到期。若写入占住 reactor，这里会先等到写
+        // 完成（或者永远等不到），断言随即失败。
+        tokio::time::timeout(std::time::Duration::from_millis(80), write)
+            .await
+            .expect_err("the write must still be waiting when the timer fires");
+        release.await.unwrap();
     }
 
     #[test]

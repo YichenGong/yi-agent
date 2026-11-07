@@ -130,8 +130,11 @@ pub struct PutConfigRequest {
 
 /// PUT /api/config — 接收部分更新。
 ///
-/// 空串与全空白串都表示「删掉这个键、回退默认」——由 `settings::write_to` 统一
-/// 处理，这里不另写一份判据。
+/// 空串与全空白串都表示「删掉这个键、回退默认」——由统一受管写入
+/// （`settings::store::commit_patch`）处理，这里不另写一份判据。
+///
+/// **收敛在 `spawn_blocking` 里执行**：提交可能为了实例写锁最多等 5 秒，直接在
+/// async 任务里做会占住 reactor 线程。响应形状与错误分类保持不变。
 pub async fn put_config(
     State(state): State<AppState>,
     Json(request): Json<PutConfigRequest>,
@@ -145,7 +148,20 @@ pub async fn put_config(
         patch.insert(item.key, value);
     }
 
-    match settings::write_to(&state.settings_path, &Value::Object(patch)) {
+    let path = state.settings_path;
+    let patch = Value::Object(patch);
+    let committed = tokio::task::spawn_blocking(move || settings::write_to(&path, &patch))
+        .await
+        .unwrap_or_else(|error| {
+            // `spawn_blocking` 的 JoinError：任务 panic 或运行时关闭。这不是
+            // 一次「零提交」的证明，但响应只能报内部错误；不要让 panic 冒到
+            // 连接层而丢掉 JSON 响应。
+            Err(SettingsError::Io(format!(
+                "settings write task failed: {error}"
+            )))
+        });
+
+    match committed {
         Ok(()) => (axum::http::StatusCode::OK, Json(json!({ "ok": true }))),
         Err(SettingsError::InvalidSetting { key, reason }) => (
             axum::http::StatusCode::BAD_REQUEST,

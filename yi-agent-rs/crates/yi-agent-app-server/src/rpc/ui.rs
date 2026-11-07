@@ -127,7 +127,12 @@ pub(crate) async fn handle(
                 .get("patch")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            match crate::settings_rpc::write_value(state.settings_path, &patch) {
+            // 受管写入在阻塞线程池里执行：等实例写锁是同步睡眠，直接在本
+            // async 任务里做会占住 reactor（`main` 循环也就发不出别的响应）。
+            let result =
+                crate::settings_rpc::write_value_async(state.settings_path.to_path_buf(), patch)
+                    .await;
+            match result {
                 Ok(value) => {
                     write_response(state.hub, state.client, ok_response(id, value)).await?
                 }
