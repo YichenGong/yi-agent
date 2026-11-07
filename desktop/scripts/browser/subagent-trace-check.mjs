@@ -489,9 +489,25 @@ try {
   await rm(profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
   report.finishedAt = new Date().toISOString();
   report.passed = report.failures.length === 0;
+  /*
+   * 零检查也算通过是假的通过。
+   *
+   * 曾经发生：旧 worktree 的 vite 还占着端口，新脚本连上了那台服务器却拿不到
+   * 约定页面，超时后 `failures` 仍为空，于是打出「PASS（0 checks, 0 matrix
+   * cells）」并以 exit 0 结束——一条验收都没跑却报告成功。这里要求矩阵与检查
+   * 都真的产出了条目，否则明确判失败。
+   */
+  if (report.checks.length === 0 || report.matrix.length === 0) {
+    report.passed = false;
+    report.failures.push({
+      label: "the run produced no checks",
+      reason: `checks=${report.checks.length} matrix=${report.matrix.length}; the page never loaded`,
+    });
+  }
   await mkdir(dirname(reportPath), { recursive: true });
   await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   console.log(`report: ${reportPath}`);
+  if (!report.passed) process.exitCode = 1;
   console.log(report.passed
     ? `PASS subagent trace browser checks (${report.checks.length} checks, ${report.matrix.length} matrix cells)`
     : `FAIL ${report.failures.length} check(s)`);
