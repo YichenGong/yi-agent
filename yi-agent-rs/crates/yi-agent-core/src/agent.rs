@@ -128,6 +128,21 @@ pub struct AgentConfig {
     /// waiting), and `Stream` (a connection reset mid-stream is not an idle
     /// transport hiccup).
     pub provider_error_retry_limit: u16,
+    /// 请求体超过它就执行同 path 去重（无损）。默认 2 MiB。
+    ///
+    /// 网关按字节拒绝超限请求（413），auto-compact 只按 token 触发，两者在
+    /// 图片多的长会话里相差三个数量级，故需要一道字节闸。
+    pub request_body_soft_limit: usize,
+    /// 请求体超过它就允许有损降级（把更旧的图换成占位文字）。默认 8 MiB。
+    /// 网关真实上限未知，故取值保守。
+    pub request_body_hard_limit: usize,
+    /// 硬阈值降级时保留原始分辨率的最近图片张数（按不同 path 计）。默认 3。
+    pub request_keep_full_images: usize,
+    /// 第 2 级降级用的图片缩放器。`None` = 无法缩放，直接退到占位（第 3 级）。
+    ///
+    /// 实现放在能依赖图像编解码库的 crate（`yi-agent-tools`）：`core` 不引
+    /// `image`，故此处只持有 trait 对象。
+    pub image_downscaler: Option<Arc<dyn crate::image_projection::ImageDownscaler>>,
     /// Whether thinking blocks from *previous* turns are replayed verbatim in
     /// each provider request (and kept on disk). Default `true` = today's
     /// behaviour, so the request body is byte-identical.
@@ -156,6 +171,10 @@ impl Default for AgentConfig {
             think_stall_retry_limit: 3,
             think_stall_backoff_base: std::time::Duration::from_secs(2),
             provider_error_retry_limit: 3,
+            request_body_soft_limit: 2 * 1024 * 1024,
+            request_body_hard_limit: 8 * 1024 * 1024,
+            request_keep_full_images: 3,
+            image_downscaler: None,
             preserve_thinking: true,
         }
     }
@@ -481,6 +500,13 @@ pub enum AgentError {
     /// The turn stops instead of accumulating without bound (spec §5.3).
     #[error("side conversation budget exhausted: {0}")]
     Budget(#[from] crate::run_budget::BudgetExceeded),
+    /// 请求体降级到底后仍超过硬阈值。此时发出去必然被网关以 413 拒绝，
+    /// 与其让用户看到一个来自上游的晦涩错误，不如在本地说清楚原因和出路。
+    #[error(
+        "request body {bytes} bytes still exceeds the {limit}-byte limit after degrading \
+         history images; start a new conversation or compact this one"
+    )]
+    RequestTooLarge { bytes: usize, limit: usize },
 }
 
 impl Agent {
@@ -1153,10 +1179,55 @@ async fn think_phase(
     } else {
         crate::thinking::strip_thinking_except_last_assistant(messages)
     };
+    // 请求体字节闸：网关按**字节**拒绝超限请求（413），而 auto-compact 只按
+    // token 触发，长会话里内联图片的 base64 能让两者相差三个数量级。这里只在
+    // 请求副本上降级：`session` 与落盘的 `.jsonl` 逐字不变（桌面端按 path 读回
+    // 原图渲染，故界面零影响）。
+    let projected = crate::image_projection::project_with(
+        &request_messages,
+        &crate::image_projection::ProjectionLimits {
+            soft_limit: config.request_body_soft_limit,
+            hard_limit: config.request_body_hard_limit,
+            keep_full_images: config.request_keep_full_images,
+        },
+        config.image_downscaler.as_deref(),
+    );
+    if projected.step != crate::image_projection::ProjectionStep::AsIs {
+        tracing::info!(
+            step = ?projected.step,
+            bytes_before = projected.bytes_before,
+            bytes_after = projected.bytes_after,
+            placeheld = projected.placeheld,
+            downscaled = projected.downscaled,
+            turn,
+            "request images projected to fit the body budget"
+        );
+        let _ = tx.try_send(AgentEvent::Notice {
+            level: NoticeLevel::Info,
+            text: format!(
+                "请求体 {} → {}（省略 {} 张、缩放 {} 张历史图片）",
+                human_bytes(projected.bytes_before),
+                human_bytes(projected.bytes_after),
+                projected.placeheld,
+                projected.downscaled
+            ),
+        });
+    }
+    // 兜底（阶梯最后一级）：降级到底仍超硬阈值时**不发**，本地说明原因。
+    // 发出去只会换来网关的 413，错误信息还远离真正的成因。
+    if projected.bytes_after > config.request_body_hard_limit {
+        let _ = tx
+            .send(AgentEvent::Error(AgentError::RequestTooLarge {
+                bytes: projected.bytes_after,
+                limit: config.request_body_hard_limit,
+            }))
+            .await;
+        return ThinkOutcome::Stopped;
+    }
     let req = ProviderRequest {
         model: config.model.clone(),
         system: config.system_prompt.clone(),
-        messages: request_messages,
+        messages: projected.messages,
         tools: tools.schemas(),
         params: config.gen_params.clone(),
     };
@@ -2191,6 +2262,19 @@ fn estimate_tokens(text: &str) -> u32 {
 }
 
 /// Estimate prefill tokens from the full request (system + tools + all messages).
+/// 人类可读的字节数，用于降级提示（`69.3 MB → 1.2 MB`）。
+fn human_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    let value = bytes as f64;
+    if value >= KIB * KIB {
+        format!("{:.1} MB", value / (KIB * KIB))
+    } else if value >= KIB {
+        format!("{:.0} KB", value / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn estimate_prefill_tokens(req: &crate::provider::ProviderRequest) -> u32 {
     let mut total = req.system.as_deref().map(estimate_tokens).unwrap_or(0);
     // Tools schema (name + description + input_schema JSON) is part of prefill.
@@ -2769,6 +2853,191 @@ mod tests {
                 ..Default::default()
             }
         }
+    }
+
+    /// 构造一张内联图片块（payload 大小可控）。
+    fn inline_image(path: &str, payload_bytes: usize) -> ContentBlock {
+        ContentBlock::Image {
+            source: crate::message::ImageSource::Base64 {
+                media_type: "image/jpeg".into(),
+                data: "A".repeat(payload_bytes),
+            },
+            detail: Default::default(),
+            path: Some(path.to_string()),
+        }
+    }
+
+    /// 一条含图片的 tool 往返，直接写进 `Session`：
+    /// assistant(tool_use) + tool(tool_result{图})。
+    fn image_history(path: &str, payload_bytes: usize, copies: usize) -> Vec<Message> {
+        let mut messages = vec![Message::user("复刻户型图")];
+        for index in 0..copies {
+            let id = format!("t{index}");
+            messages.push(Message::assistant(vec![ContentBlock::ToolUse {
+                id: id.clone(),
+                name: "view_image".into(),
+                input: serde_json::json!({ "path": path }),
+            }]));
+            messages.push(Message {
+                role: crate::message::Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: id,
+                    content: vec![
+                        ContentBlock::Text(format!("viewed {path}")),
+                        inline_image(path, payload_bytes),
+                    ],
+                    is_error: false,
+                }],
+            });
+        }
+        messages
+    }
+
+    /// 预置一段图片历史后，实际发出去的请求必须被压到硬阈值以下。
+    ///
+    /// 端到端证据：投影接在 `think_phase` 的请求构造点上。
+    #[tokio::test]
+    async fn request_body_stays_under_hard_limit_with_many_images() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let config = AgentConfig {
+            request_body_soft_limit: 100_000,
+            request_body_hard_limit: 100_000,
+            request_keep_full_images: 0,
+            ..Default::default()
+        };
+        let mut session = Session::new();
+        session.replace_messages(image_history("same.png", 3_000_000, 3));
+        let before = serde_json::to_vec(&session.messages().to_vec())
+            .unwrap()
+            .len();
+        let mut agent = Agent::new(provider.clone(), Arc::new(ToolRegistry::new()), config)
+            .with_session(session);
+
+        let events = collect_events_async(agent.run("continue".into()).await.unwrap()).await;
+        assert!(!events.is_empty(), "the run must produce events");
+
+        let requests = provider.recorded_requests();
+        let last = requests.last().expect("a request must have been issued");
+        let body = serde_json::to_vec(&last.messages).unwrap();
+        assert!(
+            before > 8_000_000,
+            "fixture must exceed the limit, got {before}"
+        );
+        assert!(
+            body.len() <= 100_000,
+            "request body {} must be projected under the 100000-byte hard limit",
+            body.len()
+        );
+    }
+
+    /// 阶梯最后一级：降级到底仍超硬阈值时必须**本地报错且不发送**。
+    ///
+    /// 场景：图片没有 `path`（旧数据）→ 既不能去重也不能占位（占位等于永久
+    /// 丢失，模型无法重取）；又没有可用缩放器 → 无从降级。此时发出去只会
+    /// 换来网关的 413，错误信息还远离真正成因。
+    #[tokio::test]
+    async fn oversized_body_is_refused_locally_instead_of_hitting_the_gateway() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let config = AgentConfig {
+            request_body_soft_limit: 100_000,
+            request_body_hard_limit: 100_000,
+            request_keep_full_images: 0,
+            ..Default::default()
+        };
+        let mut session = Session::new();
+        // 无 path 的图片：不去重、不占位，因此降级无从下手。
+        session.replace_messages(vec![
+            Message::user("look"),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "view_image".into(),
+                input: serde_json::json!({ "path": "a.png" }),
+            }]),
+            Message {
+                role: crate::message::Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: vec![
+                        ContentBlock::Text("viewed".into()),
+                        ContentBlock::Image {
+                            source: crate::message::ImageSource::Base64 {
+                                media_type: "image/png".into(),
+                                data: "A".repeat(3_000_000),
+                            },
+                            detail: Default::default(),
+                            path: None,
+                        },
+                    ],
+                    is_error: false,
+                }],
+            },
+        ]);
+        let mut agent = Agent::new(provider.clone(), Arc::new(ToolRegistry::new()), config)
+            .with_session(session);
+
+        let events = collect_events_async(agent.run("continue".into()).await.unwrap()).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::RequestTooLarge { .. }))),
+            "must report the oversized body locally, got {events:?}"
+        );
+        assert!(
+            provider.recorded_requests().is_empty(),
+            "an over-limit body must not be sent to the provider"
+        );
+    }
+
+    /// 投影只改请求副本：`session` 里的历史必须逐字不变。
+    #[tokio::test]
+    async fn session_history_is_not_mutated_by_projection() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let config = AgentConfig {
+            request_body_soft_limit: 100_000,
+            request_body_hard_limit: 100_000,
+            request_keep_full_images: 0,
+            ..Default::default()
+        };
+        let mut session = Session::new();
+        session.replace_messages(image_history("same.png", 3_000_000, 3));
+        let before = serde_json::to_vec(&session.messages().to_vec()).unwrap();
+        // 去掉尾部 `]`，只比较「这段历史自身」是否被逐字保留。
+        let before_slice = |bytes: &Vec<u8>| bytes[..bytes.len() - 1].to_vec();
+        let mut agent = Agent::new(provider.clone(), Arc::new(ToolRegistry::new()), config)
+            .with_session(session);
+
+        let events = collect_events_async(agent.run("continue".into()).await.unwrap()).await;
+        assert!(!events.is_empty(), "the run must produce events");
+
+        // `run` 会在这段历史之后**追加**本轮的 user prompt 与 assistant 回复，
+        // 这是正常行为；投影本身不得改动已经存在的前缀。
+        let after = serde_json::to_vec(&agent.session().messages().to_vec()).unwrap();
+        assert!(
+            after.starts_with(&before_slice(&before)),
+            "projection must not rewrite the existing history"
+        );
+
+        // 更强的判据：三张图的完整 payload 仍在会话里。
+        let payloads: Vec<usize> = agent
+            .session()
+            .messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .flat_map(|content| content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Image {
+                    source: crate::message::ImageSource::Base64 { data, .. },
+                    ..
+                } => Some(data.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(payloads, vec![3_000_000, 3_000_000, 3_000_000]);
     }
 
     fn collect_events(stream: BoxStream<'static, AgentEvent>) -> Vec<AgentEvent> {
@@ -5378,6 +5647,10 @@ mod tests {
             think_stall_retry_limit: 0,
             think_stall_backoff_base: std::time::Duration::from_secs(1),
             provider_error_retry_limit: 3,
+            request_body_soft_limit: 2 * 1024 * 1024,
+            request_body_hard_limit: 8 * 1024 * 1024,
+            request_keep_full_images: 3,
+            image_downscaler: None,
             preserve_thinking: true,
         };
         assert_eq!(config.model, "custom-model");

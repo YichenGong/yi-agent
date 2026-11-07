@@ -430,6 +430,12 @@ pub fn build_agent_config(
         compact_threshold: Some(cfg.compact_threshold),
         compact_user_budget_tokens: cfg.compact_user_budget_tokens,
         compact_tool_budget_tokens: cfg.compact_tool_budget_tokens,
+        // 请求体超限时的第 2 级降级：把超出「最近 N 张」的旧图缩到 1024 长边。
+        // 不注入也能工作（直接退到占位），但那样旧图对模型彻底消失；注入后
+        // 模型仍看得到缩略图。装配只此一处，各调用点不再各自设置。
+        image_downscaler: Some(std::sync::Arc::new(
+            yi_agent_tools::image_downscale::ImagePrepDownscaler::new(),
+        )),
         ..Default::default()
     }
 }
