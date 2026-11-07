@@ -726,7 +726,7 @@ where D: serde::Deserializer<'de> {
 
 ThreadStore 增加 `load_for_activation(&self, id: &str) -> io::Result<Option<LoadedThread>>` 与 `read_meta_for_activation(&self, id: &str) -> io::Result<Option<ThreadMeta>>`：激活读中，整个meta不存在可按旧历史兼容；文件存在但I/O、JSON或基线形状错误一律Err。与既有load共享读取实现、对本次读取的一份meta作决定，不能先严格预读再调用会重新读取/吞错的load。列举/搜索的既有宽容API可以保留，但resume/fork/重建不得通过它们把非法元数据变成缺失。
 
-- [ ] **Step 1: 写失败测试。** session_sandbox.rs 内表驱动：saved workspace/promotable + explicit read-only→read-only/false；saved read-only + explicit full→仍read-only/false；无saved/无trusted→只读回退告警。ThreadMeta旧json缺字段可读；对null、非法mode、错误类型、坏JSON和存在但不可读meta，通过真实load_for_activation/resume/fork入口断言拒绝激活，不只单测serde。合法缺字段冷历史可保守激活，可信热controller优先且落盘失败仍保有内存基线。新增字段后适配所有ThreadMeta构造字面量（含其他测试模块），不能等Task14才补编译。
+- [x] **Step 1: 写失败测试。** session_sandbox.rs 内表驱动：saved workspace/promotable + explicit read-only→read-only/false；saved read-only + explicit full→仍read-only/false；无saved/无trusted→只读回退告警。ThreadMeta旧json缺字段可读；对null、非法mode、错误类型、坏JSON和存在但不可读meta，通过真实load_for_activation/resume/fork入口断言拒绝激活，不只单测serde。合法缺字段冷历史可保守激活，可信热controller优先且落盘失败仍保有内存基线。新增字段后适配所有ThreadMeta构造字面量（含其他测试模块），不能等Task14才补编译。
 
 ```rust
 #[test]
@@ -740,13 +740,13 @@ fn wider_host_does_not_expand_saved_read_only() {
 
 定义 `SandboxBaseline::new(mode: &str, promotable: bool) -> Result<Self, String>` 为受控解析接口，错误仅模式类别不回显输入；read-only自动归一false。ResolvedSandboxBaseline 的 `baseline` 为公开内部字段，`warning: Option<SandboxBaselineWarning>`；warning枚举 `LegacyReadOnlyFallback` / `HostRestrictionApplied`。
 
-- [ ] **Step 2: RED。** Run `cargo test -p yi-agent-app-server --lib session_sandbox`、`cargo test -p yi-agent-app-server --lib sandbox_baseline`。新增RPC测试保存startup.sandbox后resume旧session不能套新默认，先观察旧代码变宽的失败。
-- [ ] **Step 3: 最小实现。** 新建会话用Task3当前默认+真实来源装配，激活工具/委派之前持久化实际base/promotable；不得取controller.effective的瞬时Yolo值。恢复/fork/合法重建把基线通过现有逐会话工厂上下文传入，不把某个会话写进共享cfg；临时上下文用RAII在正常/错误/panic展开时恢复，避免TLS泄漏。
+- [x] **Step 2: RED。** Run `cargo test -p yi-agent-app-server --lib session_sandbox`、`cargo test -p yi-agent-app-server --lib sandbox_baseline`。新增RPC测试保存startup.sandbox后resume旧session不能套新默认，先观察旧代码变宽的失败。
+- [x] **Step 3: 最小实现。** 新建会话用Task3当前默认+真实来源装配，激活工具/委派之前持久化实际base/promotable；不得取controller.effective的瞬时Yolo值。恢复/fork/合法重建把基线通过现有逐会话工厂上下文传入，不把某个会话写进共享cfg；临时上下文用RAII在正常/错误/panic展开时恢复，避免TLS泄漏。
 
 老热会话从可信controller读取并保存，失败仅告警、继续保有内存基线；冷旧历史无证据时只读不可提权、告警再固化。对当前显式CLI/env硬限制求更严格模式、可提权取AND；根规则复用原授权，不合并陌生根。元数据非法拒绝激活；基线持久化新会话失败不启动工具/委派。不要在设置保存时批量恢复会话/扫描历史。
 
-- [ ] **Step 4: GREEN。** Run `cargo test -p yi-agent-tools --lib sandbox`、`cargo test -p yi-agent-app-server --lib sandbox_baseline`、`cargo test -p yi-agent-app-server --lib thread_lifecycle`。额外故障注入：新基线写失败无激活，热基线写失败不取消现存运行；normal/yolo双向切换遵循固化promotable。
-- [ ] **Step 5: 文档/门禁/提交。** permission/app-server模块交叉引用明确兼容例外，message `fix: preserve session sandbox baselines across live defaults`。
+- [x] **Step 4: GREEN。** Run `cargo test -p yi-agent-tools --lib sandbox`、`cargo test -p yi-agent-app-server --lib sandbox_baseline`、`cargo test -p yi-agent-app-server --lib thread_lifecycle`。额外故障注入：新基线写失败无激活，热基线写失败不取消现存运行；normal/yolo双向切换遵循固化promotable。
+- [x] **Step 5: 文档/门禁/提交。** permission/app-server模块交叉引用明确兼容例外，message `fix: preserve session sandbox baselines across live defaults`。
 
 ## Task 10: 精确 settings 协议、错误分类和诊断
 

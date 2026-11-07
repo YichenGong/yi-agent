@@ -74,6 +74,18 @@
   - 判据：变异验证（把 `current_admission_limits` 的来源强制为 `None`）→ 上述 4 条全部变红，还原后恢复绿
   - 判据：`cargo test -p yi-agent-subagent --lib a_live_factory_exposes_admission_limits_that_follow_a_save` → 1 passed（无 binding 返回 `None`；有 binding 时读到 3/5，保存后同一来源读到 1/2）；`cargo test -p yi-agent-subagent --lib` → 105 passed；`cargo test -p yi-agent-store` → 全绿；`cargo test -p yi-agent-core --test subagent_scheduler` → 22 passed；`cargo clippy --all-targets -- -D warnings` 干净
 
+- [x] 会话沙箱基线固化与安全历史恢复（交叉引用于「运行参数即时生效」整项，**不重复计数**）：
+  `crates/yi-agent-app-server/src/session_sandbox.rs` 新增 `SandboxBaseline`（手写 `Serialize`/`Deserialize`，反序列化经 `new` 归一 `read-only ⇒ promotable=false`；错误只报类别不回显输入）、`resolve_resume_baseline`（信任序 `trusted_live > saved > 保守只读回退`，最后与显式宿主限制求交，只能更窄）、`resolve_activation_baseline`（额外处理「meta 由非 `thread/start` 路径懒创建、且无历史」这一合法无记录场景：采纳当前默认并固化）与 `new_session_baseline`。
+  `ThreadMeta` 新增 `sandbox_baseline: Option<SandboxBaseline>`，用 `deserialize_present_baseline` 区分「字段缺失」（旧 meta，可保守激活）与「存在但非法/`null`」（损坏，拒绝激活）。`ThreadStore` 新增 `read_meta_strict` / `read_meta_for_activation` / `load_for_activation`（与 `load` 共享同一份读取实现，只按 `MetaPolicy` 决定坏 meta 是重建还是报错）、`set_sandbox_baseline`。`fork_thread` 改用严格读，损坏源不再被洗成「无记录」的新会话，且继承源基线。
+  接线：`attach_delegation` 新增 `sandbox_baseline` 参数，只覆盖逐调用 `thread_cfg`（不写共享 `cfg`）；`start_thread_core` 计算一次基线、同时写 meta 与工具装配；`thread/resume` 与 `driver_resume` 从 meta 解析并在 `should_persist` 时回写（写盘失败仅告警，不阻断激活）；CLI `TuiSessionStore::create_new` 记录 `config.sandbox`。`SandboxController` 新增只读 `baseline()`（无 setter）。
+  - 判据：`cargo test -p yi-agent-app-server --lib session_sandbox` → 13 passed
+  - 判据：`cargo test -p yi-agent-app-server --lib baseline` → 17 passed（含 `resume_keeps_a_recorded_baseline_instead_of_todays_default`、`resuming_legacy_history_without_a_baseline_falls_back_to_read_only`、`resume_refuses_a_corrupt_baseline`、`a_fork_inherits_the_source_baseline`、`a_present_but_null_baseline_is_refused_at_activation`）
+  - 判据：`cargo test -p yi-agent-app-server --lib a_read_only_baseline_wins_over_todays_default_sandbox` → 1 passed；变异验证（忽略 `attach_delegation` 的基线覆盖）→ 变红，还原后绿
+  - 判据：变异验证（resume 忽略 `loaded.meta.sandbox_baseline` 而直接取 `cfg` 默认）→ `resuming_legacy_history_without_a_baseline_falls_back_to_read_only` 变红，还原后绿
+  - 判据：`cargo test -p yi-agent-app-server --lib fork` → 17 passed；`cargo test -p yi-agent-app-server --lib thread_lifecycle` → 45 passed；`cargo test -p yi-agent-tools --lib sandbox` → 9 passed
+  - 判据：`cargo test -p yi-agent-app-server --lib` → 1414 passed / 7 ignored；`cargo test -p yi-agent --bin yi-agent` → 891 passed / 1 ignored；`cargo clippy --all-targets -- -D warnings` 干净
+  - 已知边界：CLI/TUI 的**恢复**路径仍用启动时 config 装配（未消费基线），与 app-server 的 resume 不同；后续如需一致应单独接入，不在本项判据内。
+
 - [ ] 运行参数的全宿主接线（交叉引用于「运行参数即时生效」整项，**不重复计数**）：
   `src/bootstrap.rs` 新增 `bootstrap_agent_with_binding(cfg, mode, binding)`（生产入口）与三个复用件：`live_source_for(cfg, catalog, binding)`（用**同一个** composer 造每会话来源）、`composer_for(cfg, catalog)`（有目录句柄时用它的 composer，无 skills 时造无目录 composer，稳定上下文因此一致）、`attach_live_source(agent, source)`（`None` 时为空操作，静态调用方逐字节不变）。旧 `bootstrap_agent` 保留为静态 facade（`#[allow(dead_code)]` 标明是测试/无热更新调用方用的），行为与历史一致。
   `src/side_conversation/source.rs` 的 `EffectiveSideSource` 新增 `live: Option<Arc<dyn AgentSettingsSource>>`：旁问每轮 `Agent::new` 后挂父的共享来源，但 `revision`/`generation` 不变（保存不是生命周期变更），硬 `ManagedRunLimits` 与已消耗预算照旧；`runner.rs` 在 `start_turn` 里 `set_live_settings`。启动期快照与 app-server 冷读路径填 `None`（那时没有活跃父 agent，与设计「未装配的历史会话下次装配读最新值」一致）。
