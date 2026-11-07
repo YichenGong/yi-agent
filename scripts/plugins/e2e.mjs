@@ -208,6 +208,15 @@ export function verdictFor({ caseSpec, outcome, capabilities = {}, executorUnsup
   // 执行器自己说 unsupported 时优先信它：它知道哪些判据没被证明，退出码只知道
   // 「跑完了」。这是 A17 那种「证明了一部分」的用例唯一诚实的记法。
   if (executorUnsupported) return "unsupported";
+
+  // 声明了**永久缺口**的用例不可能整体通过：缺口是代码里还没有的那一段，
+  // 命令跑绿只证明「已实现的部分没问题」。这条曾经漏过——`permanentGap`
+  // 只影响文案、不影响判词，A08 于是把「限流未实现」记成了 pass。
+  const gap = caseSpec.permanentGap;
+  if (typeof gap === "string" && gap.trim() !== "" && outcome === "pass") {
+    return "unsupported";
+  }
+
   if (outcome === "pass") return "pass";
   if (outcome === "fail") return "fail";
 
@@ -309,8 +318,14 @@ export const OUTCOMES = Object.freeze(["pass", "fail", "missing"]);
 ///
 /// 命令是**字符串**而不是 argv 数组，因为映射表要能被人读懂、能直接复制到终端
 /// 里复算。这里自己拆分而不是过 shell，是为了让报告里的命令就是真正跑的那条：
-/// 过 shell 会引入引号、变量展开、管道这些无法从字符串反推的东西。
-export function parseCommand(raw) {
+/// 过 shell 会引入引号、管道这些无法从字符串反推的东西。
+///
+/// **`$VAR` / `${VAR}` 会被展开**，这曾经是一个真缺口：映射表里写着
+/// `bash scripts/verify-plugin-update.sh "$YI_AGENT_ACCEPTANCE_APP" .`，
+/// 但执行层不过 shell，变量原样当参数传下去，脚本收到的不是路径而是字面量
+/// `$YI_AGENT_ACCEPTANCE_APP`。展开只认 `env` 里真有的名字：未定义就报错，
+/// 不落成空串——空串会被下游读成「没给」，与漏配混在一起。
+export function parseCommand(raw, { env: lookup = process.env } = {}) {
   if (!isNonEmptyString(raw)) fail("a command must be a non-empty string");
   // 只支持前置 `FOO=bar` 形式的环境变量，够用且能一眼看懂。
   const tokens = raw.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
@@ -322,9 +337,32 @@ export function parseCommand(raw) {
     env[token.slice(0, split)] = token.slice(split + 1).replace(/^["']|["']$/g, "");
     index += 1;
   }
-  const rest = tokens.slice(index).map((token) => token.replace(/^["']|["']$/g, ""));
+  const rest = tokens
+    .slice(index)
+    .map((token) => expandVariables(token.replace(/^["']|["']$/g, ""), lookup));
   if (rest.length === 0) fail(`command has no executable: ${raw}`);
   return { command: rest[0], args: rest.slice(1), env };
+}
+
+/// 展开一个参数里的 `$VAR` / `${VAR}`。
+///
+/// 未定义的名字**报错**而不是留空：留空会让 `--remote-path ""` 混进「没给」
+/// 的情况，报告里就看不出是漏配还是故意留空。`$$` 保持字面量，给需要真的写
+/// 一个 `$` 的场合留出口。
+export function expandVariables(token, lookup = process.env) {
+  return token.replace(/\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (
+    whole,
+    braced,
+    bare,
+  ) => {
+    if (whole === "$$") return "$";
+    const name = braced ?? bare;
+    const value = lookup?.[name];
+    if (value === undefined) {
+      fail(`command references $${name}, which is not set in the environment`);
+    }
+    return String(value);
+  });
 }
 
 /// 缺这个可执行文件，就说明这条命令不可能有意义地跑起来。
@@ -356,7 +394,7 @@ export function runCommand(
     unsupportedExitCodes = null,
   } = {},
 ) {
-  const parsed = parseCommand(raw);
+  const parsed = parseCommand(raw, { env });
   // 每条命令可以声明自己的工作目录。cargo 与 fault-matrix 都必须在
   // `yi-agent-rs/` 里跑；从仓库根跑得到的是「找不到 Cargo.toml」，那种错误
   // 会被读成实现失败，而真正的问题是工作目录。相对路径按传入的 `cwd` 解析。

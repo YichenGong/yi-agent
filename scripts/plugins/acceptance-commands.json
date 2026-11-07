@@ -28,7 +28,7 @@
       "commands": [
         {
           "kind": "artifact",
-          "run": "bash scripts/verify-plugin-update.sh \"$YI_AGENT_ACCEPTANCE_APP\" .",
+          "run": "bash yi-agent-rs/scripts/verify-plugin-update.sh \"$YI_AGENT_ACCEPTANCE_APP\" .",
           "needs": [
             "yi-agent-rs/target/debug/yi-agent",
             "yi-agent-rs/target/debug/plugin-pack"
@@ -99,13 +99,13 @@
         },
         {
           "kind": "command",
-          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --app desktop/src-tauri/target-probe/release/bundle/macos/yi-agent.app --output .artifacts/plugins/probe.json",
+          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --app desktop/src-tauri/target-probe/release/bundle/macos/yi-agent.app --output .artifacts/plugins/probe-a08.json",
           "unsupportedExitCodes": [
             2
           ]
         }
       ],
-      "unsupportedWithout": null
+      "permanentGap": "rate limiting of a page that floods host messages is not implemented (no throttle exists in plugin_host), so the flood-bounded half of A08 cannot be proven by any run; the interaction, recovery and sizing cases are covered by the probe"
     },
     {
       "id": "A09",
