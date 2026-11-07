@@ -886,7 +886,14 @@ impl AgentSupervisor {
         // The fork prefix is a one-shot seed: take it as the `WorkerStart` is
         // assembled, so the supervisor does not retain a forked child's whole
         // transcript for the daemon's life.
-        let fork_messages = self.take_fork_messages(task_id);
+        //
+        // It is also where the task boundary is attached. Doing it here, at
+        // the single exit every factory passes through, means an in-process
+        // child and a cross-process executor child get the same seed, and a
+        // caller cannot forget the marker when it uploads a fork payload.
+        let fork_messages = self
+            .take_fork_messages(task_id)
+            .map(super::fork_context::forked_seed);
         let workspace_mode = self.workspace_mode(task_id);
         let inherited_sandbox = self.inherited_sandbox(task_id);
         let extra_roots = self.extra_roots(task_id).unwrap_or_default();
@@ -2992,9 +2999,16 @@ mod tests {
             .unwrap()
             .take()
             .expect("the factory received a WorkerStart");
+        let seed = request.fork_messages.expect("the fork prefix is forwarded");
         assert_eq!(
-            request.fork_messages,
-            Some(vec![Message::user("parent said")])
+            seed.len(),
+            2,
+            "the recorded history is forwarded unchanged, plus the boundary"
+        );
+        assert_eq!(
+            seed[0],
+            Message::user("parent said"),
+            "the recorded history must be forwarded verbatim"
         );
         assert!(
             supervisor.fork_messages(&child).is_none(),
@@ -3047,5 +3061,53 @@ mod tests {
             .take()
             .expect("the factory received a WorkerStart");
         assert!(request.fork_messages.is_none(), "fork is opt-in");
+    }
+
+    #[tokio::test]
+    async fn a_forked_worker_receives_its_inherited_history_closed_by_a_boundary() {
+        use crate::message::{ContentBlock, Role};
+        let mut supervisor =
+            AgentSupervisor::new_with_objective(RootSessionId::new(), "obj".into());
+        let child = spawn_child(&mut supervisor);
+        supervisor.set_fork_messages(
+            &child,
+            vec![
+                Message::user("parent said"),
+                Message::assistant(vec![ContentBlock::Text("parent working".into())]),
+            ],
+        );
+
+        let captured = Arc::new(Mutex::new(None));
+        let factory = CapturingWorkerFactory {
+            start: captured.clone(),
+        };
+        supervisor.start_worker(&factory, &child).await.unwrap();
+
+        let request = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the factory received a WorkerStart");
+        let seed = request
+            .fork_messages
+            .expect("a forked worker must receive its inherited history");
+
+        assert_eq!(
+            seed.len(),
+            3,
+            "two inherited messages plus the boundary marker"
+        );
+        assert_eq!(
+            seed.last().unwrap().content,
+            vec![ContentBlock::Text(
+                crate::subagent::fork_context::SUBAGENT_FORK_BOUNDARY.into()
+            )],
+            "the worker's seed must end on the task boundary, not on the parent's last turn"
+        );
+        assert_eq!(
+            seed.last().unwrap().role,
+            Role::User,
+            "the boundary must be a user turn so the objective follows as user"
+        );
     }
 }

@@ -313,8 +313,24 @@ fn fork_true_spawns_a_child_whose_first_request_carries_the_caller_history() {
     );
     assert_eq!(
         fixture.first_request_message_count(),
-        2,
-        "one inherited history message plus the objective"
+        3,
+        "inherited history, the task boundary, and the objective"
+    );
+
+    // The boundary is the load-bearing part: without it the child reads the
+    // parent's tail as its own next step. It must sit between the two, so the
+    // ordering itself tells the model where the background ends.
+    let boundary = texts
+        .iter()
+        .position(|text| {
+            text.contains(yi_agent_core::subagent::fork_context::SUBAGENT_FORK_BOUNDARY)
+        })
+        .unwrap_or_else(|| {
+            panic!("the child's first request must close the history with a boundary: {texts:?}")
+        });
+    assert!(
+        history < boundary && boundary < objective,
+        "the boundary must separate the inherited history from the objective: {texts:?}"
     );
 
     // The caller's own session is untouched: a fork copies, it does not move.
@@ -429,6 +445,16 @@ fn a_forked_read_only_child_still_receives_the_history() {
         texts.iter().any(|text| text.contains(PARENT_HISTORY)),
         "a read-only forked child must still carry the history: {texts:?}"
     );
+    assert!(
+        texts.iter().any(
+            |text| text.contains(yi_agent_core::subagent::fork_context::SUBAGENT_FORK_BOUNDARY)
+        ),
+        "a read-only forked child must still get the task boundary: {texts:?}"
+    );
     assert!(texts.iter().any(|text| text.contains(OBJECTIVE)));
-    assert_eq!(fixture.first_request_message_count(), 2);
+    assert_eq!(
+        fixture.first_request_message_count(),
+        3,
+        "history, task boundary, objective -- the same seed as a coding child"
+    );
 }
