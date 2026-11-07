@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 import type { Item, RetryCause } from "../lib/protocol";
 import { fileNameOf } from "../lib/attachmentLimits";
@@ -7,12 +7,19 @@ import { useImageData, type ImageReadCall } from "../lib/useImageData";
 import { useStickToBottom } from "../lib/useStickToBottom";
 import { findAnchor, restoreScrollTop, type ItemBox, type ViewAnchor } from "../lib/viewAnchor";
 import { useThrottledText } from "../lib/useThrottledText";
+import { itemText } from "../lib/itemText";
+import { createHeightBook } from "../lib/heightBook";
+import { useTranscriptWindow } from "../hooks/useTranscriptWindow";
+import { DEFAULT_LIMITS, type VisibleRange } from "../lib/transcriptWindow";
+import type { TranscriptWindowApi } from "../hooks/useTranscriptWindow";
+import { planCompensation } from "../lib/scrollCompensation";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
 import { HelpCard } from "./HelpCard";
 import { UsageCard } from "./UsageCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { HighlightText } from "./HighlightText";
+import { SEARCH_HIT_SELECTOR } from "../hooks/useTranscriptSearch";
 import { TranscriptPlaceholder } from "./TranscriptPlaceholder";
 
 /**
@@ -112,30 +119,6 @@ const ToolCallRow = memo(ToolCallCard);
 const NO_CALL: ImageReadCall = () => Promise.reject(new Error("image/read unavailable"));
 
 /**
- * The text an item renders, lifted out as a primitive.
- *
- * For a prefix item this is the written-once value and it never moves again.
- * For the tail it is re-read on every render from the very object `Session`
- * mutates in place — and it is what `ChatItem`'s comparator compares, and what
- * the agent-message branch renders. The comparator must never read
- * `item.text`; see `ChatItem` for why.
- */
-function itemText(item: Item | NoticeItem | ReasoningItem): string {
-  switch (item.type) {
-    case "agentMessage":
-    case "userMessage":
-    case "reasoning":
-    // `display:"omitted"` 的 thinking 明文是空串，呈现由 `redacted` 决定；text 仍
-    // 要照传，好让就地追加能被比较器看见。
-    case "thinking":
-      return item.text;
-    default:
-      // `toolCall` 无 text；`notice` 的正文由上面的 notice 分支单独渲染。
-      return "";
-  }
-}
-
-/**
  * One transcript item.
  *
  * `text` is passed as its own primitive prop on purpose. `item/delta` mutates
@@ -177,28 +160,40 @@ const ChatItem = memo(
     // 保留子消息 self-start/self-end 的对齐，禁止收缩以保持可滚动的自然高度。
     const node = (() => {
       switch (item.type) {
-        case "notice":
-        // 结构化载荷按 `kind` 分派；没有载荷的就是普通文本提示（胶囊）。
-        return item.body?.kind === "config" ? (
-          <ConfigCard config={item.body.data} error={item.body.error} />
-        ) : item.body?.kind === "help" ? (
-          <HelpCard target={item.body.target} error={item.body.error} />
-        ) : item.body?.kind === "usage" ? (
-          <UsageCard report={item.body.report} />
-        ) : (
+        case "notice": {
+          // 卡片型 notice 按 `kind` 分派。用**穷尽 switch** 而不是 `?.kind ===` 链：
+          // `NoticeBody` 加新 kind 时，下面 `never` 那行会直接编译失败，逼我们同时
+          // 更新 `session.CARD_KINDS`，否则搜索层会把卡片当成文本（看得见搜不到）。
+          const body = item.body;
+          switch (body?.kind) {
+            case "config":
+              return <ConfigCard config={body.data} error={body.error} />;
+            case "help":
+              return <HelpCard target={body.target} error={body.error} />;
+            case "usage":
+              return <UsageCard report={body.report} />;
+            default:
+              if (body !== undefined) {
+                const unhandled: never = body;
+                void unhandled;
+              }
+          }
+          // 没有载荷的就是普通文本提示（胶囊）。
           // 服务端 `thread/notice` 带 level：Warn（通道回退 / effort 降级）用琥珀色
           // 让人一眼看出「走了别的路」；本地 `/命令` 提示与 Info 保持既有中性胶囊。
-          <div
-            data-testid="notice"
-            className={
-              item.level === "Warn"
-                ? "my-1 self-center rounded-md bg-amber-500/10 px-3 py-1 text-xs text-amber-300"
-                : "my-1 self-center rounded-md bg-raised/60 px-3 py-1 text-xs text-fg-muted"
-            }
-          >
-            {item.text}
-          </div>
-        );
+          return (
+            <div
+              data-testid="notice"
+              className={
+                item.level === "Warn"
+                  ? "my-1 self-center rounded-md bg-amber-500/10 px-3 py-1 text-xs text-amber-300"
+                  : "my-1 self-center rounded-md bg-raised/60 px-3 py-1 text-xs text-fg-muted"
+              }
+            >
+              {item.text}
+            </div>
+          );
+        }
       case "reasoning":
         return <ReasoningBlock text={item.text} />;
       case "thinking":
@@ -307,18 +302,18 @@ function LiveTail({
 }
 
 /**
- * The settled history above the streaming tail.
+ * The mounted slice of settled history, `[start, end)`, above the streaming tail.
  *
  * Its whole purpose is to *not* re-render while only the tail grows. It bails
- * out whenever `items`, `count` and `structuralVersion` are all unchanged; a
- * pure text append touches none of them, so a long session performs no work
- * proportional to its length per delta. (`items` is mutated in place, so the
- * array identity never changes and this memo is what makes the prefix a frozen
- * subtree rather than a re-rendered one.)
+ * out whenever `items`, the window bounds and `structuralVersion` are all
+ * unchanged; a pure text append touches none of them, so a long session performs
+ * no work proportional to its length per delta. (`items` is mutated in place, so
+ * the array identity never changes and this memo is what makes the window a
+ * frozen subtree rather than a re-rendered one.)
  *
- * `count` is explicit because `items` is mutated in place: its length changes
- * without the array identity changing, so the memo cannot rely on the array
- * reference alone to notice that a new item appeared.
+ * `start`/`end`/`total` are explicit because `items` is mutated in place: its
+ * length changes without the array identity changing, so the memo cannot rely on
+ * the array reference alone to notice that a new item appeared.
  *
  * `structuralVersion` is a **prop, not a `key`**: it only has to make this
  * component re-render *in place*. Keying it would remount the subtree instead
@@ -330,16 +325,23 @@ function LiveTail({
  * so only the items that actually moved re-render, whereas a remount re-parses
  * every prefix message's markdown.
  */
-const HistoryPrefix = memo(
-  function HistoryPrefix({
+const HistoryWindow = memo(
+  function HistoryWindow({
     items,
-    count,
+    total,
+    start,
+    end,
     threadId,
     call,
     query,
   }: {
     items: (Item | NoticeItem | ReasoningItem)[];
-    count: number;
+    /** `items.length`。数组原地变更，长度变而身份不变，必须单独传。 */
+    total: number;
+    /** 挂载区起点（含）。 */
+    start: number;
+    /** 逻辑终点（**排他**），可等于 `total`（此时含尾部那条）。 */
+    end: number;
     threadId: string | null;
     call: ImageReadCall;
     /**
@@ -351,9 +353,17 @@ const HistoryPrefix = memo(
     /** 搜索关键词，透传给每条消息。 */
     query: string;
   }) {
+    // `end` 是逻辑终点，**含**尾部那条；尾部恒由 `LiveTail` 单独渲染，
+    // 所以这里要 `Math.min(end, total - 1)`。漏掉这个 clamp，`end === total` 时
+    // 最后一条会被渲染两次（React key 相同，控制台直接报错）。
+    const stop = Math.min(end, total - 1);
+    const from = Math.min(start, stop);
     const out = [];
-    for (let i = 0; i < count; i += 1) {
+    for (let i = from; i < stop; i += 1) {
       const it = items[i];
+      // 窗口边界可能落在一次原地替换的中间帧上；`undefined` 直接跳过，
+      // 不要渲染出一个没有 id 的空条目。
+      if (!it) continue;
       out.push(
         <ChatItem
           key={it.id ?? i}
@@ -367,10 +377,12 @@ const HistoryPrefix = memo(
     }
     return <>{out}</>;
   },
-  // `items`/`count` unchanged + no structural change ⇒ nothing above moved.
+  // `items`/window bounds unchanged + no structural change ⇒ nothing above moved.
   (prev, next) =>
     prev.items === next.items &&
-    prev.count === next.count &&
+    prev.total === next.total &&
+    prev.start === next.start &&
+    prev.end === next.end &&
     prev.structuralVersion === next.structuralVersion &&
     prev.threadId === next.threadId &&
     prev.call === next.call &&
@@ -404,6 +416,8 @@ export function ChatView({
   syncError = null,
   onRetrySync,
   isRemote = false,
+  windowApiRef,
+  activeHit,
 }: {
   items: (Item | NoticeItem | ReasoningItem)[];
   error?: string | null;
@@ -460,6 +474,18 @@ export function ChatView({
    * 中途的帧可能不含锚点那条消息）与锚点**真的没了**（被删/历史被截断）。
    * 前者要继续等，后者才回退到底部。只靠 DOM 猜不出来。
    */
+  /**
+   * 可选的出口：把窗口 API 交给宿主，供搜索跳转等命令式开窗使用。
+   *
+   * 用 ref 而不是 props 回调：`requestFocus` 的身份必须稳定，且宿主要在
+   * **事件处理器里**调用它，不能靠 props 变化驱动。
+   */
+  windowApiRef?: { current: TranscriptWindowApi | null };
+  /**
+   * 搜索的当前命中。命中多半未挂载（窗口化），所以这里只负责**给已挂载的
+   * 那个 `mark` 打标**；未挂载时由宿主先开窗，挂载后再生效。
+   */
+  activeHit?: { itemId: string; offset: number } | null;
   syncing?: boolean;
   /**
    * 对账失败的原因（`ThreadView.syncError`）。仅 `syncState === "failed"` 时非空。
@@ -504,6 +530,153 @@ export function ChatView({
   const tail = items.length > 0 ? items[items.length - 1] : undefined;
   const effectiveCall = call ?? NO_CALL;
 
+  // 未挂载区的高度估算：一条会话只建一本，存活到会话结束。
+  const windowBook = useMemo(() => createHeightBook(), []);
+
+  // 测量当前视口。`elRef` 在下面才声明，但闭包只在 rAF 里执行，那时已赋值。
+  const measureVisible = useCallback((): VisibleRange | null => {
+    const el = elRef.current;
+    // 未布局（jsdom、首帧、`scrollHeight` 为 0）时返回 null：`nextWindow` 会保持
+    // 跟随且不翻页。这条守卫同时让测试能确定地断言首屏条数。
+    if (!el || el.scrollHeight === 0 || el.clientHeight === 0) return null;
+    const rows = el.querySelectorAll<HTMLElement>("[data-item-id]");
+    if (rows.length === 0) return null;
+    const viewTop = el.scrollTop;
+    const viewBottom = viewTop + el.clientHeight;
+    const firstNode = rows[0];
+    const lastNode = rows[rows.length - 1];
+    // 相对内容顶部的坐标系：减去容器自身的文档偏移，再加上 scrollTop。
+    const base = el.getBoundingClientRect().top - el.scrollTop;
+    const firstTop = firstNode.getBoundingClientRect().top - base;
+    const lastBottom = lastNode.getBoundingClientRect().bottom - base;
+    // `first`/`last` 是**挂载区相对序号**：这一层数不出前面还有多少条，
+    // `useTranscriptWindow` 会加上 `window.start` 变成绝对 index。
+    return {
+      first: 0,
+      last: rows.length - 1,
+      // **不要夹到 >=0**：`gapTopPx` 为负表示顶边已在视口上方，这是「用户在窗口
+      // 内部」的正常状态，必须与「顶边贴住视口顶（0）」区分。夹掉符号会让底部
+      // 跟随被误判成翻到顶，窗口逐帧抖动。
+      gapTopPx: firstTop - viewTop,
+      gapBottomPx: viewBottom - lastBottom,
+    };
+  }, []);
+
+  // 这里**不传** `focus` prop：锚点恢复（Task 10）与搜索跳转（Task 11）都走
+  // 命令式的一次性 `requestFocus()`。传 `focus={ref.current}` 属于渲染期读可变
+  // 值，且值恒为 null，等于给 hook 加一条走不通的分支。
+  // `requestFocus` 由 Task 10（锚点恢复）与 Task 11（搜索跳转）消费；现在不取，
+  // 否则 `noUnusedLocals` 会报错。
+  const windowApi = useTranscriptWindow({
+    itemCount: items.length,
+    measure: measureVisible,
+    book: windowBook,
+  });
+  const { window: win, nudge, requestFocus } = windowApi;
+
+  // 宿主拿到的必须是**稳定**对象：它在事件处理器里调用 `requestFocus`，
+  // 每次渲染换新引用会让调用方每次都得重取。
+  useLayoutEffect(() => {
+    if (!windowApiRef) return;
+    windowApiRef.current = windowApi;
+    return () => {
+      windowApiRef.current = null;
+    };
+  }, [windowApiRef, windowApi]);
+
+  // **翻页必须由滚动驱动。** 滚动既不改变 `itemCount` 也不改变 `focus`，hook 内部
+  // 没有任何 React 依赖会因此变化——不在这里接上滚动事件，窗口会永远停在首屏那
+  // 60 条，用户滚到顶也加载不出更早的历史。`nudge` 内部按帧去重，可逐帧调用。
+  //
+  // 与 `useStickToBottom` 各挂一个 `scroll` 监听：职责不同（一个管贴底意图、一个
+  // 管窗口翻页），都走 passive，开销可忽略。
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const onScroll = () => nudge();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [nudge]);
+
+  // 给「当前命中」的那一个 `mark` 打标，CSS 靠它把当前命中画得比其余更实。
+  // 必须在渲染落地后做：`mark` 由 rehype 插件产出，随 query 变化被整体替换，
+  // 存在 state 里的节点引用必然失效，所以每轮都重新找。
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const previous = Array.from(el.querySelectorAll<HTMLElement>("[data-search-active]"));
+    for (const node of previous) node.removeAttribute("data-search-active");
+    if (!activeHit) return;
+    // 只在该条已挂载时才有节点。条内第 offset 个命中 = 该行里的第 offset 个 mark。
+    // 不用属性选择器：id 来自服务端，引号/逗号会破坏语法，且 `CSS.escape`
+    // 在 jsdom 下不存在。扫描一遍更稳（与锚点恢复的做法一致）。
+    const row = Array.from(el.querySelectorAll<HTMLElement>("[data-item-id]")).find(
+      (n) => n.dataset.itemId === activeHit.itemId,
+    );
+    if (!row) return;
+    const marks = row.querySelectorAll<HTMLElement>(SEARCH_HIT_SELECTOR);
+    marks[activeHit.offset]?.setAttribute("data-search-active", "true");
+  }, [activeHit, query, win.start, win.end]);
+
+  // 窗口变化会改变内容高度，而 WKWebView **不实现 scroll anchoring**：视口上方多挂
+  // 200 条，用户看到的内容就整体位移；从下方卸载则让 `scrollHeight` 变小、
+  // `scrollTop` 被浏览器往下夹，`useStickToBottom` 会把这次位移读成「用户上翻」并
+  // 永久关闭跟随。所以每次窗口变更都要补偿一次。
+  const prevWindowRef = useRef<{ start: number; end: number } | null>(null);
+  const prevHeightRef = useRef<number>(0);
+  useLayoutEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const prev = prevWindowRef.current;
+    const prevHeight = prevHeightRef.current;
+    prevWindowRef.current = { start: win.start, end: win.end };
+    prevHeightRef.current = el.scrollHeight;
+
+    // 首帧没有「上一次」，不需要补偿。
+    if (prev === null || prevHeight === 0) return;
+    if (prev.start === win.start && prev.end === win.end) return;
+
+    // **锚点持有期间由漂移校正独占位置。** `planCompensation` 的差值分支假设
+    // 「高度变化全部发生在视口上方」，对滚动阅读是对的；但锚点恢复后追加的内容
+    // 通常长在锚点**下方**，此时再加差值会把人推走（实测：恢复 1212 后又被加
+    // 1000）。这种情形的位置由下面的锚点校正负责，这里必须让路。
+    if (heldAnchor.current !== null && !userTookOver.current) return;
+
+    const plan = planCompensation({
+      prevScrollHeight: prevHeight,
+      nextScrollHeight: el.scrollHeight,
+      prevViewportHeight: el.clientHeight,
+      scrollTop: el.scrollTop,
+      wasFollowing: isFollowing(),
+    });
+
+    // 先写位置再动跟随状态。两种顺序实测都不会被判成「用户上翻」（补偿总是向下
+    // 移动，`onScroll` 只把向上的位移读成意图），但先写位置能保证 `releaseFollow`
+    // 记录的基线就是补偿后的位置，少一次多余的事件判定。
+    if (Math.abs(el.scrollTop - plan.scrollTop) >= 1) {
+      el.scrollTop = plan.scrollTop;
+      selfScrolling.current = el.scrollTop;
+    }
+    if (plan.follow === "to-bottom") scrollToBottom();
+    else releaseFollow();
+  }, [win.start, win.end, isFollowing, scrollToBottom, releaseFollow]);
+
+  // 把挂载区的真实高度写回 `HeightBook`：中位数越准，spacer 越准，分页后的视觉
+  // 跳动越小（设计 §2.4 的螺旋收敛）。
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    for (const node of el.querySelectorAll<HTMLElement>("[data-item-id]")) {
+      const id = node.dataset.itemId;
+      if (!id) continue;
+      const h = node.getBoundingClientRect().height;
+      // **必须过滤 0**：未布局（首帧、jsdom、刚挂载还没排版）时高度是 0，而
+      // `HeightBook.record` 认为 0 合法（折叠条目确实可能为 0）会照收。大量 0
+      // 进来会把中位数拉到 0，spacer 归零，滚动条比例整个失真。
+      if (h > 0) windowBook.record(id, h);
+    }
+  }, [win.start, win.end, windowBook]);
+
   // 采集用的元素句柄：与 `useStickToBottom` 的 ref 指向同一个 DOM 节点。
   const elRef = useRef<HTMLDivElement | null>(null);
   // 回调每次渲染都可能换身份（宿主内联箭头），用 ref 读最新的，避免把采集
@@ -524,6 +697,8 @@ export function ChatView({
   const userTookOver = useRef(false);
   /** 上一次由**我们**写入的 `scrollTop`；用于识别它自己触发的 scroll 事件。 */
   const selfScrolling = useRef<number | null>(null);
+  /** 已在数据层找到 index、等 `requestFocus` 开的那一窗渲染落地的锚点。 */
+  const pendingAnchorRef = useRef<ViewAnchor | null>(null);
   useLayoutEffect(() => {
     // 恢复状态属于本次访问，而不是上一次成功恢复的会话。
     // A→尚未恢复的 B→A 同样必须重新对位，不能被旧 restoredFor 短路。
@@ -531,10 +706,9 @@ export function ChatView({
     heldAnchor.current = null;
     userTookOver.current = false;
     selfScrolling.current = null;
+    pendingAnchorRef.current = null;
   }, [threadId]);
   useLayoutEffect(() => {
-    const el = elRef.current;
-    if (!el) return;
     if (restoredFor.current === threadId) return;
     // `null` = 离开时贴底，`undefined` = 从没记过：两者都走既有的"到底"，
     // 由下面的跟随分支负责，这里不重复做。
@@ -542,13 +716,11 @@ export function ChatView({
       restoredFor.current = threadId;
       return;
     }
-    releaseFollow();
-    // 不用 `[data-item-id="..."]` 选择器：id 来自服务端，逗号/引号都会破坏
-    // 选择器语法，且 `CSS.escape` 在 jsdom 下不存在。扫描一遍更稳。
-    const target = Array.from(el.querySelectorAll<HTMLElement>("[data-item-id]")).find(
-      (node) => node.dataset.itemId === anchor.itemId,
-    );
-    if (!target) {
+
+    // 第一步：在**数据层**找 index。不能按 DOM 找——窗口化后锚点通常不在挂载区，
+    // 按 DOM 找不到会被误判成「锚点真的没了」而静默跳到底部，这正是要消除的退化。
+    const index = items.findIndex((it) => it.id === anchor.itemId);
+    if (index === -1) {
       // 内容还在补齐：回放分帧到达，此刻可能只收到了前几帧（不含锚点那条）。
       // 不锁定，等内容继续到达再试。
       if (syncing || items.length === 0) return;
@@ -558,16 +730,36 @@ export function ChatView({
       scrollToBottom();
       return;
     }
+
+    // 第二步：开窗把锚点包进挂载区。用 limits 表达，不写字面量。
+    requestFocus({ index, before: DEFAULT_LIMITS.buffer, after: 3 * DEFAULT_LIMITS.buffer });
+    releaseFollow();
+    // 第三步：**不在这里写 scrollTop**。锚点此刻还没挂载，`querySelector` 仍找
+    // 不到它；等下面的「锚点已挂载」effect 在对的位置接手。
+    pendingAnchorRef.current = anchor;
+    // `items.length` 是"可恢复的时机"：冷会话回放是**分帧**到达的，而生产环境下
+    // `anchor` 是 Map 里的同一个对象（引用恒定）。只依赖 `anchor` 会让这个 effect
+    // 在内容真正出现时不再重跑，恢复永远补不上（实测停在 2424 而非 1200）。
+  }, [threadId, anchor, items.length, syncing, scrollToBottom, releaseFollow, items, requestFocus]);
+
+  // 锚点进入挂载区之后再对位。窗口化之前这里可以同步做完（全部条目都在 DOM），
+  // 现在必须等 `requestFocus` 开的那一窗渲染落地。
+  useEffect(() => {
+    const el = elRef.current;
+    const pending = pendingAnchorRef.current;
+    if (!el || !pending || restoredFor.current === threadId) return;
+    // 不用 `[data-item-id="..."]` 选择器：id 来自服务端，逗号/引号都会破坏
+    // 选择器语法，且 `CSS.escape` 在 jsdom 下不存在。扫描一遍更稳。
+    const row = Array.from(el.querySelectorAll<HTMLElement>("[data-item-id]")).find(
+      (n) => n.dataset.itemId === pending.itemId,
+    );
+    if (!row) return;
     const base = el.getBoundingClientRect().top - el.scrollTop;
     const next = restoreScrollTop(
-      { id: anchor.itemId, top: target.getBoundingClientRect().top - base },
-      anchor,
+      { id: pending.itemId, top: row.getBoundingClientRect().top - base },
+      pending,
     );
-    if (next === null) {
-      restoredFor.current = threadId;
-      scrollToBottom();
-      return;
-    }
+    if (next === null) return;
     // 锚消息已到达，但其后的回放内容可能还不足以容纳原视口偏移。
     // 此时写入会被夹到临时底部，scroll 采集再把旧锚点抹成 null。
     if (syncing && next > el.scrollHeight - el.clientHeight + 1) return;
@@ -580,13 +772,11 @@ export function ChatView({
     selfScrolling.current = el.scrollTop;
     restoredFor.current = threadId;
     // 记住"这一行应该在视口顶"，供下方的漂移校正使用。
-    heldAnchor.current = anchor;
+    heldAnchor.current = pending;
+    pendingAnchorRef.current = null;
     // 恢复完立刻放弃跟随，否则下一条 delta 会把人拽回底部。
     releaseFollow();
-    // `items.length` 是"可恢复的时机"：冷会话回放是**分帧**到达的，而生产环境下
-    // `anchor` 是 Map 里的同一个对象（引用恒定）。只依赖 `anchor` 会让这个 effect
-    // 在内容真正出现时不再重跑，恢复永远补不上（实测停在 2424 而非 1200）。
-  }, [threadId, anchor, items.length, syncing, scrollToBottom, releaseFollow]);
+  }, [threadId, win.start, win.end, items.length, syncing, releaseFollow]);
 
   // 恢复之后，锚点**上方**的内容还可能改变高度：图片是异步读出来的
   // （`BubbleImage` 在拿到 url 之前返回 null，高度 0），工具卡/推理块也可能
@@ -648,7 +838,10 @@ export function ChatView({
     let observer: ResizeObserver | null = null;
     if (typeof ResizeObserver !== "undefined") {
       observer = new ResizeObserver(schedule);
-      // 观察整个内容流：任何一条消息变高（图片加载、卡片展开）都会回调。
+      // 观察 spacer：它们的高度代表「未挂载区间」的布局变化。未挂载区没有节点
+      // 可观察，spacer 是唯一可用的信号。
+      for (const sp of el.querySelectorAll("[data-spacer]")) observer.observe(sp);
+      // 观察挂载区：图片异步加载、工具卡展开会让已挂载条目变高。
       for (const child of el.querySelectorAll("[data-item-id]")) observer.observe(child);
     }
     // 没有 `ResizeObserver` 的环境（旧 WebView、测试）退化为轮询：只比总高度，
@@ -670,7 +863,12 @@ export function ChatView({
       if (poll !== null) window.clearInterval(poll);
       observer?.disconnect();
     };
-  }, [threadId, items.length, syncing]);
+    // `win.start`/`win.end` 必须在依赖里：锚点常常不在首屏挂载区（长会话尤其如此），
+    // `heldAnchor` 是在**窗口变更后**那个 commit 才被写上的，本 effect 若只在
+    // `threadId`/`items.length` 变化时跑，它会在「此时 `heldAnchor` 还是 null」的
+    // commit 里早退、从此再也建不起观察者——恢复位置写对了，但锚点上方内容变高
+    // 后再也没人校正（实测停在 1012，应为 1312）。
+  }, [threadId, items.length, syncing, win.start, win.end]);
 
   useEffect(() => {
     const el = elRef.current;
@@ -784,6 +982,16 @@ export function ChatView({
     followIfAtBottom,
   ]);
 
+  // 未挂载区间的高度估算。`win.end` 是**排他**终点且含尾部那条，而
+  // `HistoryWindow` 只渲染到 `stop = min(end, total - 1)`（尾部恒由 `LiveTail`
+  // 渲染）。所以尾部下方未挂载的只有 `[stop, total - 1)` 这一段：
+  //   - `end === total`（跟随中）-> `stop === total - 1` -> 下方为 0
+  //   - `end < total`          -> `stop === end`         -> 下方 `total - 1 - end` 条
+  const medianH = windowBook.median();
+  const spacerTop = win.start * medianH;
+  const windowStop = Math.min(win.end, Math.max(items.length - 1, 0));
+  const spacerBottom = Math.max(0, items.length - 1 - windowStop) * medianH;
+
   return (
     <div
       ref={setScroller}
@@ -807,9 +1015,13 @@ export function ChatView({
           <TranscriptPlaceholder kind="loading" />
         )
       ) : null}
-      <HistoryPrefix
+      {/* 未挂载历史的占位高度：滚动条比例因此真实，滚动仍由浏览器原生完成。 */}
+      <div data-spacer="top" aria-hidden="true" style={{ height: spacerTop }} />
+      <HistoryWindow
         items={items}
-        count={items.length - 1}
+        total={items.length}
+        start={win.start}
+        end={win.end}
         structuralVersion={structuralVersion}
         threadId={threadId}
         call={effectiveCall}
@@ -824,6 +1036,7 @@ export function ChatView({
           query={query}
         />
       )}
+      <div data-spacer="bottom" aria-hidden="true" style={{ height: spacerBottom }} />
       {retrying && (
         <div className="my-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
           {RETRY_CAUSE_LABELS[retrying.cause]} — retrying {retrying.attempt}/

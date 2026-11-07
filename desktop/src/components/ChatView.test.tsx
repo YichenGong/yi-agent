@@ -451,7 +451,10 @@ describe("ChatView frozen prefix", () => {
 
     const { rerender } = render(<ChatView items={list} />);
     const settled = calls.text;
-    expect(settled).toBe(201); // every item rendered once on mount
+    // 窗口化之后只有首屏 60 条会挂载（`initialSize`），而不是全部 201 条。
+    // 本用例真正要钉的是「流式增量不重渲染已挂载的历史」，首屏条数随窗口策略
+    // 变化，所以这里按实际挂载数断言，避免把窗口大小写死进一条无关的用例。
+    expect(settled).toBe(60);
 
     // Stream 5 deltas *in place*, exactly like `Session.apply` does.
     for (let i = 1; i <= 5; i += 1) {
@@ -459,7 +462,7 @@ describe("ChatView frozen prefix", () => {
       rerender(<ChatView items={list} />);
     }
 
-    // Only the tail may have re-rendered. The 200 history items must not have.
+    // Only the tail may have re-rendered. The mounted history items must not have.
     expect(calls.text - settled).toBeLessThanOrEqual(5);
   });
 
@@ -1440,5 +1443,368 @@ describe("ChatView keeps reporting 'bottom' while the stream grows", () => {
 
     // 视口一行都没动，仍在底部 ⇒ 必须记成 null（贴底），而不是某条消息的锚点。
     expect(seen[seen.length - 1]).toEqual(["t1", null]);
+  });
+});
+
+describe("transcript windowing", () => {
+  /** 建 n 条 agentMessage，id 稳定。 */
+  function manyItems(n: number): Item[] {
+    return Array.from({ length: n }, (_, i) => ({
+      type: "agentMessage",
+      id: `m${i}`,
+      text: `row ${i}`,
+    })) as Item[];
+  }
+
+  function renderWith(list: Item[]) {
+    return render(
+      <ChatView
+        items={list}
+        threadId="t1"
+        structuralVersion={1}
+        query=""
+        call={() => Promise.reject(new Error("no images"))}
+      />,
+    );
+  }
+
+  it("3000 条会话冷启动只挂载 60 个 item 节点", () => {
+    const { container } = renderWith(manyItems(3000));
+    expect(container.querySelectorAll("[data-item-id]")).toHaveLength(60);
+  });
+
+  it("渲染上下的 spacer，未挂载区间不是真空", () => {
+    const { container } = renderWith(manyItems(3000));
+    const top = container.querySelector("[data-spacer='top']") as HTMLElement | null;
+    const bottom = container.querySelector("[data-spacer='bottom']") as HTMLElement | null;
+    expect(top).not.toBeNull();
+    expect(bottom).not.toBeNull();
+    // 冷启动跟随的是尾部：上方必须撑出 3000-60 条的高度，下方为 0。
+    expect(parseFloat(top!.style.height)).toBeGreaterThan(0);
+    expect(parseFloat(bottom!.style.height)).toBe(0);
+  });
+
+  it("尾部那条只渲染一次（HistoryWindow 与 LiveTail 不重复）", () => {
+    const { container } = renderWith(manyItems(3000));
+    const ids = Array.from(container.querySelectorAll("[data-item-id]")).map((n) =>
+      n.getAttribute("data-item-id"),
+    );
+    expect(ids[ids.length - 1]).toBe("m2999");
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("短会话（少于首屏）全挂且没有重复", () => {
+    const { container } = renderWith(manyItems(7));
+    const ids = Array.from(container.querySelectorAll("[data-item-id]")).map((n) =>
+      n.getAttribute("data-item-id"),
+    );
+    expect(ids).toEqual(["m0", "m1", "m2", "m3", "m4", "m5", "m6"]);
+  });
+
+  it("空会话不崩", () => {
+    const { container } = renderWith([]);
+    expect(container.querySelectorAll("[data-item-id]")).toHaveLength(0);
+  });
+});
+
+describe("capture() only measures the mounted window", () => {
+  it("3000 条会话单次采集的 getBoundingClientRect 次数不超过挂载区两倍", () => {
+    const spy = vi.spyOn(Element.prototype, "getBoundingClientRect");
+    const many = Array.from({ length: 3000 }, (_, i) => ({
+      type: "agentMessage",
+      id: `m${i}`,
+      text: `row ${i}`,
+    })) as Item[];
+    const { container } = render(
+      <ChatView items={many} threadId="t1" structuralVersion={1} query="" />,
+    );
+    const scroller = container.querySelector("[data-thread-id]") as HTMLElement;
+    spy.mockClear();
+    fireEvent.scroll(scroller);
+    // 只挂载 60 条，再加上容器与首尾节点的测量，远小于 3000。
+    expect(container.querySelectorAll("[data-item-id]").length).toBe(60);
+    expect(spy.mock.calls.length).toBeLessThan(200);
+    spy.mockRestore();
+  });
+
+  it("挂载区高度写回 HeightBook 后 spacer 跟着收敛（0 高度必须被忽略）", () => {
+    // jsdom 的 `getBoundingClientRect().height` 恒为 0，正是「未布局」的真实形状。
+    // 若没有 `if (h > 0)` 守卫，这 60 条会被记成 0 高度，中位数塌到 0，spacer
+    // 归零 —— 滚动条比例整个失真。
+    //
+    // 断言必须发生在**一次重渲染之后**：`windowBook.record` 不是 state，写入本身
+    // 不触发渲染，spacer 只在下次渲染时才用新中位数重算。所以这里改
+    // `structuralVersion` 强制重渲染，否则断言读的还是首次渲染的快照，注入缺陷
+    // 也照样通过（已实测：无守卫时本用例曾经是空断言）。
+    const many = Array.from({ length: 3000 }, (_, i) => ({
+      type: "agentMessage",
+      id: `m${i}`,
+      text: `row ${i}`,
+    })) as Item[];
+    const { container, rerender } = render(
+      <ChatView items={many} threadId="t1" structuralVersion={1} query="" />,
+    );
+    rerender(<ChatView items={many} threadId="t1" structuralVersion={2} query="" />);
+    const top = container.querySelector("[data-spacer='top']") as HTMLElement;
+    // fallback 中位数 40 -> 2940 条未挂载 * 40 = 117600。塌到 0 时会读到 0。
+    expect(parseFloat(top.style.height)).toBe(117600);
+  });
+});
+
+describe("window change compensates scrollTop", () => {
+  /**
+   * jsdom 不实现布局，`scrollHeight` 恒为 0，因此这里给滚动容器装一对受控的
+   * 几何属性，让补偿逻辑看到「窗口变更前后的真实高度差」。
+   *
+   * 注意两点，都是 jsdom 特有的：
+   * - `scrollTop` 的 setter 必须模拟浏览器的夹取，`useStickToBottom.pin()` 正是
+   *   靠 `scrollTop = scrollHeight` 被夹到真正的底部。
+   * - 几何只能在 `render` 之后安装，于是组件的第一次 layout effect 会把
+   *   `scrollHeight = 0` 记成基线，命中「首帧不补偿」的早退。所以每条用例都要
+   *   先做一次窗口变更（高度不变）把基线建立起来，再改高度做真正的断言。
+   */
+  function installGeometry(
+    el: HTMLElement,
+    state: { scrollHeight: number; clientHeight: number; scrollTop: number },
+  ) {
+    Object.defineProperty(el, "scrollHeight", { get: () => state.scrollHeight, configurable: true });
+    Object.defineProperty(el, "clientHeight", { get: () => state.clientHeight, configurable: true });
+    Object.defineProperty(el, "scrollTop", {
+      get: () => state.scrollTop,
+      set: (v: number) => {
+        const max = Math.max(0, state.scrollHeight - state.clientHeight);
+        state.scrollTop = Math.min(Math.max(0, v), max);
+      },
+      configurable: true,
+    });
+    return state;
+  }
+
+  const rows = (from: number, to: number, sink: Item[]) => {
+    for (let i = from; i < to; i += 1) {
+      sink.push({ type: "agentMessage", id: `m${i}`, text: `row ${i}` } as Item);
+    }
+    return sink;
+  };
+
+  it("区间变化时补偿 scrollTop（跟随中则重新贴底）", () => {
+    const many = rows(0, 3000, []);
+    const { container, rerender } = render(
+      <ChatView items={many} threadId="t1" structuralVersion={1} query="" />,
+    );
+    const scroller = container.querySelector("[data-thread-id]") as HTMLElement;
+    const geo = installGeometry(scroller, { scrollHeight: 10_000, clientHeight: 800, scrollTop: 5_000 });
+
+    // 建立基线（高度不变，差值 0，不写位置），且顺带把窗口挪一次。
+    rerender(<ChatView items={rows(3000, 3060, [...many])} threadId="t1" structuralVersion={2} query="" />);
+    const after = rows(3060, 3120, rows(3000, 3060, [...many]));
+
+    // 真正的窗口变更：上方多挂一页，内容 10000 -> 14000。
+    geo.scrollHeight = 14_000;
+    rerender(<ChatView items={after} threadId="t1" structuralVersion={3} query="" />);
+
+    // 跟随中：视口必须落到新底部 = 14000 - 800，而不是留在 5000。
+    expect(geo.scrollTop).toBe(13_200);
+  });
+
+  it("非跟随（用户在读历史）时按高度差位移，而不是贴底", () => {
+    // 跟随分支会被 `useStickToBottom` 的其它路径顺带满足，钉不住补偿本身。
+    // 只有非跟随状态的差值分支无法由别处代劳，必须单独覆盖。
+    const many = rows(0, 3000, []);
+    const { container, rerender } = render(
+      <ChatView items={many} threadId="t1" structuralVersion={1} query="" />,
+    );
+    const scroller = container.querySelector("[data-thread-id]") as HTMLElement;
+    const geo = installGeometry(scroller, { scrollHeight: 10_000, clientHeight: 800, scrollTop: 5_000 });
+
+    rerender(<ChatView items={rows(3000, 3060, [...many])} threadId="t1" structuralVersion={2} query="" />);
+
+    // 用户上翻。`useStickToBottom.onScroll` 需要**两次**事件才判定上翻：第一次
+    // 建立基线（`prevTop === null` 时只按绝对位置设意图），第二次才比较位移。
+    geo.scrollTop = 8_000;
+    fireEvent.scroll(scroller);
+    geo.scrollTop = 5_000;
+    fireEvent.scroll(scroller);
+
+    const after = rows(3060, 3120, rows(3000, 3060, [...many]));
+    geo.scrollHeight = 14_000;
+    rerender(<ChatView items={after} threadId="t1" structuralVersion={3} query="" />);
+
+    // 补偿后 5000 + 4000 = 9000：既不是留在 5000，也不是贴底 13200。
+    expect(geo.scrollTop).toBe(9_000);
+  });
+});
+
+describe("anchor restore with windowing", () => {
+  const threeThousand = () =>
+    Array.from({ length: 3000 }, (_, i) => ({
+      type: "agentMessage",
+      id: `m${i}`,
+      text: `row ${i}`,
+    })) as Item[];
+
+  const mountedIds = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll("[data-item-id]")).map((n) =>
+      n.getAttribute("data-item-id"),
+    );
+
+  it("锚点在未挂载区间时先开窗把它挂出来，而不是跳到底部", async () => {
+    // 窗口化后首屏只有末尾 60 条，`m500` 不在 DOM 里。按 DOM 查找会找不到，
+    // 旧逻辑据此判定「锚点真的没了」并跳到底部——这就是要消除的退化。
+    const { container } = render(
+      <ChatView
+        items={threeThousand()}
+        threadId="t1"
+        structuralVersion={1}
+        query=""
+        anchor={{ itemId: "m500", offset: 0 }}
+      />,
+    );
+    // 开窗走 rAF（hook 的 recompute 每帧最多一次），必须等它落地。
+    await waitFor(() => expect(mountedIds(container)).toContain("m500"));
+    // 开窗而不是全量挂载：锚点周围一页 + buffer，总数远小于 3000。
+    expect(mountedIds(container).length).toBeLessThan(1000);
+  });
+
+  it("开窗恢复后，锚点上方内容变高仍会被重新对位", async () => {
+    // 长会话里锚点通常不在首屏挂载区，恢复要先用 `requestFocus` 开窗，锚点行
+    // 才挂得上。`heldAnchor` 因此是在**窗口变更之后**那个 commit 才被写下的；
+    // 漂移校正的 effect 若只依赖 threadId/items.length，就会在
+    // 「heldAnchor 还是 null」的那个 commit 里早退、从此再也建不起观察者——
+    // 位置写对了，但锚点上方图片加载变高后再没人校正（实测停在 1012，应为 1312）。
+    // 这条用例刻意用 300 条、锚点在中段，强制走开窗路径。
+    const tops: Record<string, number> = {};
+    const state = { scrollTop: 0, contentH: 0 };
+    let scroller: HTMLElement | null = null;
+    const PAD = 12;
+    const VIEWPORT = 600;
+    const ROW = 100;
+    const N = 300;
+    const rect = (top: number) =>
+      ({ top, left: 0, bottom: top, right: 0, width: 0, height: 0, x: 0, y: top, toJSON() {} }) as DOMRect;
+    const proto = HTMLElement.prototype as unknown as Record<string, unknown>;
+    const saved = {
+      rect: proto.getBoundingClientRect,
+      sh: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight"),
+      ch: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight"),
+      st: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop"),
+    };
+    proto.getBoundingClientRect = function (this: HTMLElement) {
+      if (this === scroller) return rect(0);
+      return rect(PAD - state.scrollTop + (tops[this.dataset.itemId ?? ""] ?? 0));
+    };
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this === scroller ? state.contentH + PAD * 2 : 0;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this === scroller ? VIEWPORT : 0;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this === scroller ? state.scrollTop : 0;
+      },
+      set(this: HTMLElement, v: number) {
+        if (this !== scroller) return;
+        state.scrollTop = Math.max(0, Math.min(v, state.contentH + PAD * 2 - VIEWPORT));
+      },
+    });
+
+    try {
+      const list: Item[] = Array.from({ length: N }, (_, i) => ({
+        type: "userMessage" as const,
+        id: `a${i}`,
+        text: `m${i}`,
+      }));
+      const rebuild = (firstRowHeight: number) => {
+        for (const k of Object.keys(tops)) delete tops[k];
+        tops.a0 = 0;
+        for (let i = 1; i < N; i++) tops[`a${i}`] = firstRowHeight + (i - 1) * ROW;
+        state.contentH = firstRowHeight + (N - 1) * ROW;
+      };
+      rebuild(ROW);
+
+      const anchorA = { itemId: "a10", offset: 0 };
+      const { container, rerender } = render(
+        <ChatView items={list} threadId="B" anchor={null} />,
+      );
+      scroller = container.firstElementChild as HTMLElement;
+
+      rerender(<ChatView items={list} threadId="A" anchor={anchorA} />);
+      // 开窗走 rAF，锚点行在下一个 commit 才挂上，再等挂载后 effect 对位。
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 200));
+      });
+      // a10 的内容坐标 = py-3(12) + 10*100 = 1012；offset 0 即顶边贴视口顶。
+      expect(state.scrollTop).toBe(PAD + 10 * ROW);
+
+      // 上方图片到达：a0 从 100 变 400，锚点被推下 300px。
+      rebuild(400);
+      rerender(<ChatView items={list} threadId="A" anchor={anchorA} />);
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 400));
+      });
+      expect(state.scrollTop).toBe(PAD + 400 + 9 * ROW);
+    } finally {
+      proto.getBoundingClientRect = saved.rect;
+      for (const [name, desc] of [
+        ["scrollHeight", saved.sh],
+        ["clientHeight", saved.ch],
+        ["scrollTop", saved.st],
+      ] as const) {
+        if (desc) Object.defineProperty(HTMLElement.prototype, name, desc);
+      }
+    }
+  });
+
+  it("锚点确实不存在时回退到底部（渲染最后一条）", () => {
+    // 与上一条对照：index === -1 是「真的没了」，必须仍然贴底，不能为了
+    // 开窗而停在一个无意义的像素上。
+    const { container } = render(
+      <ChatView
+        items={threeThousand()}
+        threadId="t1"
+        structuralVersion={1}
+        query=""
+        anchor={{ itemId: "gone", offset: 0 }}
+      />,
+    );
+    expect(mountedIds(container)).toContain("m2999");
+  });
+});
+
+describe("active search hit is marked in the mounted window", () => {
+  it("给当前命中的那一个 mark 打 data-search-active", () => {
+    // CSS 靠这个属性把「当前命中」画得比其余命中更实。窗口化后当前命中可能
+    // 根本未挂载，但已挂载时必须标上，否则用户看不出自己在第几个。
+    // 用 userMessage：它走真实的 `HighlightText`，会产出真 `mark`。
+    // agentMessage 在本测试文件里被 mock 成纯 div，没有 mark 可标。
+    const items = [
+      { type: "userMessage", id: "a", text: "needle one" },
+      { type: "userMessage", id: "b", text: "needle two" },
+    ] as Item[];
+    const { container } = render(
+      <ChatView
+        items={items}
+        threadId="t1"
+        query="needle"
+        activeHit={{ itemId: "b", offset: 0 }}
+      />,
+    );
+    const marked = Array.from(container.querySelectorAll("[data-search-active]")).map(
+      (n) => n.textContent,
+    );
+    expect(marked).toEqual(["needle"]);
+    // 被标的是 id=b 那一行里的 mark，不是第一条。
+    const rowB = Array.from(container.querySelectorAll("[data-item-id]")).find(
+      (n) => n.getAttribute("data-item-id") === "b",
+    );
+    expect(rowB?.querySelector("[data-search-active]")).not.toBeNull();
   });
 });
