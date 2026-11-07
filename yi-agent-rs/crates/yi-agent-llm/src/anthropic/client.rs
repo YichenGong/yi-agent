@@ -90,10 +90,8 @@ impl AnthropicProvider {
         // 硬砍断（真实表现：长回答/长思考到点被截断成 stream error）。
         // 这里要的是「没有输出才计时」：`read_timeout` 按每次读操作计时，读到
         // 数据就重置——服务器一直在流，流就一直跑；真的静默了才判超时。
-        let client = reqwest::Client::builder()
-            .connect_timeout(timeout)
-            .read_timeout(timeout)
-            .build()
+        // 同 openai：归一化已完成，共享池避免新会话重付握手。
+        let client = crate::http::shared_client(&base_url, timeout)
             .map_err(|e| ProviderError::Network(format!("failed to build HTTP client: {e}")))?;
 
         Ok(Self {
