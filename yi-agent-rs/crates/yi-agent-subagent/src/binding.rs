@@ -298,11 +298,29 @@ impl RuntimeBinding {
         runtime_dir: PathBuf,
         handle: RuntimeHandle,
     ) -> Arc<Self> {
+        Self::for_runtime_dir_in(cfg, runtime_dir, handle, None)
+    }
+
+    /// [`Self::for_runtime_dir`], with the instance home the guardian was given.
+    ///
+    /// Without it the guardian-socket lookup inside `authority_decision` would read
+    /// `YI_AGENT_HOME` from the environment while the fixture's guardian bound under
+    /// a chosen directory, and the test would silently see "no guardian here".
+    #[cfg(test)]
+    pub fn for_runtime_dir_in(
+        cfg: yi_agent_runtime::config::RuntimeConfig,
+        runtime_dir: PathBuf,
+        handle: RuntimeHandle,
+        instance_home: Option<PathBuf>,
+    ) -> Arc<Self> {
         let plan = RepairPlan {
             cfg,
             runtime_dir,
             models_path: PathBuf::new(),
-            bringup: BringUpChoice::default(),
+            bringup: BringUpChoice {
+                instance_home,
+                ..BringUpChoice::default()
+            },
         };
         Arc::new(Self {
             state: Mutex::new(BindingState {
@@ -315,6 +333,18 @@ impl RuntimeBinding {
             flight: Mutex::new(()),
             last_active: Mutex::new(Instant::now()),
         })
+    }
+
+    /// The instance home this binding was built with, when the caller knew it.
+    ///
+    /// `None` means "resolve it from the environment": every production constructor
+    /// leaves it unset because the guardian that serves the runtime was itself
+    /// started from the same environment. A fixture that chooses its own home must
+    /// set it, or the two sides would look in different places.
+    pub fn known_instance_home(&self) -> Option<PathBuf> {
+        self.repair
+            .as_ref()
+            .and_then(|plan| plan.bringup.instance_home.clone())
     }
 
     /// The project directory this binding was created for. Used to decide

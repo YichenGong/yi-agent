@@ -643,6 +643,32 @@ impl ForegroundHost {
         client_run_id: String,
     ) -> std::io::Result<Option<Self>> {
         let control_path = yi_agent_lifecycle::scope::control_path(runtime_dir);
+        Self::connect_to(control_path, kind, client_run_id)
+    }
+
+    /// [`Self::connect`], against a guardian whose instance home the caller knows.
+    ///
+    /// The guardian derives its socket from the scope it was handed, so a caller that
+    /// chose that scope must not re-derive it from the environment: on a machine with
+    /// `YI_AGENT_HOME` set, the two would name different sockets.
+    pub fn connect_in(
+        runtime_dir: &std::path::Path,
+        instance_home: &std::path::Path,
+        kind: yi_agent_lifecycle::types::ClientKind,
+        client_run_id: String,
+    ) -> std::io::Result<Option<Self>> {
+        Self::connect_to(
+            yi_agent_lifecycle::scope::guardian_socket(runtime_dir, instance_home),
+            kind,
+            client_run_id,
+        )
+    }
+
+    fn connect_to(
+        control_path: std::path::PathBuf,
+        kind: yi_agent_lifecycle::types::ClientKind,
+        client_run_id: String,
+    ) -> std::io::Result<Option<Self>> {
         let deadline =
             yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::from_secs(2));
         let Some(lease) = yi_agent_lifecycle::client::FrontendLease::register_if_served(

@@ -826,7 +826,14 @@ impl ThreadRoot {
         let Some(runtime_dir) = self.binding.runtime_dir() else {
             return Ok(crate::thread_root::ForegroundAuthority::Embedded);
         };
-        let control_path = yi_agent_lifecycle::scope::control_path(&runtime_dir);
+        // The scope this runtime was built with is authoritative when it is known;
+        // only fall back to the environment when it is not. Reading the environment
+        // unconditionally would look for the guardian in the developer's real
+        // `~/.yi-agent` even when the caller named a different instance.
+        let control_path = match self.binding.known_instance_home() {
+            Some(home) => yi_agent_lifecycle::scope::guardian_socket(&runtime_dir, &home),
+            None => yi_agent_lifecycle::scope::control_path(&runtime_dir),
+        };
         if !control_path.exists() {
             return Ok(crate::thread_root::ForegroundAuthority::Embedded);
         }
@@ -1259,9 +1266,7 @@ mod tests {
     use yi_agent_lifecycle::client::FrontendLease;
     use yi_agent_lifecycle::deadline::Deadline;
     use yi_agent_lifecycle::types::{ArtifactIdentity, ClientKind, LeaseMode, RuntimeScope};
-    use yi_agent_supervisors::lifecycle::guardian::{
-        GUARDIAN_SOCKET_FILE, serve_with_bridge_for_test,
-    };
+    use yi_agent_supervisors::lifecycle::guardian::serve_with_bridge_for_test;
 
     /// A guardian served over a real socket, plus a daemon-side peer for the
     /// authority bridge.
@@ -1272,6 +1277,7 @@ mod tests {
     struct GuardianFixture {
         directory: tempfile::TempDir,
         runtime_dir: TestPathBuf,
+        instance_home: TestPathBuf,
         stop: Arc<AtomicBool>,
         server: Option<std::thread::JoinHandle<std::io::Result<()>>>,
         peer: Option<std::thread::JoinHandle<()>>,
@@ -1287,11 +1293,12 @@ mod tests {
                 .expect("a temp dir");
             let runtime_dir = directory.path().join("rt");
             std::fs::create_dir_all(&runtime_dir).expect("the runtime dir");
+            let instance_home = directory.path().join("instance");
             let scope = RuntimeScope {
                 key: runtime_dir.to_string_lossy().into_owned(),
                 runtime_dir: runtime_dir.clone(),
                 project_key: directory.path().to_string_lossy().into_owned(),
-                instance_home: directory.path().join("instance"),
+                instance_home: instance_home.clone(),
             };
 
             let (guardian_end, peer_end) =
@@ -1325,7 +1332,7 @@ mod tests {
                 )
             });
 
-            let socket = runtime_dir.join(GUARDIAN_SOCKET_FILE);
+            let socket = yi_agent_lifecycle::scope::guardian_socket(&runtime_dir, &instance_home);
             let readiness = TestInstant::now() + TestDuration::from_secs(10);
             while !socket.exists() {
                 assert!(
@@ -1338,6 +1345,7 @@ mod tests {
             Self {
                 directory,
                 runtime_dir,
+                instance_home,
                 stop,
                 server: Some(server),
                 peer: Some(peer),
@@ -1345,13 +1353,13 @@ mod tests {
         }
 
         fn control_socket(&self) -> TestPathBuf {
-            self.runtime_dir.join(GUARDIAN_SOCKET_FILE)
+            yi_agent_lifecycle::scope::guardian_socket(&self.runtime_dir, &self.instance_home)
         }
 
         /// A `ThreadRoot` whose binding points at this fixture's runtime directory.
         fn root(&self, thread_id: &str) -> Arc<ThreadRoot> {
             ThreadRoot::new(
-                RuntimeBinding::for_runtime_dir(
+                RuntimeBinding::for_runtime_dir_in(
                     test_config(self.directory.path()),
                     self.runtime_dir.clone(),
                     RuntimeHandle {
@@ -1361,6 +1369,7 @@ mod tests {
                         task_id: "root".into(),
                         capability: "cap".into(),
                     },
+                    Some(self.instance_home.clone()),
                 ),
                 thread_id,
                 self.directory.path().to_path_buf(),
@@ -1527,7 +1536,10 @@ mod tests {
                 test_config(directory.path()),
                 runtime_dir.clone(),
                 RuntimeHandle {
-                    socket_path: runtime_dir.join(GUARDIAN_SOCKET_FILE),
+                    socket_path: yi_agent_lifecycle::scope::guardian_socket(
+                        &runtime_dir,
+                        &directory.path().join("instance"),
+                    ),
                     workspace_root: directory.path().to_path_buf(),
                     session_id: "s".into(),
                     task_id: "root".into(),
@@ -1571,8 +1583,9 @@ mod tests {
         use crate::foreground::ForegroundHost;
 
         let fixture = GuardianFixture::start();
-        let host = ForegroundHost::connect(
+        let host = ForegroundHost::connect_in(
             &fixture.runtime_dir,
+            &fixture.instance_home,
             yi_agent_lifecycle::types::ClientKind::App,
             "host-app".to_string(),
         )
