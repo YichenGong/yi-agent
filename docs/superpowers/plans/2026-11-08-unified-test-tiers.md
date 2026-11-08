@@ -40,7 +40,7 @@
   `[test-groups.live-api]`（`max-threads = 3`）。
   default profile 的 `default-filter` 变为三行以上的多行字符串。
 
-- [ ] **Step 1: 先记录改动前的基线数字**
+- [x] **Step 1: 先记录改动前的基线数字**
 
 ```bash
 cd yi-agent-rs
@@ -49,7 +49,7 @@ cargo nextest list --all-features --workspace 2>/dev/null | grep -c '::'
 ```
 Expected: `6020`（数量随仓库演化会变，记下实际值，后面要用）。
 
-- [ ] **Step 2: 写一条会失败的检查（证明当前确实没有 live profile）**
+- [x] **Step 2: 写一条会失败的检查（证明当前确实没有 live profile）**
 
 ```bash
 cd yi-agent-rs
@@ -58,7 +58,7 @@ cargo nextest list --all-features --profile live -p yi-agent --test e2e_real \
 ```
 Expected: 报错 `profile live not found`（或类似）。这证明 profile 尚不存在。
 
-- [ ] **Step 3: 修改 `yi-agent-rs/.config/nextest.toml`**
+- [x] **Step 3: 修改 `yi-agent-rs/.config/nextest.toml`**
 
 把现有的 `default-filter = "not test(runtime_process_helper)"` 一行替换为下面的多行
 版本，并在文件末尾追加 live profile 与 test-group。**已有的
@@ -128,7 +128,7 @@ test-group = 'live-api'
 slow-timeout = { period = "300s", terminate-after = 2 }
 ```
 
-- [ ] **Step 4: 验证 live profile 能取到 18 个 live 测试**
+- [x] **Step 4: 验证 live profile 能取到 18 个 live 测试**
 
 ```bash
 cd yi-agent-rs
@@ -152,7 +152,7 @@ Expected:
 合计: 18
 ```
 
-- [ ] **Step 5: 验证 default profile 不再包含 live 测试**
+- [x] **Step 5: 验证 default profile 不再包含 live 测试**
 
 ```bash
 cd yi-agent-rs
@@ -161,7 +161,7 @@ cargo nextest list --all-features --workspace 2>/dev/null | grep -cE 'e2e_(auto_
 ```
 Expected: `0`（实测确认）
 
-- [ ] **Step 6: 验证排除项没有误伤正常测试**
+- [x] **Step 6: 验证排除项没有误伤正常测试**
 
 ```bash
 cd yi-agent-rs
@@ -181,7 +181,7 @@ Expected: `0 / 3 / 3 / 6 / 3`，且全量 `diff=0`。
 > 若 `diff` 不为 0，说明排除项误伤了正常测试，必须停下来查。
 > 若某个二进制的 normal 数变化，说明该条前缀写错，排除到了不该排的东西。
 
-- [ ] **Step 7: 验证 `--run-ignored all` 下 live 被挡住**
+- [x] **Step 7: 验证 `--run-ignored all` 下 live 被挡住**
 
 ```bash
 cd yi-agent-rs
@@ -199,7 +199,7 @@ Expected: 各二进制为 `0 / 3 / 3 / 6 / 3`，**合计 15**。
 未加 filter 时同一命令合计为 **33**，差值正好 18（= live 测试数）。
 关键判据两条：合计必须等于 15，且不能是 0（正常测试仍在）。
 
-- [ ] **Step 8: 确认 `just test` 仍能正常工作（不跑 live）**
+- [x] **Step 8: 确认 `just test` 仍能正常工作（不跑 live）**
 
 ```bash
 cd yi-agent-rs
@@ -207,7 +207,7 @@ cargo nextest list --all-features --workspace --profile ci 2>/dev/null | grep -c
 ```
 Expected: 等于 Step 1 的基线值（`--profile ci` 继承 default，同样排除 live）。
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add yi-agent-rs/.config/nextest.toml
@@ -243,7 +243,7 @@ yields 0, live profile yields 18."
 - Produces: `just test-live [suite]`，suite 取值 `llm|e2e|complex|subagent|catalog|`
   （空 = 全部）。`scripts/test-live.sh` 接受一个参数：suite 名或空。
 
-- [ ] **Step 1: 写脚本并先验证它在无 key 时的行为（这是本任务的核心验收点）**
+- [x] **Step 1: 写脚本并先验证它在无 key 时的行为（这是本任务的核心验收点）**
 
 创建 `yi-agent-rs/scripts/test-live.sh`：
 
@@ -330,7 +330,7 @@ Expected: 打印 `SKIPPED: no provider API key configured ...` 且 `exit 0`。
 > 关键：**不能出现“无输出、跑 0 个测试、rc=0”**。必须有 `SKIPPED` 字样，
 > 这是病因 4 的形态（假绿）与本设计的分界。
 
-- [ ] **Step 2: 验证未知 suite 名报错**
+- [x] **Step 2: 验证未知 suite 名报错**
 
 ```bash
 cd yi-agent-rs
@@ -338,7 +338,7 @@ bash scripts/test-live.sh nosuchsuite; echo "rc=$?"
 ```
 Expected: 打印 `error: unknown suite 'nosuchsuite'` 与合法取值，`rc=1`。
 
-- [ ] **Step 3: 验证 5 个 suite 全部能映射（覆盖病因 5）**
+- [x] **Step 3: 验证 5 个 suite 全部能映射（覆盖病因 5）**
 
 ```bash
 cd yi-agent-rs
@@ -352,7 +352,7 @@ done
 Expected: 每个都打印 `SKIPPED`（无 key 环境），且**五个都不报 unknown suite**。
 特别是 `catalog` —— 它历史上没有任何入口（病因 5）。
 
-- [ ] **Step 4: 替换 justfile 的旧段落**
+- [x] **Step 4: 替换 justfile 的旧段落**
 
 删除 `yi-agent-rs/justfile` 里 `# === 真实 LLM 测试(需 API key,默认跳过) ===` 到
 `test-real-all: ...` / `@echo "All real LLM tests passed"` 之间的**全部内容**
@@ -381,7 +381,7 @@ test-live suite="":
     bash scripts/test-live.sh "{{suite}}"
 ```
 
-- [ ] **Step 5: 验证新入口可用，旧名字已消失**
+- [x] **Step 5: 验证新入口可用，旧名字已消失**
 
 ```bash
 cd yi-agent-rs
@@ -396,7 +396,7 @@ env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u MODEL_API_KEY \
 ```
 Expected: `SKIPPED: ...`，无报错。
 
-- [ ] **Step 6: 验证无参时五个 suite 都被调度**
+- [x] **Step 6: 验证无参时五个 suite 都被调度**
 
 ```bash
 cd yi-agent-rs
@@ -415,7 +415,7 @@ MODEL_API_KEY=dummy-for-scheduling-test YI_AGENT_PROVIDER=anthropic \
 ```
 Expected: `5`（五个 suite 都被调度到）。失败是预期的（假 key），不追究。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add yi-agent-rs/scripts/test-live.sh yi-agent-rs/justfile
@@ -441,7 +441,7 @@ Runs under nextest --profile live so the 300s budget is not cut short at
 - Consumes: Task 1 验证的「263 个 proc 测试在 nextest 下全绿」。
 - Produces: 无（终端改动）。本地 `just runtime-lifecycle-check` 保留不变。
 
-- [ ] **Step 1: 再确认一次 proc 测试在 nextest 下全绿（删 CI 步骤的前提）**
+- [x] **Step 1: 再确认一次 proc 测试在 nextest 下全绿（删 CI 步骤的前提）**
 
 ```bash
 cd yi-agent-rs
@@ -460,7 +460,7 @@ cargo nextest run --all-features --profile ci \
 Expected: `263 tests run: 263 passed, 4 skipped`（数字允许小偏差，关键是 **0 failed**）。
 若有失败，**停止本任务**并报告 —— 不能删除 CI 步骤。
 
-- [ ] **Step 2: 读取当前的 macOS job 尾部**
+- [x] **Step 2: 读取当前的 macOS job 尾部**
 
 ```bash
 sed -n '140,175p' .github/workflows/ci.yml
@@ -468,7 +468,7 @@ sed -n '140,175p' .github/workflows/ci.yml
 确认待删除的是 `- name: Run shared runtime lifecycle tests` 这一步及其上方的
 注释块（当前为 152-171 行附近）。
 
-- [ ] **Step 3: 删除该步骤，并修正上方那条错误注释**
+- [x] **Step 3: 删除该步骤，并修正上方那条错误注释**
 
 把注释块（`# 共享运行时生命周期的真进程验收。` 到
 `# 无头环境不声称覆盖。`）连同 `- name: Run shared runtime lifecycle tests` 与
@@ -487,7 +487,7 @@ sed -n '140,175p' .github/workflows/ci.yml
       # 7/7 通过。删除重复步骤，同一批测试一次运行只跑一遍。
 ```
 
-- [ ] **Step 4: 验证 YAML 合法**
+- [x] **Step 4: 验证 YAML 合法**
 
 ```bash
 python3 -c "
@@ -503,7 +503,7 @@ print('OK: lifecycle step removed')
 ```
 Expected: 打印 `OK: lifecycle step removed`。
 
-- [ ] **Step 5: 确认本地入口仍在（只是 CI 不调了）**
+- [x] **Step 5: 确认本地入口仍在（只是 CI 不调了）**
 
 ```bash
 cd yi-agent-rs
@@ -511,7 +511,7 @@ grep -n '^runtime-lifecycle-check:' justfile
 ```
 Expected: 仍存在（例如 `runtime-lifecycle-check:` 在某行）。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add .github/workflows/ci.yml
@@ -542,7 +542,7 @@ The local recipe stays for running them in isolation."
 - Consumes: Task 1-2 的最终命令名（`just test-live`）。
 - Produces: 无（文档）。
 
-- [ ] **Step 1: 定位三节的当前行号**
+- [x] **Step 1: 定位三节的当前行号**
 
 ```bash
 grep -n '^## 分级测试入口\|^## 真实 LLM 测试\|^## 分级测试系统\|^## 项目进度维护' CLAUDE.md
@@ -550,7 +550,7 @@ grep -n '^## 分级测试入口\|^## 真实 LLM 测试\|^## 分级测试系统\|
 Expected: 四个行号。`## 分级测试系统` 到 `## 项目进度维护` 之间是本任务要重写的
 范围（含 `## 真实 LLM 测试`）。
 
-- [ ] **Step 2: 把 `## 分级测试入口(L0/L1/L2)` 整节替换为统一的「两个轴」章节**
+- [x] **Step 2: 把 `## 分级测试入口(L0/L1/L2)` 整节替换为统一的「两个轴」章节**
 
 ```markdown
 ## 测试分级:两个正交轴
@@ -622,7 +622,7 @@ Expected: 四个行号。`## 分级测试系统` 到 `## 项目进度维护` 之
 设计依据: `docs/superpowers/specs/2026-11-08-unified-test-tiers-design.md`
 ```
 
-- [ ] **Step 3: 删除 `## 真实 LLM 测试` 与 `## 分级测试系统` 两节**
+- [x] **Step 3: 删除 `## 真实 LLM 测试` 与 `## 分级测试系统` 两节**
 
 这两节的内容已被 Step 2 的新章节吸收。特别要删掉：
 
@@ -645,7 +645,7 @@ Expected: 四个行号。`## 分级测试系统` 到 `## 项目进度维护` 之
   `e2e_auto_compact_triggers` 依赖 token 计数假设。
 ```
 
-- [ ] **Step 4: 验证没有残留的旧命令名**
+- [x] **Step 4: 验证没有残留的旧命令名**
 
 ```bash
 grep -n 'test-real-llm\|test-real-e2e\|test-real-complex\|test-real-subagent\|test-real-all' CLAUDE.md
@@ -662,7 +662,7 @@ grep -n 'Tier 0\|Tier 1\|Tier 2\|Tier 3' CLAUDE.md
 ```
 Expected: 无输出（Tier 术语已并入两个轴）。
 
-- [ ] **Step 5: 逐条执行文档里的新命令，确认都真实可用**
+- [x] **Step 5: 逐条执行文档里的新命令，确认都真实可用**
 
 ```bash
 cd yi-agent-rs
@@ -670,7 +670,7 @@ just --list 2>/dev/null | grep -E 'check-fast|test-crate|test-affected|test-live
 ```
 Expected: 五个都出现。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add CLAUDE.md
@@ -697,13 +697,13 @@ previous commit, and records the two live-config traps (must use
 - Consumes: Task 1-4 的成果。
 - Produces: 无。
 
-- [ ] **Step 1: 找到现有的分级测试条目**
+- [x] **Step 1: 找到现有的分级测试条目**
 
 ```bash
 grep -n '分级测试\|test-real\|runtime-lifecycle' docs/project-management/tooling.md
 ```
 
-- [ ] **Step 2: 更新或新增条目**
+- [x] **Step 2: 更新或新增条目**
 
 把现有的「分级测试入口（L0/L1/L2）」条目改为反映两个轴，并新增 live 入口的记录。
 条目必须带**可验证的完成判据**（命令或文件位置），不能写主观描述：
@@ -724,14 +724,14 @@ grep -n '分级测试\|test-real\|runtime-lifecycle' docs/project-management/too
     `cargo nextest list --all-features --workspace` 不含任何 live 测试
 ```
 
-- [ ] **Step 3: 更新模块索引表的计数**
+- [x] **Step 3: 更新模块索引表的计数**
 
 ```bash
 grep -n 'tooling' docs/project-management/README.md
 ```
 按该表既有格式调整「完成 / 总计」计数（新增或修改了多少条就加减多少）。
 
-- [ ] **Step 4: 验证文档里的命令可执行**
+- [x] **Step 4: 验证文档里的命令可执行**
 
 ```bash
 cd yi-agent-rs
@@ -740,7 +740,7 @@ cargo nextest list --all-features --profile live --run-ignored only \
 ```
 Expected: `6`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/project-management/tooling.md docs/project-management/README.md
@@ -753,14 +753,73 @@ git commit -m "docs: record the unified test tiers in project management"
 
 全部任务完成后，跑一次完整验收：
 
-- [ ] `just test-live` 无 key 时打印 `SKIPPED` 且 `exit 0`
-- [ ] `just test-live nosuchsuite` 报错 `rc=1`
-- [ ] `cargo nextest list --profile live --run-ignored only` 五个二进制合计 18
-- [ ] `cargo nextest list --workspace` 在 default profile 下不含 live 测试
-- [ ] `default-filter` 加排除前后全量测试数差值为 0（不误伤正常测试）
-- [ ] `eval_baseline` 仍有 32 个测试
-- [ ] `just runtime-lifecycle-check` 的 263 个测试在 nextest 下 0 failed
-- [ ] CI macOS job 里只有一步跑 proc 测试
-- [ ] `CLAUDE.md` 只有一个 `## 分级` 章节，无 `Tier N`、无 `test-real-*`
-- [ ] `just --list` 里没有 `test-real-*`，有 `test-live`
-- [ ] `just ci` 全绿（在 `yi-agent-rs/` 下；这是合并前唯一入口）
+- [x] `just test-live` 无 key 时打印 `SKIPPED` 且 `exit 0`
+- [x] `just test-live nosuchsuite` 报错 `rc=1`
+- [x] `cargo nextest list --profile live --run-ignored only` 五个二进制合计 18
+- [x] `cargo nextest list --workspace` 在 default profile 下不含 live 测试
+- [x] `default-filter` 加排除前后全量测试数差值为 0（不误伤正常测试）
+- [x] `eval_baseline` 仍有 32 个测试
+- [x] `just runtime-lifecycle-check` 的 263 个测试在 nextest 下 0 failed
+- [x] CI macOS job 里只有一步跑 proc 测试
+- [x] `CLAUDE.md` 只有一个 `## 分级` 章节，无 `Tier N`、无 `test-real-*`
+- [x] `just --list` 里没有 `test-real-*`，有 `test-live`
+- [x] `just ci` 全绿（在 `yi-agent-rs/` 下；这是合并前唯一入口）
+
+---
+
+## 执行记录（2026-11-08）
+
+全部 5 个 Task 已实施并合入 `main`（`f88d1977`）。合并后又在合并结果上复验一轮。
+
+### 提交
+
+| 提交 | 内容 |
+|---|---|
+| `bb90d25b` | nextest：default 排除 live，新增 `[profile.live]` |
+| `b0ae00d7` | `just test-live` 取代 4 个 `test-real-*` recipe |
+| `332a04f4` | CI：macOS job 删除重复的 lifecycle 步骤 |
+| `a6a6ad63` | CLAUDE.md：两个「分级」章节合并为双轴 |
+| `01dbfeea` | 进度文档：记录保真度轴 |
+| `14f62835` | 修 `nightly.yml` 仍调旧 recipe；provider 映射覆盖第三方 |
+
+### 实测值
+
+合并后（`f88d1977` + 后续 runtime-settings 合并）在真空闲环境（load 4.25）测得：
+
+- 全量：**6250 passed / 0 failed / 41 skipped**
+- `just ci` 22 项门禁全部通过
+- `--profile live --run-ignored only`：**18**（6+5+4+2+1）
+- workspace 默认 profile 含 live：**0**
+- `--run-ignored all`（加 filter 后）：**15**（加 filter 前为 33）
+- `--profile ci` 继承 default：**6250**
+- `eval_baseline`：**32**
+- `just --list`：`test-real-*` 为 0 个，`test-live` 为 1 个
+- CI macOS job 跑测试的步骤：**1 个**
+
+测试总数从 6020 涨到 6250，是因为同期另一个合并（`ad100876` runtime settings）新增了 230 个测试，与本计划无关。
+
+### 实施中额外发现并修掉的缺陷（计划未预料）
+
+1. **`nightly.yml` 调用了已删除的 `test-real-all`** —— 被 `nightly-workflow-check`
+   抓到（`13 passed, 1 failed`）。同类的失效引用还在三份活跃文档里（
+   `subagent-runtime.md`、`ci-cd.md`、`side-conversation-acceptance.md`），一并改掉。
+   这正是该门禁存在的理由：「改了个 recipe 名，workflow 还在调旧名」靠静读发现不了。
+2. **provider 映射会假红** —— 初版只把 `anthropic`/`openai` 映射到
+   `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`。第三方 provider（deepseek、moonshot、
+   openrouter、本地 vLLM）会拿到 `MODEL_API_KEY` 却拿不到任何专属变量，测试报
+   「缺 key」失败，看起来像真实回归。改为「非 anthropic 一律映射到
+   `OPENAI_API_KEY`」——除 Anthropic 原生协议外都是 OpenAI 兼容，枚举第三方名字
+   数量无界。
+3. **一个 suite 失败会吞掉其余 suite** —— 初版循环里 `set -e` 让第一个失败的
+   suite 直接中止，后面 4 个永不执行。改为收集失败、全部跑完后统一非零退出。
+
+### 关于验证环境的注意事项
+
+这台机器常有多会话并行编译（`session-completeness-impl`、
+`fix-managed-session-container-attach`、`runtime-settings-live-apply` 等 worktree）。
+load average 冲到 40–76 时，proc 类测试会因调度延迟超时失败，表现为随机几个
+测试一起红（如 `refresh::tests::*` 多个同时 15s 超时）。实测同一批测试在 load 4.25
+时 6250 全绿。判断依据：失败测试单独跑能否稳定通过 + 当时 `uptime` 的 load。
+
+`quitting_one_frontend_leaves_the_others_work_running` 在 `just ci` 里偶发失败过一次；
+单独跑 3 次均 16/16 通过，且本计划未触碰该文件。属既有负载敏感问题。
