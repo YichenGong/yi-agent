@@ -310,6 +310,16 @@ pub struct SideRegistry {
     /// 恰好没广播出口就停摆。
     hub: std::sync::Mutex<Option<Arc<crate::broadcast::Broadcaster>>>,
     closed: std::sync::atomic::AtomicBool,
+    /// 清扫代次。每次 `close_all()` 自增。
+    ///
+    /// `create_inner` 与 `open()` 的等待者在把一条 side 对外可见之前都要复核它，
+    /// 不一致就放弃。没有它，「关掉开关」与「正在创建」并发时会漏：`create_inner`
+    /// 要读完父会话、复制附件之后才 `sides.insert`，那时清扫可能已经跑完了。
+    ///
+    /// **两处都要复核**（只护 `create_inner` 不够）：等待者在 `Creating` 占位上
+    /// 醒来后会回到 `open()` 的 loop，若不复核就会以清扫之后的新代次重试，成功
+    /// 建出一条活旁支。
+    sweep_epoch: AtomicU64,
 }
 
 impl SideRegistry {
@@ -330,6 +340,7 @@ impl SideRegistry {
             replay: tokio::sync::Mutex::new(None),
             hub: std::sync::Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
+            sweep_epoch: AtomicU64::new(0),
         }
     }
 
@@ -434,7 +445,16 @@ impl SideRegistry {
         if self.closed.load(Ordering::SeqCst) {
             return Err(SideError::new(SideErrorReason::SideClosing, "宿主正在关闭"));
         }
+        // 记下进来时的代次：等待者在 `Creating` 上醒来后会走到 loop 顶部，
+        // 若期间发生过清扫，这次 open 属于「清扫之前的意图」，不能再建。
+        let epoch = self.sweep_epoch.load(Ordering::SeqCst);
         loop {
+            if self.sweep_epoch.load(Ordering::SeqCst) != epoch {
+                return Err(SideError::new(
+                    SideErrorReason::SideClosing,
+                    "清扫期间放弃创建旁支",
+                ));
+            }
             // The wait future is created and *enabled* while the map lock is held.
             // Creating it after dropping the lock leaves a window in which the
             // creator publishes `Ready` and notifies nobody; the waiter then sleeps
@@ -513,6 +533,9 @@ impl SideRegistry {
     }
 
     async fn create_inner(&self, parent: &str) -> Result<SideSummary, SideError> {
+        // 记下进来时的清扫代次：整个创建要读父会话、复制附件，期间用户可能
+        // 把开关关掉并触发一次 `close_all`。
+        let epoch = self.sweep_epoch.load(Ordering::SeqCst);
         let source = self.resolver.resolve(parent).await?;
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
         let side_id = uuid::Uuid::new_v4().to_string();
@@ -563,6 +586,15 @@ impl SideRegistry {
         }));
         {
             let mut sides = self.sides.lock().await;
+            if self.sweep_epoch.load(Ordering::SeqCst) != epoch {
+                // 清扫发生在创建期间：这条 side 从未对外可见，直接丢弃。
+                // 返回 `SideClosing` 让 `create()` 的 Err 分支移除父占位，
+                // 而不是把 `Ready` 写回去。
+                return Err(SideError::new(
+                    SideErrorReason::SideClosing,
+                    "清扫期间创建的旁支已丢弃",
+                ));
+            }
             sides.insert(side_id.clone(), Arc::clone(&entry));
         }
         let guard = entry.lock().await;
@@ -922,6 +954,103 @@ impl SideRegistry {
     ///
     /// Never called from the request loop: the plan is explicit that shutdown must
     /// not block RPC handling on runner teardown.
+    /// 关闭所有旁支，但不把 registry 置为终态。
+    ///
+    /// 与 [`Self::shutdown`] 的语义差：
+    ///
+    /// - **不碰 `closed`**：开关是可逆的，关掉之后用户还能再打开。
+    /// - **写 tombstone**：与 `close()` 一致，让「刚关掉的那条」还能回答
+    ///   `side_not_found` 而不是「从未存在」（重连时需要这个区别）。
+    /// - **发布 `side/closed`**：客户端靠这个终态帧丢弃本地内容与在途分页。
+    ///
+    /// 并发处理的三个要点：
+    ///
+    /// - 只移除 `ParentSlot::Ready`，保留 `Creating`：清掉占位会让在途创建的
+    ///   `create()` 把 `Ready` 写回去。
+    /// - 自增 `sweep_epoch`：`create_inner` 在 `sides.insert` 之前复核、`open()`
+    ///   的等待者醒来后复核，不一致就放弃。
+    /// - 有界多轮：第一轮期间可能有 `Creating` 落定成 `Ready`。
+    ///
+    /// 不能内联在请求路径上：等 runner 收敛可能要几百毫秒，主循环是单 task。
+    pub async fn close_all(&self) {
+        self.sweep_epoch.fetch_add(1, Ordering::SeqCst);
+        // 三轮足够覆盖「第一轮期间创建落定」这一种形状。超过上限记警告而不是
+        // 静默返回——留下一条活旁支是本功能最不该有的失败模式。
+        const MAX_ROUNDS: usize = 3;
+        for round in 0..MAX_ROUNDS {
+            let entries: Vec<(String, Arc<Mutex<SideEntry>>)> = {
+                let sides = self.sides.lock().await;
+                sides
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                    .collect()
+            };
+            if entries.is_empty() {
+                self.drop_ready_parents().await;
+                return;
+            }
+            for (side_id, entry) in &entries {
+                // 与 `close()` 同一顺序：先关 runner（它会 join 核心任务），
+                // 再 stage 终态，最后在锁外投递。
+                let (parent, generation, accepted, closed) = {
+                    let mut guard = entry.lock().await;
+                    guard.closing = true;
+                    let accepted: Vec<(String, String)> =
+                        guard.ledger.accepted_requests().into_iter().collect();
+                    let parent = guard.parent.clone();
+                    let generation = guard.generation;
+                    let _ = guard.runner.close().await;
+                    let staged = Self::stage(&mut guard, |e| super::SidePublishedUpdate::Closed {
+                        side_id: e.side_id.clone(),
+                        reason: CloseReason::UserClosed,
+                    });
+                    (parent, generation, accepted, staged)
+                };
+                if let Some(staged) = closed {
+                    self.deliver(staged).await;
+                }
+                self.release_side_snapshots(side_id).await;
+                self.sides.lock().await.remove(side_id);
+                {
+                    let mut parents = self.parents.lock().await;
+                    if let Some(ParentSlot::Ready(current)) = parents.get(&parent)
+                        && current == side_id
+                    {
+                        parents.remove(&parent);
+                    }
+                }
+                let mut tombstones = self.tombstones.lock().await;
+                tombstones.insert(
+                    side_id.clone(),
+                    Tombstone {
+                        side_id: side_id.clone(),
+                        parent,
+                        generation,
+                        accepted,
+                        created_at: tokio::time::Instant::now(),
+                    },
+                );
+                Self::prune_tombstones(&mut tombstones, tokio::time::Instant::now());
+            }
+            self.drop_ready_parents().await;
+            if self.side_count().await == 0 {
+                return;
+            }
+            if round + 1 == MAX_ROUNDS {
+                tracing::warn!(
+                    remaining = self.side_count().await,
+                    "close_all hit its round limit; some sides are still live"
+                );
+            }
+        }
+    }
+
+    /// 移除所有 `Ready` 的父占位，保留 `Creating`。
+    async fn drop_ready_parents(&self) {
+        let mut parents = self.parents.lock().await;
+        parents.retain(|_, slot| matches!(slot, ParentSlot::Creating(_)));
+    }
+
     pub async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
         let entries: Vec<(String, Arc<Mutex<SideEntry>>)> = {

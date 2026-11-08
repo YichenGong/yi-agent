@@ -884,3 +884,60 @@ async fn side_publish_advances_seq_by_one() {
     assert_eq!(second, first + 1);
     assert_eq!(registry.list("p1").await[0].last_seq, second);
 }
+
+/// 关掉开关后，所有旁支必须消失，且 registry 仍可用。
+///
+/// 与既有的 `shutdown` 系列并列存在：那个测的是不可逆的进程退出，这个测的是
+/// 可逆的开关。
+#[tokio::test]
+async fn close_all_stops_every_side_and_leaves_the_registry_usable() {
+    let (_project, _home, registry) = registry_fixture().await;
+    let first = registry.open("p1").await.unwrap();
+
+    registry.close_all().await;
+
+    assert_eq!(registry.side_count().await, 0, "every side must be gone");
+    assert!(registry.list("p1").await.is_empty());
+
+    // 可逆性：关掉再打开必须还能用。这条断言是 `close_all` 与 `shutdown()` 的
+    // 分界线——复用 `shutdown()` 会让它失败。
+    let again = registry
+        .open("p1")
+        .await
+        .expect("close_all must not be terminal");
+    assert_ne!(again.side_id, first.side_id, "a new generation");
+}
+
+/// 清扫与在途创建竞争时，不能留下一条活旁支。
+///
+/// 两种在途形状都要覆盖：
+/// 1. 创建者已经跑在 `create_inner` 里（文件操作之后才 `sides.insert`）。
+/// 2. 第二条 `open` 在同一父的 `Creating` 占位上等，清扫后它醒来**不能**
+///    摇身变成新的创建者。
+///
+/// 第 2 种是 epoch 必须同时护住 `open()` 的原因：只护 `create_inner` 的话，
+/// 等待者会带着清扫之后的新代次重试，成功建出一条活旁支。
+#[tokio::test]
+async fn close_all_wins_against_a_concurrent_open() {
+    for _ in 0..20 {
+        let (_project, _home, registry) = registry_fixture().await;
+        let registry = Arc::new(registry);
+        let a = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move { registry.open("p1").await }
+        });
+        let b = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move { registry.open("p1").await }
+        });
+        tokio::task::yield_now().await;
+        registry.close_all().await;
+        let _ = a.await;
+        let _ = b.await;
+        assert_eq!(
+            registry.side_count().await,
+            0,
+            "a create or a woken waiter that outlived the sweep must not leave a live side"
+        );
+    }
+}
