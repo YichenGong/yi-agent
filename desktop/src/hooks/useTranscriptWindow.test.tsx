@@ -4,12 +4,41 @@ import { StrictMode, useCallback, useState } from "react";
 import { render, cleanup, act } from "@testing-library/react";
 import { useTranscriptWindow } from "./useTranscriptWindow";
 import { createHeightBook } from "../lib/heightBook";
-import type { FocusRequest, VisibleRange, WindowState } from "../lib/transcriptWindow";
+import type { FocusRequest, WindowState } from "../lib/transcriptWindow";
+import type { WindowMeasurement } from "../lib/transcriptGeometry";
 
 let last: WindowState = { start: 0, end: 0, following: true };
 let requestFocus: (f: FocusRequest) => void = () => {};
 let nudge: () => void = () => {};
-let measure: () => VisibleRange | null = () => null;
+/**
+ * 构造一份「历史区边界 + 可选可见行」的测量。
+ *
+ * 新口径下 `history.first/last` 是**绝对** index，gap 只由历史区行计算：
+ * 测试不再自己写相对序号，也就不会再固化成旧的 `window.start + 相对` 口径。
+ */
+function edge(args: {
+  first?: number;
+  last?: number;
+  gapTopPx: number;
+  gapBottomPx: number;
+  visible?: { first: number; last: number } | null;
+  tailVisible?: boolean;
+}): WindowMeasurement {
+  const first = args.first ?? 0;
+  const last = args.last ?? first + 10;
+  return {
+    // 三态：`undefined` = 默认「首末行都可视」；显式 `null` = 视口内没有任何行，
+    // 必须原样保留。用 `??` 会把 null 也当缺省，令「视口落进 spacer」的用例
+    // 静默退化成已覆盖，红证据就消失了。
+    visible: args.visible === undefined ? { first, last } : args.visible,
+    history: { first, last, gapTopPx: args.gapTopPx, gapBottomPx: args.gapBottomPx },
+    tailVisible: args.tailVisible ?? false,
+    viewportTop: 0,
+    viewportBottom: 800,
+  };
+}
+
+let measure: () => WindowMeasurement | null = () => null;
 let currentFocus: FocusRequest | null = null;
 
 let externalBook: ReturnType<typeof createHeightBook> | null = null;
@@ -78,16 +107,14 @@ describe("useTranscriptWindow", () => {
     // topGap 自然变大。桩必须模拟这件事，否则每帧都会被判定为「仍在顶端」
     // 而无限翻页——真实 DOM 里不会这样。
     //
-    // `first`/`last` 是**挂载区相对序号**（组件层数不出前面还有多少条），
-    // 由 hook 加上 `window.start` 变成绝对 index。这里写 `last.start` 会把
-    // 基准重复计一次，虽然当前判定只用 gap、不会失败，但会把错误口径固化下来。
-    measure = () => ({
-      first: 0,
-      last: 10,
-      // 有符号：翻页后挂载区顶边在被翻到视口上方 -> 负值；底边远在视口下方 -> 负值。
-      gapTopPx: last.start === initialStart ? 0 : -5000,
-      gapBottomPx: -5000,
-    });
+    // 翻出一页后，新挂载的 200 条落到视口上方：历史区顶边因此远在视口上方
+    // （负 gap）。桩必须模拟这件事，否则每帧都会被判「仍在顶端」而无限翻页。
+    measure = () =>
+      edge({
+        // 有符号：翻页后历史顶边在被翻到视口上方 -> 负值；底边远在视口下方 -> 负值。
+        gapTopPx: last.start === initialStart ? 0 : -5000,
+        gapBottomPx: -5000,
+      });
     // 真实场景里「贴顶」是用户滚出来的：滚动事件驱动 `nudge`。
     await act(async () => {
       nudge();
@@ -102,12 +129,7 @@ describe("useTranscriptWindow", () => {
     render(<Harness itemCount={3000} />);
     await tick();
     const initialStart = last.start;
-    measure = () => ({
-      first: 0,
-      last: 10,
-      gapTopPx: last.start === initialStart ? 0 : -5000,
-      gapBottomPx: -5000,
-    });
+    measure = () => edge({ gapTopPx: last.start === initialStart ? 0 : -5000, gapBottomPx: -5000, });
     // 只有 `measure` 变了，没有任何 React 依赖变化：不调用 nudge 就不该翻页。
     await tick();
     expect(last.start).toBe(initialStart);
@@ -135,6 +157,49 @@ describe("useTranscriptWindow", () => {
     });
     await tick();
     expect(calls).toBe(1);
+  });
+
+  it("提交后自驱动收敛：视口落进 spacer 时不需要第二次外部 scroll", async () => {
+    // 真实缺陷（D02）：`scrollTop=0` 直接落进 41004px 的顶 spacer，窗口仍是
+    // [201,600)。此时浏览器已经贴在顶部，不会再产生 scroll 事件；只靠
+    // 「滚动事件触发重算」的调度就永远停在这一帧，屏幕全空——用户只能切走再
+    // 切回（重挂载强制回尾）才看到内容。修复后必须自己继续开窗，直到覆盖。
+    render(<Harness itemCount={3000} />);
+    await tick();
+    expect(last).toEqual({ start: 2940, end: 3000, following: true });
+
+    // 脚本化几何：第一次测量 = 视口整个落在顶 spacer 里（无相交行）；此后每次
+    // 被问到就往前走一页，直到视口落在挂载区中间。方向是「向下」——窗口在
+    // 视口上方，需要把 start 往后推，而不是继续向上扩。
+    let asked = 0;
+    const scripted = (): WindowMeasurement => {
+      asked += 1;
+      if (asked === 1) {
+        return edge({ first: 201, last: 599, gapTopPx: 41004, gapBottomPx: -489396, visible: null });
+      }
+      const step = asked - 1;
+      const start = Math.min(2500, 201 + 200 * step);
+      const covered = start <= 2400;
+      return edge({
+        first: start,
+        last: Math.min(start + 399, 2998),
+        gapTopPx: covered ? -900 : 41004 - 204 * 200 * step,
+        gapBottomPx: covered ? -600000 : -600000,
+        visible: covered ? { first: 2450, last: 2470 } : null,
+      });
+    };
+    measure = scripted;
+    await act(async () => {
+      nudge();
+    });
+    await tick();
+    const afterFirst = { ...last };
+    expect(afterFirst.following).toBe(false);
+
+    // **关键断言**：此后不再派发 scroll / nudge，只推进帧。没有自驱动调度时
+    // `asked` 会停在第一次（这就是修复前的行为）。
+    await tick(10);
+    expect(asked).toBeGreaterThan(1);
   });
 
   it("itemCount 增长时跟随尾部", async () => {
@@ -169,7 +234,7 @@ describe("useTranscriptWindow", () => {
     for (let i = 0; i < 50; i += 1) book.record(`h${i}`, 400);
     expect(book.median()).toBe(400);
 
-    measure = () => ({ first: 0, last: 10, gapTopPx: -2000, gapBottomPx: -5000 });
+    measure = () => edge({ gapTopPx: -2000, gapBottomPx: -5000 });
     await act(async () => {
       nudge();
     });
@@ -192,7 +257,7 @@ describe("useTranscriptWindow", () => {
     expect(last).toEqual({ start: 2940, end: 3000, following: true });
 
     // 用户在 A 里上翻：窗口扩一页并放弃跟随。
-    measure = () => ({ first: 0, last: 10, gapTopPx: 0, gapBottomPx: -5000 });
+    measure = () => edge({ gapTopPx: 0, gapBottomPx: -5000 });
     await act(async () => {
       nudge();
     });
@@ -209,7 +274,7 @@ describe("useTranscriptWindow", () => {
 
     // 残留的请求会在**下一次重算**时才露头（切会话后的首次渲染看不出问题），
     // 所以必须再推一帧滚动：若 `pendingRef` 没被清掉，B 会被拽到 A 的 index 480。
-    measure = () => ({ first: 0, last: 10, gapTopPx: -5000, gapBottomPx: 0 });
+    measure = () => edge({ gapTopPx: -5000, gapBottomPx: 0 });
     await act(async () => {
       nudge();
     });
@@ -251,7 +316,7 @@ describe("useTranscriptWindow", () => {
 
     // 触顶：必须真的能追加一页。若 frameRef 被作废帧号粘住，这里恒为 60。
     // `gapTopPx: 0` 即「挂载区顶边贴住视口顶」，与真实触顶一致。
-    measure = () => ({ first: 0, last: 10, gapTopPx: 0, gapBottomPx: -5000 });
+    measure = () => edge({ gapTopPx: 0, gapBottomPx: -5000 });
     await act(async () => {
       nudge();
     });

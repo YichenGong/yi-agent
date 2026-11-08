@@ -5,12 +5,13 @@ import { fileNameOf } from "../lib/attachmentLimits";
 import type { NoticeItem, ReasoningItem } from "../lib/session";
 import { useImageData, type ImageReadCall } from "../lib/useImageData";
 import { useStickToBottom } from "../lib/useStickToBottom";
+import { measureTranscript, type WindowMeasurement } from "../lib/transcriptGeometry";
 import { findAnchor, restoreScrollTop, type ItemBox, type ViewAnchor } from "../lib/viewAnchor";
 import { useThrottledText } from "../lib/useThrottledText";
 import { itemText } from "../lib/itemText";
 import { createHeightBook } from "../lib/heightBook";
 import { useTranscriptWindow } from "../hooks/useTranscriptWindow";
-import { DEFAULT_LIMITS, type VisibleRange } from "../lib/transcriptWindow";
+import { DEFAULT_LIMITS } from "../lib/transcriptWindow";
 import type { TranscriptWindowApi } from "../hooks/useTranscriptWindow";
 import { planCompensation } from "../lib/scrollCompensation";
 import { AgentMessage } from "./MarkdownText";
@@ -147,6 +148,8 @@ const ChatItem = memo(
     threadId,
     call,
     query,
+    index = -1,
+    region = "history",
   }: {
     item: Item | NoticeItem | ReasoningItem;
     text: string;
@@ -154,6 +157,14 @@ const ChatItem = memo(
     call: ImageReadCall;
     /** 搜索关键词。空串表示未在搜索，不产生任何 mark。 */
     query: string;
+    /**
+     * 该条在 `items` 里的**绝对** index。测量层直接读 `data-item-index`，
+     * 不再让 hook 用 `window.start + 相对序号` 换算（tail 不在历史窗口内，
+     * 那样换算会把历史边界比错）。
+     */
+    index?: number;
+    /** 历史区还是恒挂的 live tail。历史 gap 只由 `history` 行计算。 */
+    region?: "history" | "tail";
   }) {
     // 阅读锚点必须挂在实际生成布局盒的节点上：`display: contents` 的矩形恒为
     // 零，采集会把所有消息视为同一位置并错误选中最后一条。用纵向 flex 容器
@@ -242,7 +253,12 @@ const ChatItem = memo(
       }
     })();
     return (
-      <div className="flex shrink-0 flex-col" data-item-id={item.id}>
+      <div
+        className="flex shrink-0 flex-col"
+        data-item-id={item.id}
+        data-item-index={index}
+        data-transcript-region={region}
+      >
         {node}
       </div>
     );
@@ -279,11 +295,14 @@ const ChatItem = memo(
  */
 function LiveTail({
   item,
+  index,
   threadId,
   call,
   query,
 }: {
   item: Item | NoticeItem | ReasoningItem;
+  /** 该条在 `items` 里的绝对 index（tail 恒为 `items.length - 1`）。 */
+  index: number;
   threadId: string | null;
   call: ImageReadCall;
   query: string;
@@ -297,6 +316,8 @@ function LiveTail({
       threadId={threadId}
       call={call}
       query={query}
+      index={index}
+      region="tail"
     />
   );
 }
@@ -372,6 +393,8 @@ const HistoryWindow = memo(
           threadId={threadId}
           call={call}
           query={query}
+          index={i}
+          region="history"
         />,
       );
     }
@@ -534,32 +557,18 @@ export function ChatView({
   const windowBook = useMemo(() => createHeightBook(), []);
 
   // 测量当前视口。`elRef` 在下面才声明，但闭包只在 rAF 里执行，那时已赋值。
-  const measureVisible = useCallback((): VisibleRange | null => {
+  // 测量当前视口。`elRef` 在下面才声明，但闭包只在 rAF 里执行，那时已赋值。
+  //
+  // 两条口径都在 `measureTranscript` 里钉住：绝对 index 直接读 DOM 属性
+  // （`tail` 不在历史窗口内，旧实现 `window.start + 相对序号` 会把边界比错），
+  // 历史 gap 只由历史区行计算（恒挂的 LiveTail 会把首末挂载行撑到视口内，
+  // 读成「已覆盖」后不再开窗，必须切走再切回才补上）。
+  const measureVisible = useCallback((): WindowMeasurement | null => {
     const el = elRef.current;
     // 未布局（jsdom、首帧、`scrollHeight` 为 0）时返回 null：`nextWindow` 会保持
     // 跟随且不翻页。这条守卫同时让测试能确定地断言首屏条数。
-    if (!el || el.scrollHeight === 0 || el.clientHeight === 0) return null;
-    const rows = el.querySelectorAll<HTMLElement>("[data-item-id]");
-    if (rows.length === 0) return null;
-    const viewTop = el.scrollTop;
-    const viewBottom = viewTop + el.clientHeight;
-    const firstNode = rows[0];
-    const lastNode = rows[rows.length - 1];
-    // 相对内容顶部的坐标系：减去容器自身的文档偏移，再加上 scrollTop。
-    const base = el.getBoundingClientRect().top - el.scrollTop;
-    const firstTop = firstNode.getBoundingClientRect().top - base;
-    const lastBottom = lastNode.getBoundingClientRect().bottom - base;
-    // `first`/`last` 是**挂载区相对序号**：这一层数不出前面还有多少条，
-    // `useTranscriptWindow` 会加上 `window.start` 变成绝对 index。
-    return {
-      first: 0,
-      last: rows.length - 1,
-      // **不要夹到 >=0**：`gapTopPx` 为负表示顶边已在视口上方，这是「用户在窗口
-      // 内部」的正常状态，必须与「顶边贴住视口顶（0）」区分。夹掉符号会让底部
-      // 跟随被误判成翻到顶，窗口逐帧抖动。
-      gapTopPx: firstTop - viewTop,
-      gapBottomPx: viewBottom - lastBottom,
-    };
+    if (!el || el.scrollHeight === 0) return null;
+    return measureTranscript(el);
   }, []);
 
   // 这里**不传** `focus` prop：锚点恢复（Task 10）与搜索跳转（Task 11）都走
@@ -572,6 +581,7 @@ export function ChatView({
     threadId,
     measure: measureVisible,
     book: windowBook,
+    following: isFollowing,
   });
   const { window: win, nudge, requestFocus } = windowApi;
 
@@ -1036,6 +1046,7 @@ export function ChatView({
         <LiveTail
           key={tail.id ?? "tail"}
           item={tail}
+          index={items.length - 1}
           threadId={threadId}
           call={effectiveCall}
           query={query}

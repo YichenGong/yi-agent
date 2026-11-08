@@ -16,7 +16,8 @@
     "sidecar": "bash scripts/build-sidecar.sh",
     "sidecar:release": "bash scripts/build-sidecar.sh release",
     "ios:build": "bash scripts/sync-ios-version.sh && tauri ios build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:browser:session-completeness": "node scripts/browser/session-completeness-check.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "~2.11.1",

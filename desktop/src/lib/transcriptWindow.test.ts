@@ -2,11 +2,13 @@ import { describe, it, expect } from "vitest";
 import {
   nextWindow,
   decideTrimStart,
+  cycleBudget,
   DEFAULT_LIMITS,
   type WindowState,
   type VisibleRange,
   type WindowLimits,
 } from "./transcriptWindow";
+import type { WindowMeasurement } from "./transcriptGeometry";
 
 const L: WindowLimits = DEFAULT_LIMITS;
 
@@ -259,7 +261,7 @@ describe("nextWindow / focus 定点开窗", () => {
     expect(next).toEqual(focused);
   });
 
-  it("向下分页一路扩到尾部后 following 转真", () => {
+  it("向下分页扩到尾部后**不**自动恢复跟随（意图只由用户显式给出）", () => {
     let w = nextWindow({
       current: null,
       itemCount: 800,
@@ -277,7 +279,80 @@ describe("nextWindow / focus 定点开窗", () => {
       });
     }
     expect(w.end).toBe(800);
-    expect(w.following).toBe(true);
+    // 读到底部 ≠ 用户要贴底：自动转真会让「翻历史」在中段被新输出拽走。
+    expect(w.following).toBe(false);
+  });
+
+  it("显式 following:true 时扩到尾部并持续跟住新增", () => {
+    let w: WindowState = { start: 700, end: 800, following: true };
+    w = nextWindow({ current: w, itemCount: 860, limits: L, visible: null, following: true });
+    expect(w).toEqual({ start: 700, end: 860, following: true });
+  });
+});
+
+describe("nextWindow / tail 名额与单方向", () => {
+  it("最大挂载数含 LiveTail：tail 在窗口外时历史只占 399", () => {
+    const before: WindowState = { start: 0, end: 400, following: false };
+    const w = nextWindow({
+      current: before,
+      itemCount: 5000,
+      limits: L,
+      visible: { first: 100, last: 110, gapTopPx: -5000, gapBottomPx: -5000 },
+      following: false,
+    });
+    // 400 历史行 + 恒挂 tail 会把实际 DOM 顶到 401；必须给 tail 留 1 个名额。
+    expect(w.end - w.start).toBe(399);
+    expect(w.end).toBeLessThan(5000);
+  });
+
+  it("读到底（end===itemCount）时 tail 就在窗口内，历史可用满 400", () => {
+    const before: WindowState = { start: 0, end: 400, following: false };
+    const w = nextWindow({
+      current: before,
+      itemCount: 400,
+      limits: L,
+      visible: { first: 100, last: 110, gapTopPx: -5000, gapBottomPx: -5000 },
+      following: false,
+    });
+    expect(w.end - w.start).toBe(400);
+  });
+
+  it("direction=up 时即使底边也贴住，本周期也不向下开窗", () => {
+    const before: WindowState = { start: 1000, end: 1200, following: false };
+    const both = { first: 1000, last: 1199, gapTopPx: 0, gapBottomPx: 0 };
+    const up = nextWindow({ current: before, itemCount: 5000, limits: L, visible: both, following: false, direction: "up" });
+    // 向上翻一页（start 减 200）；随后按含 tail 的实际 DOM 上限裁到 399。
+    // 视口贴着历史顶边，所以裁掉的是下方（end）——不卸用户正在读的一侧。
+    expect(up.start).toBe(800);
+    expect(up.end).toBe(1199);
+    expect(up.end - up.start).toBe(399);
+    const down = nextWindow({ current: before, itemCount: 5000, limits: L, visible: both, following: false, direction: "down" });
+    // 向下开一页；顶边仍贴住视口顶，按上限裁掉远离视口的 end 侧。
+    expect(down.start).toBe(1000);
+    expect(down.end).toBe(1399);
+    expect(down.end - down.start).toBe(399);
+  });
+
+  it("cycleBudget 是 ceil(N/page)+2，不是无限滚", () => {
+    expect(cycleBudget(600, 200)).toBe(5);
+    expect(cycleBudget(3000, 200)).toBe(17);
+    expect(cycleBudget(0, 200)).toBe(3);
+  });
+
+  it("history 边界被远处的 tail 掩盖时必须继续向下开窗（回归）", () => {
+    // 旧实现取首末挂载行 => 历史底边 + tail 底边；tail 在视口内让
+    // gapBottomPx 看起来非负，窗口就停住不动，只能靠切走再切回触发。
+    const before: WindowState = { start: 100, end: 299, following: false };
+    const m: WindowMeasurement = {
+      visible: { first: 999, last: 999 },
+      history: { first: 100, last: 298, gapTopPx: -800, gapBottomPx: 2300 },
+      tailVisible: true,
+      viewportTop: 5000,
+      viewportBottom: 5800,
+    };
+    const w = nextWindow({ current: before, itemCount: 600, limits: L, visible: m, following: false });
+    expect(w.end).toBe(499);
+    expect(w.start).toBe(100);
   });
 });
 
