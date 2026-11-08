@@ -75,6 +75,7 @@ where
             settings_path: yi_agent_runtime::settings::settings_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
+            side_gate: Arc::new(crate::side_gate::from_process_environment),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
             onboarding_preferences_path: instance_home_dir().join("preferences.json"),
@@ -169,6 +170,7 @@ where
             settings_path: yi_agent_runtime::settings::settings_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
+            side_gate: Arc::new(crate::side_gate::from_process_environment),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
             onboarding_preferences_path: instance_home_dir().join("preferences.json"),

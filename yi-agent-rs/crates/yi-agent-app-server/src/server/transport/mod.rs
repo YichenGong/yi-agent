@@ -193,6 +193,9 @@ where
         // `serve()` 不再解析——它看得到的 `build_kind()` 是进程级的，测试里恒为
         // `release`，在那儿解析会让注入永远失效。
         lead_agent_enabled,
+        // 旁问开关。与 `lead_agent_enabled` 的差别只在形状：这是每请求重读的
+        // 闭包，因为用户会在运行中拨它（spec §3.2）。
+        side_gate,
     } = attachments;
     // 受管插件存储就是实例根：`plugins/v1/*` 的登记、授权、发布目录全在它下面。
     // 与 `watchman_home`（真实 `$HOME`，只用于登录项）刻意分开。
@@ -808,6 +811,7 @@ where
                             lead_control: &lead_control,
                             lead_control_replies: &lead_control_replies,
                             lead_agent_enabled,
+                            side_gate: &side_gate,
                             pending_lead_replies: &mut pending_lead_replies,
                             remote_dir: &remote_dir,
                             relay_url: relay_url.as_deref(),

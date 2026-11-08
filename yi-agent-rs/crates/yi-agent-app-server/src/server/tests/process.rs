@@ -1159,6 +1159,9 @@ async fn trace_unwatch_rpc_preserves_children_watch() {
             params: json!({ "threadId": "thread-a" }),
         };
 
+        // 具名局部变量：`&Arc<closure>` 不会自动擦成 `&SideGate`，且在结构体
+        // 字面量里取临时值引用要靠生命周期延长，显式绑定更清楚。
+        let side_gate: crate::side_gate::SideGate = Arc::new(|| true);
         let flow = {
             let mut state = crate::rpc::AppState {
                 hub: &hub,
@@ -1204,6 +1207,7 @@ async fn trace_unwatch_rpc_preserves_children_watch() {
                 lead_control: &lead_control,
                 lead_control_replies: &lead_control_replies,
                 lead_agent_enabled: false,
+                side_gate: &side_gate,
                 side_registry: &side_registry,
                 side_tasks: &mut side_tasks,
                 side_replay: &side_replay,

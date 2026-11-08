@@ -680,6 +680,7 @@ impl Harness {
             calls,
             false,
             Some(registry),
+            Arc::new(|| true),
         )
     }
 
@@ -719,6 +720,7 @@ impl Harness {
             None,
             Some(home.to_path_buf()),
             None,
+            Arc::new(|| true),
         )
     }
 
@@ -756,6 +758,7 @@ impl Harness {
             None,
             None,
             Some(handle),
+            Arc::new(|| true),
         )
     }
 
@@ -840,6 +843,7 @@ impl Harness {
             calls,
             lead_agent_enabled,
             None,
+            Arc::new(|| true),
         )
     }
 
@@ -858,6 +862,7 @@ impl Harness {
             Arc::new(StdMutex::new(Vec::new())),
             false,
             None,
+            Arc::new(|| true),
         )
     }
 
@@ -903,6 +908,7 @@ impl Harness {
             calls,
             false,
             None,
+            Arc::new(|| true),
         )
     }
 
@@ -924,6 +930,7 @@ impl Harness {
         // 旁支注册表:注入后 `side/*` 走替身 resolver,不读真实项目目录。
         // `None` 时 `serve()` 按本进程实例家目录自建(生产路径)。
         side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
+        side_gate: crate::side_gate::SideGate,
     ) -> Self
     where
         F: Fn(
@@ -947,6 +954,7 @@ impl Harness {
             side_registry,
             None,
             None,
+            side_gate,
         )
     }
 
@@ -965,6 +973,7 @@ impl Harness {
         side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
         instance_home_override: Option<PathBuf>,
         management: Option<Arc<crate::server::local_management::ManagementHandle>>,
+        side_gate: crate::side_gate::SideGate,
     ) -> Self
     where
         F: Fn(
@@ -1082,6 +1091,9 @@ impl Harness {
                 // harness 默认关（= stable 行为）；`with_lead_flag(true)` 打开的
                 // 那个构造器会把这个值换成 true。
                 lead_agent_enabled,
+                // 旁支默认**开**：既有 side 测试全部假定能力可用（spec §6）。
+                // 需要关的用例走 `with_scope_side_flag_and_registry`。
+                side_gate,
                 // 引导的 .env / preferences 也落在隔离目录里:onboarding/*
                 // 不得写开发者真实的 `~/.yi-agent`。
                 onboarding_preferences_path: index_dir.path().join("preferences.json"),
@@ -2789,6 +2801,9 @@ impl MergedHarness {
                 // 与手工装配的 serve_stdio 用例同一个约束:空 remote_dir +
                 // `None` 会让 serve() 把旁支宿主目录建到当前工作目录。
                 side_registry: Some(test_side_registry(index_dir.path(), None)),
+                // 第二套 harness（`serve_scoped_with_loopback`）也要能跑 side
+                // 测试：默认开，关掉的用例自行构造。
+                side_gate: Arc::new(|| true),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

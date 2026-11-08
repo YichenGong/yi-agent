@@ -536,6 +536,8 @@ pub(crate) struct AppState<'a> {
     /// 存在不存在」。按值拷贝（`bool`），与 `client_scope` 同类——都是每请求
     /// 读一次的判定输入。
     pub(crate) lead_agent_enabled: bool,
+    /// 旁问开关的判定函数。每请求调一次，见 `RuntimeAttachments::side_gate`。
+    pub(crate) side_gate: &'a crate::side_gate::SideGate,
 
     // ---- 旁支会话(spec §8) ----
     /// 旁支注册表。`Arc` 是进程级唯一实例:`open` 必须让桌面与手机拿到**同一个**

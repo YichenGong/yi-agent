@@ -150,6 +150,7 @@ where
                 settings_path: yi_agent_runtime::settings::settings_path(),
                 // 与 stdio 路径同一来源：装配时算一次，不在 `serve()` 里解析。
                 lead_agent_enabled: crate::lead_gate::from_process_environment(),
+                side_gate: Arc::new(crate::side_gate::from_process_environment),
                 onboarding_preferences_path: crate::server::instance_home_dir()
                     .join("preferences.json"),
                 resident_dir: resident_dir.clone(),

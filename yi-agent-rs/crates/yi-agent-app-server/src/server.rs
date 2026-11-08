@@ -382,6 +382,12 @@ pub(crate) struct RuntimeAttachments {
     /// 生产的构造点统一调 [`crate::lead_gate::from_process_environment`]，
     /// 测试直接给 `true` / `false`。
     pub(crate) lead_agent_enabled: bool,
+    /// 旁问开关。**判定函数**而不是 `bool`：用户会在运行中拨开关，装配时算
+    /// 一次的快照会让「关掉」在已运行的宿主上无效（spec §3.2）。
+    ///
+    /// 生产构造点统一调 [`crate::side_gate::from_process_environment`]；测试直接
+    /// 给闭包，避免依赖进程级 `YI_AGENT_HOME` 与恒为 `release` 的 build kind。
+    pub(crate) side_gate: crate::side_gate::SideGate,
     /// Where `preferences.json` lives, for the `onboarding_dismissed` marker.
     /// Injectable for the same reason `models_path` is: dismissing the first-run
     /// guide must never touch the developer's real preferences file.
