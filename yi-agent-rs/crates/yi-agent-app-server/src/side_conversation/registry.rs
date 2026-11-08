@@ -1037,8 +1037,12 @@ impl SideRegistry {
                 return;
             }
             if round + 1 == MAX_ROUNDS {
+                // `await` 不能写在 `tracing` 的字段表达式里：`format_args!` 生成的
+                // 临时值会跨 await 存活，把整个 `close_all` future 变成非 `Send`，
+                // 于是它无法从 `tokio::spawn` 里调用（`flags/set` 就是这样用的）。
+                let remaining = self.side_count().await;
                 tracing::warn!(
-                    remaining = self.side_count().await,
+                    remaining,
                     "close_all hit its round limit; some sides are still live"
                 );
             }
