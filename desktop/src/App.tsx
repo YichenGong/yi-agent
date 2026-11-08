@@ -87,6 +87,7 @@ import {
   type PendingAttachment,
 } from "./lib/attachmentLimits";
 import { writeSelectedThread } from "./lib/selectedThread";
+import { onRuntimeSettingsInvalidated } from "./lib/runtimeSettingsBus";
 import { uploadImage, isHeic } from "./lib/imageUpload";
 import { pickImageFiles } from "./lib/imagePicker";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
@@ -758,6 +759,20 @@ export default function App() {
     },
     [],
   );
+
+  /**
+   * `settings/changed` 的订阅接缝。
+   *
+   * 稳定身份（空依赖）是必须的：它只闭合 `clientRef`，故每次渲染都是同一个函数，
+   * 设置页的订阅 effect 不会因为父组件重渲染而反复退订/重订。真正的 client 身份
+   * 在**订阅那一刻**从 ref 取——重连后新的 client 是另一个对象，旧的订阅不会
+   * 收到新宿主的通知，所以退订由组件在卸载/重连时完成。
+   */
+  const runtimeSettingsSubscribe = useCallback((listener: () => void) => {
+    const c = clientRef.current;
+    if (!c) return () => {};
+    return onRuntimeSettingsInvalidated(c, listener);
+  }, []);
 
   /**
    * 「实验功能」Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖
@@ -3654,6 +3669,7 @@ export default function App() {
         mcpCall={mcpCall}
         websearchCall={websearchCall}
         runtimeSettingsCall={runtimeSettingsCall}
+        runtimeSettingsSubscribe={runtimeSettingsSubscribe}
         mcpProjects={pluginProjectPaths(sess.workspaces, board.boards)}
         mcpDefaultProject={current?.info?.cwd}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页

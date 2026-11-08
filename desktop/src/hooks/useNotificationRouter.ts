@@ -16,6 +16,7 @@ import {
 import type { SideNotification } from "../lib/sideConversation";
 import { parseTheme } from "../lib/theme";
 import { notifyModelCapabilitiesChanged } from "../lib/modelCapabilitiesBus";
+import { notifyRuntimeSettingsInvalidated } from "../lib/runtimeSettingsBus";
 import type { ReasoningCapabilities } from "../lib/models";
 import { applyTagChange, applyTitleChange } from "../lib/threadListUpdate";
 import { resolveTagNames } from "../lib/threadTags";
@@ -126,6 +127,17 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
           const binding = sideRouter.bindingFor(client, slot);
           // 未握手时没有任何绑定：帧无处可归，丢弃而不是猜一条「当前连接」。
           if (binding) acceptSideNotification(client, slot, n);
+          return;
+        }
+        if (n.method === "settings/changed") {
+          // 全局设置通知**没有** thread_id，所以必须在会话过滤之前处理：
+          // `ownsThreadView` 会把它当成「不属于活动槽位的会话帧」丢掉，设置页
+          // 就再也收不到刷新提示。
+          //
+          // 按 client 身份路由（而不是全局广播）：桌面可以同时连着多个宿主，
+          // 项目 A 的保存不能去刷新另一台主机 B 的设置页。通知只带 revision 和
+          // 键名，不缓存值——订阅方自己去 `settings/read`。
+          notifyRuntimeSettingsInvalidated(client);
           return;
         }
         // 非活动槽位（别的远端项目、或本地而用户正看远端）的通知**不写**本视图。

@@ -269,3 +269,218 @@ describe("SettingsRuntimeTab platform scoping", () => {
     );
   });
 });
+
+describe("SettingsRuntimeTab concurrency", () => {
+  const deferred = <T,>() => {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  };
+
+  it("keeps edits made while a save is pending", async () => {
+    // The user submits 201, then types 202 before the host answers. The save
+    // landing must not clear the 202 they are looking at.
+    const pendingSave = deferred<unknown>();
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") {
+        return { live_apply_version: 1, fields: [field({ value: 200 })], path: "/x/settings.json" };
+      }
+      return pendingSave.promise;
+    });
+    render(<SettingsRuntimeTab call={call} />);
+    const input = (await screen.findByLabelText("最大轮次")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "201" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/ }));
+    fireEvent.change(input, { target: { value: "202" } });
+
+    // The host now reports it stored 201.
+    call.mockImplementation(async (method: string) => {
+      if (method === "settings/read") {
+        return { live_apply_version: 1, fields: [field({ value: 201 })], path: "/x/settings.json" };
+      }
+      return { ok: true, live_apply_version: 1, changed_keys: ["agent.max_turns"] };
+    });
+    pendingSave.resolve({ ok: true, live_apply_version: 1, changed_keys: ["agent.max_turns"] });
+
+    // Wait for the save to settle first: asserting straight after resolving would
+    // pass while the value is still 202 from the user's keystroke, then fail to
+    // notice the draft being discarded a moment later. A mutation that ignores
+    // edit generations must turn this red, so the read has to run first.
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /^保存$/ })).toBeTruthy();
+      expect((screen.getByRole("button", { name: /^保存$/ }) as HTMLButtonElement).disabled).toBe(
+        false,
+      );
+    });
+    await waitFor(() => {
+      expect((screen.getByLabelText("最大轮次") as HTMLInputElement).value).toBe("202");
+    });
+  });
+
+  it("adopts a remote change for a field the user has not touched", async () => {
+    let invalidate: (() => void) | null = null;
+    const subscribe = (listener: () => void) => {
+      invalidate = listener;
+      return () => {
+        invalidate = null;
+      };
+    };
+    let value = 200;
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") {
+        return { live_apply_version: 1, fields: [field({ value })], path: "/x/settings.json" };
+      }
+      return { ok: true, live_apply_version: 1 };
+    });
+    render(<SettingsRuntimeTab call={call} subscribe={subscribe} />);
+    expect(await screen.findByText("已设为 200")).toBeTruthy();
+
+    // Another window saved 250; the host says "settings changed".
+    value = 250;
+    fireEvent.click(screen.getByRole("button", { name: /保存/ })); // no-op: nothing dirty
+    expect(invalidate).toBeTypeOf("function");
+    invalidate!();
+
+    await waitFor(() => expect(screen.getByText("已设为 250")).toBeTruthy());
+  });
+
+  it("keeps the user's draft when the remote changed the same field", async () => {
+    let invalidate: (() => void) | null = null;
+    const subscribe = (listener: () => void) => {
+      invalidate = listener;
+      return () => {
+        invalidate = null;
+      };
+    };
+    let value = 200;
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") {
+        return { live_apply_version: 1, fields: [field({ value })], path: "/x/settings.json" };
+      }
+      return { ok: true, live_apply_version: 1 };
+    });
+    render(<SettingsRuntimeTab call={call} subscribe={subscribe} />);
+    const input = (await screen.findByLabelText("最大轮次")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "300" } });
+
+    value = 250;
+    invalidate!();
+
+    await waitFor(() => expect(screen.getByText(/这些项在别处也被改过/)).toBeTruthy());
+    expect((screen.getByLabelText("最大轮次") as HTMLInputElement).value).toBe("300");
+  });
+
+  it("ignores a late read from an abandoned request", async () => {
+    // Two reads race: the first is slow. Its response must not overwrite what the
+    // second (authoritative) read already showed.
+    const first = deferred<unknown>();
+    let readCount = 0;
+    let invalidate: (() => void) | null = null;
+    const subscribe = (listener: () => void) => {
+      invalidate = listener;
+      return () => {
+        invalidate = null;
+      };
+    };
+    const call = vi.fn(async (method: string) => {
+      if (method !== "settings/read") return { ok: true, live_apply_version: 1 };
+      readCount += 1;
+      if (readCount === 1) return first.promise;
+      return { live_apply_version: 1, fields: [field({ value: 900 })], path: "/x/settings.json" };
+    });
+    render(<SettingsRuntimeTab call={call} subscribe={subscribe} />);
+    // The first read is still pending; a notification triggers the second.
+    invalidate!();
+    await waitFor(() => expect(screen.getByText("已设为 900")).toBeTruthy());
+
+    // Now the stale first read lands with an older value.
+    first.resolve({ live_apply_version: 1, fields: [field({ value: 100 })], path: "/x/settings.json" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.getByText("已设为 900")).toBeTruthy();
+    expect(screen.queryByText("已设为 100")).toBeNull();
+  });
+
+  it("says only 已保存 when the host does not report live apply", async () => {
+    // An old host answers `{ok:true}` with no capability. Promising a hot reload
+    // there would be a lie the user could not detect until much later.
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") return { fields: [field({ value: 200 })], path: "/x/settings.json" };
+      return { ok: true };
+    });
+    render(<SettingsRuntimeTab call={call} />);
+    const input = (await screen.findByLabelText("最大轮次")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "210" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/ }));
+
+    await waitFor(() => expect(screen.getByText("已保存。")).toBeTruthy());
+    expect(screen.queryByText(/下一个安全执行点/)).toBeNull();
+  });
+
+  it("promises live apply when the host reports it", async () => {
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") {
+        return { live_apply_version: 1, fields: [field({ value: 200 })], path: "/x/settings.json" };
+      }
+      return { ok: true, live_apply_version: 1, changed_keys: ["agent.max_turns"] };
+    });
+    render(<SettingsRuntimeTab call={call} />);
+    const input = (await screen.findByLabelText("最大轮次")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "210" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/ }));
+
+    await waitFor(() => expect(screen.getByText(/下一个安全执行点/)).toBeTruthy());
+  });
+
+  it("adds the sandbox exception when the batch touches the default sandbox", async () => {
+    const sandbox = field({
+      key: "startup.sandbox",
+      group: "startup",
+      label: "默认沙箱",
+      type: "select",
+      value: "read-only",
+      options: ["read-only", "workspace-write"],
+    });
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") {
+        return { live_apply_version: 1, fields: [sandbox], path: "/x/settings.json" };
+      }
+      return { ok: true, live_apply_version: 1, changed_keys: ["startup.sandbox"] };
+    });
+    render(<SettingsRuntimeTab call={call} />);
+    const select = (await screen.findByLabelText("默认沙箱")) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "workspace-write" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/ }));
+
+    await waitFor(() => expect(screen.getByText(/仅影响保存后新建会话/)).toBeTruthy());
+  });
+
+  it("keeps the draft and shows the error when a read fails", async () => {
+    // A failed refresh must not wipe what the user typed, and must not leave the
+    // last success message standing as if nothing happened.
+    let fail = false;
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") {
+        if (fail) throw new Error("read failed");
+        return { live_apply_version: 1, fields: [field({ value: 200 })], path: "/x/settings.json" };
+      }
+      return { ok: true, live_apply_version: 1 };
+    });
+    let invalidate: (() => void) | null = null;
+    const subscribe = (listener: () => void) => {
+      invalidate = listener;
+      return () => {
+        invalidate = null;
+      };
+    };
+    render(<SettingsRuntimeTab call={call} subscribe={subscribe} />);
+    const input = (await screen.findByLabelText("最大轮次")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "777" } });
+
+    fail = true;
+    invalidate!();
+    await waitFor(() => expect(screen.getByText(/read failed/)).toBeTruthy());
+    expect((screen.getByLabelText("最大轮次") as HTMLInputElement).value).toBe("777");
+  });
+});

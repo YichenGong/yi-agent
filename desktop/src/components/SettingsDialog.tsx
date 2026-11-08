@@ -66,6 +66,7 @@ export function SettingsDialog({
   mcpCall,
   websearchCall,
   runtimeSettingsCall,
+  runtimeSettingsSubscribe,
   mcpProjects,
   mcpDefaultProject,
   pluginProjects,
@@ -138,6 +139,13 @@ export function SettingsDialog({
   websearchCall?: WebSearchCall;
   /** 「运行参数」Tab 的宿主 RPC 接缝（settings/read、settings/write）。 */
   runtimeSettingsCall?: RuntimeSettingsCall;
+  /**
+   * 「运行参数」Tab 的失效订阅接缝。
+   *
+   * 由 App 传入而不是组件自己去拿 client：它必须绑定到**当前那条连接**，重连后
+   * 旧连接的订阅收不到任何通知。
+   */
+  runtimeSettingsSubscribe?: (listener: () => void) => () => void;
   /** 「MCP」Tab 可选的配置项目（绝对路径）。 */
   mcpProjects?: string[];
   /** 「MCP」Tab 首选项目（当前对话的工作目录）。 */
@@ -417,7 +425,11 @@ export function SettingsDialog({
                 defaultProject={mcpDefaultProject}
               />
             ) : active === "runtime" && runtimeSettingsCall ? (
-              <SettingsRuntimeTab call={runtimeSettingsCall} isMobile={isMobile} />
+              <SettingsRuntimeTab
+                call={runtimeSettingsCall}
+                isMobile={isMobile}
+                subscribe={runtimeSettingsSubscribe}
+              />
             ) : active === "websearch" && websearchCall ? (
               <SettingsWebSearchTab call={websearchCall} />
             ) : active === "tags" ? (
