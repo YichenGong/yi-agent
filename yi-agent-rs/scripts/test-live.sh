@@ -48,12 +48,18 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${MO
     exit 0
 fi
 
-# 通用键优先：models.json 给的是 MODEL_API_KEY + provider/model 三件套，
-# 而 provider 层测试认的是各家专属变量名。
-if [ -n "${MODEL_API_KEY:-}" ] && [ -n "${YI_AGENT_PROVIDER:-}" ]; then
-    case "$YI_AGENT_PROVIDER" in
+# 通用键映射到各家专属变量名：models.json 给的是 MODEL_API_KEY + provider/model
+# 三件套，而 provider 层测试（real_integration）认的是 ANTHROPIC_API_KEY /
+# OPENAI_API_KEY 这类专属名。
+#
+# 规则：anthropic 协议走 ANTHROPIC_API_KEY，**其余一律**走 OPENAI_API_KEY。
+# 不枚举第三方名字（deepseek / moonshot / openrouter / 本地 vLLM …）——它们的
+# 数量无界，而除 Anthropic 原生协议外都是 OpenAI 兼容的。枚举会让「有 key 但
+# provider 是第三方」变成假红：测试拿不到 key 而失败，看起来像真实回归。
+if [ -n "${MODEL_API_KEY:-}" ]; then
+    case "${YI_AGENT_PROVIDER:-}" in
         anthropic) export ANTHROPIC_API_KEY="$MODEL_API_KEY" ;;
-        openai)    export OPENAI_API_KEY="$MODEL_API_KEY" ;;
+        *)         export OPENAI_API_KEY="$MODEL_API_KEY" ;;
     esac
 fi
 
@@ -63,7 +69,7 @@ for s in $SUITES; do
     echo "=== live suite: $s ($pkg::$bin) ==="
     # 一个 suite 失败不能阻止其余 suite 运行：真实使用中某个 provider 层测试
     # 失败（例如 provider 不匹配）不该把 e2e / complex 一起吞掉。失败记为
-    # 非零退出码，全部跑完后再汇总。`set -e` 会在这里中断，所以临时关掉。
+    # 非零退出码，全部跑完后再汇总。`if !` 让失败的退出码不触发 `set -e`。
     if ! cargo nextest run --all-features --profile live --run-ignored only \
         -p "$pkg" --test "$bin"; then
         failed="$failed $s"
