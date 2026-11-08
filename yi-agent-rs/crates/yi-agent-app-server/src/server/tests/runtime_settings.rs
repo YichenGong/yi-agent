@@ -80,6 +80,28 @@ async fn next_notification_within(
     }
 }
 
+/// 等到「已发布的快照」里该字段等于 `expected`。
+///
+/// 用轮询已发布快照而不是等网络帧：这条判据要回答的是「宿主内部状态到位了吗」，
+/// 帧只是它的下游。等帧会把「状态已到位但泵还没发」和「状态没到位」混为一谈。
+async fn wait_for_published_max_turns(binding: &RuntimeSettingsBinding, expected: Option<u32>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let actual = binding
+            .live
+            .published()
+            .map(|snapshot| snapshot.settings.agent.max_turns);
+        if actual == Some(expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "已发布快照里 agent.max_turns 未达到 {expected:?}，实际 {actual:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Read the next frame whose `method` matches, ignoring interleaved responses.
 async fn next_notification(h: &mut Harness, method: &str) -> serde_json::Value {
     h.read_matching(64, |v| v.get("method") == Some(&serde_json::json!(method)))
@@ -409,17 +431,40 @@ async fn an_external_edit_reaches_clients_through_the_observer() {
     let (mut h, dir, binding) = with_live().await;
     let path = dir.path().join("settings.json");
 
-    // 先落一个基线并经 RPC 读一次。这次读本身可能已经触发一条失效帧
-    // （服务启动时还没发布过快照），所以把它收掉，后面的断言才有唯一对应的
-    // 变化——否则「收到第一条通知」可能属于基线而不是被测的那次编辑。
+    // 先落一个基线并**经 RPC 读一次**：这一步确保服务已经发布过基线的快照。
+    //
+    // 这里**不等**一条基线帧。等它是错的：泵的「取基线 → 订阅 → 补齐」握手
+    // 可能把基线本身吸收成自己的起点（那时没有任何变化可播），于是那条帧永远
+    // 不会到来，测试白等到超时。曾经如此，大约每六次全量运行红一次。
+    // 破的是「必须先看到基线帧」这个假设，而不是产品行为：真正要观测的判据是
+    // 「新内容的那一帧到了」，它不需要一条前导帧。
     std::fs::write(
         &path,
         serde_json::to_vec(&serde_json::json!({"agent": {"max_turns": 5}})).unwrap(),
     )
     .unwrap();
     let _ = ask(&mut h, 30, "settings/read", serde_json::json!({})).await;
-    let baseline = next_notification(&mut h, "settings/changed").await;
-    let baseline_revision = baseline["params"]["revision"].clone();
+
+    // **确认基线已被发布，才写新值**。
+    //
+    // 不等这一步，就会与通知泵自己的启动握手赛跑：泵在 `last = published()
+    // ?? refresh()` 那一步会读盘，若此时文件已经是 6，它就**把 6 当成基线**
+    // 吸收了——没有任何「变化」可播，本用例随后一直等不到帧。
+    //
+    // 这是测试必须先建立的因果，不是产品缺陷：泵把「启动时文件的当前内容」
+    // 当作基线是正确行为（否则每个客户端一连上就会收到一条无意义的失效帧）。
+    // 判据用已发布快照里的真实值，而不是某个网络帧。
+    wait_for_published_max_turns(&binding, Some(5)).await;
+    // 记下基线的 revision。文件可能原本不存在，于是「无 → 5」本身就是一次变化，
+    // 并且已经把一帧（changed_keys 同样是 `agent.max_turns`）推进了客户端队列。
+    // 只按 changed_keys 匹配会读到那条**旧**帧，然后在下一行断言里发现发布值
+    // 还是 5。排除基线 revision 才能只认这一轮编辑。
+    let baseline_revision = binding
+        .live
+        .published()
+        .expect("基线必须已发布")
+        .revision
+        .clone();
 
     // 外部替换（模拟另一个进程保存）。只有一个字节变了：5 → 6。
     std::fs::write(
@@ -428,18 +473,23 @@ async fn an_external_edit_reaches_clients_through_the_observer() {
     )
     .unwrap();
 
-    // 等到一条属于新版本的帧，而不是「下一条恰好到达的帧」。
+    // 等到一条**报告这个新值**的帧，而不是「下一条恰好到达的帧」。
     //
     // 上限 4 秒，**故意短于 10 秒的保活拍**：那条拍也会 `refresh()` 并触发同一条
     // 外部信号，若这里等 30 秒，"观察器没接线" 也会因为保活拍而通过（实测：变异成
     // 不启动观察器后，本用例在 10.13s 绿）。4 秒只可能由观察器周期（1 秒）满足。
+    //
+    // 判据用帧内容（changed_keys），不用「revision 与基线帧不同」：
+    // 后者要求先收到一条基线帧，于是又依赖那个不该存在的假设。
     let mut note = next_notification_within(
         &mut h,
         "settings/changed",
         std::time::Duration::from_secs(4),
     )
     .await;
-    while note["params"]["revision"] == baseline_revision {
+    while note["params"]["revision"] == baseline_revision
+        || note["params"]["changed_keys"] != serde_json::json!(["agent.max_turns"])
+    {
         note = next_notification_within(
             &mut h,
             "settings/changed",
@@ -482,27 +532,45 @@ async fn a_health_regression_is_broadcast_even_with_no_changed_keys() {
     let (mut h, dir, binding) = with_live().await;
     let path = dir.path().join("settings.json");
 
-    // Baseline: a valid file, read once, and its frame consumed.
+    // 基线：一份合法文件，并经 RPC 读一次（确保已发布）。
+    //
+    // 与上面那条同理：**不等**基线帧。「取基线 → 订阅 → 补齐」可能把基线吸收
+    // 成起点，那条帧不会到来。这里改成先记下健康版内容的 revision（直接从
+    // 已发布快照取，不依赖网络帧），再等降级后的帧。
     std::fs::write(
         &path,
         serde_json::to_vec(&serde_json::json!({"agent": {"max_turns": 5}})).unwrap(),
     )
     .unwrap();
     let _ = ask(&mut h, 40, "settings/read", serde_json::json!({})).await;
-    let baseline = next_notification(&mut h, "settings/changed").await;
-    let healthy_revision = baseline["params"]["revision"].clone();
+    // 同上：先确认健康基线已发布，再去破坏文件。否则泵可能把「已损坏」当成
+    // 起点吸收掉，本用例就再也看不到降级帧。
+    wait_for_published_max_turns(&binding, Some(5)).await;
+    let healthy_revision = binding
+        .live
+        .published()
+        .expect("the baseline must be published before we corrupt the file")
+        .revision
+        .clone();
 
     // Now corrupt it. Same settings, same revision: only health moves.
     std::fs::write(&path, b"{ this is not json").unwrap();
 
+    // 只认「健康确实降级」之后的那一帧：保活拍与观察拍都会读盘，前者的语义
+    // 与本用例无关。判据用已发布快照的 health，而不是帧上的某个数字。
     let mut note = next_notification_within(
         &mut h,
         "settings/changed",
         std::time::Duration::from_secs(4),
     )
     .await;
-    // 保活拍也会读盘，所以只认「健康确实降级」之后的那一帧。
-    while note["params"]["revision"] != healthy_revision {
+    loop {
+        let degraded = binding.live.published().is_some_and(|snapshot| {
+            snapshot.health.state == yi_agent_runtime::live_settings::HealthState::Degraded
+        });
+        if degraded {
+            break;
+        }
         note = next_notification_within(
             &mut h,
             "settings/changed",

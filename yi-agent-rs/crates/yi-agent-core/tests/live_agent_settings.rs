@@ -517,16 +517,44 @@ async fn transport_retry_keeps_its_request_when_settings_change_during_backoff()
 }
 
 /// A controlled stop from a failing source must still hand queued interjections
-/// back. `flush_unconsumed` is not a rollback: it only returns text the user
+/// back. `flush_unconsumed` is not a rollout: it only returns text the user
 /// typed, so a source outage can never silently swallow it.
+///
+/// The first `snapshot()` call blocks until the test has queued the interjection.
+/// Without that rendezvous the test is a race: if the loop reaches its first safe
+/// point and fails before `interject` lands, the flush already happened with an
+/// empty inbox and the item sits there forever. That race used to make this test
+/// fail roughly once in twenty full-suite runs while always passing in isolation
+/// — a test that only fails under load teaches nothing about the product.
 #[tokio::test(flavor = "multi_thread")]
 async fn source_failure_returns_queued_interjections() {
-    struct Failing;
+    struct Failing {
+        /// Released by the test once the interjection is queued.
+        release: Arc<std::sync::Barrier>,
+        entered: Arc<std::sync::Barrier>,
+        /// Only the first call may wait; later calls must fail straight away,
+        /// otherwise the loop blocks again on a barrier nobody releases.
+        first: std::sync::atomic::AtomicBool,
+    }
     impl AgentSettingsSource for Failing {
         fn snapshot(&self) -> Result<LiveAgentSnapshot, LiveSettingsError> {
+            // `swap` returns the *previous* value: `true` means this is the
+            // first call. Inverting this check makes the first call skip the
+            // rendezvous and the test then waits forever — which is exactly the
+            // deadlock this comment exists to prevent.
+            if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // Tell the test we are at the safe point, then wait for it to
+                // finish queueing. `Barrier::wait` is a blocking call, which is
+                // why this test runs on a multi-thread runtime.
+                self.entered.wait();
+                self.release.wait();
+            }
             Err(LiveSettingsError::new("snapshot_unavailable"))
         }
     }
+
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
 
     let provider = RecordingProvider::new(vec![end_turn_text("never")]);
     let mut agent = Agent::new(
@@ -534,13 +562,19 @@ async fn source_failure_returns_queued_interjections() {
         Arc::new(ToolRegistry::default()),
         static_config(),
     );
-    agent.set_live_settings(Arc::new(Failing));
+    agent.set_live_settings(Arc::new(Failing {
+        release: Arc::clone(&release),
+        entered: Arc::clone(&entered),
+        first: std::sync::atomic::AtomicBool::new(true),
+    }));
 
     // `run` installs the inbox, so queue after it starts but before anything
     // consumes it: the very first safe point fails, so nothing will.
     let stream = agent.run("hello".into()).await.unwrap();
     let inbox = agent.inbox_handle().expect("interjection inbox");
+    entered.wait();
     inbox.interject("do not lose me".into(), None).unwrap();
+    release.wait();
 
     let events = drain(stream).await;
     assert_error_code(&events, "snapshot_unavailable");
