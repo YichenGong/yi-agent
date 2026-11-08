@@ -325,3 +325,27 @@ async fn every_side_method_is_method_not_found_when_the_flag_is_off() {
 
     h.shutdown().await;
 }
+
+/// 能力位跟着开关走，但宿主 id 与它无关：客户端用后者区分「重连」与「宿主
+/// 换代」，翻能力位时把 id 一起改掉会让它丢掉全部本地基线。
+#[tokio::test]
+async fn the_capability_bit_follows_the_flag_but_the_host_id_does_not() {
+    let home = tempfile::TempDir::new().unwrap();
+    let registry = test_side_registry(home.path(), None);
+    let expected = registry.host_instance_id().to_string();
+    let mut h = Harness::with_scope_side_flag_and_registry(Scope::Admin, registry, false).await;
+
+    let hello = call(&mut h, 1, "initialize", serde_json::json!({})).await;
+    assert_eq!(
+        hello["result"]["capabilities"]["side_conversation_v1"],
+        serde_json::json!(false),
+        "{hello}"
+    );
+    assert_eq!(
+        hello["result"]["sideHostInstanceId"],
+        serde_json::json!(expected),
+        "the host id must not depend on the flag: {hello}"
+    );
+
+    h.shutdown().await;
+}

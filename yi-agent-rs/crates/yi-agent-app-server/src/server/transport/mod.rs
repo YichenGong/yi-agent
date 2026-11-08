@@ -1019,7 +1019,9 @@ where
                             // 必须看到同一个 id,否则客户端会把「重连」当成
                             // 「宿主换代」而丢掉本地基线。
                             "capabilities": {
-                                "side_conversation_v1": crate::protocol::SIDE_CONVERSATION_V1,
+                                // 能力位跟随本机开关；宿主 id 与它无关（下一行），
+                                // 客户端靠 id 区分「重连」与「宿主换代」。
+                                "side_conversation_v1": (side_gate)(),
                             },
                             "sideHostInstanceId": side_registry.host_instance_id(),
                             "syncPlan": sync_plan,
