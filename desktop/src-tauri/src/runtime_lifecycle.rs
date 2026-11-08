@@ -2312,12 +2312,11 @@ pub fn artifact_identity_for<R: tauri::Runtime>(
 ) -> Option<ArtifactIdentity> {
     use tauri::Manager;
 
-    // `<Foo.app>/Contents/MacOS/desktop` -> `<Foo.app>`.
-    let bundle_root = app
-        .path()
-        .resource_dir()
-        .ok()
-        .and_then(|resources| resources.parent().map(std::path::Path::to_path_buf))?;
+    // Tauri reports `<Foo.app>/Contents/Resources` on macOS, not `<Foo.app>`;
+    // the rule for turning one into the other lives beside the manifest so a
+    // test can hold it to a real bundle tree.
+    let resources = app.path().resource_dir().ok()?;
+    let bundle_root = crate::runtime_manifest::bundle_root_from_resources(&resources)?;
     artifact_identity_at(&bundle_root)
 }
 
