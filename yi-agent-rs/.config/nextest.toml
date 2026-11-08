@@ -10,8 +10,30 @@
 # filter 是**第二道**保险：`--run-ignored all` 会执行所有 ignored 测试，而这条
 # 用例的本意是「永远不作为一个普通用例被调度」。写成 filter 而不是靠约定，是
 # 因为 `--run-ignored all` 恰好是排查「为什么有个测试从没跑过」时最容易输入的。
+# 排除项同时做两件事：
+#   1. `runtime_process_helper` —— 固定 `#[ignore]` 的 OS fixture，只由 harness
+#      用 `--exact --ignored` 拉起（见下方历史注释）。
+#   2. 真实 LLM 测试 —— 它们全部 `#[ignore]`，默认运行本来就不跑，但如果有人输入
+#      `--run-ignored all`（排查「某个测试从没跑过」时最容易输入的命令）就会真的
+#      调用外部 API 并产生费用。用 filter 挡住，不靠约定。
+#
+# 每条排除都必须同时满足两个条件，缺一个就会错：
+#
+#   a. 用 `binary_id(...)` 限定作用域。裸写 `not test(/^real_/)` 会连带排除
+#      `yi-agent-runtime`、`yi-agent::eval_baseline`、`frontend_runtime_lease`、
+#      `managed_production_integration` 里名称以 real_ 开头的**正常**测试。
+#   b. 前缀要按各二进制自己的命名写。五个二进制的 live 测试前缀互不相同，统一
+#      用 `^real_` 只挡得住第一个（实测：--run-ignored all 会从 33 只降到 25，
+#      而不是期望的 15）。
 [profile.default]
-default-filter = "not test(runtime_process_helper)"
+default-filter = """
+not test(runtime_process_helper)
+and not (binary_id(yi-agent-llm::real_integration) and test(/^real_(anthropic|openai)_/))
+and not (binary_id(yi-agent::e2e_real) and test(/^e2e_/))
+and not (binary_id(yi-agent::e2e_complex) and test(/^complex_/))
+and not (binary_id(yi-agent::subagent_real_e2e) and test(/^real_subagent_/))
+and not (binary_id(yi-agent::model_catalog_live_reload_e2e) and test(/^changing_models_json_/))
+"""
 slow-timeout = { period = "60s", terminate-after = 3 }
 # 显式覆盖内建默认值 true：合并门禁需要知道一次 PR 里到底坏了几个地方，
 # 首个失败就停会让修一个推一次、来回排队。本地想要快速失败用 `--fail-fast`。
@@ -52,3 +74,37 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = 'binary_id(yi-agent-supervisors::supervisor) + binary_id(yi-agent-supervisors::managed_launch) + binary_id(yi-agent::plugins_maintenance_daemon)'
 test-group = 'spawn-heavy'
+
+# ---------------------------------------------------------------------------
+# live：真实 LLM API
+# ---------------------------------------------------------------------------
+#
+# 为什么需要独立 profile，而不是只给 default 加 overrides：
+#
+# 1. 超时。default 的 slow-timeout 是 60s x 3 = 180s 就终止，而 live 测试自身
+#    预算是 300s（E2E_TIMEOUT / COMPLEX_TIMEOUT / subagent 的 deadline）。不抬
+#    预算会把合法测试误杀成「不稳定」。这里 300s x 2 = 600s，是自身预算的 2 倍。
+#
+# 2. default-filter 必须分 profile（决定性原因）。上面 default profile 排除了
+#    live 测试，好让 `--run-ignored all` 不会误跑真实 API。但实测发现：一旦
+#    default 排除了它们，`just test-live` 用 `--run-ignored only` 会拿到 0 个
+#    测试，`-E` 也覆盖不了。所以必须有一个不排除 live 的 profile。
+#
+# 实测（2026-11-08 / nextest 0.9.150）：
+#   default profile 排除 live          -> --run-ignored only 得 0 个
+#   default 排除 + -E 'test(/^real_/)' -> 仍为 0 个
+#   独立 [profile.live] 不排除        -> 得 18 个（6+5+4+2+1）
+
+[profile.live]
+inherits = "default"
+default-filter = "not test(runtime_process_helper)"
+
+[test-groups.live-api]
+# 并发 3：实测 e2e_real 串行 90.01s -> 并发 3 为 38.17s，且通过/失败集合与串行
+# 完全一致（两处失败串行也复现，故与并发无关）。真实 API 有速率限制，不要再抬。
+max-threads = 3
+
+[[profile.live.overrides]]
+filter = 'binary_id(yi-agent-llm::real_integration) + binary_id(yi-agent::e2e_real) + binary_id(yi-agent::e2e_complex) + binary_id(yi-agent::subagent_real_e2e) + binary_id(yi-agent::model_catalog_live_reload_e2e)'
+test-group = 'live-api'
+slow-timeout = { period = "300s", terminate-after = 2 }

@@ -196,7 +196,7 @@ $ grep -c "布尔代数" *.jsonl
 `drive5.py` / `drive7.py` 关闭后再 `/side` 成功开出第二代旁支并答出 `第二代旁支` /
 `SIDE-TWO`。
 
-### 3.2 真实 LLM 端到端（`just test-real-e2e`）
+### 3.2 真实 LLM 端到端（`just test-live e2e`）
 
 `4 passed, 1 failed`。失败的是 `e2e_auto_compact_triggers`，与本功能无关：
 

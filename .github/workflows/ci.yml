@@ -129,11 +129,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # 下面的 `just runtime-lifecycle-check` 需要它。漏装会让那一步在 runner 上
-      # 直接 "command not found"，而这看起来像测试失败。
-      - name: Install just
-        uses: extractions/setup-just@v2
-
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -153,19 +148,17 @@ jobs:
             -p yi-agent-lifecycle -p yi-agent \
             --profile ci
 
-      # 共享运行时生命周期的真进程验收。
+      # 真进程生命周期测试已包含在上面的 nextest 步骤里（它们不带 #[ignore]，
+      # 所以 `cargo nextest run` 本来就会执行）。2026-11-08 实测：23 个 target
+      # 共 263 个测试在 nextest 下 263 passed / 4 skipped，36s。
       #
-      # 为什么必须单独一步而不是并进上面的 nextest：这些目标会真的 fork
-      # guardian／daemon／子进程，个别用例要等真实的 10 秒优雅窗口，把它们塞进
-      # 其它 crate 的批量运行会让 macOS job 从几分钟变成十几分钟且失败时难以定位。
-      # 为什么必须用 `cargo test` 而不是 nextest：`managed_runtime_lifecycle`
-      # 用 `current_exe()` + `--exact runtime_process_helper --ignored` 拉起自己
-      # 的 OS fixture，依赖 libtest 的命令行语义；nextest 的进程模型下
-      # `--exact` 指向的是它自己的过滤参数，行为不同。
+      # 这里先前有第二步用 `just runtime-lifecycle-check`（cargo test）把它们
+      # 又跑一遍，理由写的是「managed_runtime_lifecycle 用 current_exe() +
+      # --exact 拉 fixture，nextest 的 --exact 语义不同」。该理由不成立：那个
+      # 文件里根本没有 current_exe（只有环境变量门控的 helper），而真正用
+      # current_exe() + --exact --ignored 的 managed_channel 在 nextest 下
+      # 7/7 通过。删除重复步骤，同一批测试一次运行只跑一遍。
       #
       # 缺 Node／缺 GUI：本 job 不跑桌面 Rust 生命周期测试与 vitest，那两处分别在
       # `desktop-rust` 与 `desktop` job。真实 Cmd+Q 的冒烟是**本机隔离 App 手动
       # 门禁**，无头环境不声称覆盖。
-      - name: Run shared runtime lifecycle tests
-        working-directory: yi-agent-rs
-        run: just runtime-lifecycle-check

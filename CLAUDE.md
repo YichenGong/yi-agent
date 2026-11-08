@@ -324,83 +324,86 @@ kill <pid>
   `--jobs 2` 降低并行度。本机 128G 内存实测 4 个并发 crate 测试压力可忽略,但
   低配机器/CI 上全量跑仍要留余量。
 
-## 分级测试入口(L0/L1/L2)
+## 测试分级:两个正交轴
 
-> **本节与下面的「真实 LLM 测试 Tier 0-3」是两套不同维度,别混。**
-> 本节按**改动范围**选测试深度,只跑 mock;下面的 Tier 按**是否需要真实 LLM** 分。
+> 只有一套分级概念。旧文档里「Tier 0-3」与「L0/L1/L2」是两个不同维度,
+> 已合并到下面这张表。
 
-### 用法
+### 两个轴
+
+| 轴 | 取值 | 决定什么 |
+|---|---|---|
+| **范围** (scope) | `L0` check / `L1` crate / `L2` affected / `L3` workspace | 跑多少代码 |
+| **保真度** (fidelity) | `mock` / `proc` / `live` | 要不要真进程、要不要真 API |
+
+- **mock**:纯内存 / wiremock,无真实进程。
+- **proc**:真 fork guardian / daemon / 子进程,等真实 10 秒优雅窗口。263 个测试,
+  实测 36 秒。
+- **live**:真实 LLM API,花钱、有速率限制。18 个测试,并发 3。
+
+### 用法(照着选,不用记轴)
 
 | 场景 | 命令 |
 |---|---|
-| 改完想看能不能编过 | `just check-fast` |
+| 改完看能不能编过 | `just check-fast` |
 | 只改了一个 crate | `just test-crate <crate>` |
 | 改了几处,想知道牵动谁 | `just test-affected [ref]` |
 | 收尾 / 合并前 | `just test` |
+| 想验证真实 API 还能通 | `just test-live [suite]` |
 
+- `just test` 覆盖 `L3 + mock+proc`。**永不触发真实 API 调用。**
+- `just test-live` 是唯一的 live 入口。suite 取 `llm` / `e2e` / `complex` /
+  `subagent` / `catalog`,省略则跑全部 18 个。无 key 时打印 `SKIPPED` 并 exit 0。
 - `just test-affected` 默认对比 `$(git merge-base main HEAD)`,**含未提交改动**;
   传 ref 则对比该 ref,例如 `just test-affected origin/main`。
 - 只想跑单个测试: `cargo nextest run --all-features -p <crate> -E 'test(<name>)'`。
-- 映射不出来时退出码 1 并说明原因(纯 docs / 全非 crate 路径 / 空 diff),
-  不会静默跑 0 个测试。nextest 零匹配时 rc=4,原样透传并附说明。
+  跑 live 的单个测试: `cargo nextest run --all-features --profile live
+  --run-ignored only -p <crate> --test <binary> -E 'test(<name>)'`。
 
-### 设计原则(改动这些命令前必读)
+### 设计原则(改这些命令前必读)
 
 - **分级的意义是「不同场景测不同的东西」,不是把全量测试加速。** L0-L2 各自省掉
   不同成本,都不等价于 `just test`;合并前仍要跑全量。
+- **proc 不是独立档位。** 263 个 proc 测试只占全量约 4%(36s / 821s),单独切一层
+  的认知成本大于收益。慢的根因是全量编译与 6020 个测试,解法是范围分层。
 - **`--all-targets` 不能省(L0)。** 默认不检查 `tests/`,而本仓有 108 个集成测试
   target。实测在 `crates/*/tests/` 放类型错误,不带该 flag 报 0 error(漏检)。
 - **`--all-features` 不能省(L1/L2)。** `yi-agent-store` 的
   `foreground-test-support` feature 门控了测试辅助方法,漏掉直接 `error[E0599]`。
 - **L2 用 nextest 原生 `rdeps()`,不手工算闭包**,依赖图漂移交给 nextest。
   闭包条数是验收依据: 改 `core` 得 12 个、`relay` 得 3 个、`flags` 得 8 个。
-- **L2 默认基准必须是 merge-base 的两点 diff**,不是三点 `main...HEAD`: 三点会漏
-  未提交改动,而「刚改完想跑相关测试」正是最常用场景;直接对 `main` 两点 diff 又会
-  混进别人在 main 上的提交。
-- **判据写错不会报错,只会少测。** 路径→crate 的映射是本设计的承重环节: 写宽了跑错
-  crate,写窄了静默少测。所以映射链上任何失败(cargo 缺失、`cargo metadata` 非零、
-  解析失败、workspace 报零成员)都必须显式 exit 非零,不能退化成「全部 unmapped」
-  后返回 0——那是最难发现的失败模式。
-- **判据自测: `just affected-check`**(29 条断言,已进 `just ci`)。改映射逻辑必须
-  同步改它;新增断言要做「回退修复后必须变红」的验证,否则断言可能空转。
-- **`just test` 前的并发预检只警告不阻断。** 跨会话并发是假红的真因,在 nextest
-  配置层修不掉(`spawn-heavy` 的 `max-threads` 只约束单次运行内的并发),所以让它
-  在发生时可见。看到 WARN 且失败是超时类时,**先独占复跑再判断**,别急着改代码。
+- **L2 默认基准必须是 merge-base 的两点 diff**,不是三点 `main...HEAD`。
+- **判据写错不会报错,只会少测。** 映射链上任何失败都必须显式 exit 非零,
+  不能退化成「全部 unmapped」后返回 0。
+- **判据自测: `just affected-check`**(29 条断言,已进 `just ci`)。
+- **`just test` 前的并发预检只警告不阻断。** 看到 WARN 且失败是超时类时,
+  **先独占复跑再判断**。
+- **live 必须走 `[profile.live]`,不能用 default。** default profile 的
+  `default-filter` 排除了 live 测试(防 `--run-ignored all` 误跑真实 API),
+  因此 `--run-ignored only` 在 default 下会拿到 0 个测试。`-E` 覆盖不了。
+- **`default-filter` 的排除项必须用 `binary_id(...)` 限定。** 裸写
+  `not test(/^real_/)` 会误伤 `yi-agent-runtime`、`eval_baseline`、
+  `frontend_runtime_lease` 里名称以 `real_` 开头的正常测试。五个二进制的 live
+  前缀各不相同,必须逐个写。
+- **超时预算必须大于测试自身预算。** live 测试自身是 300s
+  (`E2E_TIMEOUT`/`COMPLEX_TIMEOUT`),profile 里设 `300s x 2 = 600s`。若设成
+  default 的 180s 会把合法测试误杀成「不稳定」。
 
-实现: `yi-agent-rs/scripts/test-tiers.sh`(映射与子命令)+ `test_test_tiers.sh`(自测)。
-设计与实测依据: `docs/superpowers/specs/2026-11-07-graded-test-tiers-design.md`
+实现: `yi-agent-rs/scripts/test-tiers.sh`(范围轴)+ `yi-agent-rs/scripts/test-live.sh`
+(保真度轴)+ `.config/nextest.toml`(profile 与 test-group)。
+设计依据: `docs/superpowers/specs/2026-11-08-unified-test-tiers-design.md`
 
-## 真实 LLM 测试
+## 真实 LLM 测试的环境要求
 
-- 默认 `cargo test` / `just test` / `just ci` 只跑 mock 测试(wiremock 模拟),
-  不调用真实 LLM API,无需 API key。
-- 真实 LLM 测试用 `#[ignore]` 标记 gate,默认跳过,需手动加 `--ignored`:
-  - provider 层冒烟:`cargo test -p yi-agent-llm --test real_integration -- --ignored`
-  - 端到端(经 `yi-agent run`):`cargo test -p yi-agent --test e2e_real -- --ignored`
-- 推荐用 justfile recipe,无 API key 时自动跳过(exit 0,非失败):
-  - `just test-real-llm`:跑 provider 层
-  - `just test-real-e2e`:跑端到端
-  - `just test-real-all`:两者都跑
-- 真实测试需要环境变量 `ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`。测试代码开头
-  会检查 env var,无 key 时 `eprintln!("skip")` 并 return(双保险,即使误加
-  `--ignored` 也安全跳过)。
-- CI **不跑**真实 LLM 测试(避免成本与密钥泄露),只跑 mock 测试。
+- 配置源是 `~/.yi-agent/models.json` 的默认条目(`scripts/export-model-env.sh`
+  从中导出变量)。**不要**依赖 shell 里的全局 key——入口会先 `unset` 它们。
+- 无可用 key 时所有 live 入口打印 `SKIPPED` 并 exit 0,不算失败。
+- CI **不跑** live 测试(避免成本与密钥泄露)。
+- 已知失败(与并发无关,串行也复现,属另一条工作线):`real_openai_*`
+  打 `https://api.openai.com` 而实际 provider 走自定义 URL;
+  `e2e_auto_compact_triggers` 依赖 token 计数假设。
 - `yi-agent run` 子命令是端到端测试的载体:非交互式 drain `AgentEvent` 到
-  stdout/stderr,`--json` 切换为 JSONL 供测试断言。详见
-  `docs/plans/2026-07-26-real-llm-testing-design.md`。
-
-## 分级测试系统
-
-- **Tier 0 (Mock)**: `cargo test` / `just test` — wiremock,总是跑,无 API key
-- **Tier 1 (Provider smoke)**: `just test-real-llm` — SSE 解析、鉴权
-- **Tier 2 (Simple e2e)**: `just test-real-e2e` — 单轮文本、单工具调用
-- **Tier 3 (Complex one-shot)**: `just test-real-complex` — 多步骤生成任务
-  (个人网站、Python 脚本、数据转换、bug 修复)
-- `just test-real-all` 跑 Tier 1 + 2 + 3
-- 复杂测试用 `tempfile::TempDir` 隔离,300s 超时,结构性断言(文件存在/大小/标记)
-- 复杂测试同样是 `#[ignore]` gate,CI 不跑
-- 测试文件: `yi-agent-rs/crates/yi-agent/tests/e2e_complex.rs`
-- 共享 helper: `yi-agent-rs/crates/yi-agent/tests/common/mod.rs`
+  stdout/stderr,`--json` 切换为 JSONL 供测试断言。
 
 ## 项目进度维护
 
