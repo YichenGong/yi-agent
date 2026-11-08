@@ -20,6 +20,9 @@ pub const LEAD_AGENT_FLAG: &str = "lead_agent";
 /// 远程 SSH 执行的总开关。dev-only：stable 构建下恒关（spec §5.3.1）。
 pub const REMOTE_SSH_FLAG: &str = "remote_ssh";
 
+/// 旁问（`/side`、`/btw`）的总开关。dev-only：stable 构建下恒关。
+pub const SIDE_CONVERSATION_FLAG: &str = "side_conversation";
+
 pub const REGISTRY: &[FlagDef] = &[
     FlagDef {
         name: LEAD_AGENT_FLAG,
@@ -31,6 +34,13 @@ pub const REGISTRY: &[FlagDef] = &[
     FlagDef {
         name: REMOTE_SSH_FLAG,
         summary: "远程执行：经 ssh 在远端项目里跑常驻 app-server，手机可见",
+        owner: "yichen",
+        expires_on: "2027-06-30",
+        default: false,
+    },
+    FlagDef {
+        name: SIDE_CONVERSATION_FLAG,
+        summary: "旁问：在主会话之外开一条只读临时分支（/side、/btw）",
         owner: "yichen",
         expires_on: "2027-06-30",
         default: false,
@@ -86,6 +96,21 @@ mod tests {
         );
         assert!(!def.summary.is_empty());
         assert!(!def.owner.is_empty());
+    }
+
+    #[test]
+    fn the_side_conversation_flag_is_registered() {
+        let def = find(SIDE_CONVERSATION_FLAG).expect("side_conversation must be registered");
+        assert!(
+            !def.default,
+            "side conversations must default to off: it is an experimental feature"
+        );
+        assert!(!def.summary.is_empty(), "the settings page shows this line");
+        assert!(!def.owner.is_empty());
+        assert_eq!(
+            SIDE_CONVERSATION_FLAG, "side_conversation",
+            "the name is the flags.json key; renaming it after release orphans user settings"
+        );
     }
 
     #[test]
