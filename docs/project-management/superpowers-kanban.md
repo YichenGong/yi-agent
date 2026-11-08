@@ -28,6 +28,8 @@
 
 ## Features
 
+- [ ] **daemon socket 契约同步修复** — 宿主 `cac5afe0` 已迁到实例目录，插件仍探测旧地址，误判 daemon 消失并反复退出。2026-11-09 已交付[修复 spec](../superpowers/specs/2026-11-09-kanban-daemon-socket-contract-design.md)，待评审、待实现；不混同查询 IPC、PATH 或 worktree 授权问题。完成判据：该 spec §7 A01–A14、§8 隔离真机与获准后的正式部署复核全部有证据，含宿主/插件真实路径函数交叉测试、实例隔离、活宿主下插件 PID 稳定、真实失联有界退出。验证入口：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-ipc && cargo test -p superpowers-kanban-runner`，宿主 `cargo test -p yi-agent-lifecycle` 与 `just ci`。
+
 - [ ] **查询 IPC 在非阻塞读写下保持完整帧** — 当前 macOS accepted socket 继承非阻塞标志，请求未到或大回复背压时提前断开，造成看板“无法读取”。本轮仅完成[修复 spec 与文档自检](../superpowers/specs/2026-11-03-kanban-query-io-design.md)，尚未实现。完成判据：该 spec §7 的 A01–A15 与 §8 部署验收全部通过，含延迟请求、256 KiB 背压回复、统一截止时间/停止、帧上限及真实 daemon 转发；验证入口：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-ipc`，macOS 回退原连接处理时 A02/A04 必须变红。
 
 - [ ] **会话存活观测误报修复** — 代码已全部交付（Tasks 1–7），**待隔离实例真机验收**；真机未通过前不勾完成。根因：`server/driver/tick.rs` 只刷新进程内 `DriverState` 已登记子集，重启后普通 RPC 恢复的热会话未被重新发现；插件把未上报旧 ID 写成 false；桌面把「未观测到」说成「已不存在」、把轮询时间说成「最后活动」。
