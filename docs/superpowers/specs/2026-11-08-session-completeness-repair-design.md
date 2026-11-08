@@ -1,7 +1,8 @@
 # Session 内容完整性与显示收敛修复设计
 
 日期：2026-11-08
-状态：草案，待用户评审；未实施、未部署。
+状态：已完成三轮设计复核，供用户审阅；未实施、未部署。
+版本：rev2（2026-11-08）；[复核记录](../reports/2026-11-08-session-completeness-spec-review.md)。
 范围：普通会话正文、阅读位置、子 agent 与后台进程摘要的更新完整性。
 
 ## 1. 背景与证据
@@ -73,7 +74,8 @@
 
 - `liveLastItemId`：最近收到的 item 身份，只作兼容/诊断，**不能证明连续完整**。
 - `baseline`：一次完整、一致的普通转录快照已安装；缓存有内容、items 非空、收到 completed 都不等于有基线。
-- `view_seq`：同一宿主运行代、thread、content_epoch 下，普通会话可见状态的单调序号。
+- `view_seq`：同一 `(host_instance_id, threadId, content_epoch, view_generation)` 下，普通会话可见状态的单调序号。
+- `view_generation`：只读投影重建/回收后再创建时生成的新 UUID；不递增 content_epoch，不改变模型上下文。它避免热会话被回收后 seq 从 0 重用，让旧缓存或 token 被误当连续。所有快照、probe、序号帧及客户端同步键都包含它。
 - `content_epoch`：沿用既有可见集合世代（例如 clear）。它不是逐帧序号。
 - `synced`：完整基线 + 基线之后连续的已应用帧 + 没有已知 dirty/overflow；仅表示已收敛到已知水位，不承诺未来永不变化。
 - `following`：用户阅读意图，不能由 end===itemCount 或整体 scrollHeight 变化推导。
@@ -118,7 +120,7 @@
 
 ### 4.4 高度与阅读锚点
 
-1. 高度账本、上次布局测量、补偿状态属于 `(threadId, content_epoch, layoutSignature)`；layoutSignature 至少区分可用宽度与影响排版的设置。离开可丢弃，不新增无限全局缓存。
+1. 高度账本、上次布局测量、补偿状态属于 `(slot/host binding, threadId, content_epoch, layoutSignature)`；layoutSignature 至少区分可用宽度与影响排版的设置。离开可丢弃，不新增无限全局缓存。
 2. 同一访问中使用稳定账本；中位数变化形成合并后的 heightRevision，让 spacer、测量和补偿在同一个布局周期更新。ResizeObserver 只观测挂载行，零高／非有限值不入账。
 3. **每次布局提交维护上一份几何**，不能只在 win.start/end 变化时更新 prevHeight；否则初次中位数收敛的高度差会被积攒到下一次用户滚动。
 4. 布局变化前保留真实可视消息 ID 与 viewport-relative offset；变化后按该消息的实际坐标恢复。优先保消息位置，不把整体 scrollHeight 差都解释为“在上方新增”。
@@ -135,7 +137,7 @@
 
 同步键为 `(slot/host binding, connection generation, threadId, content_epoch)`；同名 thread 不跨宿主混用。
 
-控制器维护：baselinePresent、baselineSeq、appliedSeq、dirty、reconciling、pendingReasons，以及读取期间的有界帧缓存。视图同步态为 `unknown / syncing / synced / stale / failed`，与 running/idle/awaiting_approval 分开。
+控制器在已知基线后将 view_generation 纳入校验身份；它与 content_epoch 分开，投影回收重建不会假借 epoch 改变。控制器维护：baselinePresent、baselineSeq、appliedSeq、dirty、reconciling、pendingReasons，以及读取期间的有界帧缓存。视图同步态为 `unknown / syncing / synced / stale / failed`，与 running/idle/awaiting_approval 分开。
 
 规则：
 
@@ -147,24 +149,25 @@
 
 ### 5.2 新只读协议：保留旧 readItems 兼容
 
-新增能力 `thread_transcript_sync_v1`，同时支持两个只读方法。Rust 协议为真源，TS 绑定生成；不能只手写前端新类型。
+新增能力 `thread_transcript_sync_v1`，支持 read、probe、release 三个只读方法。Rust 协议为真源，TS 绑定生成；不能只手写前端新类型。
 
 **`thread/transcript/read`**
 
 - 首次请求：`{threadId}`，只返回一致快照的第一页。
 - 续页请求：`{threadId, snapshotToken, cursor}`，只读同一份快照，不重新 load 新时刻。
-- 每页元信息：`host_instance_id, thread_id, content_epoch, snapshot_seq, snapshotToken, nextCursor, totalItems, items`；第一份快照同时保存 `status, active_turn_id, usage, totals`，每页携带同一份元信息。
+- 每页元信息统一 snake_case：`host_instance_id, thread_id, content_epoch, view_generation, source, snapshot_seq, snapshot_token, next_cursor, total_items, items, metadata`；请求仍为 camelCase（`threadId, snapshotToken, cursor`），沿用既有请求风格。所有页携带同一份 metadata：`status, active_turn_id, last_turn_status, last_error, retrying, usage, totals, subagent_totals, info, permission_mode, reasoning_effort, last_read_at, last_completed_at`。只恢复这些当前状态，不重放审批请求或触发已读副作用。
 - cursor、token 绑定客户端授权和 thread/epoch/宿主运行代，opaque；跨客户端、跨 thread 或过期 token 返回结构化错误，不降级成新快照中间页。
-- 同一快照 pages 拼接是权威的 item 顺序，ID 唯一；最后一页才证明完整。空快照是合法的一页。
-- 默认每页最多 200 items 且目标 256 KiB；单个更大 item 可独占一页，但必须小于现有传输允许的单帧上限，超限返回明确错误，**不能截断文本后声称完整**。
-- 一个客户端最多 2 份存活快照；单份序列化材料上限 64 MiB、有效期 60 秒；客户端最多 1024 页。超预算或过期保留旧视图，退出读取并报可重试原因；不能安装半份基线。完成、取消、断开会释放快照，宿主总快照预算 256 MiB，不能挤占无限内存。
+- 同一快照 pages 拼接是权威的 item 顺序，ID 唯一；最后一页才证明捕获材料完整。`source` 在所有页保持一致，为 `hot_projection/local_disk/external_disk`；外部或无法证明本宿主管理的活动写入标 external_disk，客户端只作受限展示，不能在第一次 probe 前暂时冒充 synced。空快照是合法的一页。
+- 默认每页最多 200 items 且目标 256 KiB；计量使用 UTF-8 序列化字节数，包括完整 JSON-RPC envelope 和元信息，不能用 JS 字符数。单个更大 item 可独占一页，但整帧必须 ≤ 1 MiB（既有 `MAX_FRAME_BYTES`），超限返回 `item_too_large`，**不能截断文本后声称完整**。
+- 一个客户端最多 2 份存活快照；单份序列化材料上限 64 MiB、有效期 60 秒；客户端单周期最多 1024 页、64 MiB 拼接材料。超预算或过期保留旧视图，退出读取并报可重试原因；不能安装半份基线。宿主热投影与快照的共享材料合计预算 256 MiB（引用共享只计一次），编码工作区也预留预算，先准入再分配。
+- 新增只读资源释放 `thread/transcript/release({threadId,snapshotToken,installed?:boolean})`，返回 `{released:boolean}`，幂等、绑定同一客户端；installed 默认 false，true 仅确认该 token 的 snapshot_seq 已原子安装，用于清除 ≤ 该水位的 dirtyThrough，不能清除更新的失效。读到最后一页不提前销毁 token，客户端校验安装或失败后 finally release。取消是本地取消资格，不假装 RpcClient 已支持远端 abort；release 发不出去时由 disconnect/60 秒 TTL 回收。每页/probe 请求 10 秒超时、单快照周期 60 秒截止；超时注销该 pending，不将迟到只读响应永久留在 buffered。
 
 **`thread/view/probe`**
 
-- 输入 `{threadId}`；返回宿主运行代、epoch、最新 view_seq、status/active_turn_id、children_revision、processes_revision。
-- 仅读现成摘要，不能扫描整段 jsonl；对应列表查询需返回其覆盖的 revision，便于识别查询期间的新变化。
-- 每个 revision 在其对应摘要改变时递增，独立于正文 seq；不声称正文与两个附属列表是跨子系统的同一事务。
-- 摘要 revision 必须来自权威更新源：app-server 内的 process manager 直接更新；外部 daemon/子 agent 源通过其现有订阅加轻量水位查询刷新。probe 不能只回读一个可能已经漏通知的前端或宿主镜像；无法验证外部源时返回该摘要 stale/unknown，并对当前可见列表执行其权威只读查询。
+- 输入 `{threadId}`；返回宿主运行代、epoch、view_generation、最新 view_seq、status/active_turn_id，及独立 `children`/`processes` 摘要水位（`revision, freshness, checked_at`；freshness 为 `fresh/stale/unknown`）。冷会话无活跃投影时只做常数个文件 stat，材料指纹变化即换 view_generation，并要求重新捕获；不能扫 jsonl 或仍回旧 seq。
+- probe 不扫描整段 jsonl；当前可见附属摘要如已过期，在后台任务中做有界权威读取，不能在 RPC 主循环阻塞 IPC。既有 `watch_children` 已每 500 ms 查询 daemon 的 `ListTaskSummaries`，复用这个源与最近成功时间，不假设存在新的 daemon 轻量水位方法。
+- 对应 v1 列表查询通过可选请求字段 `includeSync:true` 返回 `sync:{revision,freshness,checked_at}`；未带字段的旧响应保持原形。查询失败时 v1 返回结构化 `source_unavailable`，不把失败折为 fresh 空表。process 未知 thread 同样在 v1 区分 unknown 与已验证空列表。
+- 每个 revision 在其对应摘要改变时递增，独立于正文 seq；不声称正文与两个附属列表是跨子系统的同一事务。相同权威快照不会递增，失败保留旧摘要并转 stale，通知丢失不影响 probe 读取权威水位。
 
 旧 `thread/readItems(afterItemId)` 的线上语义不偷偷改变。新控制器在 v1 下不拿旧 afterItemId 修缺口；既有调用点逐一收口，避免 running/remote/idle warm 各自留下一套补齐逻辑。
 
@@ -176,14 +179,14 @@ ReadView 必须具备：
 
 1. 热会话的历史基线在 driver 准备时建立；普通会话事件更新同一投影后才发布。历史材料可共享不可变引用，不复制模型 messages；流式只更新活动 item，不逐帧复制整段历史。
 2. 从当前消息投影短临界区捕获一致 `(items, metadata, snapshot_seq)`，然后在锁外分页和编码。不持广播全局锁、agent 业务锁跨网络 await。
-3. 冷会话从现有只读 store 建快照，不创建 agent、不获取执行资格。必须与 clear/delete/append 的快照边界协调，不能把不同 epoch 的日志和 partial 混成一份；读到材料变代时重新捕获或返回 stale，而不是沿用旧 token。
-4. 进行中的 agentMessage/thinking 等可见 item 使用稳定协议 ID；投影结果与最终完成项一致。不能用前端本地 reasoning ID 充当服务端权威 ID。
+3. 冷会话使用新增严格只读材料读取，不直接把容错 `ThreadStore::load/read_log` 结果当完整。只读 items/必要元信息，不解析或复制模型 messages/凭证；损坏已提交行、损坏存在的 partial/meta 返回 `corrupt_material`，不能跳行后标完整。后台读取前后校验 meta/log/partial 的文件身份、长度、mtime 与本进程材料 revision，排除 append、原子替换、truncate、delete 和 partial 提交窗口；稳定读取失败最多捕获 3 次，然后返回 `snapshot_stale`。仅与既有 store 的短锁/本进程读 revision 协调，不改执行 writer lock，不持锁跨整段 I/O。外部 writer 只保证捕获到稳定已落盘材料，不能承诺尚未落盘的其他进程流式正文；probe 标 `source=external_disk`，不冒充本宿主热投影。
+4. 进行中的 agentMessage/thinking 等可见 item 使用稳定协议 ID；Translator 在首个 reasoning delta 预分配 thinking ID，v1 帧 `sync.reasoning_item_id` 携带它，最终 ThinkingBlock 重用该 ID。旧通知 params 与旧客户端本地 reasoning 路径保持原形。快照只含可展示明文，绝不含 signature/encrypted_content/redacted data；redacted 终项按权威遮蔽语义替换，不能用“取较长文本”恢复已遮蔽内容。
 5. turn 结束、取消、异常退出和附属 metadata 更新都进入同一投影顺序。区分“执行已结束”和“持久化成功”：append 失败不能提供假的 persisted 保证；热投影仍可读，重启后未落盘内容不作恢复承诺。
 6. 已捕获 token 的分页内容不可变；clear/delete 使其不能继续覆盖新 epoch，并取消旧客户端安装资格。此只读服务不能改变 writer lock 或 running turn。
 
 ### 5.4 序号与合并 delta
 
-v1 普通会话可见事件携带 `(host_instance_id, thread_id, content_epoch, seq_from, seq_to)`：
+v1 普通会话可见事件携带 `(host_instance_id, thread_id, content_epoch, view_generation, seq_from, seq_to)`：
 
 - 普通转录、reasoning、用量及该会话状态事件在投影应用时按 thread 串行分配序号；一个事件 `from=to`。
 - 合并 delta 的范围必须连续，且同一 thread/epoch/item；跨 item、状态屏障或不连续范围先 flush，不能伪称一个连续区间。
@@ -191,18 +194,33 @@ v1 普通会话可见事件携带 `(host_instance_id, thread_id, content_epoch, 
 - 客户端 `from===appliedSeq+1` 才能连续应用。`to<=appliedSeq` 丢弃重复；from 更大说明缺口；范围跨过 appliedSeq 的半个合并 delta **不能截字符串猜测**，标 dirty 并重读快照。
 - 序号按 JS 安全整数上限校验；不得接受 NaN、负数、不合法范围或在溢出时回绕。宿主在运行代变更后重新建立 seq 空间，不跨运行代比较。
 
-订阅与恒推状态的边界：保留 `Delivery::List` 恒推，包括 `ThreadStatusUpdated` 和 `TurnCompleted`。未订阅或尚无基线时，这些帧只更新列表状态、置 dirty，不拿它们推断正文连续性。v1 订阅 ACK 定义订阅 generation 与内容投递起点；监听先于请求就绪，宿主先建立过滤与顺序边界再回复 ACK，边界之后的普通可见帧（含参与 view_seq 的状态帧）走同一 per-client/thread 有序出口。完成读取期间缓存从这个边界开始，早于快照的范围按水位丢弃。v1 能力在每客户端握手登记；出口按其能力选择带序号或旧 envelope，不修改旧客户端数据形状。取消订阅再进入必须重新验证，不把恒推状态期间跳过的正文当连续后缀。
+订阅与恒推状态的边界：保留 `Delivery::List` 恒推，包括 `ThreadStatusUpdated` 和 `TurnCompleted`。未订阅或尚无基线时，这些帧只更新列表状态、置 dirty，不拿它们推断正文连续性。
+
+- 本地 `Feed::All` 保持全收，不能为打开一条会话改成 Only。v1 `thread/subscribe` 请求可带 `mode:"all"`（仅本地允许），ACK 返回 `subscription_generation` 与 `mode`；远端仍用 `threadIds` 整体替换。未协商 v1 的请求/响应保持原形。
+- 全客户端的订阅只由一个 SubscriptionCoordinator 写入；它合并普通 LRU、旁问父会话、子 agent 轨迹持有的 thread，序列化替换请求。远端唯一 ID≤16：当前普通会话和活动详情优先，先裁掉最旧无持有 LRU；超过上限拒绝新持有并显示原因，不能悄悄取消现有活动详情。不能保留旁问的 `[parentId]` 独立替换路径。
+- v1 能力在每客户端 `initialize.params.capabilities.thread_transcript_sync_v1` 登记，响应新增 `transcriptHostInstanceId` 与 capability；它复用同一进程宿主身份，不造第二套 UUID。新 envelope 顶层可选 `sync`，包含统一 snake_case 水位字段及 subscription_generation，旧 params 原形不改。
+- 监听 ready 和缓存同步建立在首次订阅请求之前，不是等 ACK 才开始缓存。宿主先完成过滤/顺序切换再回复 ACK，ACK 之前到达的新 generation 帧也缓存；先前 generation 的帧不能更新已安装基线。连接换代和取消订阅使原基线需重新验证。
+- ReadView 的 apply→分配 seq→发布意图为一个不跨 await 的串行提交；跨 driver/主循环/status 源不允许解锁后再各自广播导致 seq 倒序。同一客户端/thread 出口按发布顺序写入，响应与其他 thread 可穿插。
+- 捕获快照在同一提交边界封闭当前 delta 合并范围：未发布范围 ≤ snapshot_seq 必须 flush/seal，后续 delta 从 snapshot_seq+1 开始新范围。无需等待网络腾位才捕获。部分重叠仍作为异常自愈，不把高频正常生成变成必然反复重读。
 
 ### 5.5 安装快照与并行实时帧
 
-顺序固定：监听就绪／远端订阅 ACK → 开始有界缓存 → 捕获并读完同一 token → 原子安装 → 应用水位后的连续实时帧。
+顺序固定：同步建立监听与有界缓存 → 等待监听 ready／远端订阅 ACK → 捕获并读完同一 token → 原子安装 → 应用水位后的连续实时帧。ACK 前到达的帧也进入缓存，不在 ACK 后才创建缓存。
 
 1. 读取期间保留现有界面；实时帧可更新临时显示，但序号帧必须同时缓存，不能把临时更新当完整基线。
-2. 按服务端顺序原子安装全部权威 items；不是把漏掉的老消息 append 到现有尾部。只有服务端快照之外的本地待确认乐观项保留，不删除草稿；仍沿用现有发送认领规则，不按相同文本随意合并两次不同提问。
+2. 按服务端顺序原子安装全部权威 items；不是把漏掉的老消息 append 到现有尾部。本地 notice/config/help/usage 卡片作为独立 overlay 保留，记录它之前的服务端 ID，安装后锚到该 ID 后；目标消失则置于权威尾部，不能因此丢提示。乐观消息使用本地提交 ID，与 `turn/start` 回包的 `user-<turn_id>`、`turn/interject` 回包的 `interjection_id` 显式关联；回包到达后按 ID 认领，未知/未确认项保留，不能仅因旧历史有相同文本就删除新提问。旧客户端文字匹配不作为 v1 原子安装的认领证明。草稿与附件不由快照清空，断线不自动重发。
 3. 丢弃 `seq_to<=snapshot_seq` 的缓存帧；从 snapshot_seq+1 连续应用。部分重叠的合并帧转 dirty；不能把已经包含在快照里的 delta 再追加一次。
 4. 缓冲上限 256 帧或 2 MiB，任一到达即 overflow。不能静默丢缓存、继续标 synced；中止此次完整性声明，合并安排新快照。
 5. 多次读取必须维护请求 generation，旧成功不能覆盖新结果；usage/totals/status 按相同快照水位与实时后缀安装，不让旧快照把新状态回退。
 6. 快照安装 bump structuralVersion；仅文字／尺寸变化继续通知 textVersion/高度测量，避免“内存完整但 DOM 陈旧”。
+7. dirty 记录已知缺口水位与本地失效 revision；捕获的 snapshot_seq 已覆盖的 dirtyThrough 可以清除，读取后新发生且未覆盖的失效不能被 finally 清掉。已知 probe 水位大于 snapshot_seq 且缓存后缀不连续时保持 stale，不把一致旧快照当最新。附属摘要 dirty 不强制重读正文。
+
+### 5.6 状态恢复与冷读取的证明边界
+
+- 普通 view_seq 覆盖显式集合：item started/completed/batch/delta、reasoning delta、turn started/completed、thread status、usage、retry/returned interjection、快照 metadata 中的设置/已读水位变更；未纳入快照的 UI focus、旁问、trace、列表提示、瞬时 notice 不分配普通 seq。工具 stdout delta 如现有 UI 不显示，投影按同样 no-op 语义处理但连续消费序号；完整工具卡以 completed 为准。不能出现某个 seq 代表快照与 Session 都无法恢复的状态变化。
+- 冷读取增加独立 material revision/in-flight mutation guard：在 append、partial 写/清、truncate、delete、epoch 变化前后标记，读取仅在无在途修改且前后 revision/文件指纹相同时接受。守卫按同一存储根/thread 共享，不是各 `ThreadStore::new` 私有计数；只服务读一致性，不改变执行锁。回收空闲投影后新建 view_generation；有 token/热 driver 的投影不能回收。
+- 同宿主冷转热先沿用已有投影/基线及 generation，再开启第一条 live；不能热化后重复装入已提交 items。外部 writer 不能受本进程 guard 约束，外部磁盘来源只作受限展示，不标 v1 synced，也不承诺其多文件跨写事务或未落盘文本完整。材料源变为本宿主热投影后重新建立可信基线。
+- ThreadView 新增正文同步态而非直接复用既有发送门控 `syncState`。epoch/stale_context 的发送限制保留；正文暂时 stale 不错误改变 turnActive，不把内容加载失败变成永久禁用插话。snapshot.metadata 中的 active_turn_id/status/terminal 信息修复 UI 状态，不能仅装 items 而留下 Stop/重试徽章。
 
 ## 6. 投递可靠性与自动对账
 
@@ -213,9 +231,13 @@ v1 普通会话可见事件携带 `(host_instance_id, thread_id, content_epoch, 
 - 必须可靠：item/started、item/completed、批量完整 items、普通会话状态／回合生命周期、同步失效提示。
 - 可合并、允许短时缺口：高频文字／工具输出 delta，但必须通过序号和 probe 发现并收敛。
 
-沿用现有关键帧背压扇出规则：本地 reliable 队列等待入队且响应取消/出口关闭；WS 最多等待既有 10 秒，慢端明确关闭并重同步，不阻塞快端。可靠性变化不能让不订阅该 thread 的客户端收到内容。
+v1 的“可靠”是**完成材料最终可恢复**：正常走有序可靠出口；若有界出口耗尽，则必须保留权威材料并记录非静默失效，恢复后用快照收敛，不能承诺无限慢客户端逐帧必收。既有队列容量仍为 256，不用扩大队列兜底。
 
-`try_send Full` 必须记 metadata-only 计数，并把受影响 `(client,thread,epoch)` 标 dirty；出口排空后合并发送一条定向可靠同步失效提示。不能往已经满的队列再 try_send 一条同样可能丢失的提示。Closed 走断线清理，不伪装仅 delta 丢失。
+- 不在 driver、RPC 主循环或 ReadView 锁内新增无限 `send().await`。每客户端出口泵负责等待网络；所有生产发布入口同步提交顺序意图。短暂满时 delta 可丢但计数，完整项/状态不能被当作普通 delta 丢弃后继续声称 synced。
+- v1 本地出口 Full：非阻塞登记每个受影响 thread 的 dirtyThrough；出口泵每次排空后优先合并发送定向 `thread/transcript/invalidated`（含最新水位及 reason），客户端快照确认覆盖水位后才清除 dirty。无空位时保留 dirty 意图，不再 try_send 同一提示。dirty 元信息按最多 16 订阅 thread 管理；本地 All 超过上限合并为连接级 invalidated，不能丢掉某会话失效，也不保留无限帧副本。
+- v1 WS 出口等待最多 10 秒；停滞或可靠意图准入失败则显式断开该客户端、重连后重建基线，快端与业务取消不等待慢端。出口 Closed 按真实断线清理。
+- 未协商客户端保留旧 envelope/订阅和既有关键帧背压；新增完成项可靠路径由独立出口处理，队列与在途材料合计仍有界。新增完成意图无法准入时显式关闭客户端，不能静默丢项或建立无限二级队列；旧本地连接须由现有连接恢复路径提示断线，不能继续报在线。既有关键帧背压可保留，但不能向业务循环增加新的等待路径。旧协议不承诺 v1 丢帧证明，不能借兼容分支绕过新客户端矩阵。
+- 可靠通知、回包、反向审批保持每客户端出口的既有顺序约束；同步失效只触发只读恢复，不重启 sidecar、不取消正在工作的 agent。R01 同时验证“完成项收到或明确进入恢复路径”与取消/快速 probe 响应。
 
 ### 6.2 不依赖用户切换的触发
 
@@ -233,7 +255,7 @@ v1 普通会话可见事件携带 `(host_instance_id, thread_id, content_epoch, 
 ### 6.3 有界请求与失败表现
 
 - 同一键最多一个 probe、一个 snapshot 周期；同一摘要最多一个列表读取，读取中再次 invalidated 留待下一轮。
-- 连续失败采用 1/2/5 秒退避，最多连续 3 次自动快照尝试；随后显示“内容可能不完整，点击重试”，保留原视图，周期性轻量 probe 仍可恢复。新连接、用户重试或更高服务端水位可开启新尝试，不能每 5 秒无限重复同一失败大快照。
+- 初次尝试之后最多 3 次自动重试，间隔 1/2/5 秒（最多 4 次捕获周期），包括缓存溢出、部分重叠和普通 I/O 失败；同一自动 episode 最长 120 秒。随后显示“内容可能不完整，点击重试”，保留原视图，周期性轻量 probe 仍运行。只有成功安装可信基线、新连接或用户显式重试才重置预算；更高服务端水位只更新已知目标，不能每次 delta/5 秒 probe 重开预算形成无限大快照。
 - 断线、hidden 或离开会话取消可见轮询；挂起中的结果只能写其仍有效的宿主／thread 身份，不写新面板。恢复可见时从 probe 开始。
 - 初次没内容的读取失败显示加载失败和重试；已有内容的失败显示非阻断 stale 提示，不清屏、不编造空列表、不将失败当 synced。
 - UI 同步状态与 turnActive 分离；内容 dirty 不能取消回合或悄悄丢弃输入。不放宽既有 stale_context/epoch 发送限制，也不因后台显示修复永久禁用运行中插话。
@@ -286,7 +308,7 @@ v1 普通会话可见事件携带 `(host_instance_id, thread_id, content_epoch, 
 
 | ID | 场景 | 必须断言 |
 | --- | --- | --- |
-| R01 | 本地/WS 出口满时发送 started、completed、状态帧 | 快端收到，慢端按可靠规则等待或明确断开；订阅过滤仍正确 |
+| R01 | 本地/WS 出口满时发送 started、completed、状态帧 | 完成材料收到或明确进入可恢复失效路径；快端与取消不等待慢端；订阅过滤仍正确，旧客户端无静默假绿 |
 | R02 | delta Full、提示期间再次 Full、出口 Closed | 一条合并定向 dirty 提示最终送达或断线；无静默假在线；计数可查 |
 | R03 | 真实 stdio→Tauri 事件桥→前端；WS/relay 组合 | 新字段透传；监听就绪后才读；处理 emit 失败／监听窗口，不只测 Broadcaster |
 | R04 | 假时钟 5 秒 probe、退避上限、dispose/hidden/离开 | 单 flight；timer 被清理；全部后台会话没有定时器风暴 |
@@ -300,7 +322,7 @@ v1 普通会话可见事件携带 `(host_instance_id, thread_id, content_epoch, 
 2. 真实 stdio 链路灌入大量工具输出，同时读取历史和生成正文；主动丢弃测试帧，确认无需切回就补齐，输入和 Stop 不被卡住。
 3. iOS/WS/relay 在弱网、前后台切换、重连时验 S04/S05/S08，原配对信息不变；没有真机结果保持未完成。
 4. 修复代码提交前和合并后分别运行 `cd yi-agent-rs && cargo fmt --all && just ci`；前端 `npx tsc --noEmit`、相关 Vitest、build 和真实浏览器脚本。Rust 优先按 yi-agent-app-server crate 跑，不默认裸全 workspace cargo test。
-5. 本次仅 spec 与诊断归档，不要求跑实现 CI；文档链接、验收编号、进度计数必须校验。诊断里的 464 个通过用例不代表此矩阵通过，故所有实现项保持 `[ ]`。
+5. 本次仅 Spec 复核、Plan 与诊断归档，不要求跑实现 CI；文档链接、验收编号、进度计数必须校验。诊断里的 464 个通过用例不代表此矩阵通过，故所有实现项保持 `[ ]`。
 
 ## 10. 实施分段与风险
 
@@ -322,6 +344,6 @@ v1 普通会话可见事件携带 `(host_instance_id, thread_id, content_epoch, 
 
 ## 11. 评审与完成状态
 
-本文已明确选择推荐方案、兼容降级、资源上限、失败表现和验收编号。用户确认后再编写实施 plan；若决定只做最小补丁，必须明确缩小验收范围，不能把它记为本 spec 全部完成。
+本文在用户要求下经过三轮复核并修订为 rev2；逐项发现、修订及反例见 [复核记录](../reports/2026-11-08-session-completeness-spec-review.md)。配套 [实施总入口与数据 Plan](../plans/2026-11-08-session-completeness-repair-impl.md)、[显示 Plan](../plans/2026-11-08-session-display-convergence-impl.md) 只规定未来实施，不代表已修复。若决定只做最小补丁，必须明确缩小验收范围，不能把它记为本 spec 全部完成。
 
-当前产物：设计草案及可追溯诊断记录。代码修复、上述 D/S/R 矩阵、正式部署均未执行。
+当前产物：修订后的设计、复核记录、实施 Plan 及可追溯诊断记录。代码修复、上述 D/S/R 矩阵、正式部署均未执行。

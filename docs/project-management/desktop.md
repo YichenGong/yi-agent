@@ -14,9 +14,9 @@
 不受本模块影响：`cargo test -p yi-agent-app-server`（397 个测试）与
 `cargo test -p yi-agent-runtime`（全绿）仍全绿。
 
-## Session 内容完整性修复（待评审，未实施）
+## Session 内容完整性修复（Spec 已复核、Plan 已编写，未实施）
 
-设计及证据：[修复 spec](../superpowers/specs/2026-11-08-session-completeness-repair-design.md) · [诊断记录](../superpowers/reports/2026-11-08-session-completeness-diagnosis.md)。旧 spacer/窗口 owner 修复保持已完成，本组单独登记。
+设计及证据：[修复 spec rev2](../superpowers/specs/2026-11-08-session-completeness-repair-design.md) · [复核记录](../superpowers/reports/2026-11-08-session-completeness-spec-review.md) · [显示 Plan A1–A5](../superpowers/plans/2026-11-08-session-display-convergence-impl.md) · [数据 Plan B1–B12](../superpowers/plans/2026-11-08-session-completeness-repair-impl.md) · [诊断记录](../superpowers/reports/2026-11-08-session-completeness-diagnosis.md)。旧 spacer/窗口 owner 修复保持已完成，本组单独登记。
 
 - [ ] 历史窗口自行覆盖视口、阅读锚点与高度补偿隔离、包括 LiveTail 的实际 DOM 上限 400 — 完成判据：spec §8 D01–D09 的真实浏览器测试及 §9 macOS WKWebView 验收；首屏补偿异常必须先形成失败用例。
 - [ ] 普通会话完整基线与 live 游标分离、一致快照安装、序号缺口和尾部丢失自动对账 — 完成判据：spec §8 S01–S11、R03–R05，包含真实 App、stdio/Tauri 与远端链路；不通过发送或切回触发补齐。
