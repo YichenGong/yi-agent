@@ -172,13 +172,28 @@ sweep_epoch: AtomicU64,
 // close_all 第一件事
 self.sweep_epoch.fetch_add(1, Ordering::SeqCst);
 
-// create_inner：在 reserve_slot **之前**记下当前 epoch，
+// create_inner：方法开头（resolve 之前）记下当前 epoch，
 // 在 sides.insert 之前复核；不一致就丢弃刚建好的 runner 并返回
 // SideClosing 错误（parents 不会写成 Ready，`create` 的 Err 分支会移除占位）。
+
+// open()：同样在进入 loop 之前记下 epoch，loop 顶部复核。
+// 等待者在 `ParentSlot::Creating` 上醒来后会回到 loop 顶部，此时它可能
+// 摇身变成新的创建者。只护 create_inner 不够：等待者带着清扫之后的新代次
+// 重试就会成功建出一条活旁支。
 ```
 
-这条测试必须有鉴别力：`close_all` 与 `open` 并发跑若干轮，断言最终
-`side_count() == 0`。没有 epoch 时该断言会间歇失败。
+这条测试必须有鉴别力：`close_all` 与 `open` 并发跑若干轮（**两个并发 `open`
+都要发**，否则等待者那条路径根本走不到），断言最终 `side_count() == 0`。
+没有 epoch 时该断言会间歇失败。
+
+**(e) 要写 tombstone**
+
+`shutdown()` 不需要（进程要退了，没人再问）。`close_all` 之后 registry 还活着，
+客户端重连时会拿旧的 `sideId` 来问，必须得到 `side_not_found`（「这条存在过，
+已关闭」）而不是「从未存在」。所以 `close_all` 照 `close()`（`registry.rs:782`
+起）的收尾写 tombstone：`Tombstone { side_id, parent, generation, accepted,
+created_at }`，`accepted` 取自 `guard.ledger.accepted_requests()`，插完再调
+`Self::prune_tombstones(...)`。
 
 **(d) 清扫要扫到空为止（有界）**
 第一轮清扫期间可能有 `Creating` 落定成 `Ready`。所以 `close_all` 用有界循环
@@ -273,7 +288,12 @@ pub fn help_text_with(target: Option<&str>, side_enabled: bool) -> String { ... 
   的同一类问题。
 - **旁支视图正在前台时必须先返回主会话**，否则用户会盯着一个已销毁的视图。
   `remote_ssh` 那段已经示范了同一手法（活动槽位是远端时回退）。这里对应的是
-  「当前视图是旁支」：先 `selectMain`，再 `dropHost`。
+  「当前视图是旁支」：先回主视图，再 `dropHost`。
+
+  入口用 `SideConversationController.back()`（无参，且能同时撤销一个尚未完成的
+  入场），**不要**用 `selectMain`：后者签名是
+  `selectMain(binding, parentId)`，需要这两个值，而此刻视图可能已经没有可用的
+  binding 了。`back()` 的既有实现就是「清入场意图 + 切回主视图」。
 
 ## 4. 数据流
 
