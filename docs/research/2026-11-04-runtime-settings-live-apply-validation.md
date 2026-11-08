@@ -181,8 +181,33 @@ cargo test -p yi-agent-subagent --lib                            # 105 passed
 cargo test -p yi-agent --test runtime_settings_live_e2e          # 7 passed
 python3 scripts/check-live-settings-coverage.py                  # 16 字段逐项执行
 cargo fmt --all -- --check                                       # 干净
-cargo clippy -p yi-agent-runtime -p yi-agent-app-server -p yi-agent-core --all-targets
+cd yi-agent-rs && just ci                                        # EXIT=0 / CI passed
 ```
+
+前端：
+
+```bash
+cd desktop && npx tsc --noEmit          # 无错
+npx vitest run                          # 2327 passed（167 files）
+npm run build                           # EXIT=0
+```
+
+## 5.1 自查阶段发现并修复的前端缺陷（4 处）
+
+提交前按 spec §8.2 逐条对照实现，发现四处真实缺陷。每处都先写会红的测试，
+再修，最后做反向变异（把修复回退必须变红）确认测试非空转。
+
+| # | 缺陷 | 后果 | 测试 |
+|---|---|---|---|
+| 1 | 每次后台刷新都 `setLoading(true)`，整块表单被换回「读取中…」 | 输入框卸载重挂：正在打字时别的窗口保存一次，光标/选区丢失，滚动位置跳回顶部。实测 `sameNode=false`、`focusKept=false` | `refreshes in place without unmounting the form or stealing focus` |
+| 2 | 提交时的代数快照写在 `setDraftState` 的 updater 里 | updater 何时执行由 React 决定；取到空对象时每个提交键都被判成「代数未变」而清掉，保存期间的新输入消失 | `clears the submitted draft even when the follow-up read fails`（变异成空快照即变红） |
+| 3 | `subscribe` 的 effect 把 `saving` 放进依赖 | 保存开始/结束各退订重订一次，两次之间到达的通知永久丢失——而「保存期间别人也保存了」正是最需要补读的时刻。实测日志 `SUB,UNSUB,SUB` | `keeps its subscription while a save is in flight` |
+| 4 | 保存成功后无条件写成功文案 | 紧随的权威读失败时，错误被成功提示覆盖，用户看到绿灯却不知道界面值是旧的（违反 spec §8.2） | `does not let the success toast hide a failed follow-up read` |
+
+缺陷 3 的测试写法值得记录：最初写的是「保存期间插一条通知，等保存结束应该补读」，
+**但这个测试抓不住缺陷**——重订发生在同一次渲染提交内，测试无法在那个极短窗口
+插入通知。改成直接断言订阅次数（保存前/保存中/保存后都应恰好一次订阅）后才
+真正变红。这是"测试看似合理但空转"的实例。
 
 ## 6. 未执行项（如实记录）
 
