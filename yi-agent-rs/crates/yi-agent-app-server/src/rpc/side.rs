@@ -62,6 +62,18 @@ pub(crate) async fn handle(
     if !owns(method) {
         return Ok(Flow::Unknown);
     }
+    // 功能不存在时，权限档不构成回答：客户端要能区分「本版本没有旁问」与
+    // 「你没有权限」，否则会渲染一个必然失败的面板。与 `remote_ssh` 关掉时
+    // `remote/relayTargets` 的处理同构。
+    if !(state.side_gate)() {
+        write_response(
+            state.hub,
+            state.client,
+            err_response(id, RpcError::method_not_found(method)),
+        )
+        .await?;
+        return Ok(Flow::Continue);
+    }
     if state.client_scope < required_scope(method) {
         write_response(
             state.hub,

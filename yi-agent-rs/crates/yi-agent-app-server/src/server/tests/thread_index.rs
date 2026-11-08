@@ -578,6 +578,7 @@ async fn eof_exits_gracefully() {
         pairing,
         Arc::new(crate::broadcast::Broadcaster::new()),
         RuntimeAttachments {
+            side_gate: Arc::new(|| true),
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             managed: Arc::new(StdMutex::new(None)),
@@ -675,6 +676,7 @@ async fn oversized_frame_returns_err() {
         pairing,
         Arc::new(crate::broadcast::Broadcaster::new()),
         RuntimeAttachments {
+            side_gate: Arc::new(|| true),
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             managed: Arc::new(StdMutex::new(None)),

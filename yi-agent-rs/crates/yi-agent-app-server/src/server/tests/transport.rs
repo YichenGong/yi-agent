@@ -106,6 +106,7 @@ async fn agent_factory_failure_returns_internal_error() {
         pairing,
         Arc::new(crate::broadcast::Broadcaster::new()),
         RuntimeAttachments {
+            side_gate: Arc::new(|| true),
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             managed: Arc::new(StdMutex::new(None)),

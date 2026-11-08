@@ -680,6 +680,7 @@ impl Harness {
             calls,
             false,
             Some(registry),
+            Arc::new(|| true),
         )
     }
 
@@ -721,6 +722,7 @@ impl Harness {
             None,
             // 静态装配：只有 `with_live_settings` 注入共享实例。
             None,
+            Arc::new(|| true),
         )
     }
 
@@ -760,6 +762,7 @@ impl Harness {
             Some(handle),
             // 静态装配：只有 `with_live_settings` 注入共享实例。
             None,
+            Arc::new(|| true),
         )
     }
 
@@ -770,6 +773,90 @@ impl Harness {
             PERMISSION_TIMEOUT,
             Scope::Admin,
             enabled,
+        )
+    }
+
+    /// 旁问开关按值注入。scope 固定 `Admin`。
+    ///
+    /// 走注入而不是写 `flags.json`：后者要求 build kind 为 `dev` 且共享进程级
+    /// `YI_AGENT_HOME`，并行测试必然互相污染（同 `with_lead_flag` 的理由）。
+    ///
+    /// 不传注册表（`None`）：`serve()` 会按实例家目录自建一份，与既有
+    /// `with_scope` 同一形状。需要注入注册表的用例走下面那个构造器。
+    #[allow(dead_code)]
+    pub(crate) async fn with_side_flag(enabled: bool) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman_in(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            Scope::Admin,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            None,
+            None,
+            None,
+            // 静态装配：只有 `with_live_settings` 注入共享实例。
+            None,
+            Arc::new(move || enabled),
+        )
+    }
+
+    /// 三个维度都可指定：scope、注册表、旁问开关。
+    ///
+    /// `side/*` 的闸门测试要同时钉「权限档不构成回答」与「关掉时方法不存在」，
+    /// 必须能同时控制前两者。
+    pub(crate) async fn with_scope_side_flag_and_registry(
+        scope: Scope,
+        registry: Arc<crate::side_conversation::SideRegistry>,
+        side_enabled: bool,
+    ) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman_in(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            scope,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            Some(registry),
+            None,
+            None,
+            // 静态装配：只有 `with_live_settings` 注入共享实例。
+            None,
+            Arc::new(move || side_enabled),
         )
     }
 
@@ -844,6 +931,7 @@ impl Harness {
             calls,
             lead_agent_enabled,
             None,
+            Arc::new(|| true),
         )
     }
 
@@ -884,6 +972,8 @@ impl Harness {
             None,
             None,
             Some(binding),
+            // 旁支默认开：这条构造器只关心运行期设置，不该顺带改变旁支行为。
+            Arc::new(|| true),
         )
     }
 
@@ -902,6 +992,7 @@ impl Harness {
             Arc::new(StdMutex::new(Vec::new())),
             false,
             None,
+            Arc::new(|| true),
         )
     }
 
@@ -947,6 +1038,7 @@ impl Harness {
             calls,
             false,
             None,
+            Arc::new(|| true),
         )
     }
 
@@ -968,6 +1060,7 @@ impl Harness {
         // 旁支注册表:注入后 `side/*` 走替身 resolver,不读真实项目目录。
         // `None` 时 `serve()` 按本进程实例家目录自建(生产路径)。
         side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
+        side_gate: crate::side_gate::SideGate,
     ) -> Self
     where
         F: Fn(
@@ -993,6 +1086,7 @@ impl Harness {
             None,
             // 默认静态装配；只有 `with_live_settings` 才注入共享实例。
             None,
+            side_gate,
         )
     }
 
@@ -1016,6 +1110,7 @@ impl Harness {
         instance_home_override: Option<PathBuf>,
         management: Option<Arc<crate::server::local_management::ManagementHandle>>,
         live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+        side_gate: crate::side_gate::SideGate,
     ) -> Self
     where
         F: Fn(
@@ -1135,6 +1230,9 @@ impl Harness {
                 // harness 默认关（= stable 行为）；`with_lead_flag(true)` 打开的
                 // 那个构造器会把这个值换成 true。
                 lead_agent_enabled,
+                // 旁支默认**开**：既有 side 测试全部假定能力可用（spec §6）。
+                // 需要关的用例走 `with_scope_side_flag_and_registry`。
+                side_gate,
                 // 引导的 .env / preferences 也落在隔离目录里:onboarding/*
                 // 不得写开发者真实的 `~/.yi-agent`。
                 onboarding_preferences_path: index_dir.path().join("preferences.json"),
@@ -2849,6 +2947,9 @@ impl MergedHarness {
                 // 与手工装配的 serve_stdio 用例同一个约束:空 remote_dir +
                 // `None` 会让 serve() 把旁支宿主目录建到当前工作目录。
                 side_registry: Some(test_side_registry(index_dir.path(), None)),
+                // 第二套 harness（`serve_scoped_with_loopback`）也要能跑 side
+                // 测试：默认开，关掉的用例自行构造。
+                side_gate: Arc::new(|| true),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

@@ -293,3 +293,59 @@ async fn side_handshake_and_list_work_together() {
 
     h.shutdown().await;
 }
+
+/// 关掉开关后，六个方法都必须报「不存在」，而不是静默成功或「权限不够」。
+///
+/// 逐条断言不抽样：漏掉一个方法就是一个仍然可用的入口。
+#[tokio::test]
+async fn every_side_method_is_method_not_found_when_the_flag_is_off() {
+    let home = tempfile::TempDir::new().unwrap();
+    let registry = test_side_registry(home.path(), None);
+    let mut h = Harness::with_scope_side_flag_and_registry(Scope::Admin, registry, false).await;
+    initialize(&mut h).await;
+
+    for (i, method) in [
+        "side/open",
+        "side/list",
+        "side/readItems",
+        "side/turnStart",
+        "side/turnInterrupt",
+        "side/close",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let answer = call(&mut h, 10 + i as u64, method, serde_json::json!({})).await;
+        assert_eq!(
+            answer["error"]["code"],
+            serde_json::json!(-32601),
+            "{method} must not exist while the flag is off: {answer}"
+        );
+    }
+
+    h.shutdown().await;
+}
+
+/// 能力位跟着开关走，但宿主 id 与它无关：客户端用后者区分「重连」与「宿主
+/// 换代」，翻能力位时把 id 一起改掉会让它丢掉全部本地基线。
+#[tokio::test]
+async fn the_capability_bit_follows_the_flag_but_the_host_id_does_not() {
+    let home = tempfile::TempDir::new().unwrap();
+    let registry = test_side_registry(home.path(), None);
+    let expected = registry.host_instance_id().to_string();
+    let mut h = Harness::with_scope_side_flag_and_registry(Scope::Admin, registry, false).await;
+
+    let hello = call(&mut h, 1, "initialize", serde_json::json!({})).await;
+    assert_eq!(
+        hello["result"]["capabilities"]["side_conversation_v1"],
+        serde_json::json!(false),
+        "{hello}"
+    );
+    assert_eq!(
+        hello["result"]["sideHostInstanceId"],
+        serde_json::json!(expected),
+        "the host id must not depend on the flag: {hello}"
+    );
+
+    h.shutdown().await;
+}
