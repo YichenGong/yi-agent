@@ -1,5 +1,12 @@
 # yi-agent-app-server（GUI app-server）
 
+## 普通会话只读同步与可靠投递（Spec 已复核、Plan 已编写，未实施）
+
+[修复 spec rev2](../superpowers/specs/2026-11-08-session-completeness-repair-design.md) · [复核记录](../superpowers/reports/2026-11-08-session-completeness-spec-review.md) · [数据 Plan B1–B12](../superpowers/plans/2026-11-08-session-completeness-repair-impl.md)；前端窗口及对账接线计入 [desktop](./desktop.md)，不在本模块重复计数。
+
+- [ ] v1 一致分页快照、活动可见投影、单调序号与轻量权威摘要 probe — 完成判据：spec §5、§7 契约及 §8 S05–S08、S10–S12 的服务端用例；读取不 resume/interrupt，不跨 epoch 混合材料，内存与分页预算生效。
+- [ ] 完成材料可靠投递、delta 丢帧定向失效与可观察性 — 完成判据：spec §6.1、§8 R01–R03/R05 的队列满、断线与真实桥接测试；保持 Delivery 订阅规则，慢端不阻塞快端，日志不含正文和密钥。
+
 ## 防休眠加固交叉引用（已实现）
 
 启动失败收口、电源线程生命周期及后台 busy 接线见 [spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md)、[plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Tasks 2–4、6。需求 P2/P3/P4 统一计入 [yi-agent-power](./yi-agent-power.md)，本模块不重复计数。
