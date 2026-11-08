@@ -482,6 +482,42 @@ describe("ChatView frozen prefix", () => {
     expect(screen.getByText("settled")).toBeTruthy();
   });
 
+  it("marks the transcript scroll container for measurement scripts", () => {
+    // 验收脚本（D 组）按这个属性抓滚动容器。`data-thread-id` 不够用：它随
+    // 会话变化，旁支还会用合成 id。
+    const { container } = render(<ChatView items={items()} threadId="t1" />);
+    const scroller = container.querySelector("[data-transcript-scroller]") as HTMLElement;
+    expect(scroller).toBeTruthy();
+    expect(scroller.getAttribute("data-thread-id")).toBe("t1");
+  });
+
+  it("updates data-item-index when an item is inserted ahead of the window", () => {
+    // 测量层（`transcriptGeometry`）按 `data-item-index` 把 DOM 行映射回**绝对**
+    // 序号，窗口化与锚点恢复全靠它换算。前面插入一条消息会让后面所有行的绝对
+    // index 平移；`ChatItem` 的 memo 比较器若只看 item/text/query，这些行不会
+    // 重渲染，DOM 上留着旧 index —— 测量层于是认为它们还属于旧的区间，
+    // spacer 高度与恢复目标一起算错。
+    const list: Item[] = [
+      { type: "agentMessage", id: "a1", text: "one" },
+      { type: "agentMessage", id: "a2", text: "two" },
+      { type: "agentMessage", id: "a3", text: "three" },
+    ];
+    const { container, rerender } = render(<ChatView items={list} structuralVersion={1} />);
+    const indexOf = (id: string) =>
+      container.querySelector(`[data-item-id="${id}"]`)?.getAttribute("data-item-index");
+
+    expect(indexOf("a1")).toBe("0");
+    expect(indexOf("a2")).toBe("1");
+
+    // 历史回放向前补了一页：所有既有条目的绝对 index +1。
+    const grown: Item[] = [{ type: "userMessage", id: "u0", text: "earlier" }, ...list];
+    rerender(<ChatView items={grown} structuralVersion={2} />);
+
+    expect(indexOf("a1")).toBe("1");
+    expect(indexOf("a2")).toBe("2");
+    expect(indexOf("u0")).toBe("0");
+  });
+
   it("keeps a prefix reasoning block expanded across a structural change", () => {
     // A structural bump must re-render the prefix **in place**, not remount it.
     // `ReasoningBlock`'s expanded flag and `ToolCallCard`'s open flag are local
@@ -1622,31 +1658,92 @@ describe("window change compensates scrollTop", () => {
     expect(geo.scrollTop).toBe(13_200);
   });
 
-  it("非跟随（用户在读历史）时按高度差位移，而不是贴底", () => {
-    // 跟随分支会被 `useStickToBottom` 的其它路径顺带满足，钉不住补偿本身。
-    // 只有非跟随状态的差值分支无法由别处代劳，必须单独覆盖。
-    const many = rows(0, 3000, []);
-    const { container, rerender } = render(
-      <ChatView items={many} threadId="t1" structuralVersion={1} query="" />,
-    );
-    const scroller = container.querySelector("[data-thread-id]") as HTMLElement;
-    const geo = installGeometry(scroller, { scrollHeight: 10_000, clientHeight: 800, scrollTop: 5_000 });
+  it("非跟随（用户在读历史）时按锚点行的真实位移纠正，而不是贴底", () => {
+    // Spec §4.4 第 3、4 条：每次布局提交维护上一份几何；布局变化后按**该消息的
+    // 实际坐标**恢复，不把整体 `scrollHeight` 差都解释为「在上方新增」。
+    //
+    // 旧断言的形状（5000 + 4000 = 9000）正是被禁止的：4000 里有多少长在视口上方
+    // 它并不知道。这里给出可判别的三种结果：
+    //   贴底            -> 13224
+    //   整体高度差      -> 9000
+    //   锚点行的真实位移 -> 5300   ← 唯一正确
+    const PAD = 12;
+    const VIEWPORT = 800;
+    const COUNT = 100;
+    const ROW = 100;
+    const tops: Record<string, number> = {};
+    let contentH = COUNT * ROW;
+    const state = { scrollTop: 5_000 };
+    let scroller: HTMLElement | null = null;
+    const rect = (top: number) =>
+      ({ top, left: 0, bottom: top, right: 0, width: 0, height: 0, x: 0, y: top, toJSON() {} }) as DOMRect;
+    const proto = HTMLElement.prototype as unknown as Record<string, unknown>;
+    const saved = {
+      rect: proto.getBoundingClientRect,
+      sh: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight"),
+      ch: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight"),
+      st: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop"),
+    };
+    proto.getBoundingClientRect = function (this: HTMLElement) {
+      // 容器按**属性**识别而不是按引用：首次渲染时 `scroller` 变量还没赋值，
+      // 按引用判断会走另一条分支，坐标基线凭空差一个容器 padding。
+      if (this.hasAttribute("data-thread-id")) return rect(0);
+      return rect(PAD - state.scrollTop + (tops[this.dataset.itemId ?? ""] ?? 0));
+    };
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? contentH + PAD * 2 : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? VIEWPORT : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? state.scrollTop : 0; },
+      set(this: HTMLElement, v: number) {
+        if (this !== scroller) return;
+        state.scrollTop = Math.max(0, Math.min(v, contentH + PAD * 2 - VIEWPORT));
+      },
+    });
 
-    rerender(<ChatView items={rows(3000, 3060, [...many])} threadId="t1" structuralVersion={2} query="" />);
+    // 只有「上方长了多少」会平移挂载行；下方增长只抬高总高度。`mounted` 是给
+    // **全部**行的坐标，与实际挂载区一致，避免拿未挂载行冒充锚点。
+    const layoutRows = (aboveExtra: number, belowExtra: number) => {
+      for (const k of Object.keys(tops)) delete tops[k];
+      for (let i = 0; i < COUNT; i += 1) tops[`m${i}`] = aboveExtra + i * ROW;
+      contentH = COUNT * ROW + aboveExtra + belowExtra;
+    };
 
-    // 用户上翻。`useStickToBottom.onScroll` 需要**两次**事件才判定上翻：第一次
-    // 建立基线（`prevTop === null` 时只按绝对位置设意图），第二次才比较位移。
-    geo.scrollTop = 8_000;
-    fireEvent.scroll(scroller);
-    geo.scrollTop = 5_000;
-    fireEvent.scroll(scroller);
+    try {
+      layoutRows(0, 0);
+      const list = rows(0, COUNT, []);
+      const { container, rerender } = render(
+        <ChatView items={list} threadId="t1" structuralVersion={1} query="" />,
+      );
+      scroller = container.querySelector("[data-thread-id]") as HTMLElement;
+      // 用户上翻到历史（两次 scroll 事件才判定上翻）。
+      state.scrollTop = 6_000;
+      fireEvent.scroll(scroller);
+      state.scrollTop = 5_000;
+      fireEvent.scroll(scroller);
+      // 上方长 300、下方长 3700：总量 10000 -> 14000。
+      layoutRows(300, 3_700);
+      rerender(<ChatView items={list} threadId="t1" structuralVersion={2} query="" />);
 
-    const after = rows(3060, 3120, rows(3000, 3060, [...many]));
-    geo.scrollHeight = 14_000;
-    rerender(<ChatView items={after} threadId="t1" structuralVersion={3} query="" />);
-
-    // 补偿后 5000 + 4000 = 9000：既不是留在 5000，也不是贴底 13200。
-    expect(geo.scrollTop).toBe(9_000);
+      expect(state.scrollTop).toBe(5_300);
+      expect(state.scrollTop).not.toBe(13_224);
+      expect(state.scrollTop).not.toBe(9_000);
+    } finally {
+      proto.getBoundingClientRect = saved.rect;
+      for (const [name, desc] of [
+        ["scrollHeight", saved.sh],
+        ["clientHeight", saved.ch],
+        ["scrollTop", saved.st],
+      ] as const) {
+        if (desc) Object.defineProperty(HTMLElement.prototype, name, desc);
+      }
+    }
   });
 });
 
