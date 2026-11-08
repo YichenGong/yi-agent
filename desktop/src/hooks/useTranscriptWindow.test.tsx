@@ -14,7 +14,7 @@ let currentFocus: FocusRequest | null = null;
 
 let externalBook: ReturnType<typeof createHeightBook> | null = null;
 
-function Harness({ itemCount }: { itemCount: number }) {
+function Harness({ itemCount, threadId }: { itemCount: number; threadId?: string }) {
   // `book` 必须稳定：内联新建会让它每次渲染都是新对象，`merged`/`recompute`
   // 的身份随之改变，依赖它的 effect 就会每次渲染都重跑。
   const [book] = useState(() => externalBook ?? createHeightBook(40));
@@ -25,6 +25,7 @@ function Harness({ itemCount }: { itemCount: number }) {
   const measureStable = useCallback(() => measure(), []);
   const state = useTranscriptWindow({
     itemCount,
+    threadId,
     measure: measureStable,
     focus: currentFocus,
     book,
@@ -182,6 +183,58 @@ describe("useTranscriptWindow", () => {
     await tick();
     expect(last).toEqual({ start: 0, end: 10, following: true });
   });
+  it("换了会话就必须重新从尾部开窗，不能继承上一条会话的窗口", async () => {
+    // 真实浏览器实测（长会话 1024 items）：在 A 里上翻到历史中间后切到等长的 B，
+    // B 打开时窗口停在**同一条中间区间**（following=false），用户看到的是 B 的
+    // 中段而不是最新内容。窗口状态是「这次访问的位置」，不属于组件生命周期。
+    const { rerender } = render(<Harness itemCount={3000} threadId="A" />);
+    await tick();
+    expect(last).toEqual({ start: 2940, end: 3000, following: true });
+
+    // 用户在 A 里上翻：窗口扩一页并放弃跟随。
+    measure = () => ({ first: 0, last: 10, gapTopPx: 0, gapBottomPx: -5000 });
+    await act(async () => {
+      nudge();
+    });
+    await tick();
+    const scrolled = { ...last };
+    expect(scrolled.following).toBe(false);
+    expect(scrolled.start).toBeLessThan(2940);
+
+    // 换个等长会话：必须回到「跟随尾部、只挂首屏」，而不是沿用上面的中间窗口。
+    measure = () => null;
+    rerender(<Harness itemCount={3000} threadId="B" />);
+    await tick();
+    expect(last).toEqual({ start: 2940, end: 3000, following: true });
+
+    // 残留的请求会在**下一次重算**时才露头（切会话后的首次渲染看不出问题），
+    // 所以必须再推一帧滚动：若 `pendingRef` 没被清掉，B 会被拽到 A 的 index 480。
+    measure = () => ({ first: 0, last: 10, gapTopPx: -5000, gapBottomPx: 0 });
+    await act(async () => {
+      nudge();
+    });
+    await tick();
+    expect(last.start).toBeGreaterThan(2000);
+  });
+
+  it("换会话时丢弃上一条会话「已排队但还没跑」的锚点开窗请求", async () => {
+    // 真实时序：`requestFocus` 只把请求塞进 ref 并排一帧 rAF。若在这帧跑之前
+    // 用户就切走了会话（点击很快、会话缓存命中时不刷新），这条属于 A 的请求
+    // 会作用到 B 上：B 一打开就跳到 A 的 index，用户看不到最新内容。
+    const { rerender } = render(<Harness itemCount={3000} threadId="A" />);
+    await tick();
+    expect(last).toEqual({ start: 2940, end: 3000, following: true });
+
+    // 排一次请求，**不推进帧**，立刻切会话。
+    await act(async () => {
+      requestFocus({ index: 500, before: 20, after: 60 });
+    });
+    rerender(<Harness itemCount={3000} threadId="B" />);
+    await tick();
+
+    expect(last).toEqual({ start: 2940, end: 3000, following: true });
+  });
+
   it("StrictMode 下挂载→卸载→再挂载后仍能翻页（cleanup 必须清掉 frameRef）", async () => {
     // 应用根部是 `<React.StrictMode>`（`main.tsx:15`），开发期每个 effect 都会
     // 跑一遍 挂载→卸载→再挂载。若 cleanup 只 `cancelAnimationFrame` 而不把

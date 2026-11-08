@@ -18,6 +18,38 @@ npm run test:browser:session-view
 
 这不是正式 `.app` 的安装/发布，也不是原生 WebKit 真机验收；阅读锚点只存本实例内存，冷启动仅恢复最后选中的会话。
 
+# 长会话的窗口几何与切换会话（真实浏览器回归）
+
+```sh
+cd desktop
+npm run test:browser:transcript-window
+```
+
+`session-view` 那套 fixture 只有 40 条消息，全部落在首屏挂载范围内，因此两个 spacer
+恒为 0、`scrollHeight` 只覆盖已挂载部分——**结构性地**测不到下面这两个缺陷：
+
+1. **spacer 被 flex 压缩成 0 高度。** `ChatView` 的滚动容器是
+   `flex min-w-0 flex-1 flex-col overflow-y-auto`。flex 子项默认 `flex-shrink: 1`，
+   而 spacer 没有内容、`min-height: auto` 解析为 0，于是它被压成 0：真实浏览器实测
+   `style.height = 53984px` 而 `getBoundingClientRect().height = 0`，容器
+   `scrollHeight` 从 65833 掉到 11849。后果是未挂载区间完全不占位——滚动条比例失真，
+   滚到该区间时视口里没有任何已挂载条目（**画面空白**），窗口翻页依赖的滚动几何也全错。
+2. **转录窗口跨会话继承。** 窗口状态存在 hook 自己的 state 里、不与 `threadId` 绑定。
+   在 A 里上翻到历史中间再切到等长的 B，B 直接落在 A 的中间区间（实测 260 条、首条是
+   B 的中段），用户看不到最新内容，要切走再切回来才恢复。
+
+fixture 用两条 **600 条**等长会话（id 前缀 A/B）+ 820px 视口，断言四件事：spacer 的
+渲染高度等于样式高度、`scrollHeight` 覆盖未挂载区间、滚到中部能翻页且视口里有条目、
+切会话后回到新会话的尾部首屏 60 条。**修复前实测红**：`styled 110160px, rendered 0px`
+（spacer）与 `got 260 mounted (inherited window 260)`（跨会话）。jsdom 没有布局引擎，
+这些断言在那里恒为 0、只会空转，所以必须真实浏览器。
+
+- `TRANSCRIPT_WINDOW_PORT`：Vite 端口，默认 1441，需空闲。
+- `TRANSCRIPT_WINDOW_DEBUG_PORT`：Chrome CDP 端口，默认 9351，需空闲。
+- `CHROME_BIN`：Chrome 可执行文件绝对路径。
+
+不调用真实 LLM、sidecar 或生产会话数据，退出时关闭子进程并删除临时 Chrome 配置。
+
 # 流式正文的实时可见性（真实浏览器回归）
 
 ```sh

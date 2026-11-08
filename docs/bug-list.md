@@ -1,5 +1,49 @@
 # Bug 列表
 
+- [x] 桌面端打开会话看到的不是最新内容、且长会话里「明明有内容但画面空白」（用户报告：「每次打开session，用户看到的内容不是最新的」「发一条消息后，切到别的session再切回来才能看到最新的内容」「会有很多数据没有显示在画面上。甚至有些session画面明明有内容但就是空白的」，并指出主要是渲染问题）。**两个独立的渲染缺陷，都在真实浏览器复现确认。**
+
+  **缺陷一：spacer 被 flex 压缩成 0 高度。** `ChatView` 的滚动容器是
+  `flex min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-4 py-3`
+  （`desktop/src/components/ChatView.tsx:999`）。flex 子项默认 `flex-shrink: 1`，
+  而两个 spacer 只有 inline `height`、没有内容，`min-height: auto` 在这种情形下解析为 0，
+  于是它们被收缩到 0。真实 Chrome 实测（1024 条真实会话）：`spacerTop.style.height`
+  是 `53984px`，而 `getBoundingClientRect().height` / `offsetHeight` / computed `height`
+  全是 **0**，容器 `scrollHeight` 只有 `11849` 而应为约 `65833`。后果是三层：
+  ① 未挂载区间完全不占高度 → 滚动条比例失真；② 用户滚到 spacer 所在的区间时，
+  视口里没有任何已挂载条目 → **画面空白**；③ 窗口翻页依赖的滚动几何全部错位
+  （实测程序化滚到 `scrollTop=20000` 时窗口不翻页，仍只挂 60 条）。
+  注入 `el.style.flexShrink='0'` 后立刻恢复：spacer 高度变回 `53984px`、
+  `scrollHeight` 涨到 `65833`，滚动几何随即正常。**修复**：两个 spacer 各加
+  `className="shrink-0"`（`ChatView.tsx:1017`、`:1030`）。
+
+  **缺陷二：转录窗口状态跨会话继承。** `useTranscriptWindow` 把 `WindowState` 存在自己的
+  `useState`/`stateRef` 里，**没有与 `threadId` 绑定**，而 `ChatView` 并未按 `threadId`
+  重挂载（`ErrorBoundary` 用的是 `resetKey`，不是 `key`），所以 hook 内部状态会跨会话存活。
+  真实 Chrome 实测（两条等长的 1024 条会话 A/B，先解除 spacer 压缩以排除缺陷一）：
+  在 A 里上翻后窗口扩到 `260` 条、`following=false`；切到无锚点记录的 B，B 打开时仍是
+  `260` 条、首条是 **B 的中段** item，而不是尾部首屏 60 条——这就是「打开看到的不是最新内容」。
+  另有一处同源残留：`pendingRef`/`appliedRef` 的一次性 focus 请求也会跨会话留下，
+  排队但尚未执行时切走，会用 A 的 index 给 B 开窗。**修复**：`UseTranscriptWindowArgs`
+  新增 `threadId`；窗口状态改为 `{ owner, window }` 一起存，只有 `owner === threadId`
+  才使用该窗口（**渲染期**即回落，不等 effect，避免闪一帧旧会话内容）；rAF 回调里读
+  **当时**的 `threadRef` 判断归属；`useLayoutEffect` 在 `threadId` 变化时清空
+  `pendingRef`/`appliedRef` 并重算。`ChatView` 把已有的 `threadId` prop 接进 hook
+  （`ChatView.tsx:570`）。
+
+  **验证。** 单测：`cd desktop && npx tsc --noEmit && npx vitest run` → **186 文件 / 2724 用例全绿**。新增判据四层，且每层都做了**回退即红**实测：
+  ① `useTranscriptWindow.test.tsx` 的 `换了会话就必须重新从尾部开窗，不能继承上一条会话的窗口`（回退 owner 隔离 → 红，`start 2740` 而非 `2940`）、`换会话时丢弃上一条会话「已排队但还没跑」的锚点开窗请求`（回退清理 → 红，`start 480`，即 A 的 index 作用到 B。这条最初写成「先 requestFocus 再跑完 tick」是**空转**的——请求当场被消费，测不到泄漏；改成「排帧后立刻切会话」才真的红）；
+  ② `ChatView.test.tsx` 的 `切换会话时窗口必须回到尾部首屏（ChatView 必须把 threadId 传给窗口 hook）`——**这条是接线层的唯一护栏**：hook 自己的测试会主动传 `threadId`，`ChatView` 若忘了传，hook 永远收到 `undefined`、隔离逻辑永不触发，而 ① 照样全绿。回退传参实测红：`expected [ 'b40', ... ] to have a length of 60 but got 260`，与用户症状逐字同形；
+  ③ `ChatView.test.tsx` 的 `spacer 必须不被 flex 压缩（shrink-0），否则占位高度归零`——jsdom 无布局，只能把约束钉在类名上（回退类名 → 红）；
+  ④ **真实浏览器**：新增 `npm run test:browser:transcript-window`（`desktop/scripts/browser/transcript-window-{check.mjs,html,tsx}`），用两条 600 条等长会话 + 820px 视口断言 spacer 渲染高度等于样式高度、`scrollHeight` 覆盖未挂载区间、滚到中部能翻页且视口内有条目、切会话回到新会话尾部首屏 60 条。修复后四项全 PASS；回退后分别红在 `top spacer must actually occupy its styled height: styled 110160px, rendered 0px` 与 `a session switch must restart from the first screen, got 260 mounted`。既有 `session-view` fixture 只有 40 条、全部挂载，spacer 恒为 0，**结构性地**测不到这两个缺陷，故另起脚本。
+
+  **已知的既存失败（与本修复无关，未在本次处理）**：`npm run test:browser:session-view` 的
+  `cold replay waits until saved offset fits the content` 在**主仓库未改动代码**上就稳定失败
+  （连跑两次均为 `expected 7400, got 4420`；该路径下只挂载 24/40 条，`scrollTop` 被夹到
+  当时的最大值）。本次修复使其后的值从 `4420` 变为 `7684`（贴底），但该断言在基线即不成立，
+  需要单独排查「冷回放等待内容容纳偏移」这条路径；脚本因此在该断言处中断，其后 5 条断言
+  不再执行，是既存的覆盖损失。另：本修复**未**处理「默认按 40px/条估算 spacer 高度、
+  长消息占比高时滚动条比例仍偏」这个次要问题（`windowBook.median()` 收敛后已大幅缓解）。
+
 - [ ] iOS 远程配对页已有相机画面，但识别二维码时黑屏（2026-11-07 用户报告）。已确认生命周期缺陷：`desktop/src/lib/qrScanner.ts:131–133` 命中即停轨道；`PairingScreen.tsx:151–173、183–191` 在兑换结束前保留黑色全屏扫码层；`QrScanner.tsx:14–19` 依赖每次渲染新建的回调导致相机重启。本地真实组件 + 模拟相机/解码、pending 兑换验证：取流 1→2 次，旧轨道已停、覆盖层仍在且无可见进度；未验证真机 WebKit 黑画面或 App 崩溃。已写 [修复 spec](superpowers/specs/2026-11-07-ios-qr-recognition-black-screen-design.md)、[实施 plan](superpowers/plans/2026-11-07-ios-qr-recognition-black-screen-impl.md) 与 [多轮审查记录](superpowers/reports/2026-11-07-ios-qr-recognition-spec-review.md) · [plan 审查记录](superpowers/reports/2026-11-07-ios-qr-recognition-plan-review.md)，当前无未解决审查意见，**未实现、未做真机验收**。完成判据：spec §6 A01–A18（含真实组件回归、无效码不停流、重复兑换守卫与旧回调隔离）及 §7 I01–I07；不以历史“扫码启动失败”修复替代本项。
 
 - [ ] P1 看板查询持续/间歇“无法读取”：插件 `superpowers-kanban-ipc/src/server.rs` 对 macOS 继承 `O_NONBLOCK` 的 accepted socket 直接 `read_until` / `write_all`，请求未到或回复背压时 `WouldBlock` 提前关闭连接。现场延迟 30ms 请求 12/12 断管；小回复经 daemon 12/12 成功，大回复 12/12 `validation`，直连非空回复截断于 8192 字节。独立 macOS 实验复现非阻塞继承与部分写；当前 11 张可见卡回复下界 8392 字节。仅完成[修复 spec 与自检](superpowers/specs/2026-11-03-kanban-query-io-design.md)，未实现/未部署；完成判据为该 spec §7 A01–A15 与 §8，含 poll 等待、统一 deadline/停止、有界完整帧、回退必红及真实 daemon 大回复验收。过去每次短暂闪现没有逐次日志归因，不以本项替代所有网络故障排查。
