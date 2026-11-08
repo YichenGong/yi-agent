@@ -19,7 +19,7 @@ use crate::pairing::PairingState;
 use crate::protocol::MAX_FRAME_BYTES;
 use crate::server::{
     ClientInitialized, ClientScopes, PERMISSION_TIMEOUT, RuntimeAttachments, WsDeviceRegistry,
-    install_device_registry, production_factory, serve,
+    install_device_registry, production_factory_with_binding, serve,
 };
 use crate::workspace_index::WorkspaceIndex;
 use yi_agent_runtime::config::RuntimeConfig;
@@ -50,6 +50,20 @@ pub async fn serve_ws(
     workspaces: Arc<WorkspaceIndex>,
     pairing: Arc<PairingState>,
 ) -> anyhow::Result<()> {
+    serve_ws_with_binding(listener, cfg, workspaces, pairing, None).await
+}
+
+/// [`serve_ws`]，并把进程级运行期设置绑定交给每个会话。
+///
+/// `None` 与历史行为逐字一致；生产入口传 `Some`（见 `run_with_binding`），让
+/// 这条入口创建的会话也随保存立即生效。
+pub async fn serve_ws_with_binding(
+    listener: tokio::net::TcpListener,
+    cfg: RuntimeConfig,
+    workspaces: Arc<WorkspaceIndex>,
+    pairing: Arc<PairingState>,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+) -> anyhow::Result<()> {
     // 启动期一次性工作。ws 是第三条生产入口,与 `run` / `serve_stdio_with_relay`
     // 同构:漏了它,`app-server --listen ws://`(以及 `--relay` 的环回桥)的首次
     // 运行就不迁移旧登记表,也没有会话期自愈循环——验收 §6.6 在这条路径上不成立。
@@ -64,16 +78,28 @@ pub async fn serve_ws(
     crate::server::migrate_legacy_model_keys_on_startup();
     crate::server::migrate_legacy_resident_requests_on_startup(&resident_dir);
     crate::server::spawn_resident_watch_loop(resident_dir);
-    serve_ws_body(listener, cfg, workspaces, pairing).await
+    serve_ws_body_inner(listener, cfg, workspaces, pairing, binding).await
 }
 
 /// [`serve_ws`] 去掉启动期工作的本体:可被测试直接调用(测试入参是隔离
 /// tempdir,不该迁移真实 `$HOME` 的登记表,更不该拉起真实 daemon)。
+#[allow(dead_code)] // Test seam; `serve_ws_with_binding` is the production path.
 pub(crate) async fn serve_ws_body(
     listener: tokio::net::TcpListener,
     cfg: RuntimeConfig,
     workspaces: Arc<WorkspaceIndex>,
     pairing: Arc<PairingState>,
+) -> anyhow::Result<()> {
+    serve_ws_body_inner(listener, cfg, workspaces, pairing, None).await
+}
+
+/// [`serve_ws_body`] 加上运行期设置绑定；`None` 走历史静态装配。
+pub(crate) async fn serve_ws_body_inner(
+    listener: tokio::net::TcpListener,
+    cfg: RuntimeConfig,
+    workspaces: Arc<WorkspaceIndex>,
+    pairing: Arc<PairingState>,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> anyhow::Result<()> {
     // 主题句柄:`ui/settings/read|write` 与每个 thread 的 `set_theme` 工具共用,
     // 与 stdio 路径同构——工厂闭包是 `'static`,拿不到 `serve_ws_inner` 里的
@@ -83,8 +109,18 @@ pub(crate) async fn serve_ws_body(
     // 清单按指纹跟随 `models.json`;工厂闭包逐会话取当前值解析 provider。
     let catalog =
         yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
-    let build_agent = production_factory(cfg.clone(), theme_for_factory, catalog);
-    serve_ws_inner(listener, cfg, workspaces, pairing, theme, build_agent).await
+    let build_agent =
+        production_factory_with_binding(cfg.clone(), theme_for_factory, catalog, binding.clone());
+    serve_ws_inner(
+        listener,
+        cfg,
+        workspaces,
+        pairing,
+        theme,
+        binding,
+        build_agent,
+    )
+    .await
 }
 
 /// [`serve_ws`] 的可注入 agent 工厂版本:测试用 mock provider(如审批 E2E)。
@@ -94,6 +130,9 @@ pub(crate) async fn serve_ws_inner<F>(
     workspaces: Arc<WorkspaceIndex>,
     pairing: Arc<PairingState>,
     theme: crate::theme_tool::ThemeHandle,
+    // 进程级运行期设置绑定。它**不是**给 `build_agent` 的（那个由调用方闭包
+    // 决定，本函数不重新构造工厂），而是给内嵌项目 daemon 的 worker 工厂用。
+    live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
     build_agent: F,
 ) -> anyhow::Result<()>
 where
@@ -148,6 +187,9 @@ where
                 models_path: yi_agent_runtime::models::models_path(),
                 websearch_path: yi_agent_tools::websearch_path(),
                 settings_path: yi_agent_runtime::settings::settings_path(),
+                // 与 stdio 路径同一来源:内嵌项目 daemon 的 worker 工厂据此
+                // 跟随保存;`None` = 历史静态行为。
+                live_settings,
                 // 与 stdio 路径同一来源：装配时算一次，不在 `serve()` 里解析。
                 lead_agent_enabled: crate::lead_gate::from_process_environment(),
                 onboarding_preferences_path: crate::server::instance_home_dir()

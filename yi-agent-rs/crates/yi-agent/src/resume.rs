@@ -138,6 +138,7 @@ mod tests {
                     last_completed_at: 0,
                     forked_from: None,
                     plugin_bindings: Vec::new(),
+                    sandbox_baseline: None,
                 })
                 .unwrap();
         }
@@ -213,6 +214,7 @@ mod tests {
                     last_completed_at: 0,
                     forked_from: None,
                     plugin_bindings: Vec::new(),
+                    sandbox_baseline: None,
                 })
                 .unwrap();
         }
@@ -250,6 +252,7 @@ mod tests {
                 last_completed_at: 0,
                 forked_from: None,
                 plugin_bindings: Vec::new(),
+                sandbox_baseline: None,
             })
             .unwrap();
         assert!(

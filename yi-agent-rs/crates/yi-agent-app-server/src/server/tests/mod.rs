@@ -575,7 +575,7 @@ pub(crate) struct Harness {
     pub(crate) _models_dir: tempfile::TempDir,
     pub(crate) resident_dir: tempfile::TempDir,
     pairing: Arc<PairingState>,
-    hub: Arc<crate::broadcast::Broadcaster>,
+    pub(crate) hub: Arc<crate::broadcast::Broadcaster>,
     pub(crate) watchman_calls: WatchmanCalls,
     /// 调用方没指定 workdir 时由 Harness 生成的隔离目录。
     ///
@@ -719,6 +719,8 @@ impl Harness {
             None,
             Some(home.to_path_buf()),
             None,
+            // 静态装配：只有 `with_live_settings` 注入共享实例。
+            None,
         )
     }
 
@@ -756,6 +758,8 @@ impl Harness {
             None,
             None,
             Some(handle),
+            // 静态装配：只有 `with_live_settings` 注入共享实例。
+            None,
         )
     }
 
@@ -840,6 +844,46 @@ impl Harness {
             calls,
             lead_agent_enabled,
             None,
+        )
+    }
+
+    /// Harness whose server holds a live-settings binding.
+    ///
+    /// `settings/read` and `settings/write` then go through the shared instance
+    /// (the production path) instead of the stateless file facade, which is what
+    /// the `settings/changed` notification and the policy/origin fields are
+    /// only observable through.
+    pub(crate) async fn with_live_settings(
+        binding: yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding,
+    ) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman_in(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            Scope::Admin,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            None,
+            None,
+            None,
+            Some(binding),
         )
     }
 
@@ -947,11 +991,17 @@ impl Harness {
             side_registry,
             None,
             None,
+            // 默认静态装配；只有 `with_live_settings` 才注入共享实例。
+            None,
         )
     }
 
     /// 见 [`Harness::with_scope_and_instance_home`]。`instance_home_override`
     /// 为 `Some` 时不再自造 tempdir，而是复用调用方给的根。
+    ///
+    /// 12 个参数：在 main 的 11 参版上再叠一个 live-settings 注入。刻意不把
+    /// `live_settings` 单独拆成第二个构造函数——两个近乎相同的 11 参签名的维护
+    /// 成本高于一次多余的可选参数，而调用点全都显式写 `None`。
     #[allow(clippy::too_many_arguments)]
     fn with_config_and_scope_and_watchman_in<F>(
         cfg: RuntimeConfig,
@@ -965,6 +1015,7 @@ impl Harness {
         side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
         instance_home_override: Option<PathBuf>,
         management: Option<Arc<crate::server::local_management::ManagementHandle>>,
+        live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
     ) -> Self
     where
         F: Fn(
@@ -1079,6 +1130,8 @@ impl Harness {
                 models_path: models_dir.path().join("models.json"),
                 websearch_path: models_dir.path().join("websearch.json"),
                 settings_path: models_dir.path().join("settings.json"),
+                // 默认静态装配；`with_live_settings` 才注入共享实例。
+                live_settings: live_settings.clone(),
                 // harness 默认关（= stable 行为）；`with_lead_flag(true)` 打开的
                 // 那个构造器会把这个值换成 true。
                 lead_agent_enabled,
@@ -1735,6 +1788,8 @@ pub(crate) async fn serve_ws_with_permission_agent(
         workspaces,
         pairing,
         theme,
+        // 这条测试接缝没有设置来源：静态装配，与历史行为一致。
+        None,
         build_permission_agent,
     )
     .await
@@ -1848,7 +1903,9 @@ fn write_meta(
         anchor_sha: None,
         last_read_at: 0,
         last_completed_at: 0,
+        sandbox_baseline: None,
         forked_from: None,
+
         extra_roots: Vec::new(),
         role: None,
     };
@@ -1882,6 +1939,7 @@ fn write_lead_meta(dir: &Path, id: &str) {
         last_read_at: 0,
         last_completed_at: 0,
         forked_from: None,
+        sandbox_baseline: None,
     };
     crate::thread_store::ThreadStore::new(dir)
         .create(&meta)
@@ -2779,6 +2837,8 @@ impl MergedHarness {
                 models_path: PathBuf::new(),
                 websearch_path: PathBuf::new(),
                 settings_path: PathBuf::new(),
+                // 这些用例不涉运行期设置：静态装配。
+                live_settings: None,
                 lead_agent_enabled: false,
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
@@ -3147,6 +3207,8 @@ mod plugin_admission;
 mod plugin_theme;
 #[cfg(test)]
 mod process;
+#[cfg(test)]
+mod runtime_settings;
 mod runtime_status;
 #[cfg(test)]
 mod side;

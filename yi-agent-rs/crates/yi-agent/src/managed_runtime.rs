@@ -16,25 +16,50 @@ use std::path::PathBuf;
 
 use yi_agent_subagent::executor::serve::{EXECUTOR_FD_ENV, serve_executor};
 
-/// Runs one client's executor until the daemon closes its control channel.
+/// Takes the inherited control descriptor, closing it on any later error.
 ///
-/// `owner` comes from the daemon's spawn command line; the descriptor comes from
-/// the same spawn. Neither is derived from anything a process could talk its way
-/// into: a wrong owner is refused by the executor itself against the descriptor's
-/// identity, and a missing descriptor is a hard error here.
-pub fn run_executor(
+/// Separate from [`run_executor_with_control`] so the production path can prove
+/// it refused an unauthorised start *before* reading configuration, creating a
+/// runtime socket directory, or building tools.
+pub fn take_executor_control() -> anyhow::Result<OwnedFd> {
+    Ok(inherited_descriptor()?)
+}
+
+/// Runs one executor on an already-taken control descriptor.
+///
+/// Taking an `OwnedFd` by value is the ordering guarantee, not a style choice:
+/// there is no way to reach this function without having authorised first, so a
+/// later refactor cannot accidentally load configuration (and thus this
+/// machine's credentials) before the refusal. The descriptor also closes on any
+/// error path below, which an `i32` would not.
+///
+/// The control channel carries work, never authority: the provider, the model
+/// and the credentials are decided here, from this machine's files. `binding`
+/// is this process's own settings source -- whatever the daemon that spawned us
+/// resolved is *not* inherited, because a shared settings path does not imply
+/// shared overrides or environment.
+pub fn run_executor_with_control(
+    control: OwnedFd,
     owner: String,
     config_path: Option<PathBuf>,
     invocation: yi_agent_runtime::config::RuntimeConfig,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> anyhow::Result<()> {
-    let control = inherited_descriptor()?;
-    // The factory is rebuilt *locally* from this machine's configuration. The
-    // control channel carries work, never authority to pick a provider, a model,
-    // or a credential.
     let models_path = config_path.unwrap_or_else(yi_agent_runtime::models::models_path);
     let runtime_socket = yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir);
-    let factory =
-        yi_agent_subagent::attach::worker_factory(&invocation, runtime_socket, &models_path)?;
+    // Hold the observation lease for as long as this executor runs: without it a
+    // settings save would only be seen when a worker happens to read on demand.
+    let _settings_lease = binding
+        .as_ref()
+        .map(|binding| binding.live.start_observing());
+    // `worker_factory_with_binding` consumes its argument, so hand it a clone and
+    // keep ours alive for the lease above.
+    let factory = yi_agent_subagent::attach::worker_factory_with_binding(
+        &invocation,
+        runtime_socket,
+        &models_path,
+        binding,
+    )?;
     // A managed executor always offers the gate: the daemon above it is the only
     // place a machine-wide limit can be enforced.
     serve_executor(control, owner, factory, true)?;
@@ -324,6 +349,7 @@ fn apply_demand_snapshot(
 /// change.
 pub fn run_managed_daemon(
     invocation: yi_agent_runtime::config::RuntimeConfig,
+    live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> anyhow::Result<()> {
     use yi_agent_supervisors::lifecycle::roles::{
         ManagedRole, inherited_bootstrap, inherited_bridge,
@@ -410,10 +436,19 @@ pub fn run_managed_daemon(
     // (the *root* being served) is taken from the invocation.
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir);
     let database = runtime_dir.join("runtime.sqlite");
-    let factory = yi_agent_subagent::attach::worker_factory(
+    // The daemon resolves its own source (the launcher passes one in) so every
+    // worker it starts follows a settings save at its next safe point. `None`
+    // keeps the historical static factory for callers that have no binding.
+    // The lease is taken *before* the binding is handed to the factory, from a
+    // clone: `worker_factory_with_binding` consumes its argument.
+    let settings_lease = live_settings
+        .as_ref()
+        .map(|binding| binding.live.start_observing());
+    let factory = yi_agent_subagent::attach::worker_factory_with_binding(
         &invocation,
         runtime_dir.clone(),
         &yi_agent_runtime::models::models_path(),
+        live_settings,
     )?;
     let (ledger, lifeline) = match managed {
         Some((ledger, lifeline)) => (Some(ledger), Some(lifeline)),
@@ -466,6 +501,12 @@ pub fn run_managed_daemon(
     // Explicit, so the plugin children are stopped before this function reports the
     // daemon gone; `Drop` would do it too, but only after the error value was built.
     drop(supervisor);
+    // 同步退出路径，没有 reactor：阻塞等待观察线程结束，而不是留下一个
+    // 正在退出的进程里的孤儿线程。必须在 `waited` 之后，否则观察线程会
+    // 在守护进程仍在跑时被停掉，后续保存就又看不到变化了。
+    if let Some(lease) = settings_lease {
+        lease.shutdown_blocking();
+    }
     waited
 }
 

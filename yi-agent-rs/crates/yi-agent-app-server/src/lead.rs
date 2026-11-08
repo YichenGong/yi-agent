@@ -156,6 +156,22 @@ pub(crate) fn lead_title_for_cwd(cwd: &Path) -> String {
 /// `find_lead` 选的是另一个组长,而客户端还记着刚才那个。以 `find_lead` 的
 /// 结论为唯一出口,分歧就只在落盘内存在(见 `ThreadStore::find_lead` 的注释)。
 pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(ThreadMeta, bool)> {
+    ensure_lead_meta_with_baseline(store, cwd, None)
+}
+
+/// `ensure_lead_meta` with an explicitly known sandbox baseline.
+///
+/// The lead conversation runs tools like any other, so it needs the baseline it
+/// is created under. Callers that have the runtime configuration pass it here;
+/// callers that do not (pure listing/fan-out helpers, which must not pay for
+/// configuration resolution) pass `None`, and the activation path adopts and
+/// persists today's default — safe precisely because a freshly seeded lead has
+/// never run a turn.
+pub fn ensure_lead_meta_with_baseline(
+    store: &ThreadStore,
+    cwd: &Path,
+    sandbox_baseline: Option<crate::session_sandbox::SandboxBaseline>,
+) -> std::io::Result<(ThreadMeta, bool)> {
     // 插件 worktree(见 [`crate::plugin_worktree`])不是项目:它没有组长,也绝不能
     // 有。堵在**落盘侧**是唯一能止住幽灵组长的地方——真机上已经落错的那些
     // (`role:"lead"` 且 `driver_project: None`,只有路径这条线索)由 `is_lead_meta`
@@ -206,6 +222,7 @@ pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(Thr
         last_read_at: 0,
         last_completed_at: 0,
         forked_from: None,
+        sandbox_baseline,
     };
     store.create(&meta)?;
     // 复读:并发下这里可能读到别人先落的、`created_at` 更早的那一个。
@@ -527,6 +544,7 @@ mod tests {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            sandbox_baseline: None,
             forked_from: None,
         };
         store.create(&existing).unwrap();

@@ -10,6 +10,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::live_settings::AgentSettingsSource;
 use crate::message::{ContentBlock, Message, Role};
 use crate::provider::{
     GenParams, NoticeLevel, Provider, ProviderError, ProviderEvent, ProviderRequest, ReasoningKind,
@@ -199,6 +200,9 @@ pub struct Agent {
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
     decision_rx: Option<DecisionRx>,
     provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
+    /// Optional narrow live-settings source. `None` keeps the historical static
+    /// `AgentConfig` behaviour byte-for-byte.
+    live_settings: Option<Arc<dyn AgentSettingsSource>>,
     /// Interjection inbox shared with the spawned `run_loop`, so a test (or a
     /// caller holding an `InboxHandle`) can deliver without a live `&Agent`.
     /// Only present while a run is active.
@@ -494,6 +498,12 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error("provider turn admission failed: {0}")]
     ProviderTurnAdmission(String),
+    /// The bound live-settings source could not produce a snapshot for this
+    /// operation. Carries only a stable code: never a prompt, key or raw
+    /// settings text. Recoverable: the run stops at this safe point instead of
+    /// issuing a request with unknown settings.
+    #[error("live settings unavailable: {0}")]
+    LiveSettings(&'static str),
     #[error("compaction error: {0}")]
     Compact(#[from] crate::compact::CompactError),
     /// A side run refused to grow: the per-side text/binary budget is spent.
@@ -520,6 +530,7 @@ impl Agent {
             permission_checker: None,
             decision_rx: None,
             provider_turn_gate: None,
+            live_settings: None,
             inbox: None,
             tool_call_tokens: ToolCallTokens::default(),
         }
@@ -554,6 +565,32 @@ impl Agent {
     pub fn with_provider_turn_gate(mut self, gate: Arc<dyn ProviderTurnGate>) -> Self {
         self.provider_turn_gate = Some(gate);
         self
+    }
+
+    /// Attach a narrow live-settings source consumed at provider operation
+    /// boundaries.
+    ///
+    /// This only binds the source. It does not swap the session, the tools or
+    /// the provider, and it does not change `AgentConfig`: the next normal THINK
+    /// re-reads the source after its first admission. Call it again to replace
+    /// the binding; an agent that was never bound (or was built by `new` alone)
+    /// keeps its static behaviour.
+    pub fn set_live_settings(&mut self, source: Arc<dyn AgentSettingsSource>) {
+        self.live_settings = Some(source);
+    }
+
+    /// The live-settings source currently bound to this agent, if any.
+    pub fn live_settings_source(&self) -> Option<Arc<dyn AgentSettingsSource>> {
+        self.live_settings.clone()
+    }
+
+    /// The provider admission gate currently bound to this agent, if any.
+    ///
+    /// Host entry points that start their own provider operation (a manual
+    /// `/compact`) must take an independent lease from the same gate the run
+    /// uses, so they never overlap a normal THINK.
+    pub fn provider_turn_gate(&self) -> Option<Arc<dyn ProviderTurnGate>> {
+        self.provider_turn_gate.clone()
     }
 
     /// Attach a permission checker and decision channel for tool gating.
@@ -788,6 +825,9 @@ impl Agent {
         let permission_checker = self.permission_checker.clone();
         let decision_rx = self.decision_rx.clone();
         let provider_turn_gate = self.provider_turn_gate.clone();
+        // Clone the source before the loop owns it; `set_live_settings` after a
+        // run started must not retroactively change that run's binding.
+        let live_settings = self.live_settings.clone();
         // Clone before the loop owns it: the `Agent` keeps its handle so
         // `interject()` works even after the stream has been moved away.
         let inbox = self.inbox.clone();
@@ -822,6 +862,7 @@ impl Agent {
                 permission_checker,
                 decision_rx,
                 provider_turn_gate,
+                live_settings,
                 inbox,
                 tool_call_tokens,
                 loop_children,
@@ -1163,79 +1204,30 @@ async fn think_phase(
     config: &AgentConfig,
     cancel_token: &CancellationToken,
     provider_turn_gate: &Option<Arc<dyn ProviderTurnGate>>,
+    live_settings: &Option<Arc<dyn AgentSettingsSource>>,
+    // The snapshot the caller already took for this iteration, before the cap
+    // check. It is the authoritative read when there is no admission wait to
+    // survive; with a gate, the post-admission read below replaces it.
+    pre_iteration: Option<&crate::live_settings::LiveAgentSnapshot>,
     messages: &mut Vec<Message>,
     turn: u32,
     payload_leases: &mut Vec<crate::run_budget::BudgetLease>,
 ) -> ThinkOutcome {
     // 1. THINK
     //
+    // The semantic request for this operation is built exactly once, and only
+    // after the first provider admission has succeeded: waiting for admission
+    // is not "the model operation has started", so a save that lands during
+    // that wait must still be honoured. Every transport retry below re-acquires
+    // admission (a fresh lease) but reuses this same request snapshot — a retry
+    // resends the original semantic request, it does not rebuild the prompt.
+    //
     // 关闭跨轮保留时，剥离**历史轮**的思考块，仅保留最后一条 assistant（当前
     // 工具循环）的——轮内硬保证：本轮的凭证必须回传，否则 Anthropic 的
     // signature 校验会失败。剥离只作用于**请求副本**：session 自身（落盘/展示
     // 的权威）在默认路径下原样保留，故 `preserve_thinking` 为默认 `true` 时
     // 请求体逐字不变（零回归）。
-    let request_messages = if config.preserve_thinking {
-        messages.clone()
-    } else {
-        crate::thinking::strip_thinking_except_last_assistant(messages)
-    };
-    // 请求体字节闸：网关按**字节**拒绝超限请求（413），而 auto-compact 只按
-    // token 触发，长会话里内联图片的 base64 能让两者相差三个数量级。这里只在
-    // 请求副本上降级：`session` 与落盘的 `.jsonl` 逐字不变（桌面端按 path 读回
-    // 原图渲染，故界面零影响）。
-    let projected = crate::image_projection::project_with(
-        &request_messages,
-        &crate::image_projection::ProjectionLimits {
-            soft_limit: config.request_body_soft_limit,
-            hard_limit: config.request_body_hard_limit,
-            keep_full_images: config.request_keep_full_images,
-        },
-        config.image_downscaler.as_deref(),
-    );
-    if projected.step != crate::image_projection::ProjectionStep::AsIs {
-        tracing::info!(
-            step = ?projected.step,
-            bytes_before = projected.bytes_before,
-            bytes_after = projected.bytes_after,
-            placeheld = projected.placeheld,
-            downscaled = projected.downscaled,
-            turn,
-            "request images projected to fit the body budget"
-        );
-        let _ = tx.try_send(AgentEvent::Notice {
-            level: NoticeLevel::Info,
-            text: format!(
-                "请求体 {} → {}（省略 {} 张、缩放 {} 张历史图片）",
-                human_bytes(projected.bytes_before),
-                human_bytes(projected.bytes_after),
-                projected.placeheld,
-                projected.downscaled
-            ),
-        });
-    }
-    // 兜底（阶梯最后一级）：降级到底仍超硬阈值时**不发**，本地说明原因。
-    // 发出去只会换来网关的 413，错误信息还远离真正的成因。
-    if projected.bytes_after > config.request_body_hard_limit {
-        let _ = tx
-            .send(AgentEvent::Error(AgentError::RequestTooLarge {
-                bytes: projected.bytes_after,
-                limit: config.request_body_hard_limit,
-            }))
-            .await;
-        return ThinkOutcome::Stopped;
-    }
-    let req = ProviderRequest {
-        model: config.model.clone(),
-        system: config.system_prompt.clone(),
-        messages: projected.messages,
-        tools: tools.schemas(),
-        params: config.gen_params.clone(),
-    };
-    // Emit a heuristic prefill estimate so the status bar shows activity
-    // before the provider returns real usage (OpenAI-compatible APIs only
-    // send usage at stream end).
-    let prefill_estimate = estimate_prefill_tokens(&req);
-    let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
+    let mut operation: Option<ProviderRequest> = None;
 
     // Retry loop for a transiently failed THINK attempt. Two families are
     // retried: an idle stall / request deadline that ended the *stream*, and
@@ -1246,6 +1238,8 @@ async fn think_phase(
     // attempt's partial content is never committed to the session.
     let mut stall_retries: u16 = 0;
     let (content, end, last_usage, frag_leases) = loop {
+        // One admission per attempt. Attempt 1 therefore takes exactly one
+        // lease (it is not acquired a second time just to build the request).
         let provider_turn_lease = match provider_turn_gate {
             Some(gate) => match tokio::select! {
                 lease = gate.acquire() => lease,
@@ -1265,6 +1259,124 @@ async fn think_phase(
             },
             None => None,
         };
+
+        // Safe point: admission above has completed for this operation, so a
+        // settings save that raced the wait is visible here. A source failure
+        // is a controlled, recoverable stop: the lease drops with this scope
+        // and no request is built from unknown settings.
+        if operation.is_none() {
+            // Without an admission gate there was no wait between the caller's
+            // snapshot and this point, so that snapshot *is* the post-wait read:
+            // consulting the source again would only sample the same safe point
+            // twice. With a gate, admission may have parked for a long time, so
+            // the value must be refreshed here (spec §5.2).
+            let live_snapshot = if provider_turn_gate.is_some() {
+                match live_settings {
+                    Some(source) => match source.snapshot() {
+                        Ok(snapshot) => Some(snapshot),
+                        Err(error) => {
+                            // Same contract as the admission-error path above:
+                            // hand queued interjections back before reporting, so
+                            // a controlled stop never swallows the user's text.
+                            flush_unconsumed(tx, inbox).await;
+                            let _ = tx
+                                .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
+                                .await;
+                            return ThinkOutcome::Stopped;
+                        }
+                    },
+                    None => None,
+                }
+            } else {
+                pre_iteration.cloned()
+            };
+            let effective = merge_static_and_live(config, live_snapshot.as_ref());
+            // Waiting for admission is not "the iteration has started": a cap
+            // lowered during that wait must stop this iteration here, before a
+            // request exists. The turn index was already counted by the caller,
+            // so this neither adds nor rewinds a turn.
+            if let Some(max) = effective.max_turns
+                && u64::from(turn) > u64::from(max)
+            {
+                info!(turn, max, "live max turns reached after admission wait");
+                flush_unconsumed(tx, inbox).await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        reason: DoneReason::MaxTurns,
+                    })
+                    .await;
+                return ThinkOutcome::Stopped;
+            }
+            let request_messages = if effective.preserve_thinking {
+                messages.clone()
+            } else {
+                crate::thinking::strip_thinking_except_last_assistant(messages)
+            };
+            // 请求体字节闸：网关按**字节**拒绝超限请求（413），而 auto-compact 只按
+            // token 触发，长会话里内联图片的 base64 能让两者相差三个数量级。这里只在
+            // 请求副本上降级：`session` 与落盘的 `.jsonl` 逐字不变（桌面端按 path 读回
+            // 原图渲染，故界面零影响）。
+            //
+            // 它必须留在 safe point 之内：降级看的是本操作最终的请求副本，若在准入
+            // 等待之前算好，等待期间到达的设置保存就会作用到一份已经定型的请求上。
+            let projected = crate::image_projection::project_with(
+                &request_messages,
+                &crate::image_projection::ProjectionLimits {
+                    soft_limit: effective.request_body_soft_limit,
+                    hard_limit: effective.request_body_hard_limit,
+                    keep_full_images: effective.request_keep_full_images,
+                },
+                effective.image_downscaler.as_deref(),
+            );
+            if projected.step != crate::image_projection::ProjectionStep::AsIs {
+                tracing::info!(
+                    step = ?projected.step,
+                    bytes_before = projected.bytes_before,
+                    bytes_after = projected.bytes_after,
+                    placeheld = projected.placeheld,
+                    downscaled = projected.downscaled,
+                    turn,
+                    "request images projected to fit the body budget"
+                );
+                let _ = tx.try_send(AgentEvent::Notice {
+                    level: NoticeLevel::Info,
+                    text: format!(
+                        "请求体 {} → {}（省略 {} 张、缩放 {} 张历史图片）",
+                        human_bytes(projected.bytes_before),
+                        human_bytes(projected.bytes_after),
+                        projected.placeheld,
+                        projected.downscaled
+                    ),
+                });
+            }
+            // 兜底（阶梯最后一级）：降级到底仍超硬阈值时**不发**，本地说明原因。
+            // 发出去只会换来网关的 413，错误信息还远离真正的成因。
+            if projected.bytes_after > effective.request_body_hard_limit {
+                let _ = tx
+                    .send(AgentEvent::Error(AgentError::RequestTooLarge {
+                        bytes: projected.bytes_after,
+                        limit: effective.request_body_hard_limit,
+                    }))
+                    .await;
+                return ThinkOutcome::Stopped;
+            }
+            let request = ProviderRequest {
+                model: effective.model.clone(),
+                system: effective.system_prompt.clone(),
+                messages: projected.messages,
+                tools: tools.schemas(),
+                params: effective.gen_params.clone(),
+            };
+            // Emit a heuristic prefill estimate so the status bar shows
+            // activity before the provider returns real usage
+            // (OpenAI-compatible APIs only send usage at stream end).
+            let prefill_estimate = estimate_prefill_tokens(&request);
+            let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
+            operation = Some(request);
+        }
+        let req = operation
+            .as_ref()
+            .expect("operation snapshot is built after the first admission");
 
         let stream = tokio::select! {
             result = provider.call_stream(req.clone()) => match result {
@@ -1309,7 +1421,8 @@ async fn think_phase(
                                 return ThinkOutcome::Stopped; // Receiver dropped, stop the loop
                             }
                             // Release the turn lease before sleeping: a retry
-                            // backoff must not hold provider capacity.
+                            // backoff must not hold provider capacity. The
+                            // retry takes a fresh lease but keeps `operation`.
                             drop(provider_turn_lease);
                             tokio::select! {
                                 _ = tokio::time::sleep(delay) => {}
@@ -1370,7 +1483,8 @@ async fn think_phase(
         };
 
         // Release the turn lease before sleeping: a retry backoff must not
-        // hold provider capacity.
+        // hold provider capacity. The retry takes a fresh lease but keeps the
+        // original operation snapshot.
         drop(provider_turn_lease);
 
         // Two transient modes are retryable: an idle stall and a request
@@ -1859,6 +1973,7 @@ async fn run_loop(
     permission_checker: Option<Arc<crate::permission::PermissionChecker>>,
     decision_rx: Option<DecisionRx>,
     provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
+    live_settings: Option<Arc<dyn AgentSettingsSource>>,
     inbox: Option<InboxHandle>,
     tool_call_tokens: ToolCallTokens,
     children: crate::managed_run::ChildTasks,
@@ -1885,7 +2000,76 @@ async fn run_loop(
             return;
         }
 
-        let compacted = maybe_auto_compact(&tx, &provider, &config, &session, &cancel_token).await;
+        // Live settings are sampled once per semantic iteration, before the
+        // max-turns check and before any auto-compaction: an iteration that is
+        // already over the cap must not spend a summary request. A save
+        // therefore applies to the next iteration only: it never rewinds
+        // consumed turns and never replays an operation that already started.
+        //
+        // A failing source is a controlled stop, but *where* it surfaces
+        // depends on admission. With a gate, the first safe point of this
+        // iteration is the post-admission read in `think_phase`: surfacing the
+        // failure here would skip admission entirely, so the error would be
+        // reported without the lease that `think_phase` must release. In that
+        // case this iteration simply cannot decide on compaction or on the cap
+        // yet and defers to `think_phase`, which re-reads after admission and
+        // reports the same error with the lease in hand. Without a gate there
+        // is no later read to defer to, so the error is final right here.
+        let live = match &live_settings {
+            Some(source) => match source.snapshot() {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    if provider_turn_gate.is_some() {
+                        warn!(
+                            code = %error.code,
+                            "live settings unavailable before admission; deferring to the post-admission read"
+                        );
+                        None
+                    } else {
+                        flush_unconsumed(&tx, &inbox).await;
+                        let _ = tx
+                            .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
+                            .await;
+                        return;
+                    }
+                }
+            },
+            None => None,
+        };
+        let effective = merge_static_and_live(&config, live.as_ref());
+
+        // Check the cap *before* compaction: an iteration that will not run must
+        // not spend a summary request. `u64` avoids overflow at `u32::MAX`.
+        let next = u64::from(turn) + 1;
+        if let Some(max) = effective.max_turns
+            && next > u64::from(max)
+        {
+            info!(turn, max, "agent loop reached max turns");
+            flush_unconsumed(&tx, &inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::MaxTurns,
+                })
+                .await;
+            return;
+        }
+
+        // Auto-compaction uses the same snapshot's threshold and budgets, and
+        // re-checks the cap after its own admission/provider wait: a save that
+        // lands while the summary is in flight is applied to the next decision
+        // point, not to the operation already running.
+        let (compacted, compaction_waited) = maybe_auto_compact(
+            &tx,
+            &inbox,
+            &provider,
+            &config,
+            &effective,
+            turn.saturating_add(1),
+            &session,
+            &cancel_token,
+            &live_settings,
+        )
+        .await;
         if matches!(compacted, AutoCompact::Cancelled) {
             // A Stop pressed while the summary was in flight. The compaction
             // future was dropped at its await, so nothing was replaced; keep the
@@ -1893,6 +2077,16 @@ async fn run_loop(
             // cancel during the provider call).
             info!(turn, "agent loop cancelled during auto-compact");
             abort_run(&tx, &inbox, &session).await;
+            return;
+        }
+        if matches!(compacted, AutoCompact::MaxTurns) {
+            info!(turn, "agent loop reached max turns after compaction wait");
+            flush_unconsumed(&tx, &inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::MaxTurns,
+                })
+                .await;
             return;
         }
         if let AutoCompact::Compacted(new_messages) = compacted {
@@ -1914,23 +2108,49 @@ async fn run_loop(
             }
         }
 
-        turn += 1;
-        if let Some(max) = config.max_turns
-            && turn > max
+        // A summary is an unbounded wait with no admission of ours in it. The
+        // snapshot taken at the top of this iteration predates that wait, so the
+        // THINK below must re-read: otherwise a save that landed during the
+        // summary would be silently applied one iteration late. Re-reading here
+        // also re-checks the cap against the same `next` iteration, so a cap
+        // lowered during the summary still stops the run.
+        let live = if compaction_waited {
+            match &live_settings {
+                Some(source) => match source.snapshot() {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        flush_unconsumed(&tx, &inbox).await;
+                        let _ = tx
+                            .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
+                            .await;
+                        return;
+                    }
+                },
+                None => None,
+            }
+        } else {
+            live
+        };
+        let effective = if compaction_waited {
+            merge_static_and_live(&config, live.as_ref())
+        } else {
+            effective
+        };
+        if compaction_waited
+            && let Some(max) = effective.max_turns
+            && u64::from(turn) + 1 > u64::from(max)
         {
-            info!(turn, max, "agent loop reached max turns");
+            info!(turn, max, "live max turns reached after the summary wait");
             flush_unconsumed(&tx, &inbox).await;
-            if tx
+            let _ = tx
                 .send(AgentEvent::Done {
                     reason: DoneReason::MaxTurns,
                 })
-                .await
-                .is_err()
-            {
-                return; // Receiver dropped, stop the loop
-            }
+                .await;
             return;
         }
+
+        turn += 1;
 
         // Fold in anything the user sent while the previous request/tools ran.
         // Placed after the max_turns check (so an interjection consumes a turn)
@@ -1959,6 +2179,8 @@ async fn run_loop(
             &config,
             &cancel_token,
             &provider_turn_gate,
+            &live_settings,
+            live.as_ref(),
             &mut messages,
             turn,
             &mut payload_leases,
@@ -2125,22 +2347,61 @@ enum AutoCompact {
     Compacted(Vec<Message>),
     Skipped,
     Cancelled,
+    /// The refreshed snapshot forbids the next iteration; end on the cap
+    /// instead of spending the iteration (and its summary) on nothing.
+    MaxTurns,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maybe_auto_compact(
     tx: &EventTx,
+    inbox: &Option<InboxHandle>,
     provider: &Arc<dyn Provider>,
-    config: &AgentConfig,
+    static_config: &AgentConfig,
+    effective: &AgentConfig,
+    next_turn: u32,
     session: &Arc<Mutex<Session>>,
     cancel_token: &CancellationToken,
-) -> AutoCompact {
-    let Some(threshold) = config.compact_threshold.filter(|threshold| *threshold > 0) else {
-        return AutoCompact::Skipped;
+    live_settings: &Option<Arc<dyn AgentSettingsSource>>,
+) -> (AutoCompact, bool) {
+    // The bool says "the provider was actually awaited in this call". A wait is
+    // a long, unbounded gap: a save that lands inside it must be visible to the
+    // next normal THINK, so the caller has to treat its own pre-iteration
+    // snapshot as stale. Nothing else re-samples the source, so without this
+    // flag the loop would build the post-summary request from the pre-wall
+    // settings (spec §5.2: re-read after a long admission/wait).
+    let Some(threshold) = effective
+        .compact_threshold
+        .filter(|threshold| *threshold > 0)
+    else {
+        return (AutoCompact::Skipped, false);
     };
     let snapshot = session.lock().unwrap().clone();
     match snapshot.last_input_tokens() {
         Some(tokens) if tokens >= threshold => {}
-        _ => return AutoCompact::Skipped,
+        _ => return (AutoCompact::Skipped, false),
+    }
+
+    // The compaction fields come from the same operation snapshot: a compaction
+    // never renders the normal prompt and never inspects the old turn's used
+    // budget. A failing source is a controlled stop, not a silent skip.
+    let compact = match live_settings {
+        Some(source) => match source.compact_snapshot() {
+            Ok(value) => Some(value),
+            Err(error) => {
+                flush_unconsumed(tx, inbox).await;
+                let _ = tx
+                    .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
+                    .await;
+                return (AutoCompact::Cancelled, false);
+            }
+        },
+        None => None,
+    };
+    let mut compaction_config = effective.clone();
+    if let Some(compact) = &compact {
+        compaction_config.compact_user_budget_tokens = compact.user_budget_tokens;
+        compaction_config.compact_tool_budget_tokens = compact.tool_budget_tokens;
     }
 
     let old_count = snapshot.len();
@@ -2150,11 +2411,76 @@ async fn maybe_auto_compact(
     // Stop button while "the model was running". Winning the race by cancel
     // drops the future at the await, so the session is still untouched.
     let compacted = tokio::select! {
-        result = crate::compact::compact_session(provider, config, &snapshot) => result,
-        _ = cancel_token.cancelled() => return AutoCompact::Cancelled,
+        result = crate::compact::compact_session(provider, &compaction_config, &snapshot) => result,
+        _ = cancel_token.cancelled() => return (AutoCompact::Cancelled, true),
     };
     match compacted {
-        Ok(Some(new_session)) if new_session.len() < old_count => {
+        Ok(None) => (AutoCompact::Skipped, true),
+        Err(error) => {
+            tracing::warn!(error = %error, "auto-compact failed, will retry next think");
+            (AutoCompact::Skipped, true)
+        }
+        Ok(Some(new_session)) => {
+            // The summary can take long enough for the limit to change. Re-check
+            // the *same* next iteration against a fresh snapshot before
+            // committing: if the cap now forbids it, nothing should be dropped
+            // for it, so the original history is kept and the run ends on the
+            // cap. The already-started summary is not replayed and its own
+            // snapshot is respected.
+            let refreshed = match live_settings {
+                Some(source) => match source.snapshot() {
+                    Ok(refreshed) => Some(refreshed),
+                    Err(error) => {
+                        flush_unconsumed(tx, inbox).await;
+                        let _ = tx
+                            .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
+                            .await;
+                        return (AutoCompact::Cancelled, true);
+                    }
+                },
+                None => None,
+            };
+            let after = merge_static_and_live(static_config, refreshed.as_ref());
+            if let Some(max) = after.max_turns
+                && u64::from(next_turn) > u64::from(max)
+            {
+                // Nothing was swapped out, so no lease is held to release: the
+                // summary future already finished. End on the cap.
+                return (AutoCompact::MaxTurns, true);
+            }
+            // Re-check the compaction trigger against that same fresh snapshot:
+            // the summary may have taken long enough for a save to change it.
+            // The summary that already ran keeps the budgets it started with
+            // (spec §5.2 — a started operation is never rolled back), but the
+            // *decision to install* it is made against the latest settings. If
+            // the history would no longer be compacted now, keep the original
+            // messages. Using `after` instead of a second `compact_snapshot()`
+            // read keeps the cap check and this one derived from one snapshot,
+            // so they can never disagree.
+            if after.compact_threshold != effective.compact_threshold {
+                info!(
+                    old = ?effective.compact_threshold,
+                    new = ?after.compact_threshold,
+                    "auto-compaction trigger changed while the summary was in flight"
+                );
+            }
+            let still_over_threshold = after
+                .compact_threshold
+                .filter(|threshold| *threshold > 0)
+                .is_some_and(|threshold| {
+                    session
+                        .lock()
+                        .unwrap()
+                        .last_input_tokens()
+                        .is_some_and(|tokens| tokens >= threshold)
+                });
+            if !still_over_threshold {
+                info!("history no longer needs compaction under the live settings");
+                return (AutoCompact::Skipped, true);
+            }
+            if new_session.len() >= old_count {
+                return (AutoCompact::Skipped, true);
+            }
             let new_messages = new_session.messages().to_vec();
             {
                 let mut current = session.lock().unwrap();
@@ -2167,12 +2493,7 @@ async fn maybe_auto_compact(
                     new_msg_count: new_messages.len(),
                 })
                 .await;
-            AutoCompact::Compacted(new_messages)
-        }
-        Ok(Some(_)) | Ok(None) => AutoCompact::Skipped,
-        Err(error) => {
-            tracing::warn!(error = %error, "auto-compact failed, will retry next think");
-            AutoCompact::Skipped
+            (AutoCompact::Compacted(new_messages), true)
         }
     }
 }
@@ -2261,6 +2582,29 @@ fn estimate_tokens(text: &str) -> u32 {
     (ascii as f32 / 4.0 + non_ascii as f32 / 1.5) as u32
 }
 
+/// Combine the static configuration with one live operation snapshot.
+///
+/// Only the five fields the snapshot owns are overridden. Model selection,
+/// generation parameters and the retry policy stay on `AgentConfig`: live
+/// settings must not rebuild the provider or silently change retry budgets.
+/// A `None` snapshot returns the static config unchanged, which is what keeps
+/// source-less agents byte-identical to the historical behaviour.
+fn merge_static_and_live(
+    config: &AgentConfig,
+    live: Option<&crate::live_settings::LiveAgentSnapshot>,
+) -> AgentConfig {
+    let Some(live) = live else {
+        return config.clone();
+    };
+    let mut effective = config.clone();
+    effective.system_prompt = live.system_prompt.clone();
+    effective.max_turns = live.max_turns;
+    effective.compact_threshold = live.compact_threshold;
+    effective.compact_user_budget_tokens = live.compact_user_budget_tokens;
+    effective.compact_tool_budget_tokens = live.compact_tool_budget_tokens;
+    effective
+}
+
 /// Estimate prefill tokens from the full request (system + tools + all messages).
 /// 人类可读的字节数，用于降级提示（`69.3 MB → 1.2 MB`）。
 fn human_bytes(bytes: usize) -> String {
@@ -2314,6 +2658,88 @@ fn estimate_prefill_tokens(req: &crate::provider::ProviderRequest) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::live_settings::LiveAgentSnapshot;
+
+    /// The merge owns exactly five fields. Model, generation parameters and the
+    /// retry policy must survive untouched: live settings cannot rebuild the
+    /// provider or silently move the retry budget (Task 5 owns turn/compact
+    /// consumption, this task owns the snapshot-to-request boundary).
+    #[test]
+    fn merge_static_and_live_overrides_exactly_the_five_live_fields() {
+        let static_config = super::AgentConfig {
+            model: "static-model".into(),
+            system_prompt: Some("static-prompt".into()),
+            max_turns: Some(7),
+            compact_threshold: Some(1),
+            compact_user_budget_tokens: 2,
+            compact_tool_budget_tokens: 3,
+            provider_error_retry_limit: 2,
+            think_stall_retry_limit: 1,
+            gen_params: crate::provider::GenParams {
+                temperature: Some(0.25),
+                max_tokens: Some(1234),
+                ..Default::default()
+            },
+            ..super::AgentConfig::default()
+        };
+
+        let live = LiveAgentSnapshot {
+            revision: "rev".into(),
+            max_turns: Some(50),
+            compact_threshold: Some(60_000),
+            compact_user_budget_tokens: 11_000,
+            compact_tool_budget_tokens: 9_000,
+            system_prompt: Some("live-prompt".into()),
+        };
+
+        let merged = super::merge_static_and_live(&static_config, Some(&live));
+
+        assert_eq!(merged.system_prompt.as_deref(), Some("live-prompt"));
+        assert_eq!(merged.max_turns, Some(50));
+        assert_eq!(merged.compact_threshold, Some(60_000));
+        assert_eq!(merged.compact_user_budget_tokens, 11_000);
+        assert_eq!(merged.compact_tool_budget_tokens, 9_000);
+
+        assert_eq!(merged.model, "static-model");
+        assert_eq!(merged.provider_error_retry_limit, 2);
+        assert_eq!(merged.think_stall_retry_limit, 1);
+        assert_eq!(merged.gen_params, static_config.gen_params);
+        assert_eq!(merged.preserve_thinking, static_config.preserve_thinking);
+    }
+
+    /// `None` must be a pure clone: the static agent's request stays identical.
+    #[test]
+    fn merge_without_live_snapshot_is_the_static_config() {
+        let static_config = super::AgentConfig::default();
+        let merged = super::merge_static_and_live(&static_config, None);
+        assert_eq!(merged.system_prompt, static_config.system_prompt);
+        assert_eq!(merged.max_turns, static_config.max_turns);
+        assert_eq!(merged.model, static_config.model);
+    }
+
+    /// `None` inside a present snapshot means "resolved to no user segment",
+    /// not "keep the static value": the runtime already applied the full
+    /// override > env > settings > default chain.
+    #[test]
+    fn live_snapshot_none_prompt_clears_the_static_prompt() {
+        let static_config = super::AgentConfig {
+            system_prompt: Some("static-prompt".into()),
+            ..super::AgentConfig::default()
+        };
+        let live = LiveAgentSnapshot {
+            revision: "rev".into(),
+            max_turns: None,
+            compact_threshold: None,
+            compact_user_budget_tokens: 1,
+            compact_tool_budget_tokens: 1,
+            system_prompt: None,
+        };
+        let merged = super::merge_static_and_live(&static_config, Some(&live));
+        assert_eq!(merged.system_prompt, None);
+        assert_eq!(merged.max_turns, None);
+        assert_eq!(merged.compact_threshold, None);
+    }
+
     use super::*;
     use crate::message::{Message, Role};
     use crate::permission::{Decision, PermissionKind};

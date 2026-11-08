@@ -393,9 +393,11 @@ pub fn migrate_env_settings(
         ("startup.sandbox", "YI_AGENT_SANDBOX"),
     ];
 
-    // 只填「尚未设置」的字段：既有 `settings.json` 的值优先。
+    // 收集候选：这里的「尚未设置」只是锁外快照的**优化**，不是最终判据。
+    // 真正的「已有值优先」由 `commit_fill_missing` 在持实例写锁重读后判定，
+    // 否则并发用户保存的值会被迁移用旧快照覆盖。
     let existing = crate::settings::load_from(settings_path);
-    let mut patch = serde_json::Map::new();
+    let mut candidates = serde_json::Map::new();
     for (path_key, env_key) in A_CLASS {
         let Some(raw) = values.get(*env_key) else {
             continue;
@@ -406,7 +408,7 @@ pub fn migrate_env_settings(
         if field_is_set(&existing, path_key) {
             continue;
         }
-        patch.insert(
+        candidates.insert(
             (*path_key).to_string(),
             serde_json::Value::from(raw.clone()),
         );
@@ -420,7 +422,7 @@ pub fn migrate_env_settings(
     let has_workdir = values.contains_key("YI_AGENT_WORKDIR");
     let has_yolo = values.contains_key("YI_AGENT_YOLO");
 
-    if patch.is_empty() && bocha_key.is_none() {
+    if candidates.is_empty() && bocha_key.is_none() {
         if !has_workdir && !has_yolo {
             // 既没有 A 类键也没有废弃键：这不是我们的文件，原样留着。
             return EnvMigrationOutcome::NothingToDo;
@@ -449,29 +451,46 @@ pub fn migrate_env_settings(
     }
 
     // 1) 先落 settings.json：写不进去就绝不改名 `.env`（否则用户的值凭空丢失）。
+    //
+    // 每个合法候选都以 `FillMissing` 提交：持锁重读后仍有有效值的字段不动。
+    // 单个非法值只跳过它本身（并明确告警：该键在文件里已有非法旧值时，迁移
+    // 不会静默覆盖它，也不会假装迁移成功）。
     let mut migrated_fields = 0usize;
-    if !patch.is_empty() {
-        // 逐个字段写入：单个字段的非法值只跳过它本身，不拖垮整次迁移。
-        for (key, value) in patch {
-            let single = serde_json::Value::Object([(key.clone(), value)].into_iter().collect());
-            match crate::settings::write_to(settings_path, &single) {
-                Ok(()) => migrated_fields += 1,
-                Err(error) => {
-                    // 键不认识 / 类型不对 / 越界：都是「这个值迁不了」，不是存储故障。
-                    // 存储故障（文件损坏 / IO）则必须中止。
-                    match error {
-                        crate::settings::SettingsError::InvalidSetting { .. } => {
-                            tracing::warn!(
-                                key = %key,
-                                %error,
-                                "skipping a .env value that settings.json cannot accept"
-                            );
-                        }
-                        other => {
-                            return EnvMigrationOutcome::SettingsNotWritable {
-                                reason: other.to_string(),
-                            };
-                        }
+    for (key, value) in candidates {
+        let single = serde_json::Value::Object([(key.clone(), value)].into_iter().collect());
+        match crate::settings::store::commit_patch(
+            settings_path,
+            &single,
+            crate::settings::store::PatchMode::FillMissing,
+        ) {
+            Ok(receipt) => {
+                if receipt.changed_keys.is_empty() {
+                    tracing::info!(
+                        key = %key,
+                        "migration left an existing settings.json value in place"
+                    );
+                } else {
+                    migrated_fields += 1;
+                }
+            }
+            Err(error) => {
+                // 键不认识 / 类型不对 / 越界：都是「这个值迁不了」，不是存储故障。
+                // 文档级错误则说明文件里另有未修复的非法字段：迁移无法把它修好，
+                // 也不能假报成功，故同样只跳过本值并点名待修键。
+                // 存储故障（文件损坏 / IO / 锁超时）必须中止，且不得改名 `.env`。
+                match error {
+                    crate::settings::SettingsError::InvalidSetting { .. }
+                    | crate::settings::SettingsError::InvalidDocument { .. } => {
+                        tracing::warn!(
+                            key = %key,
+                            %error,
+                            "skipping a .env value that settings.json cannot accept"
+                        );
+                    }
+                    other => {
+                        return EnvMigrationOutcome::SettingsNotWritable {
+                            reason: other.to_string(),
+                        };
                     }
                 }
             }
@@ -1256,6 +1275,61 @@ YI_AGENT_SYSTEM_PROMPT='hello # world'
             "there was nothing to write, so settings.json must not appear"
         );
         assert!(!fixture.websearch().exists());
+    }
+
+    /// 迁移的锁外快照只可优化：最终「是否已存在」由持锁重读决定。
+    ///
+    /// 构造一个**只有锁内重读才看得见**的既有值：文件里 `agent.max_turns` 是
+    /// 非法字符串，`field_is_set` 得到 `None`、锁外快照因此认为字段缺失并生成
+    /// 迁移候选；`FillMissing` 在持锁重读原始 JSON 时看到该键存在（值非法也算
+    /// 存在），必须保留它并点名诊断，而不是把 .env 的值覆盖上去。
+    #[test]
+    fn an_existing_invalid_value_is_not_treated_as_missing() {
+        let fixture = MigrationFixture::new();
+        std::fs::write(fixture.settings(), r#"{"agent":{"max_turns":"kept-bad"}}"#).unwrap();
+        fixture.write_env("YI_AGENT_MAX_TURNS=500\n");
+
+        let outcome = fixture.run();
+        assert!(
+            matches!(outcome, EnvMigrationOutcome::Migrated { fields: 0, .. }),
+            "the invalid candidate must be skipped, not counted, got {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.settings()).unwrap(),
+            r#"{"agent":{"max_turns":"kept-bad"}}"#,
+            "the existing (invalid) value must not be overwritten from a stale snapshot"
+        );
+        assert!(
+            !fixture.env().exists(),
+            "settings.json handling finished, so .env is consumed"
+        );
+    }
+
+    /// 存储失败（锁被长期占用之外的受控故障）必须禁止改名 `.env`。
+    ///
+    /// 这里用「settings.json 是不可读的坏 JSON」复现：持有写锁后重读失败，
+    /// 迁移不得把它当空文件覆盖，也不得把 `.env` 改名 —— 否则用户的 key
+    /// 在两边都找不回来。
+    #[test]
+    fn a_storage_failure_blocks_the_env_rename() {
+        let fixture = MigrationFixture::new();
+        std::fs::write(fixture.settings(), "[not, an, object]").unwrap();
+        fixture.write_env("YI_AGENT_MAX_TURNS=500\n");
+
+        let outcome = fixture.run();
+        assert!(
+            matches!(outcome, EnvMigrationOutcome::SettingsNotWritable { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.settings()).unwrap(),
+            "[not, an, object]",
+            "the corrupt settings.json must stay byte-identical"
+        );
+        assert!(
+            fixture.env().exists(),
+            ".env must survive when settings.json cannot be committed"
+        );
     }
 
     /// 第二次调用已无 `.env`，返回 `NothingToDo`——`DroppedOnly` 也是幂等的。

@@ -425,9 +425,20 @@ fn run_flags(action: &FlagsAction) -> Result<()> {
 /// does, then hands the inherited descriptor to the executor. No public RPC is
 /// involved, so a local process cannot ask this binary to execute anything.
 fn run_internal_executor(owner: String, models: Option<std::path::PathBuf>) -> Result<()> {
+    // Authorization first, and *before* any configuration read. Taking the
+    // descriptor later would mean a hand-started process had already resolved
+    // this machine's provider and credentials before being refused -- and the
+    // refusal is the actual security boundary, not a courtesy check.
+    let control = managed_runtime::take_executor_control()?;
     let overrides = yi_agent_runtime::config::ConfigOverrides::default();
-    let config = yi_agent_runtime::config::RuntimeConfig::load_lenient(&overrides)?;
-    managed_runtime::run_executor(owner, models, config)
+    // This process resolves its own settings source: the daemon that spawned us
+    // may have different overrides or environment, and a shared file path does
+    // not make those shared. Only this process's fixed sources apply here.
+    let (config, binding) = yi_agent_runtime::config::RuntimeConfig::load_lenient_with_binding(
+        &overrides,
+        &yi_agent_runtime::settings::settings_path(),
+    )?;
+    managed_runtime::run_executor_with_control(control, owner, models, config, Some(binding))
 }
 
 /// Serves one runtime as its guardian, resolving the scope from the environment.
@@ -474,10 +485,19 @@ fn run_internal_guardian() -> Result<()> {
 }
 
 /// Serves one runtime's business daemon as the managed role.
+///
+/// The daemon is its own process, so it cannot inherit the launcher's live
+/// settings binding through memory: it resolves the same `settings.json` itself
+/// and hands that one source to every worker factory it builds. A worker the
+/// daemon starts therefore follows a save exactly like a session in the
+/// launcher does, without either process having to know the other's state.
 fn run_internal_daemon() -> Result<()> {
     let overrides = yi_agent_runtime::config::ConfigOverrides::default();
-    let config = yi_agent_runtime::config::RuntimeConfig::load_lenient(&overrides)?;
-    managed_runtime::run_managed_daemon(config)
+    let (config, binding) = yi_agent_runtime::config::RuntimeConfig::load_lenient_with_binding(
+        &overrides,
+        &yi_agent_runtime::settings::settings_path(),
+    )?;
+    managed_runtime::run_managed_daemon(config, Some(binding))
 }
 
 fn run_internal_identity(json: bool) -> Result<()> {
@@ -585,13 +605,17 @@ fn format_revoke_result(device_id: &str, removed: bool) -> String {
 /// tracing writes to a file (and to stderr only when `YI_LOG` is set).
 fn run_app_server(cli: Cli) -> Result<()> {
     let mode = app_server_mode(&cli)?;
-    let config = config::load_lenient(&cli)?;
+    // Resolve the binding here, before any cwd drift: the settings path must be a
+    // stable absolute path, and every session this process creates shares this
+    // one source so a save is visible to all of them at once.
+    let (config, settings_binding) = config::load_lenient_with_binding(&cli)?;
     let rt = tokio::runtime::Runtime::new()?;
     match mode {
-        AppServerMode::Stdio => rt.block_on(yi_agent_app_server::run(
+        AppServerMode::Stdio => rt.block_on(yi_agent_app_server::run_with_binding(
             tokio::io::stdin(),
             tokio::io::stdout(),
             config,
+            Some(settings_binding),
         )),
         AppServerMode::Ws(addr) => rt.block_on(async move {
             let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -614,16 +638,24 @@ fn run_app_server(cli: Cli) -> Result<()> {
                     yi_agent_app_server::device_store::default_path(),
                 ),
             ));
-            yi_agent_app_server::ws::serve_ws(listener, config, workspaces, pairing).await
+            yi_agent_app_server::ws::serve_ws_with_binding(
+                listener,
+                config,
+                workspaces,
+                pairing,
+                Some(settings_binding),
+            )
+            .await
         }),
-        AppServerMode::PureRelay(url) => rt.block_on(run_relay_mode(config, url)),
+        AppServerMode::PureRelay(url) => rt.block_on(run_relay_mode(config, url, settings_binding)),
         // stdio 与中继共用一个 serve():桌面 stdout/stdin 照旧,手机经中继接入。
         AppServerMode::StdioWithRelay(url) => {
-            rt.block_on(yi_agent_app_server::serve_stdio_with_relay(
+            rt.block_on(yi_agent_app_server::serve_stdio_with_relay_and_binding(
                 tokio::io::stdin(),
                 tokio::io::stdout(),
                 config,
                 url,
+                Some(settings_binding),
             ))
         }
     }
@@ -641,6 +673,7 @@ fn run_app_server(cli: Cli) -> Result<()> {
 async fn run_relay_mode(
     config: yi_agent_runtime::config::RuntimeConfig,
     url: String,
+    binding: yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding,
 ) -> Result<()> {
     let (relay_url, session) = relay_parts(&url)?;
 
@@ -662,8 +695,14 @@ async fn run_relay_mode(
 
     let serve_pairing = std::sync::Arc::clone(&pairing);
     tokio::spawn(async move {
-        if let Err(e) =
-            yi_agent_app_server::ws::serve_ws(listener, config, workspaces, serve_pairing).await
+        if let Err(e) = yi_agent_app_server::ws::serve_ws_with_binding(
+            listener,
+            config,
+            workspaces,
+            serve_pairing,
+            Some(binding),
+        )
+        .await
         {
             eprintln!("local app-server for relay stopped: {e}");
         }
@@ -1063,6 +1102,14 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             // invoked `serve` must record the same self-ignore so the project
             // state it creates never dirties the checkout.
             ignore_project_local_runtime_state(&workdir);
+            // The daemon is a standard thread plus intermittent
+            // `runtime.block_on` calls, so nothing polls the settings file on
+            // its own. Without this lease a save made by another process (the
+            // settings page, another sidecar) would not reach the queued
+            // residents until a restart.
+            let mut settings_lease = observe_live_settings_for_daemon(cli);
+            // Shipping host, so container writes must name an open turn: this is
+            // the enforcing constructor, not the bare `start_with_factory`.
             let daemon = yi_agent_store::ipc::Daemon::start_with_factory_enforcing_session_turns(
                 &runtime_dir,
                 &database,
@@ -1081,6 +1128,11 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
                 .wait()
                 .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}"));
             supervisor.stop();
+            // 同步退出路径：这里没有 reactor，用阻塞版等观察线程真的结束，
+            // 而不是把「线程停了」变成退出时的猜测。
+            if let Some(lease) = settings_lease.take() {
+                lease.shutdown_blocking();
+            }
             result
         }
         DaemonAction::Status | DaemonAction::Stop => control_daemon_client(action, &runtime),
@@ -1097,18 +1149,46 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
 /// built before the daemon starts, that aborted the whole runtime attach on
 /// launch. `worker_factory` then picks the subagent entry (or the catalog
 /// default) from the config it is handed.
+/// Starts the settings observation thread on behalf of a daemon-hosting process.
+///
+/// The daemon's main loop is a standard thread with intermittent
+/// `runtime.block_on` calls, so the file is never read unless something asks.
+/// This lease is that something: it refreshes the shared source once a second,
+/// which is what turns "another process saved settings" into a wake-up for
+/// queued residents.
+///
+/// Returns `None` when the settings file cannot be resolved leniently. A broken
+/// settings file must not stop the daemon from serving -- the startup
+/// configuration is still valid, it simply will not be refreshed.
+///
+/// Loading the binding a second time is deliberate and cheap: `LiveSettings`
+/// is keyed on the absolute path in a process-wide registry, so this resolves to
+/// the very instance the worker factory and its workers read. A second source
+/// cannot appear here.
+fn observe_live_settings_for_daemon(
+    cli: &Cli,
+) -> Option<yi_agent_runtime::live_settings::observer::SettingsObservationLease> {
+    let (_config, binding) = config::load_lenient_with_binding(cli).ok()?;
+    Some(binding.live.start_observing())
+}
+
 fn build_daemon_worker_factory(
     cli: &Cli,
     runtime_socket: std::path::PathBuf,
 ) -> Result<Arc<dyn yi_agent_core::subagent::worker::AgentWorkerFactory>> {
-    let config = config::load_lenient(cli)?;
+    let (config, binding) = config::load_lenient_with_binding(cli)?;
     let catalog = yi_agent_runtime::models::load_catalog();
     let config = yi_agent_runtime::models::resolve_effective(&config, &catalog, None);
-    yi_agent_subagent::attach::worker_factory(
+    // The daemon's workers get the same binding the parent session uses: a save
+    // then reaches an already-running worker at its next safe point instead of
+    // waiting for the next delegation.
+    let factory = yi_agent_subagent::attach::worker_factory_with_binding(
         &config,
         runtime_socket,
         &yi_agent_runtime::models::models_path(),
-    )
+        Some(binding),
+    )?;
+    Ok(factory)
 }
 
 /// The runtime socket for a project, resolved identically everywhere.
@@ -1153,7 +1233,21 @@ fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Res
     match response {
         yi_agent_store::ipc::IpcResponse::Status {
             high_water_event_id,
-        } => println!("daemon running (event high-water: {high_water_event_id})"),
+            live_apply_version,
+        } => {
+            // Saying "running" alone hides the thing the user actually asked
+            // about: whether a settings save reaches work already in flight. An
+            // old daemon is not an error, but it must not be described as if it
+            // hot-reloads.
+            println!("daemon running (event high-water: {high_water_event_id})");
+            match live_apply_version {
+                Some(version) => println!("live settings apply: supported (version {version})"),
+                None => println!(
+                    "live settings apply: unsupported -- this daemon applies a save only to \
+                     work that has not started yet; restart it to pick up settings immediately"
+                ),
+            }
+        }
         yi_agent_store::ipc::IpcResponse::Stopping => println!("daemon stopping"),
         yi_agent_store::ipc::IpcResponse::UnsupportedProtocol { .. } => {
             anyhow::bail!("runtime daemon protocol is incompatible")
@@ -2223,7 +2317,10 @@ fn run_agent_with_seed(cli: Cli, seed: Option<ResumeSeed>) -> Result<()> {
         eprintln!("引导未完成：{error}");
     }
 
-    let config = config::load_lenient(&cli)?;
+    // Same loader as every other entry point, but this one also hands back the
+    // process-wide live-settings binding: a settings save must reach this
+    // session's existing agent instead of waiting for a restart.
+    let (config, settings_binding) = config::load_lenient_with_binding(&cli)?;
     // 条目默认档在**启动时**也要生效：与 app-server 同口径，走同一条解析链
     // （会话覆盖 > 整包注入 > 清单默认）。注入存在时（`model_injected`）整包压过
     // 清单默认；否则沿用清单 `default_model`，`/effort` 报出的即请求发出的。
@@ -2310,6 +2407,14 @@ fn run_agent_with_seed(cli: Cli, seed: Option<ResumeSeed>) -> Result<()> {
     let agent_config =
         yi_agent_runtime::bootstrap::build_agent_config(&config, prompt.system_prompt);
 
+    // Build the source once from the same composer the static prompt came from;
+    // every driver rebuild carries this `Arc` forward.
+    let live_settings = yi_agent_runtime::bootstrap::live_source_for(
+        &config,
+        prompt.catalog.as_ref(),
+        Some(&settings_binding),
+    );
+
     run_tui_agent(
         provider,
         tools,
@@ -2325,6 +2430,8 @@ fn run_agent_with_seed(cli: Cli, seed: Option<ResumeSeed>) -> Result<()> {
         prompt.catalog,
         mcp,
         seed,
+        live_settings,
+        Some(settings_binding),
     )
 }
 
@@ -2614,7 +2721,9 @@ fn run_headless(
     // 迁移必须在 `config::load` 之前：它决定了 `workdir` 从哪读。
     // 不弹引导——headless 可能跑在管道里，弹了会挂死在 stdin 上。
     let _ = prepare_environment();
-    let config = config::load_lenient(&cli)?;
+    // Headless is a production host too: bind the live source so a settings save
+    // that lands mid-run reaches the next safe point instead of the next process.
+    let (config, settings_binding) = config::load_lenient_with_binding(&cli)?;
     // 与 TUI 同一条解析链：先让 `models.json` 的默认条目补上 provider/model/key，
     // 再判断是否可发起对话。只拿裸配置判定会把「模型只在清单里」的机器误判成
     // 未配置——那是设置页配好模型、却没设任何环境变量的常见状态。
@@ -2665,6 +2774,10 @@ fn run_headless(
                 &config.workdir,
                 &model,
                 yi_agent_app_server::thread_store::ThreadMode::Normal,
+                // The sandbox this conversation starts under, recorded with it:
+                // a later settings change must not re-open it wider.
+                config.sandbox,
+                config.sandbox_promotable,
             ) {
                 Ok(store) => Some(store),
                 Err(e) => {
@@ -2736,6 +2849,11 @@ fn run_headless(
 
     let agent_config =
         yi_agent_runtime::bootstrap::build_agent_config(&config, setup.system_prompt);
+    let live_settings = yi_agent_runtime::bootstrap::live_source_for(
+        &config,
+        setup.catalog.as_ref(),
+        Some(&settings_binding),
+    );
     let mcp = setup.mcp;
 
     // resume 的种子：先升格崩溃残留的轮次，再读转录。顺序固定——反过来会
@@ -2763,9 +2881,12 @@ fn run_headless(
         session.set_last_input_tokens(seed_last_input);
         let session_handle = Arc::new(std::sync::Mutex::new(session));
 
-        let mut agent = yi_agent_core::Agent::new(provider, tools, agent_config)
-            .with_permission(checker, decision_rx)
-            .with_session_arc(Arc::clone(&session_handle));
+        let mut agent = yi_agent_runtime::bootstrap::attach_live_source(
+            yi_agent_core::Agent::new(provider, tools, agent_config)
+                .with_permission(checker, decision_rx)
+                .with_session_arc(Arc::clone(&session_handle)),
+            live_settings,
+        );
         // The delegation tools were assembled with `runtime_caller`; binding it to
         // this agent's live session makes a `fork:true` spawn read the caller's
         // transcript at call time.
@@ -3020,6 +3141,7 @@ fn run_headless(
 /// re-reads it live on each call. Swapping in a fresh session would leave the
 /// bound handle pointing at a discarded transcript, so a later `fork:true` would
 /// silently see the wrong conversation (or none).
+#[allow(dead_code)] // Static facade: the tests and rebuilds without a live source use it.
 fn rebuild_driver_agent(
     provider: Arc<dyn Provider>,
     tools: Arc<yi_agent_core::ToolRegistry>,
@@ -3030,9 +3152,37 @@ fn rebuild_driver_agent(
     >,
     session: Arc<std::sync::Mutex<yi_agent_core::Session>>,
 ) -> yi_agent_core::Agent {
-    yi_agent_core::Agent::new(provider, tools, config)
+    rebuild_driver_agent_with_live_settings(
+        provider,
+        tools,
+        config,
+        checker,
+        decision_rx,
+        session,
+        None,
+    )
+}
+
+/// [`rebuild_driver_agent`] plus the session's live runtime-settings source.
+///
+/// Every rebuild replaces the `Agent` value, so the source has to be reattached
+/// here rather than once at start-up (see `LiveRebuild::live_settings`).
+#[allow(clippy::too_many_arguments)]
+fn rebuild_driver_agent_with_live_settings(
+    provider: Arc<dyn Provider>,
+    tools: Arc<yi_agent_core::ToolRegistry>,
+    config: yi_agent_core::AgentConfig,
+    checker: Arc<yi_agent_core::permission::PermissionChecker>,
+    decision_rx: Arc<
+        tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, yi_agent_core::permission::Decision)>>,
+    >,
+    session: Arc<std::sync::Mutex<yi_agent_core::Session>>,
+    live_settings: Option<yi_agent_core::live_settings::SharedSettingsSource>,
+) -> yi_agent_core::Agent {
+    let agent = yi_agent_core::Agent::new(provider, tools, config)
         .with_session_arc(session)
-        .with_permission(checker, decision_rx)
+        .with_permission(checker, decision_rx);
+    yi_agent_runtime::bootstrap::attach_live_source(agent, live_settings)
 }
 
 /// The live provider + agent config every driver rebuild is built from.
@@ -3053,6 +3203,12 @@ fn rebuild_driver_agent(
 struct LiveRebuild {
     provider: Arc<dyn Provider>,
     config: yi_agent_core::AgentConfig,
+    /// The session's live runtime-settings source, if this process loaded a
+    /// binding. Carried on the rebuild state (not just the first agent) so every
+    /// `/model`, `/effort`, `/clear`, `/compact` and MCP refresh keeps it: the
+    /// agent value is replaced each time, and a dropped source would freeze the
+    /// session at its start-up values with no visible symptom.
+    live_settings: Option<yi_agent_core::live_settings::SharedSettingsSource>,
     /// The **session** effort override (`/effort <tier>`), or `None` when there
     /// is none. Kept apart from the entry default so a `/model` switch cannot
     /// erase it: design §4.2's precedence is 会话覆盖 → 条目默认 → 未设置, and a
@@ -3066,13 +3222,24 @@ struct LiveRebuild {
 }
 
 impl LiveRebuild {
+    #[allow(dead_code)] // Static facade for callers/tests without a live source.
     fn new(provider: Arc<dyn Provider>, config: yi_agent_core::AgentConfig) -> Self {
+        Self::with_live_settings(provider, config, None)
+    }
+
+    /// [`Self::new`] plus the session's live runtime-settings source.
+    fn with_live_settings(
+        provider: Arc<dyn Provider>,
+        config: yi_agent_core::AgentConfig,
+        live_settings: Option<yi_agent_core::live_settings::SharedSettingsSource>,
+    ) -> Self {
         // Startup carries no session override (the TUI starts with `/effort`
         // unset), and the config's effort is the resolved entry default.
         let entry_effort = config.gen_params.reasoning_effort.clone();
         Self {
             provider,
             config,
+            live_settings,
             session_effort_override: None,
             entry_effort,
         }
@@ -3139,13 +3306,14 @@ impl LiveRebuild {
         >,
         session: Arc<std::sync::Mutex<yi_agent_core::Session>>,
     ) -> yi_agent_core::Agent {
-        rebuild_driver_agent(
+        rebuild_driver_agent_with_live_settings(
             Arc::clone(&self.provider),
             tools,
             self.config.clone(),
             checker,
             decision_rx,
             session,
+            self.live_settings.clone(),
         )
     }
 }
@@ -3209,6 +3377,7 @@ fn publish_side_source(
         generation: 1,
         provider_gate: None,
         web_policy: yi_agent_runtime::side_conversation::SideWebPolicy::default(),
+        live: live.live_settings.clone(),
     };
     source.revision = revision;
     update.commit(source);
@@ -3266,6 +3435,10 @@ fn side_source_snapshot_with_session(
         generation: 1,
         provider_gate: None,
         web_policy: yi_agent_runtime::side_conversation::SideWebPolicy::default(),
+        // The start-up snapshot is published before the driver exists, so there is
+        // no parent agent to take a source from yet. The driver's first
+        // `publish_side_source` replaces it, and that one carries the source.
+        live: None,
     }
 }
 
@@ -3286,6 +3459,10 @@ fn run_tui_agent(
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
     mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
     seed: Option<ResumeSeed>,
+    live_settings: Option<yi_agent_core::live_settings::SharedSettingsSource>,
+    // `/config` 要展示**当前**有效值与来源，所以这里需要绑定本身，而不是
+    // 只有 agent 用的窄 source。
+    settings_binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -3346,7 +3523,11 @@ fn run_tui_agent(
         // `SetReasoningEffort` only the override, so the two switches compose: a
         // later `/model` cannot resurrect an earlier model's effort, nor clobber
         // a `/effort` switch (Task 8 review R1).
-        let mut live = LiveRebuild::new(Arc::clone(&provider), agent_config.clone());
+        let mut live = LiveRebuild::with_live_settings(
+            Arc::clone(&provider),
+            agent_config.clone(),
+            live_settings.clone(),
+        );
         let rebuild_decision_rx = Arc::clone(&decision_rx);
         let runtime_detach_for_driver = Arc::clone(&runtime_detach);
         let frontend_lease_for_driver = Arc::clone(&frontend_lease);
@@ -3418,6 +3599,9 @@ fn run_tui_agent(
                     .to_string()
             },
             focus_degraded: false,
+            live: settings_binding
+                .clone()
+                .map(crate::tui::slash::TuiLiveSettings::new),
         };
 
         // 会话存储：resume/fork 用调用方已打开的那份（它已持锁），
@@ -3469,6 +3653,8 @@ fn run_tui_agent(
                         &snapshot_workdir,
                         &model,
                         mode,
+                        config.sandbox,
+                        config.sandbox_promotable,
                     ) {
                         Ok(store) => Some(Arc::new(store)),
                         Err(e) => {
@@ -3595,13 +3781,16 @@ fn run_tui_agent(
             let mut initial = yi_agent_core::Session::from_messages(initial_messages.clone());
             initial.set_last_input_tokens(initial_last_input);
             let session_handle = Arc::new(std::sync::Mutex::new(initial));
-            let mut agent = yi_agent_core::Agent::new(
-                Arc::clone(&provider_clone),
-                Arc::clone(&current_tools),
-                config_clone,
-            )
-            .with_permission(Arc::clone(&current_checker), Arc::clone(&decision_rx))
-            .with_session_arc(Arc::clone(&session_handle));
+            let mut agent = yi_agent_runtime::bootstrap::attach_live_source(
+                yi_agent_core::Agent::new(
+                    Arc::clone(&provider_clone),
+                    Arc::clone(&current_tools),
+                    config_clone,
+                )
+                .with_permission(Arc::clone(&current_checker), Arc::clone(&decision_rx))
+                .with_session_arc(Arc::clone(&session_handle)),
+                live_settings.clone(),
+            );
 
             // 启动即发布一次来源:旁支继承的是「此刻父会话真正在用的东西」,
             // 所以每个可能改变它的入口都要重新发布（见下面的 publish_side_source 调用）。
@@ -3677,10 +3866,18 @@ fn run_tui_agent(
                             let handle = agent.session_handle();
                             let session = agent.session();
                             let old_msg_count = session.messages().len();
-                            match yi_agent_core::compact_session(
+                            // Manual compaction is its own provider operation:
+                            // independent lease from the run's gate, and the
+                            // compaction fields come from the latest settings
+                            // rather than the static config captured at rebuild.
+                            let live_source = agent.live_settings_source();
+                            let gate = agent.provider_turn_gate();
+                            match yi_agent_core::compact::compact_session_with_live_settings(
                                 &live.provider,
                                 &live.config,
                                 &session,
+                                live_source.as_deref(),
+                                gate.as_deref(),
                             )
                             .await
                             {
@@ -5219,6 +5416,8 @@ mod tests {
             dir.path(),
             "m",
             yi_agent_app_server::thread_store::ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
         )
         .unwrap();
         store
@@ -5254,6 +5453,8 @@ mod tests {
             dir.path(),
             "m",
             yi_agent_app_server::thread_store::ThreadMode::Normal,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
         )
         .unwrap();
         assert!(
@@ -5295,7 +5496,9 @@ mod tests {
         // 宽松加载器：清单里已经有模型（无任何注入）的机器，严格加载器会因为
         // 「没有 key」直接 bail，用户永远起不来。与 `run_headless` 同形——缺 key
         // 由下面的指引接管，而不是加载器那句干巴巴的报错。
-        let load = ["config::load_lenient", "(&cli)"].concat();
+        // Same lenient loader, now returning the live-settings binding too. The
+        // strict-loader prohibition below is the part that must not drift.
+        let load = ["config::load_lenient_with_binding", "(&cli)"].concat();
         let strict = ["config::load(", "&cli)"].concat();
         let catalog = ["models::load_catalog", "()"].concat();
         let resolve = ["models::resolve_effective(&config, &catalog", ", None)"].concat();
@@ -5381,7 +5584,9 @@ mod tests {
             .and_then(|rest| rest.split("\nfn ").next())
             .expect("build_daemon_worker_factory must exist");
         let strict = ["config::load(", "cli)"].concat();
-        let lenient = ["config::load_lenient", "(cli)"].concat();
+        // The factory now also takes the live-settings binding for the workers it
+        // starts; leniency (below) is the invariant under test.
+        let lenient = ["config::load_lenient_with_binding", "(cli)"].concat();
         let catalog = ["models::load_catalog", "()"].concat();
         let resolve = ["models::resolve_effective", "(&config, &catalog"].concat();
         assert!(
@@ -5503,8 +5708,10 @@ mod tests {
         let prepare_at = entry
             .find("prepare_environment()")
             .expect("the entry must run the migration helper");
+        // The entry now takes the lenient loader *with* the live-settings
+        // binding; the ordering requirement is unchanged, only the callee name is.
         let load_at = entry
-            .find("config::load_lenient(")
+            .find("config::load_lenient_with_binding(")
             .expect("run_agent must load config");
         assert!(
             prepare_at < load_at,

@@ -3,6 +3,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { CONNECTION_DISCONNECTED_TEXT, ConnectionError } from "./lib/connectionError";
+import { notifyRuntimeSettingsInvalidated } from "./lib/runtimeSettingsBus";
 
 type Mode = "normal" | "yolo";
 type ThreadSeed = {
@@ -414,6 +415,27 @@ vi.mock("./lib/rpc", () => ({
         return { thread_id: id, cwd: "/w", model: "m", permission_mode: "normal" };
       }
       if (method === "ui/settings/read") return { theme: "dark", resident_daemon_watchman_enabled: true };
+      // 「运行参数」Tab 的读：所有用例共用一个字段，够 App 层接线断言用。
+      if (method === "settings/read") {
+        return {
+          live_apply_version: 1,
+          path: "/tmp/settings.json",
+          fields: [
+            {
+              key: "agent.max_turns",
+              group: "agent",
+              label: "最大轮次",
+              type: "number",
+              value: 200,
+              default: "200",
+              description: "",
+              options: [],
+              min: 1,
+              max: null,
+            },
+          ],
+        };
+      }
       if (method === "ui/settings/write") return { ok: true };
       if (method === "thread/setPermissionMode") {
         if (state.failSet) throw { code: -32011, message: "unknown thread" };
@@ -2010,6 +2032,48 @@ describe("App settings & theme wiring", () => {
       }),
     );
     expect(document.documentElement.dataset.theme).toBe("light");
+  });
+
+  it("routes settings/changed to the settings tab that subscribes on that client", async () => {
+    // 端到端接线：宿主推 `settings/changed` → 设置页的订阅回调被调用。
+    // 这条通知**没有** thread_id，如果路由走到会话过滤分支就会被静默丢弃。
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "运行参数" }));
+
+    // 订阅发生在挂载那一刻，故先确认面板已读到值（挂载完成的信号）。
+    const input = (await screen.findByLabelText("最大轮次")) as HTMLInputElement;
+    expect(input).toBeTruthy();
+    const readsBefore = clients[0].requests.filter((r) => r.method === "settings/read").length;
+
+    notify("settings/changed", { revision: "2", changed_keys: ["agent.max_turns"] });
+
+    // 订阅方自己去重读：宿主推的值不放进通知（只有 revision 与键名）。
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter((r) => r.method === "settings/read").length,
+      ).toBeGreaterThan(readsBefore),
+    );
+  });
+
+  it("does not refresh settings for a notification from a different host", async () => {
+    // 通知按 client 身份隔离：另一个宿主的保存不该刷新这台主机的设置页。
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "运行参数" }));
+    await screen.findByLabelText("最大轮次");
+    const readsBefore = clients[0].requests.filter((r) => r.method === "settings/read").length;
+
+    // 另一个（未挂载的）客户端身份发出的通知。
+    act(() => {
+      notifyRuntimeSettingsInvalidated({} as never);
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(clients[0].requests.filter((r) => r.method === "settings/read").length).toBe(
+      readsBefore,
+    );
   });
 
   it("follows a ui/settings/updated notification", async () => {

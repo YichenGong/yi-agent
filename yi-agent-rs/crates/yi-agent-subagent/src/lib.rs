@@ -65,6 +65,13 @@ struct WorkerParts {
     tools: Arc<ToolRegistry>,
     config: AgentConfig,
     sandbox: yi_agent_tools::SandboxMode,
+    /// The composer the static prompt was rendered by. Kept so a live refresh
+    /// composes from the *same* composer instead of a second one whose stable
+    /// context could silently differ.
+    composer: Arc<yi_agent_runtime::live_settings::prompt::LivePromptComposer>,
+    /// The declared context window of the model these parts were built for; the
+    /// live threshold must divide by the real window, not a default.
+    model_context_length: u32,
 }
 
 impl WorkerParts {
@@ -90,11 +97,18 @@ impl WorkerParts {
         }
         let config =
             yi_agent_runtime::bootstrap::build_agent_config(&effective, prompt.system_prompt);
+        let composer =
+            yi_agent_runtime::bootstrap::composer_for(&effective, prompt.catalog.as_ref());
+        let model_context_length = effective
+            .model_context_length
+            .unwrap_or(yi_agent_runtime::live_settings::binding::FALLBACK_MODEL_CONTEXT_LENGTH);
         Ok(Self {
             provider,
             tools: Arc::new(registry),
             config,
             sandbox: effective.sandbox,
+            composer,
+            model_context_length,
         })
     }
 }
@@ -188,6 +202,16 @@ pub struct DaemonAgentWorkerFactory {
     /// 装了它才按指纹重建派生件；未装则完全沿用 `new()` 传入的静态字段
     /// （全部测试构造点因此行为不变）。
     refresh: Option<WorkerRefresh>,
+    /// 进程级运行期设置绑定。装了它，每个 worker 都会挂上同一份共享来源：
+    /// 保存的运行参数因此在 worker 的下一处安全点生效，而不是等下一次委派。
+    /// 未装时行为与历史逐字一致（静态装配）。
+    live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+    /// 静态装配路径（未装刷新器）用的 composer 与上下文长度。两者都只在装了
+    /// 绑定时才有值：没有绑定就永远不构造来源，行为与历史逐字一致。
+    live_static: Option<(
+        Arc<yi_agent_runtime::live_settings::prompt::LivePromptComposer>,
+        u32,
+    )>,
 }
 
 impl DaemonAgentWorkerFactory {
@@ -211,7 +235,32 @@ impl DaemonAgentWorkerFactory {
             max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
             max_direct_children: usize::from(yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT),
             refresh: None,
+            live_settings: None,
+            live_static: None,
         }
+    }
+
+    /// Hand the process-wide live-settings binding to every worker this factory
+    /// starts. Cloning it per worker is cheap and shares one source, so a save
+    /// reaches all live workers at once.
+    /// Hand the process-wide live-settings binding to every worker this factory
+    /// starts.
+    ///
+    /// Call it after [`Self::with_catalog`] / [`Self::with_catalog_watcher`] so
+    /// the static composer is the one that rendered this factory's prompt: the
+    /// stable context must be identical between the static and live renders.
+    pub fn with_live_settings(
+        mut self,
+        cfg: yi_agent_runtime::config::RuntimeConfig,
+        binding: yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding,
+    ) -> Self {
+        self.live_static = Some((
+            yi_agent_runtime::bootstrap::composer_for(&cfg, self.catalog.as_ref()),
+            cfg.model_context_length
+                .unwrap_or(yi_agent_runtime::live_settings::binding::FALLBACK_MODEL_CONTEXT_LENGTH),
+        ));
+        self.live_settings = Some(binding);
+        self
     }
 
     /// The child's model: always the factory's configured model.
@@ -247,6 +296,16 @@ impl DaemonAgentWorkerFactory {
             cache: Mutex::new(None),
         });
         self
+    }
+
+    /// Whether this factory hands a live-settings source to its workers.
+    ///
+    /// The app-server's project attach takes a binding and must actually spend
+    /// it: a factory built with `None` looks identical from the outside until a
+    /// worker is spawned, which is far too late to catch a dropped argument.
+    #[cfg(test)]
+    pub(crate) fn has_live_settings_for_test(&self) -> bool {
+        self.live_settings.is_some() && self.live_static.is_some()
     }
 
     /// 测试接缝：当前清单解析出的模型名。未装刷新器时回落静态配置。
@@ -671,6 +730,9 @@ fn provider_retry_failure(error: &AgentError) -> Option<RetryFailure> {
         AgentError::Provider(ProviderError::Stream(_)) => Some(RetryFailure::ProviderStream),
         AgentError::Provider(ProviderError::Auth(_) | ProviderError::InvalidRequest(_))
         | AgentError::ProviderTurnAdmission(_)
+        // A failed settings snapshot is a controlled stop, not a transport
+        // condition: resending the same operation would only fail the same way.
+        | AgentError::LiveSettings(_)
         | AgentError::Compact(_)
         | AgentError::Budget(_)
         | AgentError::RequestTooLarge { .. } => None,
@@ -697,6 +759,16 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
 
     fn max_direct_children(&self) -> usize {
         self.max_direct_children
+    }
+
+    fn live_admission_limits(
+        &self,
+    ) -> Option<std::sync::Arc<dyn yi_agent_core::live_settings::AdmissionLimitsSource>> {
+        // Only a factory that was handed a live binding has a source; the
+        // static fields above stay authoritative otherwise.
+        self.live_settings
+            .as_ref()
+            .map(|binding| binding.admission_source())
     }
 
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
@@ -856,6 +928,27 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         let worker_caller = CallerContext::unbound();
         let workspace_service = self.workspace_service.clone();
         let workspace_for_delivery = workspace.clone();
+        // Built once per worker: the source holds the shared settings `Arc` and
+        // the frozen fixed-source table, so the worker adopts a save at its next
+        // safe point. The composer is the one that rendered this worker's static
+        // prompt, keeping the stable context byte-identical across a refresh.
+        let live_settings = match (&self.live_settings, refreshed.as_ref()) {
+            (Some(binding), Some(parts)) => Some(binding.agent_source(
+                yi_agent_runtime::live_settings::binding::AgentSettingsContext {
+                    model_context_length: parts.model_context_length,
+                    prompt: Arc::clone(&parts.composer),
+                },
+            )),
+            (Some(binding), None) => self.live_static.as_ref().map(|(composer, length)| {
+                binding.agent_source(
+                    yi_agent_runtime::live_settings::binding::AgentSettingsContext {
+                        model_context_length: *length,
+                        prompt: Arc::clone(composer),
+                    },
+                )
+            }),
+            (None, _) => None,
+        };
 
         Box::pin(async move {
             if objective.trim().is_empty() {
@@ -931,6 +1024,13 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                         if let Some(fork) = fork_messages {
                             agent = agent.with_session(yi_agent_core::Session::from_messages(fork));
                         }
+                        // Reattach after construction: `Agent::new` starts with no
+                        // source, and a worker without one would run forever on the
+                        // values this daemon was started with.
+                        agent = yi_agent_runtime::bootstrap::attach_live_source(
+                            agent,
+                            live_settings.clone(),
+                        );
                         // Ordering matters: bind *after* `with_session`, or the
                         // tool handle would point at the replaced session Arc.
                         worker_caller.bind(agent.session_handle());
@@ -3477,6 +3577,65 @@ mod tests {
         );
     }
 
+    /// The factory must expose its live limits, otherwise the store's admission
+    /// path silently falls back to the static fields and every save is ignored.
+    ///
+    /// Both directions matter: a factory with no binding must expose nothing
+    /// (static callers keep working), and one with a binding must see a save
+    /// without being re-created.
+    #[test]
+    fn a_live_factory_exposes_admission_limits_that_follow_a_save() {
+        use yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding;
+        use yi_agent_runtime::live_settings::sources::FrozenRuntimeSources;
+        use yi_agent_runtime::settings::store::PatchMode;
+
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"agent": {"max_direct_children": 3, "max_resident_subagents": 5}}"#,
+        )
+        .unwrap();
+
+        let static_factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        );
+        assert!(
+            AgentWorkerFactory::live_admission_limits(&static_factory).is_none(),
+            "a factory without a binding must keep the static fields authoritative"
+        );
+
+        let live = yi_agent_runtime::live_settings::LiveSettings::shared(settings_path);
+        let binding = RuntimeSettingsBinding {
+            live: Arc::clone(&live),
+            sources: Arc::new(FrozenRuntimeSources::default()),
+        };
+        let factory =
+            static_factory.with_live_settings(watcher_test_config(directory.path()), binding);
+
+        let source = AgentWorkerFactory::live_admission_limits(&factory)
+            .expect("a live factory must expose its source");
+        let limits = source.snapshot().unwrap();
+        assert_eq!(limits.direct_children, 3);
+        assert_eq!(limits.resident_subagents, 5);
+
+        // One save, no re-creation: the same source reads the new values.
+        live.commit(
+            &serde_json::json!({
+                "agent.max_direct_children": 1,
+                "agent.max_resident_subagents": 2,
+            }),
+            PatchMode::ReplaceProvided,
+        )
+        .unwrap();
+        let limits = source.snapshot().unwrap();
+        assert_eq!(limits.direct_children, 1);
+        assert_eq!(limits.resident_subagents, 2);
+    }
+
     /// 未装 watcher 的工厂行为必须逐字节不变（零回归门禁）。
     #[test]
     fn a_factory_without_a_watcher_keeps_its_static_config() {
@@ -5000,6 +5159,165 @@ mod tests {
             ),
             other => panic!("unexpected terminal event: {other:?}"),
         }
+    }
+
+    /// Emits one tool call per turn, so the worker keeps issuing requests and a
+    /// settings save has a *next* turn to land on.
+    #[derive(Default)]
+    struct LoopingProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    #[async_trait]
+    impl Provider for LoopingProvider {
+        async fn call_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            let turn = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request);
+                requests.len()
+            };
+            let id = format!("turn-{turn}");
+            Ok(futures::stream::iter([
+                ProviderEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: "noop".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: id.clone(),
+                    partial_json: "{}".into(),
+                },
+                ProviderEvent::ToolUseEnd { id },
+                ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                },
+            ])
+            .boxed())
+        }
+    }
+
+    /// Blocks the worker between turns until the test releases it.
+    ///
+    /// The snapshot a turn runs on is taken *before* the provider call, so gating
+    /// the provider would only delay the request, not move the safe point. The
+    /// tool runs between iterations, which is exactly where a save has to land
+    /// for the next iteration to observe it.
+    struct GateTool {
+        released: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Tool for GateTool {
+        fn name(&self) -> &str {
+            "noop"
+        }
+
+        fn schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+
+        fn description(&self) -> &str {
+            "Holds the loop until the test releases it."
+        }
+
+        async fn call(&self, _args: serde_json::Value) -> yi_agent_core::ToolResult {
+            while !self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            yi_agent_core::ToolResult::text("ok")
+        }
+    }
+
+    /// A save must reach an *already running* worker, not only the next one.
+    ///
+    /// The factory is the daemon's: `worker_factory_with_binding` hands the
+    /// shared settings source to every worker it starts. Each turn re-reads it,
+    /// so the second request after a save must carry the new system prompt --
+    /// that is the difference between "the daemon sees the file" and "the worker
+    /// the daemon already runs adopts the new value".
+    #[tokio::test]
+    async fn a_running_worker_adopts_a_settings_save_at_its_next_turn() {
+        use yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding;
+        use yi_agent_runtime::live_settings::sources::FrozenRuntimeSources;
+        use yi_agent_runtime::settings::store::PatchMode;
+
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"agent": {"system_prompt": "BEFORE_SAVE"}}"#,
+        )
+        .unwrap();
+
+        let live = yi_agent_runtime::live_settings::LiveSettings::shared(settings_path);
+        let binding = RuntimeSettingsBinding {
+            live: Arc::clone(&live),
+            sources: Arc::new(FrozenRuntimeSources::default()),
+        };
+
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(LoopingProvider::default());
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(GateTool {
+            released: Arc::clone(&released),
+        }));
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(tools),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf())
+        .with_live_settings(watcher_test_config(directory.path()), binding.clone());
+
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("Keep going.")
+            .with_workspace(worker_workspace(directory.path()))
+            .with_workspace_mode(ChildWriteMode::ReadOnly);
+        let handle = factory.start(request).await.unwrap();
+
+        wait_until(
+            || !provider.requests.lock().unwrap().is_empty(),
+            "the worker to issue its first request",
+        )
+        .await;
+        let first_system = provider.requests.lock().unwrap()[0]
+            .system
+            .clone()
+            .expect("the first request must carry a system prompt");
+        assert!(
+            first_system.contains("BEFORE_SAVE"),
+            "the first turn must render the pre-save prompt: {first_system:?}"
+        );
+
+        live.commit(
+            &serde_json::json!({"agent.system_prompt": "AFTER_SAVE"}),
+            PatchMode::ReplaceProvided,
+        )
+        .expect("commit");
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        wait_until(
+            || provider.requests.lock().unwrap().len() >= 2,
+            "the worker to issue a second request after the save",
+        )
+        .await;
+        let second_system = provider.requests.lock().unwrap()[1]
+            .system
+            .clone()
+            .expect("the second request must carry a system prompt");
+        assert!(
+            second_system.contains("AFTER_SAVE"),
+            "a running worker must adopt the save on its next turn: {second_system:?}"
+        );
+        assert!(
+            !second_system.contains("BEFORE_SAVE"),
+            "the old prompt segment must be gone, not appended: {second_system:?}"
+        );
+
+        handle.cancel();
     }
 
     #[tokio::test]

@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use yi_agent_core::ApiStyle;
 
+use crate::live_settings::sources::{EffectiveRuntimeSettings, FrozenRuntimeSources, ValueSource};
+
 /// 模型键清单：只认「真实进程环境 + CLI 覆盖」这一条整包注入路径。
 pub const MODEL_ENV_KEYS: &[&str] = &[
     "YI_AGENT_PROVIDER",
@@ -157,16 +159,14 @@ pub struct ConfigOverrides {
     pub skills_catalog_budget: Option<usize>,
 }
 
-fn env_u16(name: &str) -> Option<u16> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-}
-
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
+/// 从一次 `resolve` 里取一个数字字段。`resolve` 保证每个 FIELDS 键都存在；
+/// 这里返回 0 只是不可能发生的形状错误，不做第二套默认。
+fn resolved_u64(resolved: &EffectiveRuntimeSettings, key: &str) -> u64 {
+    resolved
+        .values
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
 }
 
 /// 解析 `YI_AGENT_SANDBOX` 的值。
@@ -242,15 +242,50 @@ impl RuntimeConfig {
     /// 缺 key 时返回空串而不是报错，理由不变：桌面侧车在新机器上必须能起来才能
     /// 提供引导 RPC，CLI 要靠 `unconfigured_guidance` 给出中文指引。
     pub fn load_lenient(overrides: &ConfigOverrides) -> Result<Self> {
-        Self::load_inner(overrides)
+        Self::load_with_sources(overrides, crate::settings::settings_path())
+            .map(|(config, _, _)| config)
     }
 
-    fn load_inner(overrides: &ConfigOverrides) -> Result<Self> {
+    /// 与 [`RuntimeConfig::load_lenient`] 同一份装配，但额外交出本进程的
+    /// [`RuntimeSettingsBinding`]（共享设置源 + 初始装配冻结的来源表）。
+    ///
+    /// `settings_path` 必须是稳定的绝对路径：调用方一旦装配完就不再随 cwd/env
+    /// 变化。测试可以指向不同的临时路径，因此不同实例绝对隔离。
+    ///
+    /// 顺序固定：先 capture 真实来源，再有界取设置快照，最后做模型 / 其他装配。
+    /// 快照只走 `LiveSettings` 的有界读取；本入口与 `load_lenient` 都不再调用
+    /// 无界的 `settings::load_from`。
+    pub fn load_lenient_with_binding(
+        overrides: &ConfigOverrides,
+        settings_path: &std::path::Path,
+    ) -> Result<(Self, crate::live_settings::binding::RuntimeSettingsBinding)> {
+        let (config, sources, live) =
+            Self::load_with_sources(overrides, settings_path.to_path_buf())?;
+        let binding = crate::live_settings::binding::RuntimeSettingsBinding { live, sources };
+        Ok((config, binding))
+    }
+
+    /// 唯一的初始装配入口：`load_lenient` 与 `load_lenient_with_binding` 共用。
+    fn load_with_sources(
+        overrides: &ConfigOverrides,
+        settings_path: PathBuf,
+    ) -> Result<(
+        Self,
+        std::sync::Arc<FrozenRuntimeSources>,
+        std::sync::Arc<crate::live_settings::LiveSettings>,
+    )> {
         // 快照必须早于任何环境注入（见 `ModelEnvSnapshot` 的文档）。
         let model_env = ModelEnvSnapshot::take();
-        // `settings.json` 是第三层（覆盖 > 真实 env > settings.json > 默认）。
-        // 坏文件已在 `load_from` 里降级成全 `None`，故这里不必再处理错误。
-        let settings = crate::settings::load();
+        // 固定来源必须在合并任何 settings **之前**抽取：初次合并的结果不是来源。
+        // `capture` 内部已 `validate`（拒绝模型/凭据键与伪固定来源）。
+        let sources = std::sync::Arc::new(FrozenRuntimeSources::capture(overrides)?);
+        // 第三层：有界读取 settings.json 快照；缺文件是健康默认，坏文件是明确
+        // 的启动期回退，都不阻断启动。
+        let live = crate::live_settings::LiveSettings::shared(settings_path);
+        let snapshot = live.refresh();
+        let settings = snapshot.settings.clone();
+        // 与 `resolve` 共用同一套逐字段解析：这里不再各抄一份优先级。
+        let resolved = sources.resolve(&settings);
 
         let injected_provider = overrides
             .provider
@@ -301,32 +336,17 @@ impl RuntimeConfig {
         // 「模型只在 models.json」的机器在启动路径上直接失败。
         let api_key = injected_key.unwrap_or_default();
 
-        let max_turns = overrides
-            .max_turns
-            .or_else(|| {
-                std::env::var("YI_AGENT_MAX_TURNS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-            })
-            .or(settings.agent.max_turns)
-            .unwrap_or(MAX_TURNS_DEFAULT);
-
-        let max_resident_subagents = env_u16("YI_AGENT_MAX_RESIDENT_SUBAGENTS")
-            .or(settings.agent.max_resident_subagents)
-            .unwrap_or(RESIDENT_SUBAGENTS_DEFAULT);
-
-        let max_direct_children = env_u16("YI_AGENT_MAX_DIRECT_CHILDREN")
-            .or(settings.agent.max_direct_children)
-            .unwrap_or(DIRECT_CHILDREN_DEFAULT);
+        let max_turns = resolved_u64(&resolved, "agent.max_turns") as u32;
+        let max_resident_subagents = resolved_u64(&resolved, "agent.max_resident_subagents") as u16;
+        let max_direct_children = resolved_u64(&resolved, "agent.max_direct_children") as u16;
 
         let workdir = resolve_workdir(overrides)?;
 
-        let system_prompt = overrides
-            .system_prompt
-            .clone()
-            .or_else(|| std::env::var("YI_AGENT_SYSTEM_PROMPT").ok())
-            .or_else(|| settings.agent.system_prompt.clone())
-            .filter(|s| !s.is_empty());
+        let system_prompt = resolved
+            .values
+            .get("agent.system_prompt")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
 
         let model_context_length = overrides.model_context_length.or_else(|| {
             model_env
@@ -334,16 +354,7 @@ impl RuntimeConfig {
                 .and_then(|s| s.parse().ok())
         });
 
-        let compact_ratio = overrides
-            .compact_ratio
-            .or_else(|| {
-                std::env::var("YI_AGENT_COMPACT_RATIO")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-            })
-            .or(settings.compact.ratio)
-            .unwrap_or(COMPACT_RATIO_DEFAULT);
-
+        let compact_ratio = resolved_u64(&resolved, "compact.ratio") as u32;
         let effective_context_length = model_context_length.unwrap_or(200_000);
         let compact_threshold = effective_context_length * compact_ratio / 100;
 
@@ -357,19 +368,14 @@ impl RuntimeConfig {
             );
         }
 
-        let compact_user_budget_tokens = overrides
-            .compact_user_budget_tokens
-            .or_else(|| env_usize("YI_AGENT_COMPACT_USER_BUDGET_TOKENS"))
-            .or(settings.compact.user_budget_tokens)
-            .unwrap_or(COMPACT_USER_BUDGET_DEFAULT);
+        let compact_user_budget_tokens =
+            resolved_u64(&resolved, "compact.user_budget_tokens") as usize;
+        // 预算为零的既有报错保留：它与「来源是哪一层」无关。
         if compact_user_budget_tokens == 0 {
             bail!("compact user budget tokens must be greater than zero");
         }
-        let compact_tool_budget_tokens = overrides
-            .compact_tool_budget_tokens
-            .or_else(|| env_usize("YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS"))
-            .or(settings.compact.tool_budget_tokens)
-            .unwrap_or(COMPACT_TOOL_BUDGET_DEFAULT);
+        let compact_tool_budget_tokens =
+            resolved_u64(&resolved, "compact.tool_budget_tokens") as usize;
 
         let yolo = overrides.yolo
             || overrides.skip_permissions
@@ -377,100 +383,113 @@ impl RuntimeConfig {
                 .map(|v| v == "true")
                 .unwrap_or(false);
 
-        let env_sandbox = std::env::var("YI_AGENT_SANDBOX").ok();
-        // settings.json 的沙箱与 env 的沙箱都不算「显式指定启动姿态」：不阻断
-        // 运行期提权。只有 CLI flag 与真实 env 才把它钉死为不可提权。
-        let settings_sandbox = settings
-            .startup
-            .sandbox
-            .as_deref()
-            .and_then(parse_sandbox_mode);
-        // 显式 / env 指定的沙箱永不被提权。同时 `promotable` 只在「启动时非 yolo」时
-        // 才有意义(桌面端运行期切换场景):若启动时 yolo 已打开(CLI `--yolo`、
-        // `--dangerously-skip-permissions` 或 `YI_AGENT_YOLO`),`sandbox` 已经反映了
-        // 今天的行为,运行期不应再提权。`overrides.yolo` 蕴含 `yolo == true`,故首臂
-        // 的 `!yolo` 恒为 false;两臂统一写 `!yolo` 以免日后漂移。
-        let (sandbox, sandbox_promotable) = match overrides.sandbox {
-            Some(mode) => (mode, false),
-            None => match env_sandbox {
-                Some(value) => (
-                    parse_sandbox_mode(&value).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "invalid YI_AGENT_SANDBOX: expected read-only, workspace-write, or danger-full-access"
-                        )
-                    })?,
-                    false,
-                ),
-                None if overrides.yolo => (yi_agent_tools::SandboxMode::DangerFullAccess, !yolo),
-                None => (settings_sandbox.unwrap_or_default(), !yolo),
-            },
+        // 只有 override / 真实 env 算「显式指定启动姿态」，永不被运行期提权。
+        // settings.json 的沙箱是长住偏好，仍可提权（`promotable`）。
+        let sandbox_source = resolved
+            .sources
+            .get("startup.sandbox")
+            .copied()
+            .unwrap_or(ValueSource::Default);
+        let explicit_sandbox = matches!(
+            sandbox_source,
+            ValueSource::Override | ValueSource::Environment
+        );
+        let resolved_sandbox = resolved
+            .values
+            .get("startup.sandbox")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_sandbox_mode)
+            .unwrap_or_default();
+        // `promotable` 只在「启动时非 yolo」时才有意义(桌面端运行期切换场景):
+        // 若启动时 yolo 已打开(CLI `--yolo`、`--dangerously-skip-permissions` 或
+        // `YI_AGENT_YOLO`),`sandbox` 已经反映了今天的行为,运行期不应再提权。
+        let (sandbox, sandbox_promotable) = if explicit_sandbox {
+            (resolved_sandbox, false)
+        } else if overrides.yolo {
+            // 无显式沙箱且 CLI 要求 yolo：与旧行为一致地直接给全权。
+            (yi_agent_tools::SandboxMode::DangerFullAccess, !yolo)
+        } else {
+            (resolved_sandbox, !yolo)
         };
 
         let sandbox_writable_roots = overrides.sandbox_writable_roots.clone();
 
+        // settings.json 里的预算不算「显式指定」：只有 CLI / 真实 env 才算。
+        // 判据是「**提供了**这个来源」，与数字能否解析无关：旧实现里
+        // `YI_AGENT_SKILLS_CATALOG_BUDGET=abc` 仍算显式（值回落默认，但不再静默
+        // 截断）。技能目录超预算时仍应询问（交互终端下）。
         let skills_catalog_budget_explicit = overrides.skills_catalog_budget.is_some()
             || std::env::var("YI_AGENT_SKILLS_CATALOG_BUDGET")
                 .ok()
-                .filter(|s| !s.is_empty())
-                .is_some();
-        let skills_catalog_budget = overrides
-            .skills_catalog_budget
-            .or_else(|| {
-                std::env::var("YI_AGENT_SKILLS_CATALOG_BUDGET")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-            })
-            .or(settings.agent.skills_catalog_budget)
-            .unwrap_or(SKILLS_CATALOG_BUDGET_DEFAULT);
+                .is_some_and(|value| !value.is_empty());
+        let skills_catalog_budget = resolved_u64(&resolved, "agent.skills_catalog_budget") as usize;
 
         // 存储侧是字符串（见 settings.rs 的 TuiSettings 说明），这里解析成
-        // bool；空串与非法值已在 `normalized` 里清成 None，故只需处理默认。
-        let notifications = !matches!(settings.tui.notifications.as_deref(), Some("false"));
-        let notification_method = settings
-            .tui
-            .notification_method
-            .clone()
-            .unwrap_or_else(|| "auto".to_string());
-        let notification_condition = settings
-            .tui
-            .notification_condition
-            .clone()
-            .unwrap_or_else(|| "unfocused".to_string());
+        // bool；空串与非法值已在归一化里清成 None，故只需处理默认。
+        let notifications = !matches!(
+            resolved
+                .values
+                .get("tui.notifications")
+                .and_then(serde_json::Value::as_str),
+            Some("false")
+        );
+        let notification_method = resolved
+            .values
+            .get("tui.notification_method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("auto")
+            .to_string();
+        let notification_condition = resolved
+            .values
+            .get("tui.notification_condition")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unfocused")
+            .to_string();
         // 与 `notifications` 同理：存储侧是字符串，这里解析成 bool。
         // 用 `!matches!(.., Some("false"))` 而不是 `== Some("true")`：
         // 后者会让「键缺失」（最常见情况）得到 false，把默认的 true 变成
         // false。
-        let terminal_title = !matches!(settings.tui.terminal_title.as_deref(), Some("false"));
+        let terminal_title = !matches!(
+            resolved
+                .values
+                .get("tui.terminal_title")
+                .and_then(serde_json::Value::as_str),
+            Some("false")
+        );
 
-        Ok(RuntimeConfig {
-            provider,
-            api_url,
-            api_key,
-            model,
-            api_style: RuntimeConfig::default_api_style(),
-            reasoning_effort: None,
-            max_turns,
-            max_resident_subagents,
-            max_direct_children,
-            workdir,
-            system_prompt,
-            compact_threshold,
-            compact_ratio,
-            model_context_length,
-            compact_user_budget_tokens,
-            compact_tool_budget_tokens,
-            yolo,
-            sandbox_promotable,
-            sandbox,
-            sandbox_writable_roots,
-            skills_catalog_budget,
-            skills_catalog_budget_explicit,
-            model_injected,
-            notifications,
-            notification_method,
-            notification_condition,
-            terminal_title,
-        })
+        Ok((
+            RuntimeConfig {
+                provider,
+                api_url,
+                api_key,
+                model,
+                api_style: RuntimeConfig::default_api_style(),
+                reasoning_effort: None,
+                max_turns,
+                max_resident_subagents,
+                max_direct_children,
+                workdir,
+                system_prompt,
+                compact_threshold,
+                compact_ratio,
+                model_context_length,
+                compact_user_budget_tokens,
+                compact_tool_budget_tokens,
+                yolo,
+                sandbox_promotable,
+                sandbox,
+                sandbox_writable_roots,
+                skills_catalog_budget,
+                skills_catalog_budget_explicit,
+                model_injected,
+                notifications,
+                notification_method,
+                notification_condition,
+                terminal_title,
+            },
+            sources,
+            live,
+        ))
     }
 
     /// 返回给 GUI 的安全配置视图:api_key 脱敏,其余字段原样。
@@ -559,6 +578,12 @@ pub(crate) fn sample_config() -> RuntimeConfig {
     }
 }
 
+/// 测试支持：进程环境变量是全局状态，凡会 `set_var` 的测试都必须共用这一把锁。
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,7 +595,10 @@ mod tests {
     ///
     /// `cargo nextest` 下每个测试独立进程，环境变量天然不共享，这把锁退化为
     /// 无害的空操作；`cargo test` 下它仍是必需的。两种运行器都必须保留。
-    static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ///
+    /// 它与 `live_settings::sources` 的 env 测试共用同一把（定义见
+    /// [`super::test_support`]），否则两个模块各锁各的等于没锁。
+    use super::test_support::ENV_TEST_MUTEX;
 
     struct EnvVarGuard {
         original: BTreeMap<&'static str, Option<OsString>>,
@@ -686,6 +714,196 @@ mod tests {
         fn drop(&mut self) {
             std::env::set_current_dir(&self.0).expect("restore current directory");
         }
+    }
+
+    /// `load_lenient_with_binding`：同一份装配、显式路径、冻结来源只含固定层。
+    #[test]
+    fn with_binding_captures_only_fixed_sources_and_shares_one_live_source() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{"agent":{"max_turns":321,"max_direct_children":9}}"#);
+        let mut env = isolated_config_env();
+        env.set("YI_AGENT_HOME", instance.dir.path().join(".yi-agent"));
+        env.set("YI_AGENT_MAX_TURNS", "654");
+        let settings_path = instance.dir.path().join(".yi-agent/settings.json");
+
+        let overrides = ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            max_turns: Some(999),
+            ..Default::default()
+        };
+        let (config, binding) =
+            RuntimeConfig::load_lenient_with_binding(&overrides, &settings_path).unwrap();
+
+        assert_eq!(config.max_turns, 999);
+        assert_eq!(config.max_direct_children, 9);
+        assert_eq!(
+            binding.sources.frozen("agent.max_turns").map(|f| f.source),
+            Some(ValueSource::Override),
+            "an explicit CLI override is frozen"
+        );
+        assert!(
+            binding
+                .sources
+                .frozen("agent.max_direct_children")
+                .is_none(),
+            "a value that only came from settings.json must never be frozen as an override"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &binding.live,
+                &crate::live_settings::LiveSettings::shared(settings_path)
+            ),
+            "the binding must hand out the process-wide shared source"
+        );
+
+        // `load_lenient` 与绑定入口使用同一份装配：同一环境、同一文件必须同结果。
+        let plain = RuntimeConfig::load_lenient(&overrides).unwrap();
+        assert_eq!(plain.max_turns, config.max_turns);
+        assert_eq!(plain.max_direct_children, config.max_direct_children);
+        assert_eq!(plain.sandbox, config.sandbox);
+        assert_eq!(plain.sandbox_promotable, config.sandbox_promotable);
+        assert_eq!(plain.notifications, config.notifications);
+        assert_eq!(plain.terminal_title, config.terminal_title);
+    }
+
+    /// 「显式预算」判据是**来源存在**，不是数字能否解析。
+    ///
+    /// 旧实现里 `YI_AGENT_SKILLS_CATALOG_BUDGET=not-a-number` 仍把
+    /// `skills_catalog_budget_explicit` 置真（值回落默认，但不会静默截断）；
+    /// 若改判为「解析成功才算」，交互终端会从「询问」悄悄变成「静默截断」。
+    #[test]
+    fn an_unparsable_budget_env_still_counts_as_explicit() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 实例先在隔离环境里建好，再设 env：后建的 guard 会清掉这类键。
+        let instance = IsolatedInstance::new();
+        let mut env = isolated_config_env();
+        env.set("YI_AGENT_HOME", instance.dir.path().join(".yi-agent"));
+        env.set("YI_AGENT_SKILLS_CATALOG_BUDGET", "not-a-number");
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(cfg.skills_catalog_budget, SKILLS_CATALOG_BUDGET_DEFAULT);
+        assert!(
+            cfg.skills_catalog_budget_explicit,
+            "an env var that was provided is explicit even if unparsable"
+        );
+    }
+
+    /// 绑定入口走有界读取，绝不转调无界的 `load_from`。
+    #[test]
+    fn with_binding_never_calls_the_unbounded_loader() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{"agent":{"max_turns":42}}"#);
+        let settings_path = instance.dir.path().join(".yi-agent/settings.json");
+
+        crate::settings::reset_load_from_calls();
+        let (config, _binding) = RuntimeConfig::load_lenient_with_binding(
+            &ConfigOverrides {
+                workdir: Some(instance.dir.path().to_path_buf()),
+                ..Default::default()
+            },
+            &settings_path,
+        )
+        .unwrap();
+
+        assert_eq!(crate::settings::load_from_calls(), 0);
+        assert_eq!(config.max_turns, 42);
+    }
+
+    /// 显式路径：同一台机器上两个不同实例文件互不影响。
+    #[test]
+    fn with_binding_is_isolated_by_the_explicit_absolute_path() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
+        let first = tempfile::TempDir::new().unwrap();
+        let second = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            first.path().join("settings.json"),
+            r#"{"compact":{"ratio":40}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            second.path().join("settings.json"),
+            r#"{"compact":{"ratio":60}}"#,
+        )
+        .unwrap();
+
+        let (a, _) = RuntimeConfig::load_lenient_with_binding(
+            &ConfigOverrides {
+                workdir: Some(first.path().to_path_buf()),
+                ..Default::default()
+            },
+            &first.path().join("settings.json"),
+        )
+        .unwrap();
+        let (b, _) = RuntimeConfig::load_lenient_with_binding(
+            &ConfigOverrides {
+                workdir: Some(second.path().to_path_buf()),
+                ..Default::default()
+            },
+            &second.path().join("settings.json"),
+        )
+        .unwrap();
+
+        assert_eq!(a.compact_ratio, 40);
+        assert_eq!(b.compact_ratio, 60);
+        assert_ne!(a.compact_threshold, b.compact_threshold);
+    }
+
+    /// 保存后的值在不重启的情况下被「下一次读取」看见（同一绑定）。
+    ///
+    /// 这是 Task 3 能提供的部分：绑定 + 共享源 + gate 内发布。真正把新值交给
+    /// 运行中的会话是后续任务的事。
+    #[test]
+    fn a_commit_on_the_binding_is_visible_to_the_next_snapshot() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
+        let instance = IsolatedInstance::new();
+        let settings_path = instance.dir.path().join(".yi-agent/settings.json");
+
+        let (_, binding) = RuntimeConfig::load_lenient_with_binding(
+            &ConfigOverrides {
+                workdir: Some(instance.dir.path().to_path_buf()),
+                ..Default::default()
+            },
+            &settings_path,
+        )
+        .unwrap();
+        assert_eq!(
+            binding.live.refresh().settings.compact.ratio,
+            None,
+            "no file yet: healthy defaults"
+        );
+
+        binding
+            .live
+            .commit(
+                &serde_json::json!({"compact.ratio": 55}),
+                crate::settings::store::PatchMode::ReplaceProvided,
+            )
+            .unwrap();
+
+        let snapshot = binding.live.refresh();
+        assert_eq!(snapshot.settings.compact.ratio, Some(55));
+        let effective = binding.sources.resolve(&snapshot.settings);
+        assert_eq!(effective.values["compact.ratio"], serde_json::json!(55));
     }
 
     /// 测试用覆盖项:只设置 API key 和 workdir,其余走默认值。

@@ -169,6 +169,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -791,6 +792,177 @@ async fn thread_compact_reports_failure_without_breaking_the_connection() {
 /// YoloSwitch` 的映射由 `bootstrap.rs::interactive_yolo_config_starts_switch_on`
 /// 钉死;此处只钉死「app-server 侧 resume 读了持久化模式并透传」这一契约
 /// (server 内存中的 switch 不可从外部观测,故用记录型工厂观察传参)。
+/// A conversation recorded as read-only must stay read-only, even when the
+/// process default has since been widened.
+///
+/// This is the whole point of the baseline record: startup settings configure
+/// *new* conversations, so changing them must not retroactively re-open a
+/// conversation the user started in a narrow sandbox.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_keeps_a_recorded_baseline_instead_of_todays_default() {
+    use crate::thread_store::ThreadStore;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    // Today's default is the widest; only the recorded baseline may decide.
+    cfg.sandbox = yi_agent_tools::SandboxMode::DangerFullAccess;
+    cfg.sandbox_promotable = true;
+
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    // Rewrite the persisted baseline as if it had been created read-only.
+    let store = ThreadStore::new(dir.path());
+    store
+        .set_sandbox_baseline(
+            &tid,
+            crate::session_sandbox::SandboxBaseline::new("read-only", false).unwrap(),
+        )
+        .unwrap()
+        .then_some(())
+        .expect("the meta must exist after thread/start");
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let mut resumed = false;
+    for _ in 0..8 {
+        let v = h.read_value().await;
+        if v.get("id") == Some(&serde_json::json!(4)) {
+            assert_eq!(v["result"]["thread_id"], tid);
+            resumed = true;
+            break;
+        }
+    }
+    assert!(resumed, "thread/resume must respond");
+
+    let after = store
+        .read_meta_for_activation(&tid)
+        .unwrap()
+        .expect("meta still exists");
+    let baseline = after.sandbox_baseline.expect("the baseline must survive");
+    assert_eq!(
+        baseline.mode,
+        yi_agent_tools::SandboxMode::ReadOnly,
+        "resume must not replace the record with today's default"
+    );
+    assert!(!baseline.promotable, "read-only is never promotable");
+    h.shutdown().await;
+}
+
+/// A pre-baseline conversation with real history has no record of what its
+/// tools ran under, so resume must not assume today's (possibly wider) default.
+/// It falls back to read-only and writes that decision down, so the question is
+/// asked once rather than on every open.
+#[tokio::test(flavor = "multi_thread")]
+async fn resuming_legacy_history_without_a_baseline_falls_back_to_read_only() {
+    use crate::thread_store::ThreadStore;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    cfg.sandbox = yi_agent_tools::SandboxMode::DangerFullAccess;
+    cfg.sandbox_promotable = true;
+
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    // One real turn, then strip the baseline: this is exactly the shape of a
+    // meta written before the field existed.
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"first"}}]}}}}"#
+    ))
+    .await;
+    loop {
+        let v = h.read_value().await;
+        if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+            break;
+        }
+    }
+
+    let store = ThreadStore::new(dir.path());
+    let meta_path = store.meta_path(&tid);
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    raw.as_object_mut().unwrap().remove("sandbox_baseline");
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+    assert_eq!(
+        store
+            .read_meta_for_activation(&tid)
+            .unwrap()
+            .unwrap()
+            .sandbox_baseline,
+        None,
+        "the setup must really remove the field"
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let mut resumed = false;
+    for _ in 0..8 {
+        let v = h.read_value().await;
+        if v.get("id") == Some(&serde_json::json!(4)) {
+            resumed = true;
+            break;
+        }
+    }
+    assert!(resumed, "thread/resume must respond");
+
+    let baseline = store
+        .read_meta_for_activation(&tid)
+        .unwrap()
+        .unwrap()
+        .sandbox_baseline
+        .expect("the conservative floor must be persisted");
+    assert_eq!(baseline.mode, yi_agent_tools::SandboxMode::ReadOnly);
+    assert!(!baseline.promotable);
+    h.shutdown().await;
+}
+
+/// A corrupt baseline is not "old history": it is a claim the server cannot
+/// honor, and opening it to run tools would mean guessing the sandbox.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_refuses_a_corrupt_baseline() {
+    use crate::thread_store::ThreadStore;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    let store = ThreadStore::new(dir.path());
+    let meta_path = store.meta_path(&tid);
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    raw["sandbox_baseline"] = serde_json::json!({"mode": "god-mode", "promotable": true});
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let mut answered = None;
+    for _ in 0..8 {
+        let v = h.read_value().await;
+        if v.get("id") == Some(&serde_json::json!(4)) {
+            answered = Some(v);
+            break;
+        }
+    }
+    let v = answered.expect("thread/resume must answer even when it refuses");
+    assert!(
+        v.get("error").is_some(),
+        "a corrupt baseline must be refused, not guessed: {v}"
+    );
+    h.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn resume_passes_persisted_mode_to_factory() {
     use crate::thread_store::{ThreadMode, ThreadStore};
@@ -2014,6 +2186,7 @@ async fn kanban_observation_plain_rpc_resume_is_discovered() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
             extra_roots: Vec::new(),
             role: None,
             plugin_bindings: Vec::new(),
@@ -2153,5 +2326,151 @@ async fn kanban_observation_plain_rpc_resume_is_discovered() {
     // 之后 `FakeDaemon::drop` 的「连接一下把自己唤醒」就落到不存在的路径上,
     // `join()` 会永远等一个还在 `accept()` 的线程。
     drop(daemon);
+    h.shutdown().await;
+}
+
+/// `thread/compact` 必须走带活设置的手动压缩入口，而不是只调 core 的静态封装。
+///
+/// 用真实 `apply_session_command` 链路：agent 绑定一个"预算极紧"的 source 和一个
+/// 计数 gate，压一条很长的历史。若宿主仍调静态入口，(1) source 不会被咨询，
+/// (2) gate 上不会出现独立 lease。两条断言分别钉住这两点。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_compact_uses_the_live_entry_point() {
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use yi_agent_core::live_settings::{LiveAgentSnapshot, LiveSettingsError};
+
+    struct CountingSource {
+        calls: StdArc<AtomicUsize>,
+    }
+    impl yi_agent_core::AgentSettingsSource for CountingSource {
+        fn snapshot(&self) -> Result<LiveAgentSnapshot, LiveSettingsError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LiveAgentSnapshot {
+                revision: "rev-1".into(),
+                max_turns: None,
+                compact_threshold: Some(1),
+                // Tight budget: only the most recent short user message is kept,
+                // so a static-default compaction would retain more history.
+                compact_user_budget_tokens: 8,
+                compact_tool_budget_tokens: 1,
+                system_prompt: Some("live prompt".into()),
+            })
+        }
+    }
+
+    struct CountingGate {
+        leases: StdArc<AtomicUsize>,
+        acquisitions: StdArc<AtomicUsize>,
+    }
+    impl yi_agent_core::ProviderTurnGate for CountingGate {
+        fn acquire(
+            &self,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<Box<dyn yi_agent_core::ProviderTurnLease>, String>,
+        > {
+            self.acquisitions.fetch_add(1, Ordering::SeqCst);
+            let leases = StdArc::clone(&self.leases);
+            leases.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(Box::new(Lease(leases)) as Box<dyn yi_agent_core::ProviderTurnLease>)
+            })
+        }
+    }
+    struct Lease(StdArc<AtomicUsize>);
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    let calls = StdArc::new(AtomicUsize::new(0));
+    let leases = StdArc::new(AtomicUsize::new(0));
+    let acquisitions = StdArc::new(AtomicUsize::new(0));
+    let gate_leases = StdArc::clone(&leases);
+    let factory_calls = StdArc::clone(&calls);
+    let factory_gate = StdArc::clone(&gate_leases);
+    let factory_acquisitions = StdArc::clone(&acquisitions);
+    let factory = move |session: Option<yi_agent_core::Session>,
+                        _cwd: &std::path::Path,
+                        _mode: crate::thread_store::ThreadMode|
+          -> anyhow::Result<BuiltAgent> {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let session = session.unwrap_or_else(|| {
+            let mut s = yi_agent_core::Session::new();
+            // One long user message plus a short recent one: the tight live
+            // budget keeps only the short one.
+            s.replace_messages(vec![
+                yi_agent_core::Message::user("long ".repeat(300)),
+                yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                    "ok".into(),
+                )]),
+                yi_agent_core::Message::user("short"),
+                yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                    "ok2".into(),
+                )]),
+            ]);
+            s
+        });
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        )
+        .with_session(session)
+        .with_provider_turn_gate(StdArc::new(CountingGate {
+            leases: StdArc::clone(&factory_gate),
+            acquisitions: StdArc::clone(&factory_acquisitions),
+        }));
+        agent.set_live_settings(StdArc::new(CountingSource {
+            calls: StdArc::clone(&factory_calls),
+        }));
+        Ok(BuiltAgent {
+            agent,
+            provider,
+            config,
+            decision_tx: None,
+            decision_rx: None,
+            catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
+            sandbox: yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                true,
+            ),
+        })
+    };
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let before = calls.load(Ordering::SeqCst);
+    let v = compact_thread(&mut h, &tid).await;
+    assert_eq!(
+        v["result"]["status"], "compacted",
+        "the tight live budget must still compact: {v}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > before,
+        "thread/compact must consult the bound live settings source: a start-up \
+         rebuild (delegation/theme wiring) must not drop the binding"
+    );
+    assert_eq!(
+        acquisitions.load(Ordering::SeqCst),
+        1,
+        "a manual compaction must take exactly one independent lease"
+    );
+    assert_eq!(
+        leases.load(Ordering::SeqCst),
+        0,
+        "the manual compaction lease must be released when it returns"
+    );
     h.shutdown().await;
 }

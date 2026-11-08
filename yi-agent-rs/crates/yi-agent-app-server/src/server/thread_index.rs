@@ -101,11 +101,32 @@ pub(crate) fn attach_delegation(
     lead_agent_enabled: Option<bool>,
     // 调用方额外注入给本会话 shell 的环境变量（见 `build_runtime_tooling`）。
     extra_session_env: Vec<(String, String)>,
+    // 进程级运行期设置绑定。只有本进程自己起的 daemon 用得上（见
+    // `attach_cwd_runtime`）；`None` 与历史行为逐字一致。
+    live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+    // The sandbox this conversation runs under. Passed in, never read from `cfg`
+    // here: `cfg.sandbox` is today's default for *new* conversations, and using
+    // it while re-opening an old one is the retroactive widening this whole
+    // module is about. Callers resolve it from the conversation's own record.
+    sandbox_baseline: Option<crate::session_sandbox::SandboxBaseline>,
     built: BuiltAgent,
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
     thread_cfg.workdir = PathBuf::from(cwd);
-    let binding = match attach_cwd_runtime(runtimes, runtime_dir, &thread_cfg, models_path) {
+    // Overwrite the per-call copy only. `cfg` is the process-wide default shared
+    // by every conversation, so writing this conversation's baseline into it
+    // would leak one conversation's sandbox into the next one built.
+    if let Some(baseline) = sandbox_baseline {
+        thread_cfg.sandbox = baseline.mode;
+        thread_cfg.sandbox_promotable = baseline.promotable;
+    }
+    let binding = match attach_cwd_runtime(
+        runtimes,
+        runtime_dir,
+        &thread_cfg,
+        models_path,
+        live_settings,
+    ) {
         Ok(binding) => binding,
         Err(cause) => {
             tracing::warn!(

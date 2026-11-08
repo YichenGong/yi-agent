@@ -697,6 +697,19 @@ pub enum Notification {
     /// 只由 `ThemeHandle` 的广播触发；客户端收到即把 `data-theme` 换成新值。
     #[serde(rename = "ui/settings/updated")]
     UiSettingsUpdated { theme: String },
+    /// 运行期设置已提交（本宿主或观察到的其他进程），供客户端失效重读。
+    ///
+    /// **全局**帧：设置是宿主级，与任何 thread 无关。`changed_keys` 为空时表示
+    /// 「状态可能变了但没有逻辑设置改变」——健康状态的翻转正是这样通知的，
+    /// 客户端据此重新 read 并读取 `health`，而不是从本帧推断健康值。
+    ///
+    /// 刻意不带任何设置取值：提示词等字段属于用户内容，通知会进日志与转发通道。
+    /// `revision` 只用于同版本去重，客户端**不得**把它的大小当作跨进程提交顺序。
+    #[serde(rename = "settings/changed")]
+    SettingsChanged {
+        revision: String,
+        changed_keys: Vec<String>,
+    },
     /// 颜色标签的显示名（颜色 id → 名称）已变。
     ///
     /// **全局**帧：标签名是对所有会话生效的宿主级偏好，与任何 thread 上下文无关。
@@ -772,6 +785,7 @@ impl Notification {
             Notification::UiGitDiffFocus { thread_id, .. } => thread_id.as_deref(),
             Notification::ToolCallApprovalResolved { .. }
             | Notification::UiSettingsUpdated { .. }
+            | Notification::SettingsChanged { .. }
             | Notification::TagNamesUpdated { .. }
             | Notification::ModelCapabilitiesChanged { .. }
             | Notification::GroupsChanged { .. }
@@ -813,6 +827,7 @@ impl Notification {
             | Notification::ReadStateChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
+            | Notification::SettingsChanged { .. }
             | Notification::TagNamesUpdated { .. }
             | Notification::ModelCapabilitiesChanged { .. }
             | Notification::Error { .. }

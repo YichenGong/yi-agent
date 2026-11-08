@@ -1209,6 +1209,8 @@ async fn trace_unwatch_rpc_preserves_children_watch() {
                 side_replay: &side_replay,
                 remote_dir: &projects,
                 relay_url: None,
+                // 静态装配：这些用例不观察热更新。
+                live_settings: None,
             };
             crate::rpc::agent::handle(&mut state, &req, req.id.clone())
                 .await

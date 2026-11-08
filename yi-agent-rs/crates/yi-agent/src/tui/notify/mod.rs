@@ -165,31 +165,58 @@ enum Backend {
 }
 
 /// 通知器。持有后端与条件，`notify` 失败后自禁。
+///
+/// 终端环境事实（`auto` 解析结果、是否在多路复用器内）在构造时定死：那是
+/// 进程所在终端决定的，热更新改不了它。可变的只有三个配置值，见
+/// [`Notifier::configure`]。
 pub struct Notifier {
+    /// 配置里的协议值，`Auto` 保持原样（它的解析结果取决于终端）。
+    requested: Method,
+    /// 终端是否支持 OSC 9。构造时探测一次。
+    osc9_supported: bool,
+    /// 是否在多路复用器内（OSC 9 需要 DCS 透传）。构造时探测一次。
+    multiplexed: bool,
     /// `None` 表示已失效（写失败一次后不再尝试）。
     backend: Option<Backend>,
     condition: Condition,
+    /// 写过一次失败，本会话自禁。粘性：改设置不该让程序再赌一次。
+    failed: bool,
 }
 
 impl Notifier {
     pub fn new(method: Method, condition: Condition, env: &TerminalEnv) -> Self {
-        let resolved = match method {
-            Method::Auto => {
-                if detect_osc9_supported(env) {
-                    Method::Osc9
-                } else {
-                    Method::Bel
-                }
-            }
-            other => other,
-        };
-        let backend = match resolved {
-            Method::Osc9 | Method::Auto => Backend::Osc9(Osc9Backend::new(is_multiplexed(env))),
-            Method::Bel => Backend::Bel(BelBackend::new()),
-        };
+        let osc9_supported = detect_osc9_supported(env);
+        let multiplexed = is_multiplexed(env);
         Self {
-            backend: Some(backend),
+            requested: method,
+            osc9_supported,
+            multiplexed,
+            backend: Some(resolve_backend(method, osc9_supported, multiplexed)),
             condition,
+            failed: false,
+        }
+    }
+
+    /// Live re-apply of `tui.notification_method` / `tui.notification_condition`.
+    ///
+    /// A setting change rebuilds the backend only when the protocol actually
+    /// changed; the backends are stateless writers, so rebuilding is cheap and
+    /// safe. It deliberately does **not** clear [`Self::failed`]: a terminal
+    /// that already refused a notification is evidence about the terminal, not
+    /// about the configuration, and a save must not retry a write the terminal
+    /// has already rejected.
+    pub fn configure(&mut self, method: Method, condition: Condition) {
+        self.condition = condition;
+        if method == self.requested {
+            return;
+        }
+        self.requested = method;
+        if !self.failed {
+            self.backend = Some(resolve_backend(
+                method,
+                self.osc9_supported,
+                self.multiplexed,
+            ));
         }
     }
 
@@ -236,8 +263,25 @@ impl Notifier {
         if let Err(error) = &result {
             tracing::warn!(error = %error, "terminal notification failed; disabling for this session");
             self.backend = None;
+            self.failed = true;
         }
         result
+    }
+}
+
+/// 按「配置值 + 终端能力」定出实际后端。
+///
+/// `Auto` 在支持 OSC 9 的终端上选 OSC 9，否则退回 BEL。抽成函数是为了让
+/// 构造与热重建走**同一段**判定，不会出现两条路径各自演化。
+fn resolve_backend(method: Method, osc9_supported: bool, multiplexed: bool) -> Backend {
+    let resolved = match method {
+        Method::Auto if osc9_supported => Method::Osc9,
+        Method::Auto => Method::Bel,
+        other => other,
+    };
+    match resolved {
+        Method::Osc9 | Method::Auto => Backend::Osc9(Osc9Backend::new(multiplexed)),
+        Method::Bel => Backend::Bel(BelBackend::new()),
     }
 }
 
@@ -423,5 +467,54 @@ mod tests {
         assert!(notifier.is_disabled());
         assert_eq!(notifier.effective_backend(), "disabled");
         assert!(notifier.notify("hello").is_ok());
+    }
+    #[test]
+    fn configure_switches_the_protocol_without_a_restart() {
+        let mut notifier = Notifier::new(Method::Auto, Condition::Unfocused, &env(&[]));
+        assert!(!notifier.uses_osc9(), "no terminal hints -> bel");
+
+        notifier.configure(Method::Osc9, Condition::Always);
+        assert!(notifier.uses_osc9());
+        assert_eq!(notifier.condition(), Condition::Always);
+
+        notifier.configure(Method::Bel, Condition::Unfocused);
+        assert!(!notifier.uses_osc9());
+        assert_eq!(notifier.condition(), Condition::Unfocused);
+        assert_eq!(notifier.effective_backend(), "bel");
+    }
+
+    #[test]
+    fn configure_resolves_auto_against_the_terminal_not_the_save() {
+        // `auto` 的解析结果取决于终端能力，不是设置文件：同样的 `auto` 在
+        // 支持 OSC 9 的终端上仍然是 osc9。
+        let mut notifier = Notifier::new(
+            Method::Bel,
+            Condition::Unfocused,
+            &env(&[("TERM_PROGRAM", "iTerm.app")]),
+        );
+        assert!(!notifier.uses_osc9());
+        notifier.configure(Method::Auto, Condition::Unfocused);
+        assert!(notifier.uses_osc9(), "auto must re-resolve to osc9 here");
+    }
+
+    #[test]
+    fn a_failed_backend_is_not_revived_by_a_save() {
+        // 后端失效是终端给的结论。改设置只改「想用什么协议」，不该让程序
+        // 再往同一个已经拒绝过写入的终端里重试。
+        let mut notifier = Notifier::new(Method::Bel, Condition::Unfocused, &env(&[]));
+        notifier.backend = None;
+        notifier.failed = true;
+        notifier.configure(Method::Osc9, Condition::Always);
+        assert!(notifier.is_disabled());
+        assert_eq!(notifier.effective_backend(), "disabled");
+    }
+
+    #[test]
+    fn configure_with_the_same_method_keeps_the_working_backend() {
+        let mut notifier = Notifier::new(Method::Bel, Condition::Unfocused, &env(&[]));
+        let before = notifier.effective_backend();
+        notifier.configure(Method::Bel, Condition::Always);
+        assert_eq!(notifier.effective_backend(), before);
+        assert_eq!(notifier.condition(), Condition::Always);
     }
 }

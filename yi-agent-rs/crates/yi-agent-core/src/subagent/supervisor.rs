@@ -342,6 +342,22 @@ impl AgentSupervisor {
         self.closed_containers.contains(&self.root_task_id)
     }
 
+    /// Replaces the direct-child limit on a live supervisor.
+    ///
+    /// `spawn_with_objective` reads this field at the moment it admits a child,
+    /// so a lowered limit stops *new* children and never cancels one already
+    /// running, and a raised one makes an earlier refusal succeed on the next
+    /// attempt. The caller re-reads the live source per admission instead of
+    /// holding a copy, which is what keeps a save visible without a restart.
+    pub fn set_max_direct_children(&mut self, max_direct_children: usize) {
+        self.max_direct_children = max_direct_children;
+    }
+
+    /// The limit currently applied to this supervisor.
+    pub fn max_direct_children(&self) -> usize {
+        self.max_direct_children
+    }
+
     pub fn from_recovered_root(
         root_session_id: RootSessionId,
         root_task_id: TaskId,

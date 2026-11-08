@@ -87,7 +87,7 @@ impl PowerGuard {
                     enabled,
                 )
             },
-            || {},
+            |_| {},
         )
     }
 
@@ -95,10 +95,14 @@ impl PowerGuard {
     /// 任何非 `Send` 的平台句柄。
     ///
     /// `after_tick` 只用于测试观察「一次真实 tick 已结束」；生产传空闭包。
+    ///
+    /// 回调收到**这一拍实际采用的输入**。只发一个「跑完了」的无内容信号不够：
+    /// 信号相对 `update` 是异步的，测试排空通道之后仍可能收到上一拍的迟到信号，
+    /// 于是把「旧拍跑完」误当成「新拍跑完」。带上输入就必须逐字段匹配。
     pub(crate) fn spawn_with_factory<F, A>(initial: GuardInputs, factory: F, after_tick: A) -> Self
     where
         F: FnOnce() -> Supervisor + Send + 'static,
-        A: FnMut() + Send + 'static,
+        A: FnMut(GuardInputs) + Send + 'static,
     {
         let shared: SharedInputs = Arc::new((Mutex::new(initial), Condvar::new()));
         let shared_in = Arc::clone(&shared);
@@ -166,12 +170,12 @@ impl Drop for PowerGuard {
 
 /// 线程主体：取快照 → 放锁 → tick → 等下一拍或输入变化/stop。
 ///
-/// `after_tick` 在**真实 tick 结束之后**调用，测试用它确认「首拍已结束」，
-/// 从而不会把首拍与唤醒混为一谈。
+/// `after_tick` 在**真实 tick 结束之后**调用，并带上该拍采用的输入；测试用它
+/// 确认「首拍已结束」以及「哪一拍结束」，从而不会把上一拍的迟到信号当成新拍。
 fn run_worker<F, A>(shared: SharedInputs, make_supervisor: F, mut after_tick: A)
 where
     F: FnOnce() -> Supervisor,
-    A: FnMut(),
+    A: FnMut(GuardInputs),
 {
     let mut supervisor = make_supervisor();
     let (lock, cv) = &*shared;
@@ -183,7 +187,7 @@ where
         let grace = Duration::from_secs(snapshot.grace_secs);
         supervisor.set_windows(grace, slack_for(grace));
         supervisor.tick(snapshot.busy, snapshot.enabled);
-        after_tick();
+        after_tick(snapshot);
 
         let inputs = lock.lock().unwrap_or_else(|p| p.into_inner());
         if inputs.stop {
@@ -368,8 +372,8 @@ mod tests {
                 stop: false,
             },
             move || battery_online_supervisor(factory_clock, &factory_assertion),
-            move || {
-                let _ = tick_tx.send(());
+            move |inputs| {
+                let _ = tick_tx.send(inputs);
             },
         );
         tick_rx
@@ -412,7 +416,7 @@ mod tests {
                 stop: false,
             },
             move || battery_online_supervisor(factory_clock, &factory_assertion),
-            || {},
+            |_| {},
         );
         acquired_rx
             .recv_timeout(Duration::from_secs(1))
@@ -420,7 +424,7 @@ mod tests {
 
         guard.update(false, false, 900);
         // 不等满一拍：禁用必须立刻唤醒线程并释放。
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while releases.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -467,7 +471,7 @@ mod tests {
                     true,
                 )
             },
-            move || {
+            move |_| {
                 factory_ticks.fetch_add(1, Ordering::SeqCst);
             },
         );
@@ -516,8 +520,8 @@ mod tests {
                 stop: false,
             },
             move || battery_online_supervisor(factory_clock, &factory_assertion),
-            move || {
-                let _ = tick_tx.send(());
+            move |inputs| {
+                let _ = tick_tx.send(inputs);
             },
         );
         tick_rx
@@ -541,8 +545,14 @@ mod tests {
         drop(guard);
     }
 
-    /// G5：缩窗/扩窗/再启用仍走原 Supervisor 语义（这里只验证装配把
-    /// grace_secs 真的交给了每拍，而不是固定初值）。
+    /// A grace change submitted from the main loop must take effect on the
+    /// *next tick the worker runs*, which the update itself triggers.
+    ///
+    /// Why this matters: the main loop only calls `update` when the settings
+    /// changed or when the 10s ticker fires. A save must not have to wait for
+    /// the ticker -- so `update` has to wake the condvar. Asserting "a tick ran"
+    /// would pass even if the window never reached the policy, so this drives a
+    /// real hold and asserts the *decision* flips.
     #[test]
     fn sleep_hardening_grace_changes_reach_the_policy() {
         let (tick_tx, tick_rx) = mpsc::channel();
@@ -559,8 +569,8 @@ mod tests {
                 stop: false,
             },
             move || battery_online_supervisor(factory_clock, &factory_assertion),
-            move || {
-                let _ = tick_tx.send(());
+            move |inputs| {
+                let _ = tick_tx.send(inputs);
             },
         );
         tick_rx
@@ -573,6 +583,181 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("a grace change must wake the worker");
         drop(guard);
+    }
+
+    /// 外部可控时钟：只有测试推进它，tick 自己不会动。
+    ///
+    /// `SteppingClock` 每次采样前进 1 秒，用来测「宽限到期」需要几百拍；这里要
+    /// 测的是「起点是哪一刻」，所以时间必须停在测试指定的位置。
+    struct EditableClock {
+        elapsed: Arc<StdMutex<Duration>>,
+    }
+
+    impl Clock for EditableClock {
+        fn now(&self) -> Option<Stamp> {
+            Some(Stamp::from_duration(*self.elapsed.lock().unwrap()))
+        }
+        fn since(&self, stamp: Stamp) -> Duration {
+            self.elapsed
+                .lock()
+                .unwrap()
+                .saturating_sub(stamp.as_duration())
+        }
+        fn wall(&self) -> Option<Stamp> {
+            Some(Stamp::from_duration(*self.elapsed.lock().unwrap()))
+        }
+        fn mono_trusted(&self) -> bool {
+            true
+        }
+    }
+
+    /// 起一个用外部可控时钟的 guard，并返回可推进的时间与观测点。
+    struct PowerFixture {
+        guard: PowerGuard,
+        elapsed: Arc<StdMutex<Duration>>,
+        releases: Arc<AtomicUsize>,
+        tick_rx: mpsc::Receiver<GuardInputs>,
+    }
+
+    impl PowerFixture {
+        fn start(grace_secs: u64) -> Self {
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let releases = Arc::new(AtomicUsize::new(0));
+            let elapsed = Arc::new(StdMutex::new(Duration::ZERO));
+            let assertion = CountingAssertion::new(acquired_tx, Arc::clone(&releases));
+            let factory_assertion = assertion.clone();
+            let factory_elapsed = Arc::clone(&elapsed);
+            let (tick_tx, tick_rx) = mpsc::channel();
+            let guard = PowerGuard::spawn_with_factory(
+                GuardInputs {
+                    busy: true,
+                    enabled: true,
+                    grace_secs,
+                    stop: false,
+                },
+                move || {
+                    Supervisor::new(
+                        Arc::new(EditableClock {
+                            elapsed: factory_elapsed,
+                        }),
+                        Box::new(Battery),
+                        Box::new(AlwaysOnline),
+                        factory_assertion.handle(),
+                        true,
+                    )
+                },
+                move |inputs| {
+                    let _ = tick_tx.send(inputs);
+                },
+            );
+            // 这里只等「线程起来了」，不测延迟：满并发跑整个 lib 测试套件时
+            // 调度会把 1 秒耗光。宽松截止，避免把机器负载当逻辑失败。
+            acquired_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("work at t=0 must acquire");
+            let fixture = Self {
+                guard,
+                elapsed,
+                releases,
+                tick_rx,
+            };
+            fixture.settle();
+            fixture
+        }
+
+        /// 推进时间并提交一次输入，等**采用这份输入的那一拍**跑完。
+        ///
+        /// 匹配输入而不是「随便收到一条信号」：信号相对 `update` 是异步的，
+        /// 排空通道之后仍可能收到上一拍的迟到信号。只认 `Update` 就等于
+        /// 承认「新输入还没被采用」，于是这里会一直等到真正的目标拍。
+        fn tick_at(&mut self, secs: u64, busy: bool, grace_secs: u64) {
+            *self.elapsed.lock().unwrap() = Duration::from_secs(secs);
+            self.guard.update(busy, true, grace_secs);
+            let expected = GuardInputs {
+                busy,
+                enabled: true,
+                grace_secs,
+                stop: false,
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                // 只证明「被唤醒并采用了新输入」，不证明「多快」。
+                let seen = self
+                    .tick_rx
+                    .recv_timeout(remaining)
+                    .expect("a changed input must wake the worker");
+                if seen == expected {
+                    return;
+                }
+                // 上一拍的迟到信号：继续等目标拍。
+            }
+        }
+
+        /// 吞掉首拍可能迟到的信号，让后续等待从干净状态开始。
+        fn settle(&self) {
+            std::thread::sleep(Duration::from_millis(20));
+            while self.tick_rx.try_recv().is_ok() {}
+        }
+
+        fn released(&self) -> usize {
+            self.releases.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Lengthening the window must not drop a hold that is still running.
+    ///
+    /// This is the failure mode a naive "rebuild the policy on save" produces:
+    /// rebuilding clears `last_ok`, so the next tick sees "no work, no recent
+    /// work" and releases -- the user widened the window and the machine went to
+    /// sleep. `set_windows` only swaps durations, so the hold survives.
+    ///
+    /// The window is widened at t=400, i.e. *past* the old 300s boundary but
+    /// inside the new 3600s one. That makes "did the new window reach the
+    /// policy?" observable in a single tick: forwarding it holds, keeping the
+    /// startup value releases. The grace change itself wakes the worker, so no
+    /// 10s ticker is involved.
+    #[test]
+    fn lengthening_the_window_does_not_release_a_running_hold() {
+        let mut fixture = PowerFixture::start(300);
+        assert_eq!(fixture.released(), 0, "work at t=0 holds the assertion");
+
+        // Work stops at t=100: inside the 300s window, so still held.
+        fixture.tick_at(100, false, 300);
+        assert_eq!(fixture.released(), 0, "100s into a 300s window still holds");
+
+        // The save: 300 -> 3600, at t=400 (past the old boundary).
+        fixture.tick_at(400, false, 3600);
+        assert_eq!(
+            fixture.released(),
+            0,
+            "widening the window must not release: the hold is still inside it"
+        );
+    }
+
+    /// Shortening the window must take effect at the save, not at the next tick.
+    ///
+    /// No 10s interval is advanced anywhere here: the release is driven by
+    /// `update` waking the condvar, which is exactly the path a settings save
+    /// takes. The grace is counted from when work stopped (t=0), not from the
+    /// save -- otherwise a user who shortens the window to stop the hold would
+    /// wait another full window.
+    #[test]
+    fn a_window_save_shortens_the_remaining_grace_without_a_ticker() {
+        let mut fixture = PowerFixture::start(3600);
+        assert_eq!(fixture.released(), 0);
+
+        // Work stops at t=1200. 1 hour window: still held.
+        fixture.tick_at(1200, false, 3600);
+        assert_eq!(fixture.released(), 0, "1200s into a 3600s window holds");
+
+        // The save: 3600 -> 300. 1200 - 0 >= 300, so this very tick releases.
+        fixture.tick_at(1200, false, 300);
+        assert_eq!(
+            fixture.released(),
+            1,
+            "shortening the window must release at the save, counting from when work stopped"
+        );
     }
 
     /// 退出预算的基线检查：`spawn` 的装配本身不阻塞，Drop 有界。

@@ -115,6 +115,13 @@ pub enum RuntimeCoordinatorError {
     ResidentCapacityExhausted,
     #[error("global queued subagent capacity is exhausted")]
     QueueCapacityExceeded,
+    /// The live settings source failed while admitting.
+    ///
+    /// A settings read failure must stop *this* admission only: it is a
+    /// controlled refusal, never a reason to tear down a running worker or a
+    /// silently different limit. The code is stable and carries no values.
+    #[error("runtime settings unavailable for admission: {code}")]
+    LiveSettings { code: &'static str },
     #[error("runtime root rejects new work: {0}")]
     AdmissionClosed(String),
     #[error("the release could not prove that {outstanding} execution(s) under {roots:?} stopped")]
@@ -259,6 +266,17 @@ pub struct RuntimeCoordinator {
     fork_max_bytes: u64,
     /// Direct-child limit inherited by every supervisor this coordinator creates.
     max_direct_children: usize,
+    /// The factory's live admission source, when the host wired runtime settings.
+    ///
+    /// Read inside the actual admission paths below, never sampled into a
+    /// long-lived copy: a save must reach the next admission, not the next
+    /// process. `None` keeps the two static fields authoritative, so every
+    /// factory that does not opt in behaves exactly as before.
+    live_admission: Option<Arc<dyn yi_agent_core::live_settings::AdmissionLimitsSource>>,
+    /// The factory's static resident capacity, kept so the live-source-absent
+    /// path can answer without locking the resource coordinator (which the
+    /// resident admission path already holds when it asks).
+    static_resident_capacity: u16,
     draining: AtomicBool,
     /// Stop proofs taken off worker handles, kept after the supervisor drops the
     /// handle on a terminal transition.
@@ -810,6 +828,8 @@ impl RuntimeCoordinator {
             }
         }
         let provider_profile_id = factory.provider_profile_id();
+        let live_admission = factory.live_admission_limits();
+        let resident_capacity = factory.max_resident_subagents();
         let workspace_service = factory.default_workspace_service();
         if let Some(profile_id) = &provider_profile_id {
             resource_coordinator.configure_provider_llm_capacity(profile_id);
@@ -861,6 +881,8 @@ impl RuntimeCoordinator {
             fork_uploads: Mutex::new(HashMap::new()),
             fork_max_bytes,
             max_direct_children,
+            live_admission,
+            static_resident_capacity: resident_capacity,
             draining: AtomicBool::new(false),
             pending_stops: Mutex::new(HashMap::new()),
             clients: Mutex::new(RuntimeClients::new()),
@@ -1821,6 +1843,17 @@ impl RuntimeCoordinator {
         .await
     }
 
+    /// A wake-up receiver for live admission changes, if this coordinator has a
+    /// live source.
+    ///
+    /// The daemon uses this to retry its queue as soon as a save lands instead of
+    /// polling. `None` = static configuration, nothing to wake for.
+    pub fn live_admission_wakeup(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.live_admission
+            .as_ref()
+            .map(|source| source.subscribe())
+    }
+
     /// The live resident subagent capacity. Exists so tests assert the value
     /// actually reached the coordinator instead of re-asserting the constant.
     pub fn resident_capacity(&self) -> Option<u16> {
@@ -2162,6 +2195,11 @@ impl RuntimeCoordinator {
         let child_extra = resolve_extra_roots(None, Some(&parent_extra));
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
+            // Read while holding the supervisor: the limit and the spawn that
+            // consumes it must be one decision, otherwise a save landing
+            // between them would be applied to the wrong admission.
+            let limits = self.current_admission_limits()?;
+            supervisor.set_max_direct_children(usize::from(limits.direct_children));
             let child = supervisor.spawn_with_objective(
                 parent.clone(),
                 yi_agent_core::subagent::worker::SpawnRequest::new(
@@ -2526,6 +2564,13 @@ impl RuntimeCoordinator {
                         .expect("runtime resident wait mutex poisoned")
                         .insert(task.clone());
                 }
+                // Safe point: a save that landed while this task waited is
+                // visible here, and one that lands after this grant must not
+                // revoke a lease that already exists. The capacity is written
+                // into the live coordinator, so the queued entries evaluated
+                // below (including other tasks) use the same value.
+                let limits = self.current_admission_limits()?;
+                coordinator.set_capacity("resident:global", limits.resident_subagents);
                 let Some(lease) = coordinator.grant_next("resident:global") else {
                     return Err(RuntimeCoordinatorError::ResidentCapacityExhausted);
                 };
@@ -6528,6 +6573,139 @@ impl RuntimeCoordinator {
             self.release_resident_lease(task);
         }
         confirmed.into_iter().map(|(task, _, _, _)| task).collect()
+    }
+
+    /// The two capacities as they stand *now*.
+    ///
+    /// Called inside an admission path, after any wait that could have parked:
+    /// reading it earlier would let a save that landed during the wait be
+    /// ignored, and caching it would let one beyond the next save.
+    fn current_admission_limits(
+        &self,
+    ) -> Result<yi_agent_core::live_settings::AdmissionLimits, RuntimeCoordinatorError> {
+        // Never take `resource_coordinator` here: the resident admission path
+        // calls this while it already holds that lock, and `std::sync::Mutex`
+        // is not reentrant.
+        match &self.live_admission {
+            Some(source) => source
+                .snapshot()
+                .map_err(|error| RuntimeCoordinatorError::LiveSettings { code: error.code }),
+            None => Ok(yi_agent_core::live_settings::AdmissionLimits {
+                direct_children: u16::try_from(self.max_direct_children).unwrap_or(u16::MAX),
+                resident_subagents: self.static_resident_capacity,
+            }),
+        }
+    }
+
+    /// Re-reads the live limits and applies them, then returns.
+    ///
+    /// This is the explicit entry a host calls after a save. Reading the source
+    /// once per refresh keeps a multi-key change consistent, and the actual
+    /// admission paths read again before every grant, so a save that lands
+    /// after this call is still honoured by the next admission. Callers that
+    /// already hold a supervisor lock must not call this (it locks them all).
+    pub async fn refresh_live_admission(&self) -> Result<(), RuntimeCoordinatorError> {
+        let limits = self.current_admission_limits()?;
+        self.resource_coordinator
+            .lock()
+            .expect("resource coordinator mutex poisoned")
+            .set_capacity("resident:global", limits.resident_subagents);
+        // Clone the handles and release the map before awaiting, so a session
+        // attaching concurrently is not blocked for the whole refresh and no
+        // std mutex guard is held across an await.
+        let supervisors: Vec<Arc<AsyncMutex<AgentSupervisor>>> = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for supervisor in supervisors {
+            supervisor
+                .lock()
+                .await
+                .set_max_direct_children(usize::from(limits.direct_children));
+        }
+        Ok(())
+    }
+
+    /// Retries admission for resident children that are queued for capacity.
+    ///
+    /// A raised limit must reach the *original* queue: the contract is "wake the
+    /// tasks already waiting, do not wait for a new user message". Every
+    /// candidate here was refused at spawn time and is durable as `queued`, so
+    /// this only re-runs the same admission path — it invents no client request
+    /// and touches no remote-interaction timestamp.
+    ///
+    /// Failures are counted, not propagated: one task whose workspace cannot be
+    /// provisioned must not strand the rest of the queue.
+    pub async fn wake_queued_residents(&self) -> usize {
+        if self.live_admission.is_none() {
+            return 0;
+        }
+        let waiting: std::collections::HashSet<TaskId> = self
+            .resident_waiting
+            .lock()
+            .expect("runtime resident wait mutex poisoned")
+            .iter()
+            .cloned()
+            .collect();
+        if waiting.is_empty() {
+            return 0;
+        }
+        // Clone the handles and drop the map guard before awaiting, for the same
+        // reason `refresh_live_admission` does: a session attaching concurrently
+        // must not wait for this whole pass.
+        let supervisors: Vec<(RootSessionId, Arc<AsyncMutex<AgentSupervisor>>)> = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .iter()
+            .map(|(session, handle)| (session.clone(), Arc::clone(handle)))
+            .collect();
+
+        let mut admitted = 0;
+        for (session, handle) in supervisors {
+            // A queued id belongs to exactly one supervisor. Look it up under a
+            // short lock, then release it before the admission path takes the
+            // same lock again.
+            let queued: Vec<TaskId> = {
+                let supervisor = handle.lock().await;
+                waiting
+                    .iter()
+                    .filter(|task| supervisor.task(task).is_some() && !supervisor.has_worker(task))
+                    .cloned()
+                    .collect()
+            };
+            for task in queued {
+                // Skip tasks another pass already admitted while we walked the
+                // map; `start_worker` would otherwise report "already owns a
+                // worker" and be counted as a failure.
+                let still_waiting = self
+                    .resident_waiting
+                    .lock()
+                    .expect("runtime resident wait mutex poisoned")
+                    .contains(&task);
+                if !still_waiting {
+                    continue;
+                }
+                match self.start_worker(&session, &task).await {
+                    Ok(()) => admitted += 1,
+                    Err(RuntimeCoordinatorError::ResidentCapacityExhausted) => {
+                        // Still full: leave it queued and stop scanning this
+                        // session rather than retrying the same refusal.
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "could not admit a queued resident child after a capacity change"
+                        );
+                    }
+                }
+            }
+        }
+        admitted
     }
 
     fn ensure_admitting(&self) -> Result<(), RuntimeCoordinatorError> {

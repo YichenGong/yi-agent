@@ -44,24 +44,36 @@ fn bring_up_with(
     cfg: &RuntimeConfig,
     runtime_dir: &Path,
     models_path: &Path,
+    live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> Result<Arc<RuntimeBinding>, yi_agent_subagent::attach::AttachFailure> {
     use yi_agent_subagent::attach::{
-        AttachFailure, BringUpPolicy, ensure_owned_runtime, ensure_owned_runtime_with_policy,
+        AttachFailure, BringUpPolicy, ensure_owned_runtime_with_binding,
+        ensure_owned_runtime_with_policy_and_binding,
     };
 
     match bringup.policy {
         // Embedded needs no scope; the four-argument form keeps its exact
         // historical behaviour, including which policy a later repair uses.
-        BringUpPolicy::Embedded => {
-            ensure_owned_runtime(cfg, runtime_dir.to_path_buf(), models_path).map(|attached| {
-                RuntimeBinding::managed(
-                    cfg,
-                    runtime_dir.to_path_buf(),
-                    models_path.to_path_buf(),
-                    Arc::new(attached),
-                )
-            })
-        }
+        // The binding only reaches a daemon this process starts itself; a
+        // managed (separate-process) daemon resolves the same file on its own.
+        // Passing it in the embedded branch is therefore the embedded half of
+        // the live-settings contract, and the managed branch stays unaffected.
+        BringUpPolicy::Embedded => ensure_owned_runtime_with_binding(
+            cfg,
+            runtime_dir.to_path_buf(),
+            models_path,
+            live_settings.cloned(),
+        )
+        .map(|attached| {
+            RuntimeBinding::managed_with_live_settings(
+                cfg,
+                runtime_dir.to_path_buf(),
+                models_path.to_path_buf(),
+                Arc::new(attached),
+                bringup.clone(),
+                live_settings.cloned(),
+            )
+        }),
         BringUpPolicy::Managed => {
             let Some(instance_home) = bringup.instance_home.as_deref() else {
                 // A managed start with no scope to resolve has nothing to join and
@@ -72,21 +84,23 @@ fn bring_up_with(
                     "the managed policy needs the instance home this process never installed",
                 ));
             };
-            ensure_owned_runtime_with_policy(
+            ensure_owned_runtime_with_policy_and_binding(
                 cfg,
                 runtime_dir.to_path_buf(),
                 models_path,
                 instance_home,
                 bringup.policy,
                 bringup.expected.as_ref(),
+                live_settings.cloned(),
             )
             .map(|attached| {
-                RuntimeBinding::managed_with(
+                RuntimeBinding::managed_with_live_settings(
                     cfg,
                     runtime_dir.to_path_buf(),
                     models_path.to_path_buf(),
                     Arc::new(attached),
                     bringup.clone(),
+                    live_settings.cloned(),
                 )
             })
         }
@@ -101,7 +115,7 @@ pub(crate) fn bring_up_with_for_test(
     runtime_dir: &Path,
     models_path: &Path,
 ) -> Result<Arc<RuntimeBinding>, yi_agent_subagent::attach::AttachFailure> {
-    bring_up_with(bringup, cfg, runtime_dir, models_path)
+    bring_up_with(bringup, cfg, runtime_dir, models_path, None)
 }
 
 /// Test seam: an identity that is *not* the running build.
@@ -131,6 +145,7 @@ pub(crate) fn attach_cwd_runtime(
     runtime_dir: &Path,
     cfg: &RuntimeConfig,
     models_path: &Path,
+    live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> Result<Arc<RuntimeBinding>, String> {
     let key = project_key(&cfg.workdir);
     // A project directory that no longer exists has nothing to bring up, and the
@@ -171,7 +186,7 @@ pub(crate) fn attach_cwd_runtime(
     // that never consults the policy cannot honour `YI_AGENT_BRINGUP=managed` at
     // all -- the policy, and everything behind it, would only ever run in tests.
     let bringup = yi_agent_subagent::attach::process_bringup_choice();
-    let outcome = bring_up_with(&bringup, cfg, runtime_dir, models_path);
+    let outcome = bring_up_with(&bringup, cfg, runtime_dir, models_path, live_settings);
     let mut cache = runtimes.lock().unwrap_or_else(|p| p.into_inner());
     match &outcome {
         // Only durable conclusions are worth remembering. A transient failure is
@@ -465,12 +480,24 @@ pub(crate) fn rebuild_thread_agent_with_theme(
     // bound to this thread's live conversation must keep seeing the same
     // session across the rebuild.
     let session_handle = agent.session_handle();
+    // A rebuild replaces the `Agent` value, so the live-settings source and the
+    // provider admission gate have to be carried over explicitly. Losing them
+    // here would freeze this thread's runtime settings at start-up values and
+    // make a manual `/compact` skip its own admission lease.
+    let live_settings = agent.live_settings_source();
+    let provider_turn_gate = agent.provider_turn_gate();
     let registry = registry_with_theme_tool(&tools, theme);
     let mut rebuilt =
         yi_agent_core::Agent::new(provider.clone(), Arc::new(registry), config.clone())
             .with_session_arc(session_handle);
     if let (Some(checker), Some(rx)) = (permission, decision) {
         rebuilt = rebuilt.with_permission(checker, rx);
+    }
+    if let Some(source) = live_settings {
+        rebuilt.set_live_settings(source);
+    }
+    if let Some(gate) = provider_turn_gate {
+        rebuilt = rebuilt.with_provider_turn_gate(gate);
     }
     apply_session(&mut rebuilt, session);
     BuiltAgent {
@@ -506,11 +533,19 @@ pub(crate) fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) ->
     // bound just below, survives the rebuild and keeps reading the thread's
     // current transcript rather than a snapshot taken here.
     let session_handle = agent.session_handle();
+    let live_settings = agent.live_settings_source();
+    let provider_turn_gate = agent.provider_turn_gate();
     let mut rebuilt =
         yi_agent_core::Agent::new(provider.clone(), tooling.registry.clone(), config.clone())
             .with_session_arc(session_handle.clone());
     if let Some(rx) = decision_rx.clone() {
         rebuilt = rebuilt.with_permission(tooling.permission.clone(), rx);
+    }
+    if let Some(source) = live_settings {
+        rebuilt.set_live_settings(source);
+    }
+    if let Some(gate) = provider_turn_gate {
+        rebuilt = rebuilt.with_provider_turn_gate(gate);
     }
     // Bind the caller to the rebuilt agent's *live* session handle. `tooling`'s
     // `caller` and the registry's tool instances share one inner slot, so this

@@ -46,6 +46,7 @@ fn meta(id: &str, cwd: &std::path::Path) -> crate::thread_store::ThreadMeta {
         last_completed_at: 0,
         forked_from: None,
         plugin_bindings: Vec::new(),
+        sandbox_baseline: None,
     }
 }
 

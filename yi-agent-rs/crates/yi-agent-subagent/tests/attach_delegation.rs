@@ -1638,3 +1638,86 @@ fn a_single_shot_request_is_not_replayed_after_an_ambiguous_failure() {
          frames: {after_idempotent:?}, result: {idempotent:?}"
     );
 }
+
+/// A daemon that predates live apply must still be usable, but must not be
+/// mistaken for one that hot-reloads: the difference is what a save promises.
+///
+/// The fixture is a hand-rolled socket that answers `Status` with the *old*
+/// frame shape (no `live_apply_version`). Using the real daemon cannot produce
+/// that shape, and no amount of in-process mocking proves the parse of an old
+/// wire frame -- the field simply is not there.
+#[test]
+fn an_old_daemon_reads_as_no_live_apply_but_stays_usable() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let socket = yi_agent_store::ipc::socket_path_for(dir.path()).unwrap();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+    // Two connections: the liveness probe and the capability probe each open
+    // their own. Answer the pre-live-apply `Status` frame (no
+    // `live_apply_version`) on both, then stop.
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let mut stream = stream;
+            let response = serde_json::json!({
+                "protocol_version": request["protocol_version"],
+                "request_id": request["request_id"],
+                "result": { "type": "Status", "high_water_event_id": 3 },
+            });
+            let _ = writeln!(stream, "{response}");
+            let _ = stream.flush();
+        }
+    });
+
+    assert_eq!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy,
+        "an old daemon answering Status is alive, not wedged"
+    );
+
+    // Capability is separate from liveness: the old daemon has no live apply.
+    assert_eq!(
+        yi_agent_subagent::attach::probe_live_apply(&socket),
+        yi_agent_subagent::attach::LiveApplyProbe::Unsupported,
+        "a Status frame without the field must read as old capability, not as healthy-with-live-apply"
+    );
+
+    server.join().unwrap();
+}
+
+/// The counterpart to the old-daemon test: a real current daemon must report
+/// `Supported`. Without this pair, a probe that always answered `Unsupported`
+/// would pass the old-daemon test and the feature would silently be a no-op.
+#[test]
+fn a_current_daemon_reports_live_apply_support() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+
+    let owned = yi_agent_subagent::attach::ensure_owned_runtime(
+        &cfg,
+        runtime.path().to_path_buf(),
+        &isolated_models_path(repo.path()),
+    )
+    .expect("a dead runtime must be replaced with a fresh one");
+
+    assert_eq!(
+        yi_agent_subagent::attach::probe_live_apply(&owned.socket_path),
+        yi_agent_subagent::attach::LiveApplyProbe::Supported,
+        "a daemon built from this tree applies settings live and must say so"
+    );
+}

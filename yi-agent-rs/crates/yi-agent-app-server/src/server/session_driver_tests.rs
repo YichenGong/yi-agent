@@ -268,6 +268,8 @@ impl Host {
             thread_roots: &self.thread_roots,
             managed: &self.managed,
             models_path: &self.models_path,
+            // 本测试宿主不涉运行期设置：静态装配。
+            live_settings: None,
             cfg: &self.cfg,
             hub: &self.hub,
             turn_tx: &self.turn_tx,
@@ -366,6 +368,7 @@ impl Host {
             &self.git_diff,
             &self.workspaces,
             build_agent,
+            None,
             &self.lead_inbox,
             &self.lead_replies,
             &self.lead_control,
@@ -1887,6 +1890,7 @@ fn resume_meta(
         anchor_sha: Some("deadbeef".into()),
         last_read_at: 0,
         last_completed_at: 0,
+        sandbox_baseline: None,
         forked_from: None,
         plugin_bindings: Vec::new(),
     };

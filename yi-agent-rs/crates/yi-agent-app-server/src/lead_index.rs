@@ -424,7 +424,9 @@ mod tests {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            sandbox_baseline: None,
             forked_from: None,
+
             model_ref: None,
             reasoning_effort: None,
             tag: None,

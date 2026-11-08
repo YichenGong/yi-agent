@@ -166,6 +166,7 @@ pub(crate) async fn handle(
                 Vec::new(),
                 // RPC 起的会话不绑插件（绑定由驱动方按已提交激活算好传入）。
                 Vec::new(),
+                state.live_settings,
             )
             .await?;
 

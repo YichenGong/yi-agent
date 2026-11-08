@@ -63,6 +63,8 @@ pub(crate) async fn driver_tick<F>(
     git_diff: &crate::git_diff_tool::GitDiffHandle,
     workspaces: &WorkspaceIndex,
     build_agent: &F,
+    // 进程级运行期设置绑定:被驱动会话所在项目的内嵌 daemon 也跟随保存。
+    live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
     lead_inbox: &crate::lead::LeadInbox,
     lead_replies: &crate::lead::LeadReplies,
     lead_control: &crate::lead_control::LeadControlInbox,
@@ -157,6 +159,7 @@ pub(crate) async fn driver_tick<F>(
                 thread_roots,
                 managed,
                 models_path,
+                live_settings,
                 lead_agent_enabled,
                 cfg,
                 hub,

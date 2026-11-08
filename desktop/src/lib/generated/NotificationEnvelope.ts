@@ -56,4 +56,4 @@ subagent_input_tokens: number, subagent_output_tokens: number, subagent_cache_re
  * `ProcessStatus` 的 serde 标签：starting / running / ready / exited /
  * killed / failed_to_start。
  */
-state: string, } } | { "method": "item/toolCall/approvalResolved", "params": { perm_id: string, by: string, decision: string, } } | { "method": "ui/settings/updated", "params": { theme: string, } } | { "method": "ui/tagNames/updated", "params": { tag_names: Record<string, string>, } } | { "method": "ui/gitDiff/focus", "params": { threadId: string | null, note: string | null, } } | { "method": "error", "params": { message: string, } });
+state: string, } } | { "method": "item/toolCall/approvalResolved", "params": { perm_id: string, by: string, decision: string, } } | { "method": "ui/settings/updated", "params": { theme: string, } } | { "method": "settings/changed", "params": { revision: string, changed_keys: Array<string>, } } | { "method": "ui/tagNames/updated", "params": { tag_names: Record<string, string>, } } | { "method": "ui/gitDiff/focus", "params": { threadId: string | null, note: string | null, } } | { "method": "error", "params": { message: string, } });

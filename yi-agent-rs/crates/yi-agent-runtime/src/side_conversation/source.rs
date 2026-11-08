@@ -123,6 +123,14 @@ pub struct EffectiveSideSource {
     /// its own lease from it rather than reusing the parent's.
     pub provider_gate: Option<Arc<dyn yi_agent_core::ProviderTurnGate>>,
     pub web_policy: SideWebPolicy,
+    /// The parent's live runtime-settings source, when the host has one.
+    ///
+    /// Deliberately **not** part of the lifecycle: a settings save must reach a
+    /// running side's next turn without bumping `revision` or `generation`, which
+    /// would make the side look like it needs to be replaced. The side keeps its
+    /// own hard `ManagedRunLimits` and its spent budget; only the ordinary
+    /// dynamic values follow the save.
+    pub live: Option<Arc<dyn yi_agent_core::live_settings::AgentSettingsSource>>,
 }
 
 impl std::fmt::Debug for EffectiveSideSource {
@@ -137,6 +145,7 @@ impl std::fmt::Debug for EffectiveSideSource {
             .field("revision", &self.revision)
             .field("generation", &self.generation)
             .field("has_provider_gate", &self.provider_gate.is_some())
+            .field("has_live_settings", &self.live.is_some())
             .finish()
     }
 }

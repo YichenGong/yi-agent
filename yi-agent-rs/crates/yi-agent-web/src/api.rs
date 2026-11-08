@@ -61,11 +61,36 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
         groups.push(json!({ "name": group, "vars": vars }));
     }
 
+    // Additive metadata, never a replacement. The phone UI reads `groups` and
+    // `vars[].source`; those stay exactly as they were. The live block only lets
+    // a new client say "configuration is degraded" or "this host serves live
+    // settings", instead of silently rendering stale-looking values.
+    let live = yi_agent_runtime::live_settings::LiveSettings::shared(state.settings_path.clone());
+    let snapshot = live.refresh();
+    let health = json!({
+        "state": match snapshot.health.state {
+            yi_agent_runtime::live_settings::HealthState::Healthy => "healthy",
+            yi_agent_runtime::live_settings::HealthState::Degraded => "degraded",
+        },
+        "code": snapshot.health.code,
+        "invalid_keys": snapshot.health.invalid_keys,
+    });
+
     (
         axum::http::StatusCode::OK,
         Json(json!({
             "groups": groups,
             "path": state.settings_path.display().to_string(),
+            "live_apply_version": 1,
+            "revision": snapshot.revision,
+            "snapshot_origin": match snapshot.origin {
+                yi_agent_runtime::live_settings::SnapshotOrigin::Current => "current",
+                yi_agent_runtime::live_settings::SnapshotOrigin::LastKnownGood => "last_known_good",
+                yi_agent_runtime::live_settings::SnapshotOrigin::StartupFallback => {
+                    "startup_fallback"
+                }
+            },
+            "health": health,
         })),
     )
 }
@@ -130,8 +155,11 @@ pub struct PutConfigRequest {
 
 /// PUT /api/config — 接收部分更新。
 ///
-/// 空串与全空白串都表示「删掉这个键、回退默认」——由 `settings::write_to` 统一
-/// 处理，这里不另写一份判据。
+/// 空串与全空白串都表示「删掉这个键、回退默认」——由统一受管写入
+/// （`settings::store::commit_patch`）处理，这里不另写一份判据。
+///
+/// **收敛在 `spawn_blocking` 里执行**：提交可能为了实例写锁最多等 5 秒，直接在
+/// async 任务里做会占住 reactor 线程。响应形状与错误分类保持不变。
 pub async fn put_config(
     State(state): State<AppState>,
     Json(request): Json<PutConfigRequest>,
@@ -145,11 +173,36 @@ pub async fn put_config(
         patch.insert(item.key, value);
     }
 
-    match settings::write_to(&state.settings_path, &Value::Object(patch)) {
+    let path = state.settings_path;
+    let patch = Value::Object(patch);
+    let committed = tokio::task::spawn_blocking(move || settings::write_to(&path, &patch))
+        .await
+        .unwrap_or_else(|error| {
+            // `spawn_blocking` 的 JoinError：任务 panic 或运行时关闭。这不是
+            // 一次「零提交」的证明，但响应只能报内部错误；不要让 panic 冒到
+            // 连接层而丢掉 JSON 响应。
+            Err(SettingsError::Io(format!(
+                "settings write task failed: {error}"
+            )))
+        });
+
+    match committed {
         Ok(()) => (axum::http::StatusCode::OK, Json(json!({ "ok": true }))),
         Err(SettingsError::InvalidSetting { key, reason }) => (
             axum::http::StatusCode::BAD_REQUEST,
             Json(json!({ "code": "invalid_setting", "key": key, "error": reason })),
+        ),
+        Err(SettingsError::InvalidDocument { keys }) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "invalid_document", "keys": keys })),
+        ),
+        Err(SettingsError::LockTimeout) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({ "code": "settings_lock_timeout" })),
+        ),
+        Err(SettingsError::TooLarge) => (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "code": "settings_too_large" })),
         ),
         Err(error) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,

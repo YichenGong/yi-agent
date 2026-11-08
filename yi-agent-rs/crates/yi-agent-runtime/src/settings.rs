@@ -5,6 +5,9 @@
 
 use std::collections::BTreeMap;
 
+pub mod document;
+pub mod store;
+
 /// 解析一行 `.env`，口径与 `dotenvy` 对齐。
 ///
 /// 对齐的四条：
@@ -510,6 +513,13 @@ fn migrate_legacy_keys(value: &mut serde_json::Value) {
         return;
     };
 
+    // 目标分组存在但不是对象（例如手改成 `"power": null`）时不能搬：下面的
+    // `expect("just inserted an object")` 会 panic。启动期的一条 breach 不能
+    // 让进程崩掉，坏形状留给调用方按字段/分组诊断。
+    if value.get(NEW_GROUP).is_some_and(|group| !group.is_object()) {
+        return;
+    }
+
     // 新键已存在就不动：用户显式设的值优先。
     let already_set = value
         .get(NEW_GROUP)
@@ -553,6 +563,7 @@ fn migrate_legacy_keys(value: &mut serde_json::Value) {
 /// `FIELDS` 校验，越界或枚举非法的值置 `None` 并 `warn`。用户手改 `sandbox`
 /// 拼错时不该连 `max_turns` 一起回默认。
 pub fn load_from(path: &Path) -> Settings {
+    count_load_from_call();
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Settings::default(),
@@ -590,6 +601,31 @@ pub fn load_from(path: &Path) -> Settings {
     settings.normalized()
 }
 
+/// 运行期有界读取绝不该转调无界加载器；测试用它钉住这条边界。
+#[cfg(test)]
+pub(crate) fn reset_load_from_calls() {
+    LOAD_FROM_CALLS.with(|slot| slot.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn load_from_calls() -> usize {
+    LOAD_FROM_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOAD_FROM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_load_from_call() {
+    LOAD_FROM_CALLS.with(|slot| slot.set(slot.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn count_load_from_call() {}
+
 /// 读实例目录下的 `settings.json`。
 pub fn load() -> Settings {
     load_from(&settings_path())
@@ -602,7 +638,22 @@ impl Settings {
     /// 2. **单字段非法只清掉那一个**：按 [`FIELDS`] 校验数值边界与枚举白名单，
     ///    不合法就置 `None` 并 `warn`。整份文件丢掉会让用户「改错一个字段、
     ///    全盘回默认」——spec 的错误处理一节明确要求逐字段降级。
-    fn normalized(mut self) -> Settings {
+    ///
+    /// 这是启动期的宽容入口；运行期有界读取走 [`Settings::normalized_silently`]，
+    /// 后者不写日志（原文可能含提示词），把键名交给快照健康诊断。
+    fn normalized(self) -> Settings {
+        let (settings, invalid_keys) = self.normalized_silently();
+        log_normalization(&invalid_keys);
+        settings
+    }
+
+    /// 与 [`Settings::normalized`] 同一套规则，但不写任何一条日志。
+    ///
+    /// 供运行期有界读取使用：那里拿到的原文可能包含提示词与其它用户值，
+    /// 逐字段 `warn` 会把取值写进日志。返回的键名只描述「哪些字段回退了」，
+    /// 交给快照的健康诊断，不进日志。
+    pub(crate) fn normalized_silently(mut self) -> (Settings, Vec<String>) {
+        let mut invalid_keys: Vec<String> = Vec::new();
         self.agent.system_prompt = self
             .agent
             .system_prompt
@@ -618,11 +669,7 @@ impl Settings {
             ($key:literal, $field:expr) => {{
                 if let Some(value) = $field {
                     if !within($key, value as u64) {
-                        tracing::warn!(
-                            key = $key,
-                            value,
-                            "settings.json value is out of range; falling back to the default"
-                        );
+                        invalid_keys.push($key.to_string());
                         $field = None;
                     }
                 }
@@ -654,37 +701,25 @@ impl Settings {
         );
 
         // 枚举白名单：只认 `parse_sandbox_mode` 那份映射，不另写一遍。
-        // 该函数当前是 `config.rs` 里的私有 `fn`，本任务需把它的可见性改成
-        // `pub(crate) fn parse_sandbox_mode(...)`（`settings.rs` 与 `config.rs`
-        // 同 crate，`pub(crate)` 足够）。
-        if let Some(enabled) = self.tui.notifications.as_deref()
-            && !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false")
-        {
-            tracing::warn!(
-                value = enabled,
-                "settings.json has an unknown tui.notifications; falling back to the default"
-            );
-            self.tui.notifications = None;
-        }
-        if let Some(enabled) = self.tui.terminal_title.as_deref()
-            && !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false")
-        {
-            tracing::warn!(
-                value = enabled,
-                "settings.json has an unknown tui.terminal_title; falling back to the default"
-            );
-            self.tui.terminal_title = None;
-        }
+        let mut invalid_two_state = |key: &str, slot: &mut Option<String>| {
+            if let Some(value) = slot.as_deref()
+                && !matches!(value.to_ascii_lowercase().as_str(), "true" | "false")
+            {
+                invalid_keys.push(key.to_string());
+                *slot = None;
+            }
+        };
+        invalid_two_state("tui.notifications", &mut self.tui.notifications);
+        invalid_two_state("tui.terminal_title", &mut self.tui.terminal_title);
+        invalid_two_state(PREVENT_IDLE_SLEEP_KEY, &mut self.power.prevent_idle_sleep);
+
         if let Some(method) = self.tui.notification_method.as_deref()
             && !matches!(
                 method.to_ascii_lowercase().as_str(),
                 "auto" | "osc9" | "bel"
             )
         {
-            tracing::warn!(
-                value = method,
-                "settings.json has an unknown tui.notification_method; falling back to the default"
-            );
+            invalid_keys.push("tui.notification_method".to_string());
             self.tui.notification_method = None;
         }
         if let Some(condition) = self.tui.notification_condition.as_deref()
@@ -693,28 +728,13 @@ impl Settings {
                 "unfocused" | "always"
             )
         {
-            tracing::warn!(
-                value = condition,
-                "settings.json has an unknown tui.notification_condition; falling back to the default"
-            );
+            invalid_keys.push("tui.notification_condition".to_string());
             self.tui.notification_condition = None;
-        }
-        if let Some(enabled) = self.power.prevent_idle_sleep.as_deref()
-            && !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false")
-        {
-            tracing::warn!(
-                value = enabled,
-                "settings.json has an unknown power.prevent_idle_sleep; falling back to the default"
-            );
-            self.power.prevent_idle_sleep = None;
         }
         if let Some(sandbox) = self.startup.sandbox.as_deref()
             && crate::config::parse_sandbox_mode(sandbox).is_none()
         {
-            tracing::warn!(
-                value = sandbox,
-                "settings.json has an unknown startup.sandbox; falling back to the default"
-            );
+            invalid_keys.push("startup.sandbox".to_string());
             self.startup.sandbox = None;
         }
 
@@ -726,15 +746,84 @@ impl Settings {
             self.power.idle_grace_minutes,
         ) && remote > grace
         {
-            tracing::warn!(
-                remote,
-                grace,
-                "power.remote_touch_minutes exceeds power.idle_grace_minutes; falling back to the defaults"
-            );
+            invalid_keys.push("power.remote_touch_minutes".to_string());
+            invalid_keys.push("power.idle_grace_minutes".to_string());
             self.power.remote_touch_minutes = None;
             self.power.idle_grace_minutes = None;
         }
-        self
+        invalid_keys.dedup();
+        (self, invalid_keys)
+    }
+}
+
+/// 启动期宽容归一化的结果。
+pub(crate) struct StartupFallback {
+    pub settings: Settings,
+    pub invalid_keys: Vec<String>,
+}
+
+/// 只用**已经读进内存的字节**做宽容归一化，绝不回头再读文件。
+///
+/// 可行时返回部分有效设置与回退过的键名；连 JSON 都无法解释时返回 `None`，
+/// 由调用方回退到全默认。`strict_keys` 是严格校验已诊断出的坏键，一并并入
+/// 诊断，保证「启动期没有严格快照也能说清哪里坏了」。
+///
+/// 与 [`load_from`] 的差别只有一处：解析失败不再静默回全默认。它不记录取值，
+/// 也不调用会输出字段值的 [`Settings::normalized`]。
+pub(crate) fn lenient_startup_fallback(
+    bytes: &[u8],
+    strict_keys: Vec<String>,
+) -> Option<StartupFallback> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    migrate_legacy_keys(&mut value);
+
+    let mut invalid_keys = strict_keys;
+    // 已知分组存在但不是对象（`"power": null`）时整组丢弃并记名。留着它会让
+    // 整份反序列化失败，把同一文件里**其它合法分组**也一起丢掉——而启动期
+    // 宽容回退的整个价值就在于保住那些合法字段。
+    let mut drop_groups: Vec<&str> = Vec::new();
+    for field in FIELDS {
+        let group = field.group;
+        if value
+            .get(group)
+            .is_some_and(|group_value| !group_value.is_object())
+            && !drop_groups.contains(&group)
+        {
+            drop_groups.push(group);
+        }
+    }
+    for group in drop_groups {
+        if let Some(object) = value.as_object_mut() {
+            object.remove(group);
+        }
+        if !invalid_keys.iter().any(|key| key == group) {
+            invalid_keys.push(group.to_string());
+        }
+    }
+
+    let settings = serde_json::from_value::<Settings>(value).ok()?;
+    let (settings, normalized_keys) = settings.normalized_silently();
+    for key in normalized_keys {
+        if !invalid_keys.contains(&key) {
+            invalid_keys.push(key);
+        }
+    }
+    Some(StartupFallback {
+        settings,
+        invalid_keys,
+    })
+}
+
+/// 启动期归一化的诊断：只记键名，不记取值，也不记提示词原文。
+fn log_normalization(invalid_keys: &[String]) {
+    for key in invalid_keys {
+        tracing::warn!(
+            key = key.as_str(),
+            "settings.json has an invalid value; falling back to the default"
+        );
     }
 }
 
@@ -758,6 +847,15 @@ pub enum SettingsError {
     /// 文件存在，但读不出来 / 不是 JSON 对象。拒绝覆盖。
     Corrupt(String),
     Io(String),
+    /// 整份文档有多个非法已知字段。**只带键名**：错误会进日志、RPC 和前端，
+    /// 不能把用户填的原文（可能含密钥）带出去。
+    InvalidDocument {
+        keys: Vec<String>,
+    },
+    /// 等实例写锁超过单调时钟上限（5 秒）。
+    LockTimeout,
+    /// 完整文件超过 1 MiB 上限。
+    TooLarge,
 }
 
 impl std::fmt::Display for SettingsError {
@@ -768,6 +866,16 @@ impl std::fmt::Display for SettingsError {
             }
             SettingsError::Corrupt(reason) => write!(f, "settings.json is not writable: {reason}"),
             SettingsError::Io(reason) => write!(f, "settings.json io error: {reason}"),
+            SettingsError::InvalidDocument { keys } => {
+                write!(f, "invalid settings.json keys: {}", keys.join(", "))
+            }
+            SettingsError::LockTimeout => {
+                write!(
+                    f,
+                    "settings.json is locked by another writer; try again later"
+                )
+            }
+            SettingsError::TooLarge => write!(f, "settings.json exceeds the 1 MiB limit"),
         }
     }
 }
@@ -782,115 +890,23 @@ pub fn write(patch: &serde_json::Value) -> Result<(), SettingsError> {
 /// 部分更新：`patch` 的键是点路径（`agent.max_turns`），值为 `null` 或 `""`
 /// 表示删除该键、回退默认。
 ///
+/// 这是 [`store::commit_patch`] 的兼容外壳：所有写入共享同一把实例写锁、同一次
+/// 持锁重读和同一个 `rename` 提交点，这里只丢弃回执。**不要再写第二个原子写
+/// 实现**——迁移、RPC 与 web 表单都经这里或 `commit_patch`。
+///
 /// **读-改-写，不是重建**：文件里的未知顶层键原样保留。这是 `env_file::write`
 /// 一号缺陷（保存时删掉不认识的键）的直接修复。
+///
+/// 与旧实现的差别（有意收紧，见 spec §8）：持锁重读后对**完整候选**做严格
+/// 校验。文件里既有的非法已知字段若未被本次 patch 修好，整批拒绝并列出键名，
+/// 而不是把坏候选保存成成功；反之，一次把所有坏字段都修好的 patch 可以正常
+/// 落盘。
 pub fn write_to(path: &Path, patch: &serde_json::Value) -> Result<(), SettingsError> {
-    let patch = patch
-        .as_object()
-        .ok_or_else(|| SettingsError::InvalidSetting {
-            key: "<root>".to_string(),
-            reason: "patch must be a JSON object".to_string(),
-        })?;
-
-    // 全部校验先做完：任何一项失败都零写入。
-    let mut ops: Vec<(&'static FieldSpec, Option<serde_json::Value>)> = Vec::new();
-    for (key, value) in patch {
-        let spec = find_spec(key).ok_or_else(|| SettingsError::InvalidSetting {
-            key: key.clone(),
-            reason: "unknown setting".to_string(),
-        })?;
-        ops.push((spec, validate_value(spec, value)?));
-    }
-
-    // 读底：文件存在却读不出来 → 拒绝覆盖（与 `save_catalog_to` 同一守卫）。
-    let mut object = match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|value| value.as_object().cloned())
-            .ok_or_else(|| {
-                SettingsError::Corrupt(format!(
-                    "{} exists but is not a readable JSON object",
-                    path.display()
-                ))
-            })?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
-        Err(error) => return Err(SettingsError::Io(error.to_string())),
-    };
-
-    for (spec, value) in ops {
-        apply_op(&mut object, spec.key, value);
-    }
-
-    // 跨字段：远端窗口不得长于宽限窗口。`validate_value` 是逐字段无状态的，
-    // 做不了这个判断，只能在这里做。
-    //
-    // 必须基于**合并后的完整对象**：用户可能只 patch 一个键（例如只把宽限改小），
-    // 此时远端窗口的生效值来自文件里的旧值。
-    //
-    // 但**不能**在这里调 `normalized()`：它自带的倒挂回落会把倒挂值清成 None，
-    // 于是下面的比较永远为假、任何倒挂都不会被拒绝。改为对两个字段各自做
-    // 单字段钳制（`within` 按 FieldSpec.min/max 判界），越界即当默认。
-    let merged_value = serde_json::Value::Object(object.clone());
-    let merged = match serde_json::from_value::<Settings>(merged_value) {
-        Ok(settings) => settings,
-        Err(error) => {
-            // `write_to` 只校验过「顶层是对象」，内层可能是结构性的坏
-            // （比如 `"agent": 5`）。这与「文件存在却读不出来 → 拒绝覆盖」
-            // 的守卫同向：宁可不写，也不把坏文件当默认值覆盖掉。
-            return Err(SettingsError::Corrupt(format!(
-                "the merged settings would not deserialize: {error}"
-            )));
-        }
-    };
-
-    // 只钳制、不做倒挂回落——否则本次要检查的倒挂会先被清掉。
-    // 不复用 `power_windows_minutes`：它要一个完整的 `&Settings`，
-    // 而这里手上只有两个 Option。直接算等价。
-    let grace_minutes = merged
-        .power
-        .idle_grace_minutes
-        .filter(|&value| within("power.idle_grace_minutes", value))
-        .unwrap_or(POWER_IDLE_GRACE_MINUTES_DEFAULT);
-    let remote_minutes = merged
-        .power
-        .remote_touch_minutes
-        .filter(|&value| within("power.remote_touch_minutes", value))
-        .unwrap_or(POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
-
-    // 只在本次 patch 触碰了这两个键时才拒绝。否则文件里既有的倒挂会让用户
-    // 连改 `agent.max_turns` 都失败——那是把人锁在文件外面。文件里的既有
-    // 倒挂由加载侧的 `normalized()` 静默回落并 warn，不影响写入。
-    let touches_power_windows = patch.contains_key("power.idle_grace_minutes")
-        || patch.contains_key("power.remote_touch_minutes");
-    if touches_power_windows && remote_minutes > grace_minutes {
-        return Err(SettingsError::InvalidSetting {
-            key: "power.remote_touch_minutes".to_string(),
-            reason: format!(
-                "must not exceed power.idle_grace_minutes \
-                 (the remote window {remote_minutes} is longer than the grace \
-                 {grace_minutes}, which would make the grace ineffective on battery)"
-            ),
-        });
-    }
-
-    // 删掉只剩空壳的分组对象，避免留下 {"agent":{}} 这种噪音。
-    for group in ["agent", "compact", "startup", "tui", "power"] {
-        if object
-            .get(group)
-            .and_then(|value| value.as_object())
-            .is_some_and(|inner| inner.is_empty())
-        {
-            object.remove(group);
-        }
-    }
-
-    let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
-        .map_err(|error| SettingsError::Io(error.to_string()))?;
-    write_atomically(path, &text).map_err(|error| SettingsError::Io(error.to_string()))
+    store::commit_patch(path, patch, store::PatchMode::ReplaceProvided).map(|_| ())
 }
 
 /// 校验单个值；`Ok(None)` 表示「删键」。
-fn validate_value(
+pub(super) fn validate_value(
     spec: &'static FieldSpec,
     value: &serde_json::Value,
 ) -> Result<Option<serde_json::Value>, SettingsError> {
@@ -952,7 +968,7 @@ fn validate_value(
 }
 
 /// 把一个点路径键套进顶层对象。`None` 表示删键。
-fn apply_op(
+pub(super) fn apply_op(
     object: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
     value: Option<serde_json::Value>,
@@ -977,42 +993,6 @@ fn apply_op(
             }
         }
     }
-}
-
-/// 临时文件 + `rename` + `0600`，与 `models.rs` 的 `save_catalog_to` 同一套。
-fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!("settings.json.{}.{}.tmp", std::process::id(), seq));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(text.as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&tmp, text)?;
-    }
-    std::fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1878,38 +1858,43 @@ malformed line
         let before = std::fs::read(&path).unwrap();
 
         // 只 patch 宽限（5 → 60 会合法；这里相反：把宽限压到 2，远端 5 就倒挂了）。
+        //
+        // 统一入口对完整候选做严格文档校验，跨字段错误因此报成
+        // `InvalidDocument`（点名远端窗口），而不是单字段的 `InvalidSetting`：
+        // 倒挂不是某个字段自身越界，而是两个字段合起来非法。
         let patch = serde_json::json!({"power.idle_grace_minutes": 2});
         let error = write_to(&path, &patch).unwrap_err();
         match error {
-            SettingsError::InvalidSetting { key, reason } => {
-                assert_eq!(key, "power.remote_touch_minutes");
-                assert!(
-                    reason.contains("must not exceed"),
-                    "reason should explain the cross-field rule, got {reason}"
-                );
+            SettingsError::InvalidDocument { keys } => {
+                assert_eq!(keys, vec!["power.remote_touch_minutes".to_string()]);
             }
-            other => panic!("expected InvalidSetting, got {other:?}"),
+            other => panic!("expected InvalidDocument, got {other:?}"),
         }
 
         let after = std::fs::read(&path).unwrap();
         assert_eq!(after, before, "a rejected write must not touch the file");
     }
 
-    /// 旧键不会因为「保存了别的字段」而消失——这是预期行为，不是 bug。
-    /// `write_to` 只对 patch 里出现的键调 `apply_op`，其余原样保留。
+    /// 一次无关写入会把旧别名规范化到新键——值不丢，旧键不残留。
+    ///
+    /// 统一入口写的是 `validate_document` 的规范原文，所以「只改别的字段」也会
+    /// 顺手把 `agent.prevent_idle_sleep` 搬到 `power.prevent_idle_sleep`。这是
+    /// 有意的收紧：旧键留着会让清空新键时旧值复活（见 store 的回归用例）。
     #[test]
-    fn migrate_legacy_key_stays_on_disk_after_other_writes() {
+    fn an_unrelated_write_normalises_the_legacy_alias() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_json(&dir, r#"{"agent":{"prevent_idle_sleep":"false"}}"#);
         write_to(&path, &serde_json::json!({"power.idle_grace_minutes": 30})).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["power"]["prevent_idle_sleep"], "false");
+        assert_eq!(value["power"]["idle_grace_minutes"], 30);
         assert!(
-            text.contains("agent"),
-            "the legacy key must survive an unrelated write, got {text}"
+            value.get("agent").is_none(),
+            "the emptied legacy group must be pruned, got {text}"
         );
-        assert!(text.contains("prevent_idle_sleep"), "got {text}");
-        // 而新值确实写进去了。
-        assert!(text.contains("idle_grace_minutes"), "got {text}");
+        // 迁移后的语义没有丢：开关仍是关。
+        assert!(!prevent_idle_sleep_enabled(&load_from(&path)));
     }
 
     /// 迁移结果可重放：把迁好的 Settings 整份写回，再读一次必须相等。
@@ -1956,26 +1941,51 @@ malformed line
         assert_eq!(remote, POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
     }
 
-    /// 文件里已有一对倒挂的手改值（宽限 5、远端 30）时，改**无关**字段
-    /// 仍须成功。否则用户手改坏了一对值之后就再也存不进任何设置——
-    /// 那是把人锁在文件外面。倒挂本身由加载侧 `normalized()` 回落。
+    /// 文件里已有一对倒挂的手改值（宽限 5、远端 30）时，写**无关**字段也被拒：
+    /// 统一入口不允许把未修复的非法候选保存成成功，但错误点名要修的键，用户
+    /// 因此能一次修好，而不是被锁在文件外面。
     #[test]
-    fn an_unrelated_write_succeeds_despite_an_inverted_pair_on_disk() {
+    fn an_unrelated_write_is_rejected_until_the_inverted_pair_is_repaired() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_json(
             &dir,
             r#"{"power":{"idle_grace_minutes":5,"remote_touch_minutes":30}}"#,
         );
-        write_to(&path, &serde_json::json!({"agent.max_turns": 123})).unwrap();
+        let before = std::fs::read(&path).unwrap();
 
-        let text = std::fs::read_to_string(&path).unwrap();
+        let error = write_to(&path, &serde_json::json!({"agent.max_turns": 123})).unwrap_err();
         assert!(
-            text.contains("123"),
-            "the unrelated write must land, got {text}"
+            matches!(&error, SettingsError::InvalidDocument { keys } if keys == &vec!["power.remote_touch_minutes".to_string()]),
+            "the unrepaired candidate must be rejected with the key to fix, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a rejected write must not touch the file"
+        );
+
+        // 同一次 patch 里把这对窗口一起修好即可落盘——用户不会被锁在文件外面。
+        write_to(
+            &path,
+            &serde_json::json!({
+                "agent.max_turns": 123,
+                "power.idle_grace_minutes": 30,
+                "power.remote_touch_minutes": 5,
+            }),
+        )
+        .unwrap();
+        let settings = load_from(&path);
+        assert_eq!(settings.agent.max_turns, Some(123));
+        assert_eq!(
+            (
+                settings.power.idle_grace_minutes,
+                settings.power.remote_touch_minutes
+            ),
+            (Some(30), Some(5))
         );
     }
 
-    /// 但触碰这对窗口就被拒——哪怕只是其中一个键。
+    /// 只把宽限压小（远端窗口保持不变）造成的倒挂同样被拒，且零写入。
     #[test]
     fn touching_an_inverted_pair_is_still_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1986,7 +1996,11 @@ malformed line
         let error =
             write_to(&path, &serde_json::json!({"power.idle_grace_minutes": 2})).unwrap_err();
         assert!(
-            matches!(error, SettingsError::InvalidSetting { .. }),
+            matches!(
+                &error,
+                SettingsError::InvalidDocument { keys }
+                    if keys == &vec!["power.remote_touch_minutes".to_string()]
+            ),
             "touching the inverted pair must be rejected, got {error:?}"
         );
     }

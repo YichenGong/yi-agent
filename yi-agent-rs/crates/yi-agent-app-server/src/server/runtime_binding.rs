@@ -103,10 +103,32 @@ pub(crate) fn current_session_preserve_thinking() -> bool {
 /// 的 `model_ref`(由 [`with_session_model_ref`] 设定)解析 provider/api_url/
 /// api_key/model 四个字段,使**整条会话**跑在清单条目的 url/key/model 上,而非
 /// 全局 `cfg`(解析不中则原样回退 `cfg`)。
+#[allow(dead_code)] // The static facade: tests and binding-less callers still use it.
 pub(crate) fn production_factory(
     cfg: RuntimeConfig,
     theme: crate::theme_tool::ThemeHandle,
     catalog: Arc<yi_agent_runtime::models::CatalogWatcher>,
+) -> impl Fn(
+    Option<yi_agent_core::Session>,
+    &Path,
+    crate::thread_store::ThreadMode,
+) -> anyhow::Result<BuiltAgent>
++ Send
++ Sync
++ 'static {
+    production_factory_with_binding(cfg, theme, catalog, None)
+}
+
+/// [`production_factory`]，但把进程级运行期设置绑定交给每个会话。
+///
+/// 绑定里只有共享的设置源与初始装配冻结的固定来源；设置键不含模型或凭据，
+/// 因此本工厂按会话派生 `thread_cfg`（cwd / yolo / 关联根 / 模型条目）之后仍
+/// 可以把同一个绑定克隆给每个会话，而不必逐会话重新 capture。
+pub(crate) fn production_factory_with_binding(
+    cfg: RuntimeConfig,
+    theme: crate::theme_tool::ThemeHandle,
+    catalog: Arc<yi_agent_runtime::models::CatalogWatcher>,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> impl Fn(
     Option<yi_agent_core::Session>,
     &Path,
@@ -141,10 +163,20 @@ pub(crate) fn production_factory(
         if let Some(effort) = current_session_reasoning_effort() {
             thread_cfg.reasoning_effort = Some(effort);
         }
-        let built = yi_agent_runtime::bootstrap::bootstrap_agent(
-            &thread_cfg,
-            yi_agent_runtime::bootstrap::PermissionMode::Interactive,
-        )?;
+        // Each session gets its own clone of the process-wide binding: the
+        // shared source is the same `Arc`, so one save is visible to every live
+        // thread, while the frozen source table is read-only and cheap to clone.
+        let built = match &binding {
+            Some(binding) => yi_agent_runtime::bootstrap::bootstrap_agent_with_binding(
+                &thread_cfg,
+                yi_agent_runtime::bootstrap::PermissionMode::Interactive,
+                binding.clone(),
+            )?,
+            None => yi_agent_runtime::bootstrap::bootstrap_agent(
+                &thread_cfg,
+                yi_agent_runtime::bootstrap::PermissionMode::Interactive,
+            )?,
+        };
         // 主题工具必须进每个 thread 的工具集;委派随后可能用
         // `wrap_for_delegation` 换掉 registry,那条路径([`build_runtime_tooling`])
         // 同样注册。`Agent::new` 会顺带清掉权限检查器,故重建后必须重新装上

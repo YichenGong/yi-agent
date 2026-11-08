@@ -218,6 +218,51 @@ fn side_prompt_ends_with_the_fixed_policy_and_is_read_only() {
     );
 }
 
+/// A side keeps the configured catalog budget even when the directory is far
+/// larger: it must never inherit another role's "include everything" decision.
+#[test]
+fn side_prompt_truncates_an_oversized_catalog_without_prompting() {
+    let mut cfg = crate::config::sample_config_for_side_test();
+    let dir = tempfile::tempdir().unwrap();
+    cfg.workdir = dir.path().to_path_buf();
+    cfg.skills_catalog_budget = 400;
+
+    let skills_root = dir.path().join("skills");
+    for index in 0..20 {
+        let skill = skills_root.join(format!("s{index:02}"));
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: s{index:02}\ndescription: {}\n---\nbody",
+                "x".repeat(600)
+            ),
+        )
+        .unwrap();
+    }
+
+    let roots = vec![(skills_root, yi_agent_skills::SkillScope::User)];
+    let prompts = crate::live_settings::prompt::LivePromptComposer::new(
+        &cfg,
+        crate::live_settings::prompt::PromptRole::Side,
+        Some(Arc::new(yi_agent_skills::SkillsService::new(roots))),
+        crate::live_settings::prompt::InitialCatalogPolicy::Bounded,
+    )
+    .unwrap()
+    .render(
+        cfg.system_prompt.as_deref(),
+        400,
+        crate::live_settings::sources::ValueSource::Settings,
+    )
+    .unwrap()
+    .expect("a prompt");
+    assert!(
+        !prompts.contains("s19"),
+        "an oversized catalog must be truncated, not included whole"
+    );
+    assert!(prompts.ends_with(yi_agent_core::SIDE_SYSTEM_POLICY));
+}
+
 // ---------------------------------------------------------------------------
 // the fixed registry
 // ---------------------------------------------------------------------------
@@ -311,6 +356,75 @@ async fn side_gate_starts_while_the_parent_still_holds_a_lease_when_capacity_is_
         .expect("the side must not be serialised behind the parent's whole turn")
         .unwrap();
     drop(side_lease);
+}
+
+/// A settings save must reach a running side's ordinary values **without** being
+/// mistaken for a lifecycle change.
+///
+/// The distinction matters: `revision` marks "the parent moved, replace me" and
+/// `generation` marks "the parent was cleared/deleted, I am void". A save is
+/// neither -- it only changes ordinary runtime values -- so a side that rebuilt
+/// itself (or closed) on every save would lose its history and its spent budget
+/// for no reason.
+#[tokio::test]
+async fn a_settings_save_reaches_the_side_without_a_lifecycle_change() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let settings_path = dir.path().join("settings.json");
+    std::fs::write(&settings_path, r#"{"agent": {"max_turns": 5}}"#).unwrap();
+    let overrides = crate::config::ConfigOverrides {
+        provider: Some("anthropic".to_string()),
+        api_key: Some("sk-test".to_string()),
+        model: Some("test-model".to_string()),
+        workdir: Some(dir.path().to_path_buf()),
+        ..Default::default()
+    };
+    let (cfg, binding) =
+        crate::config::RuntimeConfig::load_lenient_with_binding(&overrides, &settings_path)
+            .expect("test config loads");
+
+    let composer = crate::bootstrap::composer_for(&cfg, None);
+    let live: Arc<dyn yi_agent_core::live_settings::AgentSettingsSource> =
+        binding.agent_source(crate::live_settings::binding::AgentSettingsContext {
+            model_context_length: 200_000,
+            prompt: composer,
+        });
+
+    let mut source = source_with_history("q", "a");
+    source.live = Some(Arc::clone(&live));
+    let revision = source.revision;
+    let generation = source.generation;
+    assert_eq!(
+        live.snapshot().expect("snapshot").max_turns,
+        Some(5),
+        "the side must read the parent's shared source"
+    );
+
+    binding
+        .live
+        .commit(
+            &serde_json::json!({"agent.max_turns": 9}),
+            crate::settings::store::PatchMode::ReplaceProvided,
+        )
+        .expect("commit");
+
+    // Same source, new value: the save is visible on the *existing* side.
+    assert_eq!(
+        source
+            .live
+            .as_ref()
+            .expect("still attached")
+            .snapshot()
+            .expect("snapshot")
+            .max_turns,
+        Some(9),
+        "a save must reach the running side's ordinary values"
+    );
+    // ...while nothing about its lifecycle identity moved.
+    assert_eq!(source.revision, revision, "a save is not a source revision");
+    assert_eq!(
+        source.generation, generation,
+        "a save must not void the side's history or its spent budget"
+    );
 }
 
 #[tokio::test]

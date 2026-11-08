@@ -301,6 +301,11 @@ export class ThreadStore {
       // 兜底分支会去读一个不存在的字段,把正文写进 `undefined` 这个假会话。
       return false;
     }
+    if (n.method === "settings/changed") {
+      // 全局设置通知，没有 `thread_id`：它由 `runtimeSettingsBus` 按 client 身份
+      // 单独路由，绝不能掉进下面的兜底分支去读一个不存在的字段。
+      return false;
+    }
     const id = n.params.thread_id;
     const v = this.view(id);
     const visible = v.session.apply(n);

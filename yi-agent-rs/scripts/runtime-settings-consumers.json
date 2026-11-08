@@ -1,0 +1,147 @@
+{
+  "$comment": [
+    "「运行参数」每个字段的实际消费测试清单。不是运行期配置源，只用于验收。",
+    "",
+    "为什么需要它：`FIELDS` 里存在一个键，不等于这个键会被任何代码读到。",
+    "策略表能证明“这个键有采纳策略”，却证明不了“改了它会改变行为”。",
+    "这里的每一行都指向一个**真实存在、真实运行、非 ignored** 的测试，",
+    "该测试断言了这个字段的实际效果（请求体、准入计数、真机断言等），",
+    "而不是“配置对象里有这个值”。",
+    "",
+    "新增字段却没有映射 → `consumer_manifest_covers_all_fields` 失败；",
+    "清单里写了不存在的测试名 → check-live-settings-coverage.py 失败。",
+    "",
+    "一个测试覆盖多个字段时，各字段分别显式列一行：映射按字段独立校验，",
+    "共用同一测试不会让某个字段变成“顺带被证明”。"
+  ],
+  "fields": [
+    {
+      "key": "agent.max_turns",
+      "package": "yi-agent-core",
+      "target_kind": "test",
+      "target": "live_compact_settings",
+      "test_name": "lowered_turn_limit_stops_before_the_next_think",
+      "consumes": "运行中把上限降低后，下一次 THINK 之前就必须停：证明轮次检查读的是实时值"
+    },
+    {
+      "key": "agent.max_direct_children",
+      "package": "yi-agent-store",
+      "target_kind": "test",
+      "target": "live_admission",
+      "test_name": "the_direct_child_limit_is_read_at_each_spawn",
+      "consumes": "每次真实 spawn 前重读直接子进程额度，而不是沿用构造时的常数"
+    },
+    {
+      "key": "agent.max_resident_subagents",
+      "package": "yi-agent-store",
+      "target_kind": "test",
+      "target": "live_admission",
+      "test_name": "shrinking_capacity_keeps_running_workers_and_refuses_new_ones",
+      "consumes": "resident 容量降额后仍运行的不取消、新的被拒：证明准入读实时额度"
+    },
+    {
+      "key": "agent.system_prompt",
+      "package": "yi-agent-runtime",
+      "target_kind": "lib",
+      "target": "",
+      "test_name": "live_settings::prompt::tests::normal_role_orders_every_segment",
+      "consumes": "用户段真的进入了拼装后的 system prompt，且相对顺序固定"
+    },
+    {
+      "key": "agent.skills_catalog_budget",
+      "package": "yi-agent-runtime",
+      "target_kind": "lib",
+      "target": "",
+      "test_name": "live_settings::prompt::tests::include_all_survives_unrelated_changes_and_revokes_on_drift",
+      "consumes": "预算变化让 IncludeAll 选择失效并可重新解析，而不是只改一个字段"
+    },
+    {
+      "key": "power.prevent_idle_sleep",
+      "package": "yi-agent-app-server",
+      "target_kind": "lib",
+      "target": "",
+      "test_name": "power_guard::tests::sleep_hardening_disable_wakes_the_worker_and_skips_the_grace",
+      "consumes": "关掉后立刻唤醒 worker 并释放断言，不等满一个宽限期"
+    },
+    {
+      "key": "power.idle_grace_minutes",
+      "package": "yi-agent-app-server",
+      "target_kind": "lib",
+      "target": "",
+      "test_name": "power_guard::tests::a_window_save_shortens_the_remaining_grace_without_a_ticker",
+      "consumes": "窗口变短立刻作用于已运行的守卫，且不等 10 秒 ticker"
+    },
+    {
+      "key": "power.remote_touch_minutes",
+      "package": "yi-agent-app-server",
+      "target_kind": "lib",
+      "target": "",
+      "test_name": "power_busy::tests::a_custom_remote_window_expires_at_its_own_boundary",
+      "consumes": "自定义远端窗口在自己的边界过期：证明忙碌判定读的是配置值"
+    },
+    {
+      "key": "compact.ratio",
+      "package": "yi-agent-core",
+      "target_kind": "test",
+      "target": "live_compact_settings",
+      "test_name": "raised_threshold_during_summary_keeps_the_original_history",
+      "consumes": "阈值在摘要期间抬高后，本次摘要仍按原快照处理，下一轮才换"
+    },
+    {
+      "key": "compact.user_budget_tokens",
+      "package": "yi-agent-core",
+      "target_kind": "test",
+      "target": "live_compact_settings",
+      "test_name": "live_compaction_budget_changes_retained_history",
+      "consumes": "压缩预算真的影响保留下来的历史长度"
+    },
+    {
+      "key": "compact.tool_budget_tokens",
+      "package": "yi-agent-core",
+      "target_kind": "test",
+      "target": "live_compact_settings",
+      "test_name": "live_compaction_budget_changes_retained_history",
+      "consumes": "同一场景覆盖工具预算：压缩后保留的工具结果量随该值变化"
+    },
+    {
+      "key": "startup.sandbox",
+      "package": "yi-agent-app-server",
+      "target_kind": "lib",
+      "target": "",
+      "test_name": "session_sandbox::tests::a_recorded_baseline_ignores_todays_default",
+      "consumes": "已记录的基线不接受今天的新默认值：证明该键只影响新会话"
+    },
+    {
+      "key": "tui.notifications",
+      "package": "yi-agent",
+      "target_kind": "bin",
+      "target": "yi-agent",
+      "test_name": "tui::app::notification_tests::disabled_notifications_produce_nothing",
+      "consumes": "关闭后真实通知器不产生任何一条通知"
+    },
+    {
+      "key": "tui.terminal_title",
+      "package": "yi-agent",
+      "target_kind": "bin",
+      "target": "yi-agent",
+      "test_name": "tui::app::notification_tests::a_title_switch_change_reaches_the_writer",
+      "consumes": "切换后真实写到终端标题的 writer 被重配"
+    },
+    {
+      "key": "tui.notification_method",
+      "package": "yi-agent",
+      "target_kind": "bin",
+      "target": "yi-agent",
+      "test_name": "tui::app::notification_tests::a_method_change_reconfigures_the_notifier_in_place",
+      "consumes": "方式变化就地重配通知器，不必重启 TUI"
+    },
+    {
+      "key": "tui.notification_condition",
+      "package": "yi-agent",
+      "target_kind": "bin",
+      "target": "yi-agent",
+      "test_name": "tui::app::notification_tests::should_notify_respects_condition",
+      "consumes": "通知条件真的参与“这一条发不发”的判定"
+    }
+  ]
+}

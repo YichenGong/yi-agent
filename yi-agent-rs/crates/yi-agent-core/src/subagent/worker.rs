@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::ProviderTurnGate;
+use crate::live_settings::AdmissionLimitsSource;
 use crate::message::Message;
 
 use super::task::{
@@ -858,6 +859,17 @@ pub trait AgentWorkerFactory: Send + Sync {
         crate::subagent::supervisor::MAX_DIRECT_CHILDREN
     }
 
+    /// Live replacement for the two capacities above, when the application
+    /// wires runtime settings into its factory.
+    ///
+    /// Defaulting to `None` keeps the static methods authoritative, so every
+    /// pre-existing factory and test keeps compiling and behaving as before.
+    /// The store reads this inside its actual admission path; it must not be
+    /// polled to derive a long-lived copy.
+    fn live_admission_limits(&self) -> Option<Arc<dyn AdmissionLimitsSource>> {
+        None
+    }
+
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         None
     }
@@ -1050,6 +1062,86 @@ mod stop_confirmation_tests {
         assert!(
             !gated.is_stopped(),
             "reopening an earlier gate closes the confirmation again"
+        );
+    }
+
+    /// Factories that never wired live admission inherit a hard `None`, so the
+    /// runtime keeps using the static capacities instead of guessing.
+    #[test]
+    fn worker_factory_defaults_to_no_live_admission_limits() {
+        struct StaticFactory;
+        impl AgentWorkerFactory for StaticFactory {
+            fn start(
+                &self,
+                request: WorkerStart,
+            ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+                Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+            }
+        }
+
+        assert!(StaticFactory.live_admission_limits().is_none());
+    }
+
+    /// A wiring factory must be able to hand core a source without changing any
+    /// other factory method, and the source must stay observable as an `Arc`.
+    #[tokio::test]
+    async fn worker_factory_can_expose_a_live_admission_limits_source() {
+        struct Limits {
+            value: std::sync::Mutex<crate::live_settings::AdmissionLimits>,
+            changed: watch::Sender<u64>,
+        }
+        impl crate::live_settings::AdmissionLimitsSource for Limits {
+            fn snapshot(
+                &self,
+            ) -> Result<
+                crate::live_settings::AdmissionLimits,
+                crate::live_settings::LiveSettingsError,
+            > {
+                Ok(*self.value.lock().unwrap())
+            }
+            fn subscribe(&self) -> watch::Receiver<u64> {
+                self.changed.subscribe()
+            }
+        }
+
+        struct LiveFactory(Arc<Limits>);
+        impl AgentWorkerFactory for LiveFactory {
+            fn start(
+                &self,
+                request: WorkerStart,
+            ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+                Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+            }
+            fn live_admission_limits(
+                &self,
+            ) -> Option<Arc<dyn crate::live_settings::AdmissionLimitsSource>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let (changed, _keepalive) = watch::channel(0);
+        let limits = Arc::new(Limits {
+            value: std::sync::Mutex::new(crate::live_settings::AdmissionLimits {
+                direct_children: 2,
+                resident_subagents: 3,
+            }),
+            changed,
+        });
+        let factory = LiveFactory(limits.clone());
+        let source = factory.live_admission_limits().expect("source is wired");
+        assert_eq!(source.snapshot().unwrap().direct_children, 2);
+
+        let mut woken = source.subscribe();
+        *limits.value.lock().unwrap() = crate::live_settings::AdmissionLimits {
+            direct_children: 1,
+            resident_subagents: 3,
+        };
+        limits.changed.send(1).unwrap();
+        woken.changed().await.unwrap();
+        assert_eq!(source.snapshot().unwrap().direct_children, 1);
+        assert_eq!(
+            factory.max_direct_children(),
+            crate::subagent::supervisor::MAX_DIRECT_CHILDREN
         );
     }
 

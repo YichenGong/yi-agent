@@ -405,6 +405,11 @@ pub(crate) struct AppState<'a> {
     pub(crate) websearch_path: &'a Path,
     /// `settings.json` 路径。可注入，让测试不必改 `HOME`。
     pub(crate) settings_path: &'a Path,
+    /// 进程级运行期设置绑定。`thread/start` 与 `thread/resume` 把它交给
+    /// `attach_delegation`，使本进程自起的项目 daemon 的 worker 工厂也跟随
+    /// 设置保存（`None` = 历史静态行为）。
+    pub(crate) live_settings:
+        Option<&'a yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
     /// 进程内「正在探测」的模型名登记表：`model/probe` 与 `model/upsert` 的
     /// 后台探测共用同一张表，保证同名条目的探测不会并发跑两轮。它只是内存态，
     /// 每个 app-server 进程一份（见 `serve()` 里的构造）。

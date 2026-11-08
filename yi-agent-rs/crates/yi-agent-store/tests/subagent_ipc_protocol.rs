@@ -230,3 +230,53 @@ fn session_delegation_lifecycle_v3_unknown_command_field_is_validation() {
     assert_eq!(response["result"]["code"], "validation");
     assert_healthy(daemon.socket_path());
 }
+
+/// A new daemon advertises the live-apply capability on `Status`.
+///
+/// The field is additive and optional: a client that has never heard of it
+/// reads the same frame as before, and an old daemon's frame (no field) reads
+/// as `None`, which is exactly the "old capability, degrade" signal. Both
+/// directions are asserted here because only the pair makes the claim
+/// meaningful -- serializing `Some` alone would pass even if parsing a missing
+/// field errored out.
+#[test]
+fn status_reports_the_live_apply_capability_and_tolerates_old_daemons() {
+    let dir = TempDir::new().unwrap();
+    let daemon = Daemon::start(dir.path().join("runtime"), dir.path().join("db")).unwrap();
+
+    let response = send_request(daemon.socket_path(), IpcRequest::Status).unwrap();
+    let yi_agent_store::ipc::IpcResponse::Status {
+        live_apply_version, ..
+    } = response
+    else {
+        panic!("Status must answer with a Status frame, got {response:?}");
+    };
+    assert_eq!(
+        live_apply_version,
+        Some(yi_agent_store::ipc::LIVE_APPLY_VERSION),
+        "a daemon that applies settings live must say so"
+    );
+
+    // The same frame on the wire carries the field ...
+    let frame = serde_json::to_value(yi_agent_store::ipc::IpcResponse::Status {
+        high_water_event_id: 7,
+        live_apply_version: Some(yi_agent_store::ipc::LIVE_APPLY_VERSION),
+    })
+    .unwrap();
+    assert_eq!(
+        frame["live_apply_version"],
+        json!(yi_agent_store::ipc::LIVE_APPLY_VERSION)
+    );
+
+    // ... and an old daemon's frame, which has no such field, must still parse.
+    let old = json!({ "type": "Status", "high_water_event_id": 7 });
+    let parsed: IpcResponse = serde_json::from_value(old).unwrap();
+    assert_eq!(
+        parsed,
+        IpcResponse::Status {
+            high_water_event_id: 7,
+            live_apply_version: None,
+        },
+        "an old daemon must read as 'no live apply', not as a parse error"
+    );
+}

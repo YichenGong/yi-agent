@@ -584,6 +584,8 @@ async fn eof_exits_gracefully() {
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             settings_path: PathBuf::new(),
+            // 这些用例不涉运行期设置：静态装配。
+            live_settings: None,
             lead_agent_enabled: false,
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
@@ -679,6 +681,8 @@ async fn oversized_frame_returns_err() {
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             settings_path: PathBuf::new(),
+            // 这些用例不涉运行期设置：静态装配。
+            live_settings: None,
             lead_agent_enabled: false,
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
@@ -2991,6 +2995,7 @@ async fn writer_lock_refuses_a_second_writer_on_the_same_thread() {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
         })
         .unwrap();
 

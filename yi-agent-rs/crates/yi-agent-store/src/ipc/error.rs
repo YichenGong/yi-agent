@@ -182,6 +182,14 @@ pub(crate) fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         IpcError::Runtime(RuntimeCoordinatorError::ResidentCapacityExhausted) => {
             IpcErrorCode::RateLimited
         }
+        // Unknown settings are not a daemon fault and not the caller's mistake:
+        // the daemon refused an admission because it could not read the
+        // configuration it must obey. Reporting Internal would send operators
+        // hunting for a crash that is not there, and Validation would blame a
+        // caller whose request was fine.
+        IpcError::Runtime(RuntimeCoordinatorError::LiveSettings { .. }) => {
+            IpcErrorCode::InvalidState
+        }
         IpcError::Runtime(RuntimeCoordinatorError::Draining) => IpcErrorCode::InvalidState,
         IpcError::Runtime(RuntimeCoordinatorError::AuthorityDenied(_)) => {
             IpcErrorCode::AuthorityDenied

@@ -151,6 +151,38 @@ pub struct ThreadMeta {
     /// 这是**正确**的缺省而不是迁移遗留：绝大多数会话与插件无关。
     #[serde(default)]
     pub plugin_bindings: Vec<yi_agent_plugins::Binding>,
+    /// The sandbox this conversation actually ran under when it started.
+    ///
+    /// Startup settings are the *default for new conversations*, so a saved
+    /// change must never silently re-open an old conversation wider than it was
+    /// when it began running the user's tools. This field is that record.
+    ///
+    /// Absent means a meta written before the field existed: the loader reports
+    /// `None` and activation falls back to a conservative read-only baseline with
+    /// a warning. Present-but-`null` or present-but-invalid is a corrupt claim,
+    /// not history, and must refuse activation instead of guessing — hence the
+    /// custom deserializer rather than plain `Option`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_baseline",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sandbox_baseline: Option<crate::session_sandbox::SandboxBaseline>,
+}
+
+/// Distinguishes "field absent" from "field present but invalid".
+///
+/// `#[serde(default)]` alone maps both to `None`, which would let a hand-edited
+/// or partially-written meta claim "no baseline" and be treated as legacy. The
+/// caller needs the difference: absent is history and takes the conservative
+/// fallback, while a present-but-wrong value is corruption and must be refused.
+fn deserialize_present_baseline<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::session_sandbox::SandboxBaseline>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    crate::session_sandbox::SandboxBaseline::deserialize(deserializer).map(Some)
 }
 
 impl ThreadMeta {
@@ -261,6 +293,15 @@ pub struct PartialTurn {
     pub usage: Option<TurnUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_total: Option<TurnUsage>,
+}
+
+/// How [`ThreadStore::load_with_meta_policy`] treats an unreadable meta file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetaPolicy {
+    /// Rebuild from the transcript and carry on (listing/UI reads).
+    Tolerant,
+    /// Fail (activation reads, where a guess could grant unrecorded access).
+    Strict,
 }
 
 /// `load` 的结果:meta + 拼接后的 items + 最后一条记录的 messages/usage。
@@ -440,8 +481,15 @@ impl ThreadStore {
             ThreadLockError::Io(err) => err,
         })?;
 
+        // Strict on the source: a fork copies this conversation's messages
+        // *and* its sandbox baseline. If the meta cannot be read, the baseline
+        // is unknown, and a tolerant read would silently rebuild the meta and
+        // hand the copy "no record" — which then activates at the read-only
+        // floor at best, or adopts a default the user never chose for this
+        // history at worst. Refusing here keeps a corrupt source from being
+        // laundered into a fresh, apparently-legitimate conversation.
         let mut loaded = self
-            .load(from)?
+            .load_for_activation(from)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("thread {from}")))?;
 
         let now = now_millis();
@@ -493,6 +541,11 @@ impl ThreadStore {
                 .collect(),
             // 唯一组长不变量：一个项目只能有一个 lead
             role: None,
+            // A fork inherits the source conversation's sandbox, not today's
+            // default. The messages being copied were produced under the
+            // source's baseline, and widening the sandbox on copy would grant
+            // tools access the user never authorized for that history.
+            sandbox_baseline: loaded.meta.sandbox_baseline,
             forked_from: Some(from.to_string()),
             content_epoch: 0,
             // 锚点/已读/完成时刻都不能继承：继承 last_item_id 会让桌面端的
@@ -844,6 +897,36 @@ impl ThreadStore {
         self.clear_partial(id)
     }
 
+    /// Read the meta file, treating only "no such file" as absent.
+    ///
+    /// Used by the activation paths (`load_for_activation`,
+    /// `read_meta_for_activation`) so a hand-edited or partially-written meta
+    /// cannot masquerade as a conversation that never had a recorded baseline.
+    pub fn read_meta_strict(&self, id: &str) -> io::Result<Option<ThreadMeta>> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        match std::fs::read_to_string(self.meta_path(id)) {
+            Ok(text) => serde_json::from_str::<ThreadMeta>(&text)
+                .map(Some)
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("thread {id} has an unreadable meta: {error}"),
+                    )
+                }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Just the meta, for callers that need the baseline before deciding whether
+    /// to load a transcript at all. Same strictness as
+    /// [`ThreadStore::load_for_activation`].
+    pub fn read_meta_for_activation(&self, id: &str) -> io::Result<Option<ThreadMeta>> {
+        self.read_meta_strict(id)
+    }
+
     /// 严格读 partial：只有「文件不存在」才返回 `None`，损坏/不可读都是错误。
     fn read_partial_strict(&self, id: &str) -> io::Result<Option<PartialTurn>> {
         match read_optional_text(&self.partial_path(id))? {
@@ -853,6 +936,31 @@ impl ThreadStore {
     }
 
     pub fn load(&self, id: &str) -> io::Result<Option<LoadedThread>> {
+        self.load_with_meta_policy(id, MetaPolicy::Tolerant)
+    }
+
+    /// Activation read: the same transcript loading as [`ThreadStore::load`], but
+    /// a meta file that exists yet cannot be read or parsed is an error instead
+    /// of being silently rebuilt from the log.
+    ///
+    /// The difference matters only for decisions that must not run on a guess.
+    /// `load`'s tolerance exists so a corrupt meta never hides a conversation
+    /// from the UI; re-opening it to run tools is a different question, and there
+    /// "we could not read the record of what this conversation was allowed to
+    /// do" must refuse rather than default to *something*.
+    ///
+    /// A missing meta file is still compatible history (`None` from the meta
+    /// reader), not corruption: that is the pre-baseline case the conservative
+    /// fallback exists for.
+    pub fn load_for_activation(&self, id: &str) -> io::Result<Option<LoadedThread>> {
+        self.load_with_meta_policy(id, MetaPolicy::Strict)
+    }
+
+    fn load_with_meta_policy(
+        &self,
+        id: &str,
+        policy: MetaPolicy,
+    ) -> io::Result<Option<LoadedThread>> {
         if !valid_id(id) {
             return Err(invalid_id(id));
         }
@@ -864,10 +972,19 @@ impl ThreadStore {
 
         let (mut items, mut messages, mut usage, mut totals) = self.read_log(id);
 
-        let meta = std::fs::read_to_string(&meta_path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<ThreadMeta>(&t).ok())
-            .unwrap_or_else(|| rebuild_meta(id, &log, &messages));
+        // One read, one decision: the policy below applies to this very meta
+        // value, not to a pre-flight probe that a later read could contradict.
+        let meta = match policy {
+            MetaPolicy::Tolerant => std::fs::read_to_string(&meta_path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<ThreadMeta>(&t).ok())
+                .unwrap_or_else(|| rebuild_meta(id, &log, &messages)),
+            MetaPolicy::Strict => match self.read_meta_strict(id)? {
+                Some(meta) => meta,
+                // No meta file at all: legacy history, still loadable.
+                None => rebuild_meta(id, &log, &messages),
+            },
+        };
 
         // 合流 checkpoint：仅当 partial 的首个 item id 尚未出现在主 jsonl
         // （= 该轮未成功收尾）时采纳。首个 item 是本轮提问 `user-<turn_id>`，
@@ -1111,6 +1228,27 @@ impl ThreadStore {
     pub fn set_permission_mode(&self, id: &str, mode: ThreadMode) -> io::Result<bool> {
         Ok(self
             .update_meta(id, |meta| meta.permission_mode = mode)?
+            .is_some())
+    }
+
+    /// Record the sandbox a conversation runs under.
+    ///
+    /// Written when activation had to *decide* a baseline rather than read one:
+    /// a pre-baseline meta with history gets the conservative read-only floor,
+    /// and a meta created outside `thread/start` (the lazily seeded lead) adopts
+    /// today's default. Persisting both means the decision is made once and the
+    /// conversation never re-enters the "no evidence" path.
+    ///
+    /// Deliberately does not bump `updated_at`: like `set_permission_mode`, this
+    /// is bookkeeping, not conversation activity, and bumping it would reorder
+    /// the sidebar on every resume of an old thread.
+    pub fn set_sandbox_baseline(
+        &self,
+        id: &str,
+        baseline: crate::session_sandbox::SandboxBaseline,
+    ) -> io::Result<bool> {
+        Ok(self
+            .update_meta(id, |meta| meta.sandbox_baseline = Some(baseline))?
             .is_some())
     }
 
@@ -1638,6 +1776,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         last_read_at: 0,
         last_completed_at: 0,
         forked_from: None,
+        sandbox_baseline: None,
     }
 }
 
@@ -1848,6 +1987,7 @@ mod tests {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
         }
     }
 
@@ -3586,6 +3726,30 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
+    /// A corrupt source must not be laundered into a clean-looking copy. With a
+    /// tolerant read the meta would be rebuilt and the copy would claim "no
+    /// baseline", which activation would then have to treat as unknown history.
+    #[test]
+    fn fork_refuses_a_corrupt_source_meta() {
+        let (_dir, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        std::fs::write(
+            s.meta_path("thread-corrupt-src"),
+            r#"{"thread_id":"thread-corrupt-src","cwd":"/tmp","model":"m",
+                "created_at":1,"updated_at":1,"title":null,"permission_mode":"normal",
+                "sandbox_baseline":{"mode":"not-a-mode","promotable":false}}"#,
+        )
+        .unwrap();
+        let error = s
+            .fork_thread("thread-corrupt-src", "thread-corrupt-copy")
+            .expect_err("a corrupt source must not be forked");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            !s.meta_path("thread-corrupt-copy").exists(),
+            "a refused fork must not leave a half-created conversation behind"
+        );
+    }
+
     fn sample_meta(id: &str) -> ThreadMeta {
         ThreadMeta {
             plugin_bindings: Vec::new(),
@@ -3611,6 +3775,7 @@ mod tests {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
         }
     }
 
@@ -4007,6 +4172,7 @@ mod tests {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
@@ -4061,6 +4227,7 @@ mod tests {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
@@ -4141,6 +4308,7 @@ mod tests {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
         };
         store.create(&meta).unwrap();
         store.set_model_ref("t", Some("B")).unwrap();
@@ -4270,6 +4438,7 @@ mod tests {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            sandbox_baseline: None,
         };
         store.create(&lead).unwrap();
         store
@@ -4353,6 +4522,7 @@ mod tests {
                     last_read_at: 0,
                     last_completed_at: 0,
                     forked_from: None,
+                    sandbox_baseline: None,
                 })
                 .unwrap();
             store
@@ -4925,6 +5095,141 @@ mod tests {
             loaded.meta.plugin_bindings,
             vec![binding],
             "resume must not drop or rewrite the binding"
+        );
+    }
+
+    /// A meta written before baselines existed must read as "no record", not as
+    /// a parse failure: those conversations are still openable, and activation
+    /// decides what floor to give them.
+    #[test]
+    fn a_meta_without_a_baseline_reads_as_none() {
+        let (_dir, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        std::fs::write(
+            s.meta_path("thread-legacy-baseline"),
+            r#"{"thread_id":"thread-legacy-baseline","cwd":"/tmp/keep-me","model":"m",
+                "created_at":1,"updated_at":1,"title":null,"permission_mode":"normal"}"#,
+        )
+        .unwrap();
+        let active = s
+            .load_for_activation("thread-legacy-baseline")
+            .unwrap()
+            .expect("legacy meta must still be readable");
+        assert_eq!(active.meta.sandbox_baseline, None);
+        assert_eq!(
+            active.meta.cwd, "/tmp/keep-me",
+            "cwd reset to empty means the meta failed to parse and was rebuilt"
+        );
+    }
+
+    /// Absent (compatible history) and present-but-null (a claim that cannot be
+    /// honored) must not collapse into the same answer.
+    #[test]
+    fn a_present_but_null_baseline_is_refused_at_activation() {
+        let (_dir, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        std::fs::write(
+            s.meta_path("thread-null-baseline"),
+            r#"{"thread_id":"thread-null-baseline","cwd":"/tmp","model":"m",
+                "created_at":1,"updated_at":1,"title":null,"permission_mode":"normal",
+                "sandbox_baseline":null}"#,
+        )
+        .unwrap();
+        let error = s
+            .load_for_activation("thread-null-baseline")
+            .expect_err("an explicit null baseline must not activate");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        // The tolerant read still works: listing must never hide a thread.
+        assert!(s.load("thread-null-baseline").unwrap().is_some());
+    }
+
+    #[test]
+    fn an_unknown_baseline_mode_is_refused_at_activation() {
+        let (_dir, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        std::fs::write(
+            s.meta_path("thread-bad-mode"),
+            r#"{"thread_id":"thread-bad-mode","cwd":"/tmp","model":"m",
+                "created_at":1,"updated_at":1,"title":null,"permission_mode":"normal",
+                "sandbox_baseline":{"mode":"god-mode","promotable":true}}"#,
+        )
+        .unwrap();
+        let error = s
+            .load_for_activation("thread-bad-mode")
+            .expect_err("an unknown sandbox mode must not activate");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_wrongly_shaped_baseline_is_refused_at_activation() {
+        let (_dir, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        std::fs::write(
+            s.meta_path("thread-bad-shape"),
+            r#"{"thread_id":"thread-bad-shape","cwd":"/tmp","model":"m",
+                "created_at":1,"updated_at":1,"title":null,"permission_mode":"normal",
+                "sandbox_baseline":{"mode":"workspace-write","promotable":"yes"}}"#,
+        )
+        .unwrap();
+        assert!(
+            s.load_for_activation("thread-bad-shape").is_err(),
+            "a string where a bool belongs is corruption, not history"
+        );
+    }
+
+    #[test]
+    fn a_read_only_baseline_is_persisted_with_promotion_off() {
+        let (_dir, s) = store();
+        let mut meta = sample_meta("thread-ro");
+        meta.sandbox_baseline = Some(
+            crate::session_sandbox::SandboxBaseline::new("read-only", true)
+                .expect("read-only is a valid mode"),
+        );
+        s.create(&meta).unwrap();
+        let loaded = s.load_for_activation("thread-ro").unwrap().unwrap();
+        let baseline = loaded
+            .meta
+            .sandbox_baseline
+            .expect("baseline must round-trip");
+        assert!(!baseline.promotable, "read-only can never be promotable");
+    }
+
+    #[test]
+    fn a_baseline_round_trips_through_disk() {
+        let (_dir, s) = store();
+        let mut meta = sample_meta("thread-baseline-roundtrip");
+        meta.sandbox_baseline =
+            Some(crate::session_sandbox::SandboxBaseline::new("workspace-write", true).unwrap());
+        s.create(&meta).unwrap();
+        let raw = std::fs::read_to_string(s.meta_path("thread-baseline-roundtrip")).unwrap();
+        assert!(
+            raw.contains("\"sandbox_baseline\""),
+            "the baseline must actually be written, not dropped by serde"
+        );
+        let loaded = s
+            .load_for_activation("thread-baseline-roundtrip")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.meta.sandbox_baseline, meta.sandbox_baseline,
+            "the record read back must be the record written"
+        );
+    }
+
+    /// An unrecorded baseline carries forward on fork: the copied history ran
+    /// under the source's sandbox, so the copy must not be widened.
+    #[test]
+    fn a_fork_inherits_the_source_baseline() {
+        let (_dir, s) = store();
+        let mut meta = sample_meta("thread-src");
+        meta.sandbox_baseline =
+            Some(crate::session_sandbox::SandboxBaseline::new("read-only", false).unwrap());
+        s.create(&meta).unwrap();
+        s.fork_thread("thread-src", "thread-copy").unwrap();
+        let forked = s.load("thread-copy").unwrap().expect("forked thread");
+        assert_eq!(
+            forked.meta.sandbox_baseline, meta.sandbox_baseline,
+            "a fork must not adopt today's default instead of the source's sandbox"
         );
     }
 

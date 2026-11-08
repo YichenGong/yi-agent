@@ -54,11 +54,15 @@ pub(crate) mod scoped;
 pub(crate) mod stdio;
 
 #[allow(unused_imports)]
-pub(crate) use notifications::{pump_git_diff_notifications, pump_theme_notifications};
+pub(crate) use notifications::{
+    pump_git_diff_notifications, pump_settings_notifications, pump_theme_notifications,
+};
 // `run` 与 `serve_stdio_with_relay` 由 `lib.rs` 以 `pub use` 再导出给 CLI，故这里
 // 必须同样是 `pub`；其余仅在 crate 内使用。
 pub(crate) use scoped::{parse_relay_url, serve_scoped, serve_scoped_core, serve_stdio};
-pub use scoped::{run, serve_stdio_with_relay};
+pub use scoped::{
+    run, run_with_binding, serve_stdio_with_relay, serve_stdio_with_relay_and_binding,
+};
 #[allow(unused_imports)]
 pub(crate) use stdio::{pump_stdout, read_lines};
 
@@ -193,6 +197,9 @@ where
         // `serve()` 不再解析——它看得到的 `build_kind()` 是进程级的，测试里恒为
         // `release`，在那儿解析会让注入永远失效。
         lead_agent_enabled,
+        // 进程级运行期设置绑定:只给本项目自己起的 daemon 的 worker 工厂用
+        // (见 `attach_cwd_runtime`)。`None` = 历史静态行为。
+        live_settings,
     } = attachments;
     // 受管插件存储就是实例根：`plugins/v1/*` 的登记、授权、发布目录全在它下面。
     // 与 `watchman_home`（真实 `$HOME`，只用于登录项）刻意分开。
@@ -311,6 +318,12 @@ where
     // 组长 I/O 之后。低频是刻意的:唤醒组长要真花钱(见 `LEAD_TICK`)。
     let mut lead_ticker =
         tokio::time::interval_at(tokio::time::Instant::now() + LEAD_TICK, LEAD_TICK);
+    // 设置变化的唤醒端：本地保存与观察到的外部改动都会推进它。用它把电源三参数
+    // 的生效点从「下一拍 tick」提前到「变化到达」，否则用户把保活关掉后机器仍会
+    // 被按住最多一个 `POWER_TICK`。
+    let mut settings_wake = live_settings
+        .as_ref()
+        .map(|binding| binding.live.subscribe());
     // 主循环侧的保活拍：只做「读设置 + 算 activity + 写两个原子」。
     // 真正的探测与断言在线程里（`power_guard`），这里不碰任何 I/O，
     // 所以用 `interval` 而不是 `interval_at`——立刻跑一次也无害。
@@ -337,6 +350,26 @@ where
     ));
     // 建 thread 的工具仍需该句柄(与 watcher 同一实例,故通知不落空)。
     let git_diff_handle = git_diff.clone();
+
+    // 运行期设置的主动观察:本宿主存活期间一直持租约。
+    //
+    // 为什么必须由「真正持有宿主生命周期」的这一层持有:观察线程要跨进程看见
+    // 别的进程（桌面设置页、另一个 app-server、CLI）改了文件,而本进程自己只有
+    // 保存那一刻才会读到新值。租约一 drop 线程就停,所以它不能挂在某个会话或
+    // 某次请求上。
+    //
+    // `None` = 历史静态装配，既不观察也不发通知（老客户端不会收到从没见过的帧）。
+    let mut settings_lease = live_settings
+        .as_ref()
+        .map(|binding| binding.live.start_observing());
+    // 观察到的变化 → `settings/changed`。与上面那条租约同时存在：没有观察者
+    // 就没有外部变化可播。
+    let mut settings_changes = live_settings.as_ref().map(|binding| {
+        tokio::spawn(crate::server::pump_settings_notifications(
+            std::sync::Arc::clone(&binding.live),
+            Arc::clone(&hub),
+        ))
+    });
     // 组长信箱的消费端。订阅**在这里**、而不是在 RPC 分支里懒订阅:订阅者一旦
     // 晚于投递建立,那条消息就永远收不到(见 `LeadInbox::deliver` 的「无人订阅」
     // 退化分支)。主循环是唯一消费者,故一条 `broadcast` 通道即可。
@@ -356,6 +389,48 @@ where
     // 「谁在等哪一轮」;把「等哪一轮」也塞进它,就会让一个纯登记表长出路由知识。
     // 与 `threads` 同属主循环局部量,同样串行访问,故无需加锁。
     let mut pending_lead_replies: HashMap<String, Vec<String>> = HashMap::new();
+
+    // 电源三参数的唯一来源。三个值必须来自**同一份**设置快照：拆成三次读取时，
+    // 主循环可能读到「新开关 + 旧宽限」，那一拍策略输入从未真实存在过。live 宿主
+    // 用共享实例（与各会话读到的是同一份），静态宿主沿用直接读盘。
+    fn power_settings(
+        live: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+        path: &Path,
+    ) -> yi_agent_runtime::settings::Settings {
+        match live {
+            Some(binding) => binding.live.refresh().settings.clone(),
+            None => yi_agent_runtime::settings::load_from(path),
+        }
+    }
+
+    // 提交一次电源输入。定时拍与「设置变化」两条路径共用它，保证两边算的是
+    // 同一套业务值，不会出现「tick 用旧口径、唤醒用新口径」。
+    macro_rules! commit_power_inputs {
+        () => {{
+            let settings = power_settings(live_settings.as_ref(), &settings_path);
+            // 三个值从这一份快照里一次算完：分开读三次会让这一拍拿到
+            // 「新开关 + 旧宽限」这种从未存在过的组合。
+            let inputs = crate::power_busy::power_inputs(&settings);
+            let (enabled, grace_secs, remote_secs) =
+                (inputs.enabled, inputs.grace_secs, inputs.remote_secs);
+
+            // 本进程侧：本地会话 ∪ 远端近期交互。两项都是纯内存判断，
+            // 放主循环里是安全的（不碰 I/O，也不起子进程）。
+            let local = crate::power_busy::local_busy(&threads);
+            let remote = crate::power_busy::remote_touch_busy(
+                last_remote_touch,
+                &power_clock,
+                Duration::from_secs(remote_secs),
+            );
+            // `latest()` 永远立刻返回（上一拍的结果），绝不等待。
+            let daemon = busy_sampler.latest();
+
+            // 一次提交一致的三个业务值：探测与 IOKit 都在供电线程里，
+            // 这里只持锁写字段、放锁后唤醒，绝不阻塞。值没变就不唤醒，
+            // 避免每 10 秒一次无意义的 tick。
+            power_guard.update(local || remote || daemon, enabled, grace_secs);
+        }};
+    }
 
     loop {
         // 上传登记表的 TTL 清理：每轮循环开头收走超时的 staging 会话。放在这里
@@ -775,6 +850,7 @@ where
                             models_path: &models_path,
                             websearch_path: &websearch_path,
                             settings_path: &settings_path,
+                            live_settings: live_settings.as_ref(),
                             probes: &probes,
                             onboarding_preferences_path: &onboarding_preferences_path,
                             watchman_home: &watchman_home,
@@ -1070,33 +1146,19 @@ where
             }
             Some(error) = fatal_rx.recv() => return Err(error),
             _ = power_ticker.tick() => {
-                // 开关与两个窗口每拍现读磁盘，所以设置页保存后下一拍就生效，
-                // 不必重启进程。`load_from` 是「读一次文件 + 逐字段校验」，
-                // 10s 一次开销可忽略。
-                //
-                // **同一拍内只读一次盘**：`settings` 这一个变量同时喂给开关、
-                // 两个窗口与远端判定，四处不会读到不同版本。
-                let settings = yi_agent_runtime::settings::load_from(&settings_path);
-                let enabled = yi_agent_runtime::settings::prevent_idle_sleep_enabled(&settings);
-                let (grace_min, remote_min) =
-                    yi_agent_runtime::settings::power_windows_minutes(&settings);
-                let (grace_secs, remote_secs) = (grace_min * 60, remote_min * 60);
-
-                // 本进程侧：本地会话 ∪ 远端近期交互。两项都是纯内存判断，
-                // 放主循环里是安全的（不碰 I/O，也不起子进程）。
-                let local = crate::power_busy::local_busy(&threads);
-                let remote = crate::power_busy::remote_touch_busy(
-                    last_remote_touch,
-                    &power_clock,
-                    Duration::from_secs(remote_secs),
-                );
-                // `latest()` 永远立刻返回（上一拍的结果），绝不等待。
-                let daemon = busy_sampler.latest();
-
-                // 一次提交一致的三个业务值：探测与 IOKit 都在供电线程里，
-                // 这里只持锁写字段、放锁后唤醒，绝不阻塞。值没变就不唤醒，
-                // 避免每 10 秒一次无意义的 tick。
-                power_guard.update(local || remote || daemon, enabled, grace_secs);
+                // 保活拍仍然保留：`local_busy` 随会话状态变化、`remote_touch_busy`
+                // 随时间流逝过期，这两件事都不会产生设置事件，必须靠周期性重算。
+                commit_power_inputs!();
+            }
+            // 设置变化即刻重算：把「关掉保活 / 缩短宽限」的生效点提前到变化到达，
+            // 而不是等下一拍。不删上面的定时拍——它覆盖的是时间驱动的变化。
+            _ = async {
+                match settings_wake.as_mut() {
+                    Some(wake) => { let _ = wake.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                commit_power_inputs!();
             }
             _ = driver_ticker.tick() => {
                 // 通用会话驱动器内联跑一轮:问每个驱动插件「下一步起/续哪个
@@ -1123,6 +1185,7 @@ where
                     &git_diff_handle,
                     &workspaces,
                     &build_agent,
+                    live_settings.as_ref(),
                     &lead_inbox,
                     &lead_replies,
                     &lead_control,
@@ -1190,6 +1253,7 @@ where
                         thread_roots: &thread_roots,
                         managed: &managed,
                         models_path: &models_path,
+                        live_settings: live_settings.as_ref(),
                         lead_agent_enabled,
                         cfg: &cfg,
                         hub: &hub,
@@ -1253,6 +1317,7 @@ where
                     thread_roots: &thread_roots,
                     managed: &managed,
                     models_path: &models_path,
+                    live_settings: live_settings.as_ref(),
                     lead_agent_enabled,
                     cfg: &cfg,
                     hub: &hub,
@@ -1306,6 +1371,7 @@ where
                     thread_roots: &thread_roots,
                     managed: &managed,
                     models_path: &models_path,
+                    live_settings: live_settings.as_ref(),
                     lead_agent_enabled,
                     cfg: &cfg,
                     hub: &hub,
@@ -1349,6 +1415,15 @@ where
     // 见 `power_guard::sleep_until_stop`），不会拖慢退出。
     drop(power_guard);
     drop(busy_sampler);
+
+    // 设置观察收口：先停泵（它只读已发布快照），再让租约等线程真的退出。
+    // 顺序反过来会让泵在租约释放后仍被唤醒一次，读到的是最后一个快照。
+    if let Some(pump) = settings_changes.take() {
+        pump.abort();
+    }
+    if let Some(lease) = settings_lease.take() {
+        lease.shutdown().await;
+    }
 
     // 旁支收口:先掐掉还在跑的创建/关闭任务,再让注册表把各 runner 停干净
     // (它要等核心任务真正 quiescent,所以必须 await)。放在 detached runtime

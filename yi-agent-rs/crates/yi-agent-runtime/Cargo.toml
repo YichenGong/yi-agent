@@ -32,6 +32,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# 集成测试自己调 flock 验证跨进程排他（libc 只在生产依赖里不足以让测试链接）。
+libc = "0.2"
 # The side tests mock `Provider`/`Tool`, whose traits are `#[async_trait]`.
 async-trait = "0.1"
 # `start_paused` / `advance` for the 30-minute idle-deadline test.

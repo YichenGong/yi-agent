@@ -1077,6 +1077,46 @@ fn a_configured_direct_child_limit_is_enforced_and_reported() {
     ));
 }
 
+/// A lowered limit must stop new children without touching live ones.
+///
+/// This is the supervisor half of "a settings save applies at the next safe
+/// point, never retroactively": shinking capacity can never cancel a running
+/// child (its work is already in progress), and raising it must be enough for
+/// the very next spawn to succeed — no reconstruction of the supervisor.
+#[test]
+fn a_live_limit_change_applies_to_the_next_spawn_only() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new()).with_max_direct_children(2);
+    let root = supervisor.root_task_id().clone();
+
+    let first = supervisor.spawn(root.clone()).unwrap();
+    let second = supervisor.spawn(root.clone()).unwrap();
+    assert!(matches!(
+        supervisor.spawn(root.clone()),
+        Err(SpawnError::DirectChildLimitReached { limit: 2 })
+    ));
+
+    // Lower below the number of running children: they survive.
+    supervisor.set_max_direct_children(1);
+    assert_eq!(supervisor.max_direct_children(), 1);
+    for child in [&first, &second] {
+        let state = supervisor.task(child).unwrap().state().clone();
+        assert!(
+            !state.is_terminal(),
+            "a lowered limit must not cancel an already admitted child, got {state:?}"
+        );
+    }
+    assert!(matches!(
+        supervisor.spawn(root.clone()),
+        Err(SpawnError::DirectChildLimitReached { limit: 1 })
+    ));
+
+    // Raising it must be visible to the next spawn with no rebuild.
+    supervisor.set_max_direct_children(3);
+    supervisor
+        .spawn(root)
+        .expect("a raised limit must admit the next child immediately");
+}
+
 /// Drives a task to a settled terminal state through the public reducer.
 fn settle_task(supervisor: &mut AgentSupervisor, task: &TaskId, event: TaskEvent) {
     supervisor
