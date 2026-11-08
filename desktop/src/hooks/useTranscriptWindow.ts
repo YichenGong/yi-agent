@@ -183,6 +183,10 @@ export function useTranscriptWindow({
     // 用户手势开启**新**周期：预算与「无进展」判定都要重新计，否则用户滚一下
     // 就继承上一轮的 stalled 标记，永远不再补页。
     if (reason === "user") cycleRef.current = null;
+    // 页面不可见时不排帧：后台标签页的 rAF 会被节流甚至完全停发，而一旦切回
+    // 可见，积压的帧可能连跑多次、把基于旧布局的结论应用到新布局上。切回可见
+    // 时由下面的 visibilitychange 监听补一次（不需要外部 scroll）。
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
     if (frameRef.current !== null) return;
     frameRef.current = requestAnimationFrame(() => {
       frameRef.current = null;
@@ -196,6 +200,12 @@ export function useTranscriptWindow({
       if (cycle === null || cycle.owner !== ownerKey || cycle.generation !== generation) {
         cycle = beginConvergence(ownerKey, itemCountRef.current, generation);
       }
+      // 用户的贴底意图必须传给窗口计算：读者把滚动条拖到底之后，视口可能落在
+      // **下方 spacer** 里（早先 `focus` 开出来的中段窗口还没被收回来）。只靠
+      // 「补页往后追」永远追不上——那些页本身也只是把 spacer 变短，视口仍在
+      // 未挂载区间。把 `following` 传进去，`nextWindow` 才能直接把窗口收回到
+      // 尾部，视口立刻有内容。
+      const followIntent = followingRef.current?.();
       const next = nextWindow({
         current,
         itemCount: itemCountRef.current,
@@ -206,6 +216,9 @@ export function useTranscriptWindow({
         // 一个周期只走一个方向：否则窄视口里「上翻—下卸」会互相抵消。
         direction: cycle.direction,
         focus: pendingRef.current,
+        // 只在调用方真的给出意图时传：`nextWindow` 用 `input.following ?? 默认`
+        // 决定冷启动要不要贴尾，传一个假的 `false` 会让新会话从头部开始。
+        following: followIntent,
       });
       // 消费掉这次 focus：它只影响一次窗口计算。
       pendingRef.current = null;
@@ -229,9 +242,8 @@ export function useTranscriptWindow({
       // 0 高度扩窗。
       const covered = visible !== null && visible.visible !== null;
       // 跟随中不补页：贴底写入负责把视口放到尾部，收敛只需退出。
-      const followIntent = followingRef.current?.() ?? false;
       const decision =
-        followIntent && !covered
+        followIntent === true && !covered
           ? "settled"
           : decideConvergence(cycle, signature, covered, visible !== null);
 
@@ -304,6 +316,20 @@ export function useTranscriptWindow({
     pendingRef.current = focus;
     recompute();
   }, [focus, recompute]);
+
+  // 切回可见：补一次重算。隐藏期间的测量与决策都过期了，而且此时不会有
+  // scroll 事件来救——正是「切出去切回来才看到更多」那个形状。
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") return;
+      // 换一轮：隐藏期间积攒的「无进展签名」描述的是旧布局。
+      cycleRef.current = null;
+      recompute("user");
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [recompute]);
 
   useEffect(
     () => () => {

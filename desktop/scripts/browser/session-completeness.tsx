@@ -35,6 +35,8 @@ const grown = new Map<string, number>();
 
 function Fixture() {
   const [id, setId] = useState<SessionId>("A");
+  // D04 要求「新 width」：容器宽度变化会改变每行高度（换行），是真实的布局变化。
+  const [width, setWidthValue] = useState(900);
   const [, bump] = useState(0);
   const capture = useRef<(() => void) | null>(null);
   const windowApi = useRef<TranscriptWindowApi | null>(null);
@@ -88,6 +90,14 @@ function Fixture() {
       replayChunk,
       grow,
       retry: () => windowApi.current?.retry(),
+      /** D03：把窗口定点开到第 `index` 条（真实的搜索跳转/锚点开窗路径）。 */
+      focus: (index: number) => {
+        flushSync(() => windowApi.current?.requestFocus({ index, before: 20, after: 60 }));
+      },
+      /** D04：改容器宽度，制造换行导致的行高变化。 */
+      setWidth: (px: number) => {
+        flushSync(() => setWidthValue(px));
+      },
       scrollTo: (top: number) => {
         const scroller = document.querySelector<HTMLElement>("[data-thread-id]");
         if (scroller) scroller.scrollTop = top;
@@ -119,7 +129,7 @@ function Fixture() {
   });
 
   return (
-    <div style={{ height: 820, display: "flex", flexDirection: "column", width: 900 }}>
+    <div style={{ height: 820, display: "flex", flexDirection: "column", width }}>
       <ChatView
         items={sessions[id]}
         threadId={id}

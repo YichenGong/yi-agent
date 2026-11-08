@@ -1,5 +1,5 @@
 /** @vitest-environment jsdom */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { StrictMode, useCallback, useState } from "react";
 import { render, cleanup, act } from "@testing-library/react";
 import { useTranscriptWindow } from "./useTranscriptWindow";
@@ -47,10 +47,12 @@ function Harness({
   itemCount,
   threadId,
   anchorIds,
+  following,
 }: {
   itemCount: number;
   threadId?: string;
   anchorIds?: readonly string[];
+  following?: () => boolean;
 }) {
   // `book` 必须稳定：内联新建会让它每次渲染都是新对象，`merged`/`recompute`
   // 的身份随之改变，依赖它的 effect 就会每次渲染都重跑。
@@ -67,6 +69,7 @@ function Harness({
     focus: currentFocus,
     book,
     anchorIds,
+    following,
   });
   last = state.window;
   requestFocus = state.requestFocus;
@@ -371,5 +374,87 @@ describe("useTranscriptWindow: 视口落在未挂载区间", () => {
     expect(last.end).toBeGreaterThanOrEqual(expected);
     // 不应报「无法显示」——那会让用户以为内容坏了。
     expect(last.following).toBe(false);
+  });
+});
+
+describe("useTranscriptWindow: 页面不可见时暂停调度", () => {
+  it("hidden 期间不排帧，可见后由 visibilitychange 自动恢复", async () => {
+    // Spec A2：滚动/提交触发的续测只在页面可见时有意义。标签页在后台时 rAF 被
+    // 浏览器节流甚至完全停发，却仍可能在切回时一次性连跑多帧，把已经过期的
+    // 窗口结论应用到新布局上。正确行为：不可见时**不排帧**，切回可见时补一次。
+    const book = createHeightBook();
+    for (let i = 0; i < 3000; i += 1) book.record(`m${i}`, 100);
+    externalBook = book;
+    render(<Harness itemCount={3000} />);
+    await tick();
+
+    const hidden = vi.spyOn(document, "visibilityState", "get");
+    try {
+      hidden.mockReturnValue("hidden");
+      const before = last.start;
+      measure = () => edge({ first: before, last: before + 5, gapTopPx: 0, gapBottomPx: -5000 });
+      await act(async () => {
+        nudge();
+      });
+      await tick(4);
+      // 不可见时不推进。
+      expect(last.start).toBe(before);
+
+      // 切回可见：不需要任何外部 scroll，也要自己续上。
+      hidden.mockReturnValue("visible");
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await tick(6);
+      expect(last.start).toBeLessThan(before);
+    } finally {
+      hidden.mockRestore();
+    }
+  });
+});
+
+describe("useTranscriptWindow: 贴底意图要让窗口回到尾部", () => {
+  it("用户拖到底部而窗口还停在中段时，窗口必须收回尾部", async () => {
+    // 真实回归（D03）：读者把滚动条一路拖到底（`following` 意图为真），但窗口
+    // 仍停在早先 `focus(100)` 开出来的中段区间。此刻视口落在**下方 spacer** 里，
+    // 于是屏幕空白；而「跟随中不补页」分支直接判 `settled`，连补页都不做，
+    // 窗口永远停在原处——不滚动就一直是空白。
+    //
+    // 正确行为：贴底意图为真且视口没被覆盖时，窗口本身就应当回到尾部
+    // （`following: true` 的窗口），而不是靠补页无限往后追。
+    let following = false;
+    const book = createHeightBook();
+    for (let i = 0; i < 3000; i += 1) book.record(`m${i}`, 100);
+    externalBook = book;
+    render(<Harness itemCount={3000} following={() => following} />);
+    await tick();
+
+    // 先往前开一窗，制造「窗口在中段」的状态。
+    measure = () => edge({ first: 100, last: 105, gapTopPx: -100, gapBottomPx: -5000 });
+    await act(async () => {
+      requestFocus({ index: 100, before: 20, after: 60 });
+    });
+    await tick(4);
+    expect(last.start).toBeLessThan(200);
+    expect(last.following).toBe(false);
+
+    // 用户拖到底：意图变成贴底，但视口没有任何相交行（落在下方 spacer 里）。
+    following = true;
+    measure = () =>
+      ({
+        visible: null,
+        history: { first: 0, last: 300, gapTopPx: -500_000, gapBottomPx: 500_000 },
+        tailVisible: false,
+        viewportTop: 500_000,
+        viewportBottom: 500_800,
+      }) as WindowMeasurement;
+    await act(async () => {
+      nudge();
+    });
+    await tick(6);
+
+    // 窗口必须回到尾部（跟随态），覆盖视口可见的末尾内容。
+    expect(last.following).toBe(true);
+    expect(last.end).toBe(3000);
   });
 });

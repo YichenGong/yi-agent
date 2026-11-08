@@ -4,6 +4,7 @@ import {
   decideConvergence,
   noteAdvance,
   noteFocus,
+  estimateFocusIndex,
   type ConvergenceCycle,
 } from "./transcriptConvergence";
 
@@ -61,5 +62,47 @@ describe("decideConvergence", () => {
     expect(next.remaining).toBe(4);
     expect(next.lastSignature).toBe("sig-a");
     expect(next.focusedOnce).toBe(false);
+  });
+});
+
+describe("estimateFocusIndex", () => {
+  // 符号约定（与 `measureTranscript` 一致，见其接口注释）：
+  //   gapBottomPx = viewportBottom - historyLast.bottom
+  //     > 0 -> 视口底在历史区底边**下方**（视口落在历史区之后的 spacer 里）
+  //     < 0 -> 视口仍在历史区内部（底边还没到）
+  //   gapTopPx = historyFirst.top - viewportTop
+  //     > 0 -> 视口顶在历史区顶边**上方**（视口落在历史区之前的 spacer 里）
+  //     < 0 -> 视口已进入历史区
+  it("视口落在历史区之后时按下方溢出量往后估", () => {
+    const index = estimateFocusIndex(
+      { viewportTop: 60_000, history: { first: 0, last: 10, gapTopPx: -60_000, gapBottomPx: 50_000 } },
+      100,
+      3000,
+    );
+    // 历史区底边之后还有 50000px ≈ 500 条。
+    expect(index).toBe(10 + 500 + 1);
+  });
+
+  it("视口落在历史区之前时按上方溢出量往前估", () => {
+    const index = estimateFocusIndex(
+      { viewportTop: 0, history: { first: 900, last: 950, gapTopPx: 40_000, gapBottomPx: -1000 } },
+      100,
+      3000,
+    );
+    expect(index).toBe(900 - 400 - 1);
+  });
+
+  it("视口里的历史行已经覆盖时不预测（返回历史区首条）", () => {
+    const index = estimateFocusIndex(
+      { viewportTop: 1000, history: { first: 30, last: 40, gapTopPx: -1000, gapBottomPx: -2000 } },
+      100,
+      3000,
+    );
+    expect(index).toBe(30);
+  });
+
+  it("没有历史区测量时返回 null，调用方不得乱跳", () => {
+    expect(estimateFocusIndex({ viewportTop: 0, history: null }, 100, 3000)).toBeNull();
+    expect(estimateFocusIndex(null, 100, 3000)).toBeNull();
   });
 });

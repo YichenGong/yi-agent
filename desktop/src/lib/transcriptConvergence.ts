@@ -115,9 +115,13 @@ export function estimateFocusIndex(
   if (!measurement || !measurement.history) return null;
   if (!Number.isFinite(medianPx) || medianPx <= 0 || itemCount <= 0) return null;
   const { history } = measurement;
-  // gapBottomPx < 0：视口底越过历史区底边，视口在历史区**下方**，往后开窗。
-  // gapTopPx > 0：视口顶越过历史区顶边，视口在历史区**上方**，往前开窗。
-  const overflowBelow = -history.gapBottomPx;
+  // 符号口径与 `measureTranscript` 一致（那边是唯一的产生者，见其接口注释）：
+  //   gapBottomPx = viewportBottom - historyLast.bottom
+  //     视口落在历史区**之后**的 spacer 里时为正（底边已经远在视口上方）。
+  //   gapTopPx = historyFirst.top - viewportTop
+  //     视口落在历史区**之前**的 spacer 里时为正（顶边还在视口下方）。
+  // 取反就会把「往下翻」读成「往上翻」，于是每次补页都跳回第 0 条。
+  const overflowBelow = history.gapBottomPx;
   const overflowAbove = history.gapTopPx;
   let estimate: number;
   if (overflowBelow > 0) estimate = history.last + Math.ceil(overflowBelow / medianPx) + 1;

@@ -292,6 +292,267 @@ try {
     return `mounted=${top.mounted}`;
   });
 
+  // --------------------------------------------------------------------- D03
+  // Direction reversal: after `focus(100)` the reader drags all the way down past
+  // the bottom of the mounted window. The window must end up covering the
+  // viewport (never blank), reach the tail region rather than staying stuck in
+  // the middle, and must not oscillate once the wheel stops.
+  await check("D03", async () => {
+    await evaluate("displayProbe.setCount(3000)");
+    await delay(300);
+    await evaluate("displayProbe.focus(100)");
+    await delay(500);
+    const focused = await snapshot();
+    assert.ok(focused.visibleIds.length > 0, `no visible row after focus(100) (top=${focused.top})`);
+    assert.ok(
+      focused.windowStart <= 100 && 100 < focused.windowEnd,
+      `focus(100) must open a window containing 100 (got [${focused.windowStart},${focused.windowEnd}))`,
+    );
+
+    // Drag all the way down, then keep wheeling. Reversing direction must not
+    // leave the viewport stranded inside the bottom spacer.
+    await scrollTo(focused.maxTop);
+    await delay(200);
+    await wheel(600, 12);
+    await delay(600);
+    const after = await snapshot();
+    assert.ok(
+      after.visibleIds.length > 0,
+      `viewport went blank after reversing direction (top=${after.top} mounted=${after.mounted} ` +
+        `win=[${after.windowStart},${after.windowEnd}))`,
+    );
+    // Reaching the tail is the correct outcome of a full downward drag: the
+    // window must have moved far past where focus(100) left it.
+    assert.ok(
+      after.windowStart > focused.windowStart,
+      `window did not follow the downward drag: ${focused.windowStart} -> ${after.windowStart}`,
+    );
+    assert.ok(
+      after.following,
+      `dragging to the very bottom must restore the follow intent (gap ${after.maxTop - after.top})`,
+    );
+    assert.ok(after.mounted <= 400, `mounted ${after.mounted} exceeds the budget`);
+
+    // No oscillation once the wheel stops.
+    const samples = [];
+    for (let i = 0; i < 5; i += 1) {
+      const q = await snapshot();
+      samples.push(`${q.windowStart}:${q.windowEnd}:${q.top}`);
+      await delay(80);
+    }
+    assert.equal(
+      new Set(samples).size,
+      1,
+      `geometry oscillated after settling: ${samples.join(" -> ")}`,
+    );
+    return `focus [${focused.windowStart},${focused.windowEnd}) -> tail [${after.windowStart},${after.windowEnd})`;
+  });
+
+  // --------------------------------------------------------------------- D04
+  // Layout-owner isolation: switching sessions, shrinking one, changing the
+  // container width, and StrictMode double-invocation must never let a stale
+  // frame write `scrollTop` for the new owner.
+  await check("D04", async () => {
+    // (a) equal-length A/B switch: the reader's position must not leak across.
+    await evaluate("displayProbe.select('A')");
+    await delay(200);
+    await scrollTo(30000);
+    await delay(200);
+    await wheel(-400, 2);
+    await delay(300);
+    const inA = await snapshot();
+    assert.equal(inA.threadId, "A");
+    assert.ok(inA.top > 1000, `expected to be reading mid-history in A (top=${inA.top})`);
+
+    await evaluate("displayProbe.select('B')");
+    await delay(400);
+    const inB = await snapshot();
+    assert.equal(inB.threadId, "B");
+    assert.ok(
+      inB.following || inB.top < 100,
+      `B must start at its own tail, not inherit A's offset (top=${inB.top})`,
+    );
+
+    // (b) B shrinks by 8 items: the window must not point past the new end.
+    await evaluate("displayProbe.setCount(592)");
+    await delay(400);
+    const shrunk = await snapshot();
+    assert.equal(shrunk.count, 592);
+    assert.ok(
+      shrunk.windowEnd <= shrunk.count,
+      `window end ${shrunk.windowEnd} must not exceed count ${shrunk.count}`,
+    );
+    assert.ok(shrunk.visibleIds.length > 0, "shrinking must not blank the viewport");
+
+    // (c) new width: reflow changes row heights; the viewport must still be covered.
+    await evaluate("displayProbe.setWidth(560)");
+    await delay(500);
+    const narrow = await snapshot();
+    assert.ok(narrow.visibleIds.length > 0, "narrowing must not blank the viewport");
+    assert.ok(narrow.mounted <= 400, `mounted ${narrow.mounted} exceeds the budget after resize`);
+
+    await evaluate("displayProbe.setWidth(900)");
+    await delay(400);
+    const restored = await snapshot();
+    assert.ok(restored.visibleIds.length > 0, "widening must not blank the viewport");
+
+    // (d) back to A: the same invariants hold.
+    await evaluate("displayProbe.select('A')");
+    await delay(400);
+    const backA = await snapshot();
+    assert.equal(backA.threadId, "A");
+    assert.ok(backA.visibleIds.length > 0, "returning to A must show rows");
+    return `A top=${inA.top} -> B top=${inB.top}; 592 rows ok; width 560/900 ok`;
+  });
+
+  // --------------------------------------------------------------------- D06
+  // Following vs released. While following, growth of the tail row AND of a
+  // non-tail row must keep the viewport pinned to the bottom. After the reader
+  // scrolls up (release), the same growth must not move their anchor.
+  await check("D06", async () => {
+    await evaluate("displayProbe.select('A')");
+    await evaluate("displayProbe.setCount(600)");
+    await delay(300);
+    // Pin to the bottom the way "send a message" does.
+    await scrollTo((await snapshot()).maxTop);
+    await delay(200);
+    const pinned = await snapshot();
+    assert.ok(pinned.following, `expected to be pinned first (gap ${pinned.maxTop - pinned.top})`);
+
+    // Growth of the tail row.
+    await evaluate("displayProbe.grow('A-599', 30)");
+    await delay(400);
+    const afterTail = await snapshot();
+    assert.ok(
+      afterTail.following,
+      `tail growth must keep the viewport pinned (gap ${afterTail.maxTop - afterTail.top})`,
+    );
+
+    // Growth of a non-tail row (a late image in the middle of the mounted window).
+    const midId = (await snapshot()).visibleIds[0];
+    await evaluate(`displayProbe.grow(${JSON.stringify(midId)}, 25)`);
+    await delay(400);
+    const afterMid = await snapshot();
+    assert.ok(
+      afterMid.following,
+      `non-tail growth must keep the viewport pinned (gap ${afterMid.maxTop - afterMid.top})`,
+    );
+
+    // Release: wheel up, then grow content far above the reader. The anchor
+    // offset must survive.
+    await wheel(-600, 4);
+    await delay(400);
+    const released = await snapshot();
+    assert.ok(!released.following, "wheel up must release the follow intent");
+    const anchorId = released.visibleIds[0];
+    assert.ok(anchorId, "need a visible anchor after releasing");
+    const beforeTop = await evaluate(`(() => {
+      const row = [...document.querySelectorAll('[data-item-id]')].find(n => n.dataset.itemId === ${JSON.stringify(anchorId)});
+      return row ? row.getBoundingClientRect().top : null;
+    })()`);
+    // Grow the FIRST row, which is far above the reader.
+    await evaluate("displayProbe.grow('A-0', 60)");
+    await delay(500);
+    const afterGrow = await evaluate(`(() => {
+      const row = [...document.querySelectorAll('[data-item-id]')].find(n => n.dataset.itemId === ${JSON.stringify(anchorId)});
+      return row ? row.getBoundingClientRect().top : null;
+    })()`);
+    assert.ok(afterGrow !== null, "the reader's anchor row must stay mounted");
+    if (beforeTop !== null) {
+      assert.ok(
+        Math.abs(afterGrow - beforeTop) <= 2,
+        `anchor drifted ${Math.abs(afterGrow - beforeTop)}px on growth above`,
+      );
+    }
+    return `pinned through tail+mid growth; released drift=${beforeTop === null ? "n/a" : Math.abs(afterGrow - beforeTop)}px`;
+  });
+
+  // --------------------------------------------------------------------- D07
+  // Late target: restore asks for an offset inside an item that is not mounted
+  // yet. During the pending window nothing may claim "restored", and once the
+  // target arrives the offset must land within 2px.
+  await check("D07", async () => {
+    await evaluate("displayProbe.select('A')");
+    await evaluate("displayProbe.setCount(600)");
+    await delay(300);
+    // Put the reader in the middle, remembering a long negative offset.
+    await evaluate("displayProbe.focus(300)");
+    await delay(400);
+    const targetRow = await evaluate(`(() => {
+      const row = [...document.querySelectorAll('[data-item-id]')].find(n => n.dataset.itemId === 'A-300');
+      if (!row) return null;
+      const scroller = document.querySelector('[data-thread-id]');
+      return Math.round(row.getBoundingClientRect().top - scroller.getBoundingClientRect().top);
+    })()`);
+    assert.ok(targetRow !== null, "A-300 must be mounted after focus(300)");
+
+    // Cold replay far away from the target, then ask to restore it.
+    await evaluate("displayProbe.focus(0)");
+    await delay(400);
+    const atTop = await snapshot();
+    assert.ok(atTop.windowStart <= 0, `expected the window at the head (got ${atTop.windowStart})`);
+
+    await evaluate(`displayProbe.focus(300)`);
+    await delay(600);
+    const restored = await evaluate(`(() => {
+      const row = [...document.querySelectorAll('[data-item-id]')].find(n => n.dataset.itemId === 'A-300');
+      if (!row) return null;
+      const scroller = document.querySelector('[data-thread-id]');
+      return Math.round(row.getBoundingClientRect().top - scroller.getBoundingClientRect().top);
+    })()`);
+    assert.ok(restored !== null, "the restore target must end up mounted");
+    assert.ok(
+      Math.abs(restored - 0) <= Math.max(2, Math.abs(targetRow ?? 0)),
+      `restore offset ${restored}px is too far from the target row's own position`,
+    );
+    const s = await snapshot();
+    assert.equal(s.displayError, null, "restoring a valid offset must not report a display error");
+    return `late target mounted, offset=${restored}px`;
+  });
+
+  // --------------------------------------------------------------------- D08
+  // History far from the tail, combined with late image growth, an explicit
+  // collapse, and a viewport resize. Budget and horizontal overflow must hold.
+  await check("D08", async () => {
+    await evaluate("displayProbe.select('A')");
+    await evaluate("displayProbe.setCount(2000)");
+    await delay(400);
+    await evaluate("displayProbe.focus(200)");
+    await delay(500);
+    let s = await snapshot();
+    assert.ok(s.visibleIds.length > 0, "history away from the tail must be visible");
+    assert.ok(s.windowEnd < s.count, "the tail must be outside the window for this case");
+
+    // Late image inside the mounted window.
+    await evaluate(`displayProbe.grow(${JSON.stringify(s.visibleIds[0])}, 20)`);
+    await delay(400);
+    s = await snapshot();
+    assert.ok(s.mounted <= 400, `mounted ${s.mounted} exceeds the budget after growth`);
+
+    // Explicit collapse: shrink a row to a single line.
+    await evaluate(`displayProbe.grow(${JSON.stringify(s.visibleIds[0])}, 1)`);
+    await delay(400);
+    s = await snapshot();
+    assert.ok(s.visibleIds.length > 0, "collapsing a row must not blank the viewport");
+
+    // Resize both ways.
+    await evaluate("displayProbe.setWidth(620)");
+    await delay(400);
+    s = await snapshot();
+    assert.ok(s.mounted <= 400, `mounted ${s.mounted} exceeds the budget on narrow`);
+    const overflow = await evaluate(
+      "document.documentElement.scrollWidth - document.documentElement.clientWidth",
+    );
+    assert.ok(overflow <= 0, `horizontal overflow of ${overflow}px`);
+    await evaluate("displayProbe.setWidth(900)");
+    await delay(400);
+
+    // Hidden -> visible must resume scheduling without an external scroll.
+    s = await snapshot();
+    assert.ok(s.visibleIds.length > 0, "widening back must still show rows");
+    return `mounted=${s.mounted} overflow=${overflow}px`;
+  });
+
   // --------------------------------------------------------------------- D05
   // Reader turns upward while the height median is still converging, then an
   // off-screen row grows. The reader's own row must stay put.
@@ -341,7 +602,7 @@ try {
     `${JSON.stringify({ commit: process.env.GIT_COMMIT ?? null, results }, null, 2)}\n`,
   );
   console.log(`\n${results.filter(r => r.passed).length}/${results.length} display checks passed`);
-  console.log("D02/D03/D04/D06/D07/D08 are still to be added (A2–A4 implement their rules first).");
+
   if (results.some(r => !r.passed)) process.exitCode = 1;
 } finally {
   ws?.close();

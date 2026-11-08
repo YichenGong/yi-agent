@@ -638,15 +638,55 @@ export function ChatView({
   });
   const { window: win, nudge, requestFocus } = windowApi;
 
+  /**
+   * 宿主（搜索跳转）请求开窗的**目标条号**，开到位后要一次性把视口移过去。
+   *
+   * 只开窗不够：窗口化之后目标那一段原本没挂载，视口多半正落在未挂载的 spacer
+   * 里。窗口换到目标附近时两个 spacer 一长一短，`scrollHeight` 几乎不变、浏览器
+   * 也不会自己纠正 `scrollTop`，于是**开完窗仍然什么都看不到**——用户点「下一个
+   * 命中」却以为没找到。所以开到位后必须显式把那条对到视口顶。
+   *
+   * 位置仍然只由协调器写（`requestRestore` → `planLayout`），不新增第二条写入路径。
+   */
+  const pendingJumpRef = useRef<number | null>(null);
+
   // 宿主拿到的必须是**稳定**对象：它在事件处理器里调用 `requestFocus`，
   // 每次渲染换新引用会让调用方每次都得重取。
+  //
+  // `requestFocus` 在这里被包一层，只为记住「这次开窗是为了跳到第几条」；真正的
+  // 开窗仍然交给 hook，对位由下面的 effect 在目标挂载之后做。
+  const hostApi = useMemo<TranscriptWindowApi>(
+    () => ({
+      ...windowApi,
+      requestFocus: (f) => {
+        pendingJumpRef.current = f.index;
+        windowApi.requestFocus(f);
+      },
+    }),
+    [windowApi],
+  );
   useLayoutEffect(() => {
     if (!windowApiRef) return;
-    windowApiRef.current = windowApi;
+    windowApiRef.current = hostApi;
     return () => {
       windowApiRef.current = null;
     };
-  }, [windowApiRef, windowApi]);
+  }, [windowApiRef, hostApi]);
+
+  // 目标一进挂载区就对位一次。`win.start/end` 变了才可能「刚进来」，所以用它触发；
+  // 目标仍在窗口外就继续等下一次提交（收敛器会自己续推，不需要外部滚动）。
+  useLayoutEffect(() => {
+    const index = pendingJumpRef.current;
+    if (index === null) return;
+    if (index < win.start || index >= win.end) return;
+    const target = items[index];
+    if (!target?.id || elRef.current === null) return;
+    // 还查不到节点说明这一帧节点尚未提交，等下一次。
+    if (elRef.current.querySelector(`[data-item-id="${CSS.escape(target.id)}"]`) === null) return;
+    pendingJumpRef.current = null;
+    requestRestore({ itemId: target.id, offset: 0 });
+    planLayout();
+  }, [win.start, win.end, items, requestRestore, planLayout]);
 
   // **翻页必须由滚动驱动。** 滚动既不改变 `itemCount` 也不改变 `focus`，hook 内部
   // 没有任何 React 依赖会因此变化——不在这里接上滚动事件，窗口会永远停在首屏那

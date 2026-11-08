@@ -291,7 +291,7 @@ interface DisplayProbe {
 // window.displayProbe: DisplayProbe; fixture uses real ChatView + index.css.
 ```
 
-- [ ] **Step 1 — 写失败断言**：fixture 支持600/3000条、每条8行确定性文本、820px viewport、A/B切换、分帧回放与图片/代码块增高；关闭 `overflow-anchor`。按下面步骤逐例测试，不用追加 scroll 去“催一下”。
+- [x] **Step 1 — 写失败断言**：fixture 支持600/3000条、每条8行确定性文本、820px viewport、A/B切换、分帧回放与图片/代码块增高；关闭 `overflow-anchor`。按下面步骤逐例测试，不用追加 scroll 去“催一下”。
 
 | IDs | 精确操作与断言 |
 | --- | --- |
@@ -316,9 +316,9 @@ assert.equal(s.count,600); assert.ok(s.mounted<=400);
 ```
 
 将 `waitUntil`、`evaluate` 和子进程清理写入本脚本（基于已读 `transcript-window-check.mjs` 的CDP协议），不能依赖另一个 fixture 的全局 probe。新增 npm script `test:browser:session-completeness`。固定端口1452/CDP9362，可由 `SESSION_COMPLETENESS_PORT`/`SESSION_COMPLETENESS_DEBUG_PORT`覆盖。
-- [ ] **Step 2 — 证明判别性**：在临时回退代码中执行新脚本，D01/D05必须红；对A3补偿根因按单点变异取得证据。若当前主线某场景已通过，把它记为兼容场景，不虚报新增修复。
-- [ ] **Step 3 — 完成脚本与报告**：缺Chrome退出非零；Runtime.exceptionThrown使失败；finally TERM→有界KILL所有自己spawn的进程并删临时profile。报告写 `.artifacts/session-completeness/display.json`，字段为ID/pass/geometry/steps/commit，不含用户正文。同步README命令与macOS人工表，保持全部未测真机行 `[ ]`。
-- [ ] **Step 4 — 全部绿**：`cd desktop && npm test && npx tsc --noEmit && npm run build && npm run test:browser:session-completeness && npm run test:browser:session-view && npm run test:browser:transcript-window && npm run test:browser:stream-live`，随后Rust全局门禁。将D组逐行证据写入测试文档，不用“脚本退出0”替代单行结果。
+- [x] **Step 2 — 证明判别性**：在临时回退代码中执行新脚本，D01/D05必须红；对A3补偿根因按单点变异取得证据。若当前主线某场景已通过，把它记为兼容场景，不虚报新增修复。
+- [x] **Step 3 — 完成脚本与报告**：缺Chrome退出非零；Runtime.exceptionThrown使失败；finally TERM→有界KILL所有自己spawn的进程并删临时profile。报告写 `.artifacts/session-completeness/display.json`，字段为ID/pass/geometry/steps/commit，不含用户正文。同步README命令与macOS人工表，保持全部未测真机行 `[ ]`。
+- [ ] **Step 4 — 全部绿**：`cd desktop && npm test && npx tsc --noEmit && npm run build && npm run test:browser:session-completeness && npm run test:browser:session-view && npm run test:browser:transcript-window && npm run test:browser:stream-live`，随后Rust全局门禁。将D组逐行证据写入测试文档，不用“脚本退出0”替代单行结果。**已完成部分（2026-11-08）**：`npx vitest run` 191 文件 / 2783 passed（连跑两次稳定）、`npx tsc --noEmit`、`npm run build`、`session-completeness` 9/9、`transcript-window` 4/4、`stream-live` 2/2，逐行证据写入 [docs/testing/session-completeness.md](../../testing/session-completeness.md)。**未完成**：`test:browser:session-view` 的 `user scroll takes control from drift correction`（`expected 2000, got 2240`）在 A3/A4 基线与当前工作区同样失败（已逐一 checkout 验证），属既有基线问题，故该项仍不勾。
 - [ ] **Step 5 — 独立WKWebView验收与提交**：用户授权测试安装后才打独立app，设独立bundle id及绝对 `YI_AGENT_HOME`。执行D01/D05/D06/D07，分别切session与切app/window；记录锚点偏移/截图/commit。未有真机结果不得勾选显示feature。提交 `test: cover session display convergence in real browsers`，不自动合main或替换正式app。
 
 ## 自审覆盖与收尾
