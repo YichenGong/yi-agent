@@ -9,8 +9,8 @@
 
 | 入口 | 内容 | 实测耗时 |
 |---|---|---|
-| `just test` | nextest `--workspace --all-features` | 821 秒（5709 个测试） |
-| `just runtime-lifecycle-check` | 23 个 target，`cargo test` 串行 | 36.7 秒（262 个测试） |
+| `just test` | nextest `--workspace --all-features` | 821 秒（当时 5709 个测试；2026-11-08 复查已增至 6020 个） |
+| `just runtime-lifecycle-check` | 23 个 target，`cargo test` 串行 | 34.1 秒（263 个测试） |
 | `just test-real-*`（4 个 + `all`） | 真实 LLM，`#[ignore]` 门控 | 分钟级，花钱 |
 | `just desktop-check` / `plugin-*-check` | tsc + vitest + 插件独立 workspace | 分钟级 |
 | `just mutants` / `ci-patch` / `eval` | 变异测试 / 覆盖率 / 评测 | 8-10 分钟 / 7.2GB |
@@ -21,7 +21,7 @@
 
 **病因 1：`just test` 无条件带上全部真进程测试。**
 
-262 个真进程测试（真的 fork guardian / daemon / 子进程，个别等真实 10 秒优雅窗口）
+263 个真进程测试（真的 fork guardian / daemon / 子进程，个别等真实 10 秒优雅窗口）
 不带 `#[ignore]`，因此 nextest `--workspace` 会执行它们。改一个字符串和改运行时
 调度付一样的代价。
 
@@ -29,7 +29,7 @@
 
 `.github/workflows/ci.yml` 的 macos job 先用 nextest 跑 8 个 crate（含全部
 lifecycle target），再用 `just runtime-lifecycle-check`（`cargo test`）跑同样的
-262 个测试。
+263 个测试。
 
 **病因 3：病因 2 的理由是错的。**
 
@@ -41,7 +41,7 @@ fixture，nextest 的进程模型下 `--exact` 行为不同」。
 
 | 验证 | 结果 |
 |---|---|
-| `runtime-lifecycle-check` 全部 262 个测试在 nextest 下 | **262 passed, 4 skipped, 36.769s** |
+| `runtime-lifecycle-check` 全部 263 个测试在 nextest 下 | **263 passed, 4 skipped, 34.05s** |
 | `managed_channel`（真的用 `current_exe()` + `--exact --ignored` 拉 fixture）| **7 passed** |
 | `managed_runtime_lifecycle` 里是否存在 `current_exe` / `--exact` | **不存在**（该文件只有环境变量门控的 helper） |
 
@@ -117,10 +117,23 @@ live 测试，`justfile` 里没有任何 recipe 指向它。它会静默地永�
 **决策**：`just test-crate` / `just test-affected` / `just test` 都跑 `mock+proc`。
 不提供「只跑 mock，不跑 proc」的入口。
 
-**理由**：262 个 proc 测试实测 36.7 秒，只占全量 821 秒的 4.5%。单独再切一层，
-用户要多做一次「我该不该跑 proc」的判断，收益远小于认知成本。
+**这不是在回避病因 1，而是换了解法。** 病因 1 的痛点是「改一个字符串也要等 13 分钟」，
+但耗时的大头不是 proc，而是**全量的编译与 6020 个测试本身**。切出 proc 只能省 34 秒，
+而 `just test-crate`（37 秒）与 `just test-affected`（只跑闭包）能省掉的是分钟级。
+所以病因 1 的正确解法是**加范围维度的分层**（L1/L2），不是把 proc 单独切出来。
 
-**实测依据**：`runtime-lifecycle-check` 全部 262 个测试在 nextest 下 36.769 秒。
+**理由**：263 个 proc 测试实测 34.1 秒，只占全量 821 秒的 4.1%（数字口径：34.1/821）。
+单独再切一层，用户要多做一次「我该不该跑 proc」的判断，收益远小于认知成本。
+
+**实测依据**（2026-11-08，nextest 0.9.150）：
+
+| 验证 | 结果 |
+|---|---|
+| `runtime-lifecycle-check` 的 23 个 target、263 个测试在 nextest 下 | **263 passed, 4 skipped, 34.05s**（wall 66s） |
+| 全 workspace 测试总数 | 6020 |
+
+**边界**：如果将来 proc 测试增长到显著占比（例如超过全量耗时的 20%），应重新评估
+是否切分。当前 4.1% 不支持这个复杂度。
 
 ### D3：live 迁移到 nextest，并发 3
 
@@ -201,9 +214,10 @@ slow-timeout = { period = 300, terminate-after = 2 }      # 报错：expected a 
 **注意**：`exit 0` 跳过仍是「成功」，但它有显式输出。这与「静默跑 0 个测试然后
 成功」的区别是**可观测性**——日志里能看见跳过原因。
 
-### D6：不合并 `test-live` 与 `proc`
+### D6：`live` 永不进入 `just test`
 
-**决策**：`live` 永不包含在 `just test` 里。
+**决策**：`just test`（L3, mock+proc）不包含任何 live 测试。live 只能由
+`just test-live` 主动调用。
 
 **理由**：live 花钱、有速率限制、需要密钥、结果依赖外部服务。它必须是**主动调用**。
 `#[ignore]` 已经是天然的保险，但见下方风险 R1——不能只依赖它。
@@ -213,7 +227,7 @@ slow-timeout = { period = 300, terminate-after = 2 }      # 报错：expected a 
 **决策**：删除 `.github/workflows/ci.yml` macos job 的
 `Run shared runtime lifecycle tests` 一步，其覆盖已包含在上一步的 nextest 中。
 
-**理由**：实测 262 个测试在 nextest 下全绿（病因 3），重复跑无收益。同时修正那条
+**理由**：实测 263 个测试在 nextest 下全绿（病因 3），重复跑无收益。同时修正那条
 错误的注释，避免后人再被误导。
 
 **风险控制**：该改动只影响 CI，本地 `just runtime-lifecycle-check` **保留**，因为
@@ -304,7 +318,7 @@ just test-live [suite]
    - 关键断言：**不能出现「无输出、跑 0 个测试、rc=0」**（病因 4 的形态）。
 2. **suite 覆盖完整性**：断言上表 5 个二进制都被某个 suite 映射到。
    这条断言防的是病因 5（`model_catalog_live_reload_e2e` 无人覆盖）。
-3. **nextest 能跑 proc 测试**：`runtime-lifecycle-check` 的 262 个测试在 nextest 下
+3. **nextest 能跑 proc 测试**：`runtime-lifecycle-check` 的 263 个测试在 nextest 下
    全绿（已实测），删除 CI 重复步骤前必须再确认一次。
 4. **超时不误杀**：live profile 的 `slow-timeout` 累计值必须 > 300s（最长自身预算）。
    可以写一条断言读取配置并比较，纳入 `just affected-check` 同类自测。
@@ -366,7 +380,7 @@ ignored 测试显式排除。这与既有的 `runtime_process_helper` 排除是�
 - [ ] `just test-live` 无 key 时每个 suite 都打印 `SKIPPED` 并 `exit 0`
 - [ ] `just test-live llm` 在有 key 时真实执行
 - [ ] 上表 5 个 live 二进制全部被某个 suite 覆盖（含 `catalog`）
-- [ ] `just runtime-lifecycle-check` 与 nextest 跑同一批 262 个测试结果一致
-- [ ] CI macOS job 中 262 个测试只跑一遍
+- [ ] `just runtime-lifecycle-check` 与 nextest 跑同一批 263 个测试结果一致
+- [ ] CI macOS job 中 263 个测试只跑一遍
 - [ ] `CLAUDE.md` 里只有一个「分级」概念，无两个同名章节
 - [ ] `just test` 仍然只跑 mock+proc，不触发任何真实 API 调用
