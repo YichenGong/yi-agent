@@ -940,6 +940,22 @@ export default function App() {
         const read = (name: string) =>
           rows.find((row) => row.name === name)?.enabled === true;
         setLeadAgentEnabled(read("lead_agent"));
+        // 关掉旁问开关时立刻清掉**本地**槽位的旁支视图。宿主那边的 `close_all`
+        // 已经把它们都关了，界面上再挂着就是点不动的空壳（点进去只会得到
+        // `side_not_found`）。
+        //
+        // 只处理本地：远端项目跑的是另一台机器的二进制，它们的开关由那台机器的
+        // `initialize` 决定，本机拨开关不该替它清视图。
+        if (written.name === "side_conversation" && written.enabled === false) {
+          // 先返回主会话再销毁：顺序反了会让用户盯着一个已消失的视图。
+          // `back()` 无参、且能撤销一个尚未完成的入场，正是这里要的语义
+          // （`selectMain` 需要 binding + parentId，而此刻视图可能已经没 binding）。
+          sideConversationRef.current.back();
+          const store = sideStoreRef.current;
+          for (const binding of store.bindingsForSlot(LOCAL_SLOT)) {
+            store.dropHost(binding.key);
+          }
+        }
         // 关掉远端开关时立刻清掉所有远端连接与进程（spec §5.4）。只改
         // `flags.json` 的话，已经连上的 ssh 会一直跑，用户看到的是「开关关了，
         // 远端还在」。写后处理放在前端而不是 Rust 侧：`flags/set` 在宿主里是

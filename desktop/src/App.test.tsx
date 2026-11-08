@@ -111,6 +111,9 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     sideSnapshots: {} as Record<string, Record<string, unknown>>,
     // `side/close` 是否回 `close_conflict`（模拟状态在确认与执行之间变了）。
     sideCloseConflict: false,
+    // `flags/list` 里 `side_conversation` 的值。默认**开**：既有的旁支用例
+    // 假定能力可用；「关掉开关」的用例显式把它设成 false。
+    sideConversationFlagEnabled: true,
   },
   // 捕获 `@tauri-apps/api/webview` 注册的拖放 handler，供用例驱动事件。
   dragDrop: { fn: null as null | ((event: unknown) => void) },
@@ -379,6 +382,13 @@ vi.mock("./lib/rpc", () => ({
               expires_on: "2027-01-31",
               source: state.leadFlagEnabled ? "file" : "default",
             },
+            {
+              name: "side_conversation",
+              summary: "旁问",
+              enabled: state.sideConversationFlagEnabled,
+              expires_on: "2027-06-30",
+              source: state.sideConversationFlagEnabled ? "file" : "default",
+            },
           ],
         };
       }
@@ -387,6 +397,7 @@ vi.mock("./lib/rpc", () => ({
         // 否则"设置页拨完开关，界面要跟着变"这条路径根本测不出来。
         const { name, enabled } = params as { name: string; enabled: boolean };
         if (name === "lead_agent") state.leadFlagEnabled = enabled;
+        if (name === "side_conversation") state.sideConversationFlagEnabled = enabled;
         return { name, enabled };
       }
       if (method === "thread/lead") {
@@ -7280,6 +7291,58 @@ describe("App 旁支视图", () => {
     await waitFor(() => expect(screen.queryByText(/^\/side · /)).toBeNull());
 
     expect(screen.queryByRole("button", { name: "返回主会话" })).toBeNull();
+  });
+
+  /**
+   * 关掉实验开关时，本地槽位的旁支视图必须一起消失。
+   *
+   * 宿主会 `close_all`，界面上再挂着就是点不动的空壳——用户点进去只会得到
+   * `side_not_found`。这条钉住「拨完开关界面跟着变」的那一半，宿主那一半由
+   * app-server 的 `close_all` 测试覆盖。
+   */
+  it("drops the local side binding when the flag is turned off", async () => {
+    await readyWithSide();
+    await command("/btw why is it slow");
+    await waitFor(() => expect(methods()).toContain("side/open"));
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
+
+    // 用户在设置页把开关关掉。
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "实验功能" }));
+    const checkbox = (await screen.findByRole("checkbox", {
+      name: "side_conversation 开关",
+    })) as HTMLInputElement;
+    expect(checkbox.checked).toBe(true);
+    fireEvent.click(checkbox);
+
+    await waitFor(() => expect(methods()).toContain("flags/set"));
+    // 视图回到主会话，返回条与旁支标识一起消失。
+    await waitFor(() => expect(screen.queryByText(/^\/side · /)).toBeNull());
+    expect(screen.queryByRole("button", { name: "返回主会话" })).toBeNull();
+  });
+
+  /**
+   * 远端项目跑的是另一台机器的二进制，本机拨开关不该影响它（spec §3.6）。
+   *
+   * 这里只断言「本机拨关不会给它发关闭帧」：flags 是机器级的，远端宿主的
+   * `initialize` 才决定它自己有没有能力，前端没有依据去替它清视图。
+   */
+  it("does not close remote sides when the local flag turns off", async () => {
+    await readyWithSide();
+    await command("/btw why is it slow");
+    await waitFor(() => expect(methods()).toContain("side/open"));
+    reset();
+
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "实验功能" }));
+    fireEvent.click(
+      await screen.findByRole("checkbox", { name: "side_conversation 开关" }),
+    );
+    await waitFor(() => expect(methods()).toContain("flags/set"));
+
+    // 收尾只落在本地状态上：绝不为「本机关的」去关闭或打断别处的旁支。
+    expect(methods()).not.toContain("side/close");
+    expect(methods()).not.toContain("side/turnInterrupt");
   });
 
   it("stops only the side's own turn", async () => {
