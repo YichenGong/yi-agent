@@ -1,5 +1,9 @@
 # yi-agent-tui
 
+## 一次性旁问退出（待审阅，未实现）
+
+- [ ] `/back` 与 `/side-close` 退出即销毁 — [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §4、§8、§9。完成判据：`cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::side` 与 driver/输入循环集成验证运行中退出、Creating 中退出、父任务继续、重入新快照、帮助不再承诺保留；新测试与真实终端验收尚未执行。
+
 ## 模块说明
 
 yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。提供结构化对话历史展示、输入编辑、slash 命令弹窗、状态栏、bash 弹窗等功能。从早期 InlineRenderer（reedline 流式打印）迁移而来，现已设为默认 TUI 模式。

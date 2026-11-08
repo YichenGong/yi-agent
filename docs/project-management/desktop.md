@@ -1,5 +1,9 @@
 # desktop（Tauri GUI）
 
+## 一次性对话快照旁问（待审阅，未实现）
+
+- [ ] 桌面/手机离开销毁与全新重入 — [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §4、§6–§9。完成判据：`cd desktop && npx tsc --noEmit && npx vitest run src/hooks/useSideConversationController.test.tsx src/App.test.tsx` 覆盖返回、切会话/项目、迟到 open、断网退出重试、新代零旧正文/草稿；再执行 spec §9 桌面与手机同宿主联合验收。旧记录中“返回保留/后台续聊”的行为与断言将被覆盖，历史自动检查不证明本项完成。
+
 ## 模块说明
 
 `desktop/` 是 yi-agent 的原生桌面应用，基于 **Tauri 2.x**（原生 OS webview）+

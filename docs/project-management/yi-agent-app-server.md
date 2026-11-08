@@ -1,5 +1,9 @@
 # yi-agent-app-server（GUI app-server）
 
+## 一次性旁问生命周期（待审阅，未实现）
+
+- [ ] 入场身份与精确退出协议 — [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §6、§7、§9。完成判据：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib side` 及真实 stdio 集成覆盖 Creating 中退出、同父 Closing 占位、旧操作不命中新代、控制端共享销毁、能力协商和通知背压下有界清理；新用例尚未实现/执行。
+
 ## 普通会话只读同步与可靠投递（Spec 已复核、Plan 已编写，未实施）
 
 [修复 spec rev2](../superpowers/specs/2026-11-08-session-completeness-repair-design.md) · [复核记录](../superpowers/reports/2026-11-08-session-completeness-spec-review.md) · [数据 Plan B1–B12](../superpowers/plans/2026-11-08-session-completeness-repair-impl.md)；前端窗口及对账接线计入 [desktop](./desktop.md)，不在本模块重复计数。
