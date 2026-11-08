@@ -87,3 +87,36 @@ describe("HeightBook", () => {
     expect(book.median()).toBe(40);
   });
 });
+
+describe("HeightBook: revision 与入账判据", () => {
+  it("只有真实变化才递增 revision", () => {
+    // Spec §4.4 第 2 条：中位数变化要形成**合并后的** heightRevision，让 spacer、
+    // 测量与补偿在同一个布局周期更新。没有可观测的 revision，下游只能靠每次
+    // 渲染重算，既做不出「同周期更新」，也无法区分「高度真的变了」与「又测了
+    // 一遍同样的值」。
+    const book = createHeightBook();
+    expect(book.record("a", 100)).toBe(true);
+    const rev = book.revision();
+    expect(rev).toBeGreaterThan(0);
+
+    // 同样的值重复入账是无操作。
+    expect(book.record("a", 100)).toBe(false);
+    expect(book.revision()).toBe(rev);
+
+    expect(book.record("a", 140)).toBe(true);
+    expect(book.revision()).toBe(rev + 1);
+  });
+
+  it("零高与非有限值不入账", () => {
+    // 折叠条目、尚未布局的行都会报 0；把它们记成 100 条 0 高会把中位数拽到 0，
+    // spacer 随之塌陷，用户看到整段内容「消失」。
+    const book = createHeightBook();
+    const rev = book.revision();
+    expect(book.record("a", 0)).toBe(false);
+    expect(book.record("b", -10)).toBe(false);
+    expect(book.record("c", Number.NaN)).toBe(false);
+    expect(book.record("d", Number.POSITIVE_INFINITY)).toBe(false);
+    expect(book.revision()).toBe(rev);
+    expect(book.median()).not.toBe(0);
+  });
+});

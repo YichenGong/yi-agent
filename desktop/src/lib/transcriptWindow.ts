@@ -9,6 +9,8 @@
  * `useStickToBottom` 的 `scrollHeight` 语义不用改写（见设计 §2）。
  */
 
+import type { WindowMeasurement } from "./transcriptGeometry";
+
 export interface WindowState {
   /** 已挂载区间的起点（含）。 */
   start: number;
@@ -38,11 +40,11 @@ export interface FocusRequest {
  */
 export interface VisibleRange {
   /**
-   * 视口内第一条的**绝对** item index（不是挂载区相对序号）。
+   * 视口内第一条的**绝对** item index。
    *
-   * 组件层只能看见挂载区，数不出前面还有多少条，所以它给的是相对序号；
-   * `useTranscriptWindow` 负责加上 `state.start` 再传进来。两处口径必须一致，
-   * 否则截断判据会比错对象。
+   * 保留这个窄形状只为旧调用点与纯函数测试：`measureTranscript` 直接读
+   * `data-item-index`，不再做 `window.start + 相对序号` 的换算（tail 不在
+   * 历史窗口内，那样换算会把边界比错）。
    */
   first: number;
   /** 视口内最后一条的绝对 item index。 */
@@ -87,48 +89,69 @@ export const DEFAULT_LIMITS: WindowLimits = {
   bufferPx: 20 * 40,
 };
 
+/** 历史区边界的两种来源：新测量结果，或旧 `VisibleRange` 形状（只有边界）。 */
+export type EdgeLike = WindowMeasurement | VisibleRange;
+
+function edgesOf(v: EdgeLike | null): { first: number; last: number; gapTopPx: number; gapBottomPx: number } | null {
+  if (!v) return null;
+  if ("history" in v) return v.history;
+  return { first: v.first, last: v.last, gapTopPx: v.gapTopPx, gapBottomPx: v.gapBottomPx };
+}
+
+/** 一个方向的最大位移（px）：`ceil(条数/页) + 2` 页，不是无限滚。 */
+export function cycleBudget(itemCount: number, pageSize: number): number {
+  return Math.ceil(Math.max(itemCount, 1) / Math.max(pageSize, 1)) + 2;
+}
+
 export interface NextWindowInput {
   current: WindowState | null;
   itemCount: number;
   limits: WindowLimits;
-  /** 当前视口覆盖的挂载区区间；未测量出时为 null。 */
-  visible: VisibleRange | null;
+  /**
+   * 当前视口测量。`history` 只来自历史区行——恒挂的 LiveTail 不参与边界，
+   * 否则「首末挂载行」会把底边拉进视口，读成已覆盖而停止开窗。
+   */
+  visible: EdgeLike | null;
+  /**
+   * 用户是否在跟随尾部。**必须显式传入**：它来自 ScrollCoordinator 的意图，
+   * 不能由 `end === itemCount` 推导，也不能在读到底部时自动恢复。
+   * 省略时沿用 `current.following`（旧调用点的兼容行为）。
+   */
+  following?: boolean;
+  /** 本轮只允许一个方向。省略时按 gap 推导（旧调用点）。 */
+  direction?: "up" | "down" | null;
   /** 一次性开窗请求（锚点恢复 / 搜索跳转）。 */
   focus?: FocusRequest | null;
 }
 
 const clamp = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
 
-/**
- * 超限时该截掉哪一端。
- *
- * 不能无条件截 `start`：用户往上读时那会卸掉他正在看的内容。
- * 也不能只比「离视口多远」：向上翻页后视口落在新内容中间，按距离会截 `start`，
- * 把刚加载进来的历史立刻丢掉，形成「翻页—卸载—再翻页」的抖动。
- */
+/** 视口离历史区哪端更近；`true` = 该截 start。 */
 export function decideTrimStart(args: {
   following: boolean;
-  visible: VisibleRange | null;
+  visible: EdgeLike | null;
   start: number;
   end: number;
   limits: WindowLimits;
 }): boolean {
-  const { following, visible, start, end, limits } = args;
-  if (following) return true; // 用户在看最新
-  if (!visible) return true; // 尚未测量，保守保住尾部
-  if (visible.gapTopPx >= -limits.bufferPx) return false; // 刚向上分页 -> 截 end
-  if (visible.gapBottomPx >= -limits.bufferPx) return true; // 刚向下分页 -> 截 start
+  const { following, start, end, limits } = args;
+  const visible = edgesOf(args.visible);
+  if (following) return true;
+  if (!visible) return true;
+  if (visible.gapTopPx >= -limits.bufferPx) return false;
+  if (visible.gapBottomPx >= -limits.bufferPx) return true;
   const nearStart = visible.first - start;
   const nearEnd = end - visible.last;
-  return nearStart > nearEnd; // 截离视口更远的一侧
+  return nearStart > nearEnd;
 }
 
 /** 算出下一个窗口。纯函数：不读 DOM、不读时间、无副作用。 */
 export function nextWindow(input: NextWindowInput): WindowState {
-  const { current, itemCount, limits, visible, focus } = input;
+  const { current, itemCount, limits, focus } = input;
 
   if (itemCount <= 0) return { start: 0, end: 0, following: true };
 
+  const edge = edgesOf(input.visible);
   let start: number;
   let end: number;
   let following: boolean;
@@ -139,17 +162,18 @@ export function nextWindow(input: NextWindowInput): WindowState {
       start = clamp(focus.index - focus.before, 0, itemCount - 1);
       end = clamp(focus.index + focus.after + 1, start + 1, itemCount);
     } else {
-      following = true;
+      following = input.following ?? true;
       end = itemCount;
       start = Math.max(end - limits.initialSize, 0);
     }
   } else {
-    ({ start, end, following } = current);
+    start = current.start;
+    end = current.end;
+    following = input.following ?? current.following;
 
-    // 收缩：窗口整体落在新末尾之后（/clear、compact）时重新锚到尾部，
-    // 否则会剩下一个空窗口，用户看不到任何内容。
+    // 收缩：窗口整体落在新末尾之后（/clear、compact）时重新锚到尾部。
     if (start >= itemCount) {
-      following = true;
+      following = input.following ?? true;
       end = itemCount;
       start = Math.max(end - limits.initialSize, 0);
     }
@@ -164,25 +188,55 @@ export function nextWindow(input: NextWindowInput): WindowState {
       // 跟随尾部：itemCount 增长时 end 跟上，start 不动。
       if (following) end = itemCount;
 
-      if (visible) {
-        if (start > 0 && visible.gapTopPx >= -limits.bufferPx) {
-          start = Math.max(start - limits.pageSize, 0);
-          following = false; // 用户明确往上读了
-        }
-        if (end < itemCount && visible.gapBottomPx >= -limits.bufferPx) {
-          end = Math.min(end + limits.pageSize, itemCount);
-          // 滚回底部就是「要继续看最新」，与 useStickToBottom 里
-          // 「gap 回到阈值内则恢复跟随」是同一条语义，两处必须一致。
-          if (end === itemCount) following = true;
-        }
+      const wanted = input.direction ?? null;
+      const up = edge !== null && start > 0 && edge.gapTopPx >= -limits.bufferPx;
+      const down = edge !== null && end < itemCount && edge.gapBottomPx >= -limits.bufferPx;
+      // **一个周期只走一个方向**：两个方向同一帧各自加一页，会在窄视口里
+      // 「上翻—下卸」互相抵消，表现为翻不动或来回抖。direction 显式给出时
+      // 只认它（用户手势/开窗意图），否则按 gap 推一个。
+      // 两端同时越界（历史区比视口矮，或 tail 远离历史）时按越界更远的一端
+      // 决定方向；相等就原地不动，宁可少开一页也不要一帧上、一帧下地抖。
+      const dir =
+        wanted ??
+        (up && down
+          ? edge!.gapBottomPx > -edge!.gapTopPx
+            ? "down"
+            : -edge!.gapTopPx > edge!.gapBottomPx
+              ? "up"
+              : null
+          : up
+            ? "up"
+            : down
+              ? "down"
+              : null);
+      if (dir === "up" && up) {
+        start = Math.max(start - limits.pageSize, 0);
+        following = false;
+      } else if (dir === "down" && down) {
+        end = Math.min(end + limits.pageSize, itemCount);
+        // 读到底部**不等于**要跟随：意图只由用户/显式命令改变。
       }
     }
   }
 
-  if (end - start > limits.maxMounted) {
-    const trimStart = decideTrimStart({ following, visible, start, end, limits });
-    if (trimStart) start = end - limits.maxMounted;
-    else end = start + limits.maxMounted;
+  // 实际 DOM 上限含恒挂的 LiveTail：tail 在窗口外时给它留 1 个名额。
+  //
+  // **裁剪会改变 `end`，从而改变 tail 是否在窗口内**：原本贴到末尾（
+  // `end === itemCount`，tail 在窗口内、不占名额）的窗口被裁一刀后 `end` 退离
+  // 末尾，tail 立刻变回「第 N+1 条」并重新占用名额。所以这里必须**迭代到不动点**
+  // 而不是只算一次——单次计算会让最终 DOM 比预算多一条（真实回归：窗口 400 条
+  // 历史 + 恒挂 tail = 401，`mounted 401 must stay within the DOM budget`）。
+  for (;;) {
+    const reservedTail = end < itemCount ? 1 : 0;
+    const capacity = Math.max(1, limits.maxMounted - reservedTail);
+    if (end - start <= capacity) break;
+    // 裁掉**远离视口**的一端，不按翻页方向裁：方向只决定往哪加，裁哪端要看
+    // 用户实际在读哪里。按方向裁会立刻删掉刚补进来的那一页，表现为「翻不动」。
+    const trimStart = decideTrimStart({ following, visible: input.visible, start, end, limits });
+    if (trimStart) start = end - capacity;
+    else end = start + capacity;
+    // 一轮裁剪至多把 `end` 推离末尾一次，因此最多再迭代一次就会在
+    // 「tail 占名额」的口径下收敛；`break` 由上面的容量判断给出。
   }
 
   end = Math.min(end, itemCount);

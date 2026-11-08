@@ -3,11 +3,24 @@ import {
   DEFAULT_LIMITS,
   nextWindow,
   type FocusRequest,
-  type VisibleRange,
   type WindowLimits,
   type WindowState,
 } from "../lib/transcriptWindow";
+import type { WindowMeasurement } from "../lib/transcriptGeometry";
 import type { HeightBook } from "../lib/heightBook";
+import {
+  createTranscriptPositionIndex,
+  type TranscriptPositionIndex,
+} from "../lib/transcriptPositionIndex";
+import {
+  beginConvergence,
+  decideConvergence,
+  estimateFocusIndex,
+  geometrySignature,
+  noteAdvance,
+  noteFocus,
+  type ConvergenceCycle,
+} from "../lib/transcriptConvergence";
 
 export interface UseTranscriptWindowArgs {
   itemCount: number;
@@ -16,12 +29,30 @@ export interface UseTranscriptWindowArgs {
    * 切换会话必须回到尾部首屏，不能继承上一条会话的中间窗口。
    */
   threadId?: string | null;
-  /** 测量当前视口。未布局时返回 null（此时保持跟随，不翻页）。 */
-  measure: () => VisibleRange | null;
+  /**
+   * 测量当前视口。未布局时返回 null（此时暂停开窗，但**不**改变跟随意图）。
+   * 结果里的 index 已是绝对序号、gap 只算历史区，hook 不再二次换算。
+   */
+  measure: () => WindowMeasurement | null;
   /** 一次性开窗请求；调用方负责在消费后清空。 */
   focus?: FocusRequest | null;
   limits?: Partial<WindowLimits>;
   book: HeightBook;
+  /**
+   * 当前条目 id 顺序（只读，长度应等于 `itemCount`）。
+   *
+   * 用于「视口落在未挂载区间」时把偏移换算成条号。缺省时该能力降级为不做——
+   * 调用方没给顺序就无从判断第几条是谁，不能靠猜。
+   */
+  anchorIds?: readonly string[];
+  /**
+   * 当前是否处于「跟随尾部」意图（来自 ScrollCoordinator，见 Spec §4.3）。
+   *
+   * 收敛补页必须**让位**给它：跟随状态下视口位置由贴底写入负责，此刻视口暂时
+   * 没盖住窗口是正常的（贴底还没执行）。若收敛也在这里补页，两者会互相抢
+   * `scrollTop`，表现为切换会话后首屏被撑到几百条、以及来回抖动。
+   */
+  following?: () => boolean;
 }
 
 export interface TranscriptWindowApi {
@@ -31,15 +62,29 @@ export interface TranscriptWindowApi {
   /**
    * 告诉 hook「视口可能变了，请重新测量」。
    *
-   * **必须由调用方在滚动时调用。** 翻页的触发条件（`gapTopPx` / `gapBottomPx`）
-   * 只存在于 `measure()` 的返回值里，而滚动既不改变 `itemCount` 也不改变 `focus`，
-   * 没有任何 React 依赖会因此变化。少了这个入口，向上翻页永远不会发生——
-   * 窗口会停在冷启动那 60 条上。
+   * 滚动既不改变 `itemCount` 也不改变 `focus`，没有任何 React 依赖会因此变化，
+   * 所以滚动必须显式进入。
+   *
+   * 但**不能只靠滚动**：`scrollTop` 被设进 spacer 后浏览器已贴顶/贴底，不会再
+   * 产生 scroll 事件，而窗口提交本身也不保证视口里有行。那正是「内容显示不全、
+   * 切出去切回来才补上」的形状。所以提交后由 hook 自己续测（见下方 cycle）。
    *
    * 每帧最多真正重算一次，滚动事件可以逐帧调用。
    */
   nudge: () => void;
+  /**
+   * 显示收敛异常（`null` = 正常）。
+   *
+   * 只在「补页预算用完」或「同一几何反复无进展、focus 也救不回来」时非空：
+   * 此时窗口停在视口覆盖不到的位置，需要用户点「重定位阅读位置」。
+   */
+  displayError: string | null;
+  /** 用户手动重定位：开一个新的收敛周期并立即重测。 */
+  retry: () => void;
 }
+
+/** 收敛异常文案。**不要**把它写进日志当作已完成——它明确表示显示仍有缺口。 */
+export const DISPLAY_STALLED_MESSAGE = "阅读位置暂时无法定位，可点击重定位";
 
 /**
  * 维护转录窗口。
@@ -49,12 +94,14 @@ export interface TranscriptWindowApi {
  * 锚点/搜索跳转翻译成一次性的 `FocusRequest`。
  */
 export function useTranscriptWindow({
+  anchorIds,
   itemCount,
   threadId,
   measure,
   focus = null,
   limits,
   book,
+  following,
 }: UseTranscriptWindowArgs): TranscriptWindowApi {
   // **必须按标量字段 memo**，不能依赖 `limits` 对象身份：调用方几乎总是传字面量
   // （`limits={{ pageSize: 200 }}`），对象身份每次渲染都变 -> `merged` 变 ->
@@ -105,17 +152,60 @@ export function useTranscriptWindow({
   const frameRef = useRef<number | null>(null);
   const itemCountRef = useRef(itemCount);
   itemCountRef.current = itemCount;
-  const recompute = useCallback(() => {
+  // 收敛周期（Spec §4.2）。`null` = 当前没有正在进行的自动补页。
+  const cycleRef = useRef<ConvergenceCycle | null>(null);
+  // 内容代次：items 结构（条数）变化 = 旧周期的预算与签名不再可信。
+  const generationRef = useRef(0);
+  const [displayError, setDisplayError] = useState<string | null>(null);
+  // 意图读取也走 ref：它是外部闭包，变化不应改变 `recompute` 的身份。
+  const followingRef = useRef<(() => boolean) | undefined>(following);
+  followingRef.current = following;
+  // 用 ref 读当前值：如果把它放进 `recompute` 的依赖，`setDisplayError` 会改变
+  // `recompute` 的身份 -> 依赖它的 effect 再跑 -> 又一次重算，形成自激。
+  const displayErrorRef = useRef(displayError);
+  displayErrorRef.current = displayError;
+
+  /**
+   * 「当前 scrollTop 对应哪一条」的索引（Spec §4.4 第 6 条）。
+   *
+   * 只有在 `measure` 完全量不出历史区（视口落在未挂载的 spacer 里）时才用得上：
+   * 这时没有任何行可以采信，`estimateFocusIndex` 也无从估算，必须靠高度账本把
+   * 偏移换算成条号，否则窗口只能停在原处——用户看到一片空白，不滚动就永远不救。
+   */
+  const positionIndexRef = useRef<TranscriptPositionIndex>(createTranscriptPositionIndex());
+  /**
+   * 调用方给的 id 顺序。`itemCount` 不足以判断「第几条是谁」，所以需要真实的
+   * id 列表；缺失时退回 `estimateFocusIndex`（旧路径），不假装能定位。
+   */
+
+
+  const recompute = useCallback((reason: "user" | "layout" | "commit" | "items" = "layout") => {
+    // 用户手势开启**新**周期：预算与「无进展」判定都要重新计，否则用户滚一下
+    // 就继承上一轮的 stalled 标记，永远不再补页。
+    if (reason === "user") cycleRef.current = null;
+    // 页面不可见时不排帧：后台标签页的 rAF 会被节流甚至完全停发，而一旦切回
+    // 可见，积压的帧可能连跑多次、把基于旧布局的结论应用到新布局上。切回可见
+    // 时由下面的 visibilitychange 监听补一次（不需要外部 scroll）。
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
     if (frameRef.current !== null) return;
     frameRef.current = requestAnimationFrame(() => {
       frameRef.current = null;
-      // 把「挂载区相对序号」翻译成绝对 index：`measure` 只看得见挂载区，
-      // 它数不出前面还有多少条。`nextWindow` 的截断判据用的是绝对 index。
       const owner = threadRef.current;
       const current = slotRef.current.owner === owner ? slotRef.current.window : null;
-      const raw = measure();
-      const base = current?.start ?? 0;
-      const visible = raw ? { ...raw, first: base + raw.first, last: base + raw.last } : null;
+      // `measure` 给的就是绝对 index；不再加 `current.start`（tail 不在窗口内）。
+      const visible = measure();
+      const ownerKey = String(owner ?? "");
+      const generation = generationRef.current;
+      let cycle = cycleRef.current;
+      if (cycle === null || cycle.owner !== ownerKey || cycle.generation !== generation) {
+        cycle = beginConvergence(ownerKey, itemCountRef.current, generation);
+      }
+      // 用户的贴底意图必须传给窗口计算：读者把滚动条拖到底之后，视口可能落在
+      // **下方 spacer** 里（早先 `focus` 开出来的中段窗口还没被收回来）。只靠
+      // 「补页往后追」永远追不上——那些页本身也只是把 spacer 变短，视口仍在
+      // 未挂载区间。把 `following` 传进去，`nextWindow` 才能直接把窗口收回到
+      // 尾部，视口立刻有内容。
+      const followIntent = followingRef.current?.();
       const next = nextWindow({
         current,
         itemCount: itemCountRef.current,
@@ -123,23 +213,83 @@ export function useTranscriptWindow({
         // 每次重算都重新取，中位数随测量收敛后阈值自动跟上。
         limits: { ...merged, bufferPx: merged.buffer * book.median() },
         visible,
+        // 一个周期只走一个方向：否则窄视口里「上翻—下卸」会互相抵消。
+        direction: cycle.direction,
         focus: pendingRef.current,
+        // 只在调用方真的给出意图时传：`nextWindow` 用 `input.following ?? 默认`
+        // 决定冷启动要不要贴尾，传一个假的 `false` 会让新会话从头部开始。
+        following: followIntent,
       });
       // 消费掉这次 focus：它只影响一次窗口计算。
       pendingRef.current = null;
-      if (
-        current !== null &&
-        current.start === next.start &&
-        current.end === next.end &&
-        current.following === next.following
-      ) {
-        return; // 无变化不触发渲染
+
+      const changed =
+        current === null ||
+        current.start !== next.start ||
+        current.end !== next.end ||
+        current.following !== next.following;
+
+      // 几何签名描述「这一帧看到的布局」：区间 + 视口内首末行 + tail 是否可见。
+      // 只用区间不够——区间没动但视口终于有了行，也是进展。
+      const signature = geometrySignature({
+        start: current?.start ?? next.start,
+        end: current?.end ?? next.end,
+        visible: visible?.visible ?? null,
+        tailVisible: visible?.tailVisible ?? false,
+      });
+      // 「已覆盖」= 视口里至少有一行真实消息。这是收敛的目标，也是唯一能停的
+      // 条件之一；`measure()` 返回 null 表示尚未布局，此时必须暂停而不是按
+      // 0 高度扩窗。
+      const covered = visible !== null && visible.visible !== null;
+      // 跟随中不补页：贴底写入负责把视口放到尾部，收敛只需退出。
+      const decision =
+        followIntent === true && !covered
+          ? "settled"
+          : decideConvergence(cycle, signature, covered, visible !== null);
+
+      if (changed) {
+        if (next.start < (current?.start ?? next.start)) cycle.direction = "up";
+        else if (next.end > (current?.end ?? next.end)) cycle.direction = "down";
+        const nextSlot = { owner, window: next };
+        slotRef.current = nextSlot;
+        setSlot(nextSlot);
       }
-      const nextSlot = { owner, window: next };
-      slotRef.current = nextSlot;
-      setSlot(nextSlot);
+
+      // **这里就是「切出去再切回来才补齐」的修复点。** 提交只改变挂载区间，
+      // 不保证视口里有行；`scrollTop` 已经贴顶/贴底时浏览器不会再产生 scroll
+      // 事件。必须自己安排下一次测量，直到覆盖或确认无进展。
+      if (decision === "advance") {
+        cycleRef.current = noteAdvance(cycle, signature);
+        recompute("commit");
+        return;
+      }
+      if (decision === "focus") {
+        cycleRef.current = noteFocus(cycle);
+        // 先按「视口里真实存在的行」估算；量不出任何历史区时（视口落在未挂载的
+        // spacer 里）退回按高度账本换算条号。没有 id 顺序就仍然放弃——不能猜。
+        let focused = estimateFocusIndex(visible, book.median(), itemCountRef.current);
+        if (focused === null && anchorIds !== undefined) {
+          const index = positionIndexRef.current;
+          index.rebuild(anchorIds, book);
+          const at = index.indexAt(visible?.viewportTop ?? 0);
+          focused = at >= 0 ? at : null;
+        }
+        if (focused !== null) {
+          const before = Math.max(1, Math.floor(merged.pageSize / 4));
+          appliedRef.current = { index: focused, before, after: merged.pageSize - before };
+          pendingRef.current = appliedRef.current;
+        }
+        recompute("commit");
+        return;
+      }
+      cycleRef.current = cycle;
+      if (decision === "stalled") {
+        setDisplayError(DISPLAY_STALLED_MESSAGE);
+      } else if (decision === "settled" && displayErrorRef.current !== null) {
+        setDisplayError(null);
+      }
     });
-  }, [measure, merged, book]);
+  }, [measure, merged, book, anchorIds]);
 
   // 切换会话：窗口状态与一次性请求都只属于上一次访问，必须丢弃。
   // 用 layout effect（绘制前）而不是普通 effect，配合上面的渲染期同步回落，
@@ -151,9 +301,12 @@ export function useTranscriptWindow({
     recompute();
   }, [threadId, recompute]);
 
-  // 条数变化（回放、流式增长、clear）都要重算。
+  // 条数变化（回放、流式增长、clear）都要重算，并且换代：上一轮的预算与
+  // 「无进展」签名描述的是一份不同的内容，不能继续沿用。
   useEffect(() => {
-    recompute();
+    generationRef.current += 1;
+    cycleRef.current = null;
+    recompute("items");
   }, [recompute, itemCount]);
 
   // 外部传入的 focus 也生效，但同一个对象只应用一次（见 appliedRef 注释）。
@@ -163,6 +316,20 @@ export function useTranscriptWindow({
     pendingRef.current = focus;
     recompute();
   }, [focus, recompute]);
+
+  // 切回可见：补一次重算。隐藏期间的测量与决策都过期了，而且此时不会有
+  // scroll 事件来救——正是「切出去切回来才看到更多」那个形状。
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") return;
+      // 换一轮：隐藏期间积攒的「无进展签名」描述的是旧布局。
+      cycleRef.current = null;
+      recompute("user");
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [recompute]);
 
   useEffect(
     () => () => {
@@ -192,7 +359,13 @@ export function useTranscriptWindow({
     pendingRef.current = null;
   }, []);
   const nudge = useCallback(() => {
-    recompute();
+    recompute("user");
+  }, [recompute]);
+  /** 用户手动重定位：重置周期与错误，重新测一次。 */
+  const retry = useCallback(() => {
+    cycleRef.current = null;
+    setDisplayError(null);
+    recompute("user");
   }, [recompute]);
 
   return {
@@ -207,5 +380,7 @@ export function useTranscriptWindow({
     requestFocus,
     clearFocus,
     nudge,
+    displayError,
+    retry,
   };
 }

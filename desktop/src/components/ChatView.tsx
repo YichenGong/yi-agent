@@ -4,15 +4,15 @@ import type { Item, RetryCause } from "../lib/protocol";
 import { fileNameOf } from "../lib/attachmentLimits";
 import type { NoticeItem, ReasoningItem } from "../lib/session";
 import { useImageData, type ImageReadCall } from "../lib/useImageData";
-import { useStickToBottom } from "../lib/useStickToBottom";
-import { findAnchor, restoreScrollTop, type ItemBox, type ViewAnchor } from "../lib/viewAnchor";
+import { useTranscriptScroll } from "../hooks/useTranscriptScroll";
+import { measureTranscript, type WindowMeasurement } from "../lib/transcriptGeometry";
+import { findAnchor, type ItemBox, type ViewAnchor } from "../lib/viewAnchor";
 import { useThrottledText } from "../lib/useThrottledText";
 import { itemText } from "../lib/itemText";
 import { createHeightBook } from "../lib/heightBook";
 import { useTranscriptWindow } from "../hooks/useTranscriptWindow";
-import { DEFAULT_LIMITS, type VisibleRange } from "../lib/transcriptWindow";
+import { DEFAULT_LIMITS } from "../lib/transcriptWindow";
 import type { TranscriptWindowApi } from "../hooks/useTranscriptWindow";
-import { planCompensation } from "../lib/scrollCompensation";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
 import { HelpCard } from "./HelpCard";
@@ -147,6 +147,8 @@ const ChatItem = memo(
     threadId,
     call,
     query,
+    index = -1,
+    region = "history",
   }: {
     item: Item | NoticeItem | ReasoningItem;
     text: string;
@@ -154,6 +156,14 @@ const ChatItem = memo(
     call: ImageReadCall;
     /** 搜索关键词。空串表示未在搜索，不产生任何 mark。 */
     query: string;
+    /**
+     * 该条在 `items` 里的**绝对** index。测量层直接读 `data-item-index`，
+     * 不再让 hook 用 `window.start + 相对序号` 换算（tail 不在历史窗口内，
+     * 那样换算会把历史边界比错）。
+     */
+    index?: number;
+    /** 历史区还是恒挂的 live tail。历史 gap 只由 `history` 行计算。 */
+    region?: "history" | "tail";
   }) {
     // 阅读锚点必须挂在实际生成布局盒的节点上：`display: contents` 的矩形恒为
     // 零，采集会把所有消息视为同一位置并错误选中最后一条。用纵向 flex 容器
@@ -242,14 +252,28 @@ const ChatItem = memo(
       }
     })();
     return (
-      <div className="flex shrink-0 flex-col" data-item-id={item.id}>
+      <div
+        className="flex shrink-0 flex-col"
+        data-item-id={item.id}
+        data-item-index={index}
+        data-transcript-region={region}
+      >
         {node}
       </div>
     );
   },
   // Compare the mutable primitive, never `item.text`.
+  //
+  // `index`/`region` 必须比较：它们决定 `data-item-index` / `data-transcript-region`，
+  // 而测量层（`transcriptGeometry`）按这两个属性把 DOM 行映射回绝对序号与所属
+  // 区域。前面插入一条消息会让后面所有行的绝对 index 平移；不重渲染就留着旧值，
+  // 测量层会认为「这几行属于别的区间」，窗口化与锚点恢复随之错位。
   (prev, next) =>
-    prev.item === next.item && prev.text === next.text && prev.query === next.query,
+    prev.item === next.item &&
+    prev.text === next.text &&
+    prev.query === next.query &&
+    prev.index === next.index &&
+    prev.region === next.region,
 );
 
 /**
@@ -279,11 +303,14 @@ const ChatItem = memo(
  */
 function LiveTail({
   item,
+  index,
   threadId,
   call,
   query,
 }: {
   item: Item | NoticeItem | ReasoningItem;
+  /** 该条在 `items` 里的绝对 index（tail 恒为 `items.length - 1`）。 */
+  index: number;
   threadId: string | null;
   call: ImageReadCall;
   query: string;
@@ -297,6 +324,8 @@ function LiveTail({
       threadId={threadId}
       call={call}
       query={query}
+      index={index}
+      region="tail"
     />
   );
 }
@@ -372,6 +401,8 @@ const HistoryWindow = memo(
           threadId={threadId}
           call={call}
           query={query}
+          index={i}
+          region="history"
         />,
       );
     }
@@ -502,17 +533,44 @@ export function ChatView({
    */
   isRemote?: boolean;
 }) {
-  const { ref: scrollRef, scrollToBottom, followIfAtBottom, releaseFollow, isFollowing } =
-    useStickToBottom();
+  // 布局归属 = **只有会话身份**。换会话时上一条的位置不属于这一条（继承它正是
+  // 「切到等长会话却停在中段」的成因），所以必须重建协调器。
+  //
+  // 但**不能把内容版本放进归属**：`textVersion` 每个 token 都变，`structuralVersion`
+  // 每次追加 item 也变，而协调器重建会把 `followingIntent` 复位成 true、把阅读
+  // 锚点丢掉。用户上翻历史后只要还有东西流进来，每个 delta 都会被重新判定为
+  // 「在跟随」并拽回底部——实测本用例落在贴底 13224 而不是锚点纠正后的 5300。
+  // 内容增长要的是「重新测量」，那是 `planLayout` 的 `generation`，不是新归属。
+  const layoutOwnerKey = threadId ?? "none";
+  // 布局变化（图片迟到、工具卡展开、窗口旋转、渲染后 spacing 收敛）必须回到同一个
+  // 决策者。交给 `planLayout` 是因为它内部就是「读几何 → 协调器决策 → 唯一写入」；
+  // 直接回调 React setState 只会引入新的一帧而不解决位置。
+  // `onLayoutChange` 用 ref 转达（hook 内部按 ref 读），所以这里传一个稳定函数。
+  const layoutTickRef = useRef<() => void>(() => {});
+  const scrollApi = useTranscriptScroll({
+    ownerKey: layoutOwnerKey,
+    onLayoutChange: () => layoutTickRef.current(),
+  });
+  const {
+    ref: attachScroller,
+    scrollToBottom,
+    followIfAtBottom,
+    releaseFollow,
+    isFollowing,
+    requestRestore,
+    holdAnchor,
+    planLayout,
+    hasPendingRestore,
+  } = scrollApi;
   // 合并 ref：同一个 DOM 节点交给两方。依赖是两个 ref 本身（稳定引用），
   // 所以不会每次渲染都重设。
   const setScroller = useCallback(
     (el: HTMLDivElement | null) => {
       elRef.current = el;
-      scrollRef.current = el;
+      attachScroller(el);
       if (scrollerRef) scrollerRef.current = el;
     },
-    [scrollRef, scrollerRef],
+    [attachScroller, scrollerRef],
   );
 
   // `items` is `session.items` — the same array instance for the whole session,
@@ -530,36 +588,27 @@ export function ChatView({
   const tail = items.length > 0 ? items[items.length - 1] : undefined;
   const effectiveCall = call ?? NO_CALL;
 
-  // 未挂载区的高度估算：一条会话只建一本，存活到会话结束。
-  const windowBook = useMemo(() => createHeightBook(), []);
+  // 未挂载区的高度估算（Spec §4.4 第 1 条）。
+  //
+  // 账本属于**布局归属**而不是组件实例：上一条会话的消息高度对这条毫无意义，
+  // 沿用就会让短会话继承长会话的中位数，切过去的第一屏 spacer 按错误高度预留，
+  // 滚动条比例与跳转位置一起失真（实测换会话后 spacer 仍是 5600px）。
+  // `layoutOwnerKey` 变化即换新账本；旧的那本随闭包被回收，不做全局缓存。
+  const windowBook = useMemo(() => createHeightBook(), [layoutOwnerKey]);
 
   // 测量当前视口。`elRef` 在下面才声明，但闭包只在 rAF 里执行，那时已赋值。
-  const measureVisible = useCallback((): VisibleRange | null => {
+  // 测量当前视口。`elRef` 在下面才声明，但闭包只在 rAF 里执行，那时已赋值。
+  //
+  // 两条口径都在 `measureTranscript` 里钉住：绝对 index 直接读 DOM 属性
+  // （`tail` 不在历史窗口内，旧实现 `window.start + 相对序号` 会把边界比错），
+  // 历史 gap 只由历史区行计算（恒挂的 LiveTail 会把首末挂载行撑到视口内，
+  // 读成「已覆盖」后不再开窗，必须切走再切回才补上）。
+  const measureVisible = useCallback((): WindowMeasurement | null => {
     const el = elRef.current;
     // 未布局（jsdom、首帧、`scrollHeight` 为 0）时返回 null：`nextWindow` 会保持
     // 跟随且不翻页。这条守卫同时让测试能确定地断言首屏条数。
-    if (!el || el.scrollHeight === 0 || el.clientHeight === 0) return null;
-    const rows = el.querySelectorAll<HTMLElement>("[data-item-id]");
-    if (rows.length === 0) return null;
-    const viewTop = el.scrollTop;
-    const viewBottom = viewTop + el.clientHeight;
-    const firstNode = rows[0];
-    const lastNode = rows[rows.length - 1];
-    // 相对内容顶部的坐标系：减去容器自身的文档偏移，再加上 scrollTop。
-    const base = el.getBoundingClientRect().top - el.scrollTop;
-    const firstTop = firstNode.getBoundingClientRect().top - base;
-    const lastBottom = lastNode.getBoundingClientRect().bottom - base;
-    // `first`/`last` 是**挂载区相对序号**：这一层数不出前面还有多少条，
-    // `useTranscriptWindow` 会加上 `window.start` 变成绝对 index。
-    return {
-      first: 0,
-      last: rows.length - 1,
-      // **不要夹到 >=0**：`gapTopPx` 为负表示顶边已在视口上方，这是「用户在窗口
-      // 内部」的正常状态，必须与「顶边贴住视口顶（0）」区分。夹掉符号会让底部
-      // 跟随被误判成翻到顶，窗口逐帧抖动。
-      gapTopPx: firstTop - viewTop,
-      gapBottomPx: viewBottom - lastBottom,
-    };
+    if (!el || el.scrollHeight === 0) return null;
+    return measureTranscript(el);
   }, []);
 
   // 这里**不传** `focus` prop：锚点恢复（Task 10）与搜索跳转（Task 11）都走
@@ -567,23 +616,77 @@ export function ChatView({
   // 值，且值恒为 null，等于给 hook 加一条走不通的分支。
   // `requestFocus` 由 Task 10（锚点恢复）与 Task 11（搜索跳转）消费；现在不取，
   // 否则 `noUnusedLocals` 会报错。
+  // 条目 id 顺序：视口落进未挂载区间时，用它把 `scrollTop` 换算成条号并发一次
+  // focus。依赖 `items.length` 而不是 `items`：`items` 是同一个数组实例原地变化，
+  // 按引用比较永远不会更新；长度变化已经覆盖「结构性增删」，而纯文本增长不影响
+  // 条号对应关系。
+  const anchorIds = useMemo(
+    () => items.map((it) => it.id ?? ""),
+    // `items` 是同一个数组实例原地变化（`Session.apply` 直接改它），按引用做依赖
+    // 等于永不更新；`items.length` 覆盖结构性增删，`structuralVersion` 覆盖「同长度
+    // 换槽」。纯文本增长不改变 id 顺序，不需要重建。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [items.length, structuralVersion, threadId],
+  );
   const windowApi = useTranscriptWindow({
     itemCount: items.length,
     threadId,
     measure: measureVisible,
     book: windowBook,
+    following: isFollowing,
+    anchorIds,
   });
   const { window: win, nudge, requestFocus } = windowApi;
 
+  /**
+   * 宿主（搜索跳转）请求开窗的**目标条号**，开到位后要一次性把视口移过去。
+   *
+   * 只开窗不够：窗口化之后目标那一段原本没挂载，视口多半正落在未挂载的 spacer
+   * 里。窗口换到目标附近时两个 spacer 一长一短，`scrollHeight` 几乎不变、浏览器
+   * 也不会自己纠正 `scrollTop`，于是**开完窗仍然什么都看不到**——用户点「下一个
+   * 命中」却以为没找到。所以开到位后必须显式把那条对到视口顶。
+   *
+   * 位置仍然只由协调器写（`requestRestore` → `planLayout`），不新增第二条写入路径。
+   */
+  const pendingJumpRef = useRef<number | null>(null);
+
   // 宿主拿到的必须是**稳定**对象：它在事件处理器里调用 `requestFocus`，
   // 每次渲染换新引用会让调用方每次都得重取。
+  //
+  // `requestFocus` 在这里被包一层，只为记住「这次开窗是为了跳到第几条」；真正的
+  // 开窗仍然交给 hook，对位由下面的 effect 在目标挂载之后做。
+  const hostApi = useMemo<TranscriptWindowApi>(
+    () => ({
+      ...windowApi,
+      requestFocus: (f) => {
+        pendingJumpRef.current = f.index;
+        windowApi.requestFocus(f);
+      },
+    }),
+    [windowApi],
+  );
   useLayoutEffect(() => {
     if (!windowApiRef) return;
-    windowApiRef.current = windowApi;
+    windowApiRef.current = hostApi;
     return () => {
       windowApiRef.current = null;
     };
-  }, [windowApiRef, windowApi]);
+  }, [windowApiRef, hostApi]);
+
+  // 目标一进挂载区就对位一次。`win.start/end` 变了才可能「刚进来」，所以用它触发；
+  // 目标仍在窗口外就继续等下一次提交（收敛器会自己续推，不需要外部滚动）。
+  useLayoutEffect(() => {
+    const index = pendingJumpRef.current;
+    if (index === null) return;
+    if (index < win.start || index >= win.end) return;
+    const target = items[index];
+    if (!target?.id || elRef.current === null) return;
+    // 还查不到节点说明这一帧节点尚未提交，等下一次。
+    if (elRef.current.querySelector(`[data-item-id="${CSS.escape(target.id)}"]`) === null) return;
+    pendingJumpRef.current = null;
+    requestRestore({ itemId: target.id, offset: 0 });
+    planLayout();
+  }, [win.start, win.end, items, requestRestore, planLayout]);
 
   // **翻页必须由滚动驱动。** 滚动既不改变 `itemCount` 也不改变 `focus`，hook 内部
   // 没有任何 React 依赖会因此变化——不在这里接上滚动事件，窗口会永远停在首屏那
@@ -623,60 +726,75 @@ export function ChatView({
   // 200 条，用户看到的内容就整体位移；从下方卸载则让 `scrollHeight` 变小、
   // `scrollTop` 被浏览器往下夹，`useStickToBottom` 会把这次位移读成「用户上翻」并
   // 永久关闭跟随。所以每次窗口变更都要补偿一次。
-  const prevWindowRef = useRef<{ start: number; end: number } | null>(null);
-  const prevHeightRef = useRef<number>(0);
+  // **每次布局提交只允许一个位置写入者。** 旧实现有五个独立写入者（贴底、
+  // 整体高度差补偿、锚点恢复、漂移校正、窗口 focus）互相覆盖：补偿把
+  // `scrollHeight` 差全部当成「上方新增」，锚点下方长高时就把读者推走。
+  // 现在统一交给 `TranscriptScrollCoordinator`：它按「pending 恢复 > 阅读锚点 >
+  // 贴底」排序，一次布局最多写一次 `scrollTop`。
+  //
+  // 依赖里**没有** `win.start`/`win.end`：中位数收敛、图片迟到、窗口 trim 都会
+  // 改变几何，只在窗口区间变化时维护上一份几何，会把首次收敛的高度差一路攒到
+  // 用户下次滚动（Spec §4.4 第 3 条）。
   useLayoutEffect(() => {
+    // 先记账、再写 spacer、最后决策：本次布局测到的真实高度就是这一帧的位置依据。
+    // 顺序不能换——先 `planLayout` 会把「还没校正的 scrollHeight」当成结论。
+    const measured = measureMountedHeights();
+    const top = spacerTopRef.current;
+    const bottom = spacerBottomRef.current;
+    if (top) top.style.height = `${win.start * measured}px`;
+    if (bottom) bottom.style.height = `${bottomSpacerCount * measured}px`;
+    // 只在 spacer 可见（即上下真的还有未挂载区间）时才让 React 记住新中位数：
+    // 跟随状态下两个 spacer 都是 0，高度与中位数无关，此刻 setState 只会凭空多
+    // 一次渲染去和贴底写入抢帧。
+    if (spacerVisible && measured !== spacerMedian) setSpacerMedian(measured);
+    planLayout();
+  });
+
+  // 尺寸变化的唯一落点：仍由协调器决定写不写、写哪里。
+  layoutTickRef.current = () => {
+    planLayout();
+  };
+
+  /**
+   * 把挂载区的真实高度写回 `HeightBook`（Spec §4.4 第 2、3 条）。
+   *
+   * **每次布局提交都要做**，不能只在 `win.start/end` 变化时更新：图片迟到、首屏
+   * 测量落定、工具卡展开都不改变窗口区间，只在窗口变化时记账会让首次收敛出来的
+   * 中位数一直攒到用户滚动——表现就是「刚进会话高度不对，动一下才正常」。
+   *
+   * 但**不能因此每帧 setState**：它与「跟随贴底」的写入交错会让视口停在中间
+   * （实测流式时 gap 280px 不再贴底）。所以返回「中位数是否真的变了」，只在变了
+   * 时让调用方触发一次渲染；未变化时纯记账，不进入 React 更新。
+   */
+  const measureMountedHeights = useCallback((): number => {
     const el = elRef.current;
-    if (!el) return;
-    const prev = prevWindowRef.current;
-    const prevHeight = prevHeightRef.current;
-    prevWindowRef.current = { start: win.start, end: win.end };
-    prevHeightRef.current = el.scrollHeight;
-
-    // 首帧没有「上一次」，不需要补偿。
-    if (prev === null || prevHeight === 0) return;
-    if (prev.start === win.start && prev.end === win.end) return;
-
-    // **锚点持有期间由漂移校正独占位置。** `planCompensation` 的差值分支假设
-    // 「高度变化全部发生在视口上方」，对滚动阅读是对的；但锚点恢复后追加的内容
-    // 通常长在锚点**下方**，此时再加差值会把人推走（实测：恢复 1212 后又被加
-    // 1000）。这种情形的位置由下面的锚点校正负责，这里必须让路。
-    if (heldAnchor.current !== null && !userTookOver.current) return;
-
-    const plan = planCompensation({
-      prevScrollHeight: prevHeight,
-      nextScrollHeight: el.scrollHeight,
-      prevViewportHeight: el.clientHeight,
-      scrollTop: el.scrollTop,
-      wasFollowing: isFollowing(),
-    });
-
-    // 先写位置再动跟随状态。两种顺序实测都不会被判成「用户上翻」（补偿总是向下
-    // 移动，`onScroll` 只把向上的位移读成意图），但先写位置能保证 `releaseFollow`
-    // 记录的基线就是补偿后的位置，少一次多余的事件判定。
-    if (Math.abs(el.scrollTop - plan.scrollTop) >= 1) {
-      el.scrollTop = plan.scrollTop;
-      selfScrolling.current = el.scrollTop;
-    }
-    if (plan.follow === "to-bottom") scrollToBottom();
-    else releaseFollow();
-  }, [win.start, win.end, isFollowing, scrollToBottom, releaseFollow]);
-
-  // 把挂载区的真实高度写回 `HeightBook`：中位数越准，spacer 越准，分页后的视觉
-  // 跳动越小（设计 §2.4 的螺旋收敛）。
-  useEffect(() => {
-    const el = elRef.current;
-    if (!el) return;
+    if (!el) return windowBook.median();
     for (const node of el.querySelectorAll<HTMLElement>("[data-item-id]")) {
       const id = node.dataset.itemId;
       if (!id) continue;
-      const h = node.getBoundingClientRect().height;
-      // **必须过滤 0**：未布局（首帧、jsdom、刚挂载还没排版）时高度是 0，而
-      // `HeightBook.record` 认为 0 合法（折叠条目确实可能为 0）会照收。大量 0
-      // 进来会把中位数拉到 0，spacer 归零，滚动条比例整个失真。
-      if (h > 0) windowBook.record(id, h);
+      // 零高与非有限值由 `HeightBook.record` 拒绝入账（见其接口注释）。
+      windowBook.record(id, node.getBoundingClientRect().height);
     }
-  }, [win.start, win.end, windowBook]);
+    return windowBook.median();
+  }, [windowBook]);
+
+  /**
+   * 已渲染 spacer 所用的中位数。
+   *
+   * 它是**渲染输入**（spacer 高度 = 条数 × 中位数），所以必须能触发渲染；但每帧
+   * 都 setState 会让「跟随贴底」的写入与这次渲染抢帧，实测流式时视口停在中间
+   * （gap 280px 而不是 0）。因此：
+   *   - 渲染期读 state，保证 React 重渲染时 spacer 不会回退到旧值；
+   *   - 每次布局提交**直接把最新高度写进 DOM**，不等下一次渲染。
+   * 布局 effect 在绘制前执行，所以即使中间有一次渲染把高度写成旧值，也会在
+   * 同一帧内被纠正，用户看不到跳动。
+   */
+  const [spacerMedian, setSpacerMedian] = useState(() => windowBook.median());
+  // 换 owner 会换一本**新的**账本，它的中位数从 fallback 重新开始；旧值留着会让
+  // spacer 停在旧会话的高度估算上。只在换 owner 时走一次渲染，之后靠布局期直写。
+  useLayoutEffect(() => {
+    setSpacerMedian(windowBook.median());
+  }, [layoutOwnerKey, windowBook]);
 
   // 采集用的元素句柄：与 `useStickToBottom` 的 ref 指向同一个 DOM 节点。
   const elRef = useRef<HTMLDivElement | null>(null);
@@ -684,6 +802,10 @@ export function ChatView({
   // effect 绑在它的身份上。
   const rememberRef = useRef(onRememberView);
   rememberRef.current = onRememberView;
+  // 采集 effect 只依赖 threadId（见下文），holdAnchor 的引用要经 ref 转达，
+  // 免得把它塞进依赖后每次渲染都重建监听。
+  const holdAnchorRef = useRef(holdAnchor);
+  holdAnchorRef.current = holdAnchor;
 
   // 每条会话只恢复一次：`anchor` 之后可能因为采集而变化，重复对位会把用户
   // 正在做的滚动不断拉回去。
@@ -694,10 +816,6 @@ export function ChatView({
   const restoredFor = useRef<string | null | undefined>(undefined);
   /** 已恢复到的位置；漂移校正据此把这一行维持在它当初的偏移上。 */
   const heldAnchor = useRef<ViewAnchor | null>(null);
-  /** 用户恢复后自己滚动过 → 位置归他，不再校正。 */
-  const userTookOver = useRef(false);
-  /** 上一次由**我们**写入的 `scrollTop`；用于识别它自己触发的 scroll 事件。 */
-  const selfScrolling = useRef<number | null>(null);
   /** 已在数据层找到 index、等 `requestFocus` 开的那一窗渲染落地的锚点。 */
   const pendingAnchorRef = useRef<ViewAnchor | null>(null);
   useLayoutEffect(() => {
@@ -705,8 +823,6 @@ export function ChatView({
     // A→尚未恢复的 B→A 同样必须重新对位，不能被旧 restoredFor 短路。
     restoredFor.current = undefined;
     heldAnchor.current = null;
-    userTookOver.current = false;
-    selfScrolling.current = null;
     pendingAnchorRef.current = null;
   }, [threadId]);
   useLayoutEffect(() => {
@@ -743,133 +859,38 @@ export function ChatView({
     // 在内容真正出现时不再重跑，恢复永远补不上（实测停在 2424 而非 1200）。
   }, [threadId, anchor, items.length, syncing, scrollToBottom, releaseFollow, items, requestFocus]);
 
-  // 锚点进入挂载区之后再对位。窗口化之前这里可以同步做完（全部条目都在 DOM），
-  // 现在必须等 `requestFocus` 开的那一窗渲染落地。
-  useEffect(() => {
-    const el = elRef.current;
-    const pending = pendingAnchorRef.current;
-    if (!el || !pending || restoredFor.current === threadId) return;
-    // 不用 `[data-item-id="..."]` 选择器：id 来自服务端，逗号/引号都会破坏
-    // 选择器语法，且 `CSS.escape` 在 jsdom 下不存在。扫描一遍更稳。
-    const row = Array.from(el.querySelectorAll<HTMLElement>("[data-item-id]")).find(
-      (n) => n.dataset.itemId === pending.itemId,
-    );
-    if (!row) return;
-    const base = el.getBoundingClientRect().top - el.scrollTop;
-    const next = restoreScrollTop(
-      { id: pending.itemId, top: row.getBoundingClientRect().top - base },
-      pending,
-    );
-    if (next === null) return;
-    // 锚消息已到达，但其后的回放内容可能还不足以容纳原视口偏移。
-    // 此时写入会被夹到临时底部，scroll 采集再把旧锚点抹成 null。
-    if (syncing && next > el.scrollHeight - el.clientHeight + 1) return;
-    // 与漂移校正共用同一套"这是我们自己写的"标记：恢复这次的写入同样会
-    // 触发一个 scroll 事件，不能被读成用户接管。
-    // 这是一次新的恢复访问：上一轮停留时用户可能接管过滚动，但不能让该状态
-    // 跨会话切换残留，否则 A→B→A 后漂移校正会一直被禁用。
-    userTookOver.current = false;
-    el.scrollTop = next;
-    selfScrolling.current = el.scrollTop;
-    restoredFor.current = threadId;
-    // 记住"这一行应该在视口顶"，供下方的漂移校正使用。
-    heldAnchor.current = pending;
-    pendingAnchorRef.current = null;
-    // 恢复完立刻放弃跟随，否则下一条 delta 会把人拽回底部。
-    releaseFollow();
-  }, [threadId, win.start, win.end, items.length, syncing, releaseFollow]);
-
-  // 恢复之后，锚点**上方**的内容还可能改变高度：图片是异步读出来的
-  // （`BubbleImage` 在拿到 url 之前返回 null，高度 0），工具卡/推理块也可能
-  // 展开。它们一变高，锚点那一行就被整体推下去，用户看到的已经不是离开时的
-  // 那一屏——实测偏移 300px。
+  // 锚点进入挂载区之后才由协调器对位：`planLayout` 会按 pending 目标行的真实
+  // 位置算写入点，内容不足以容纳原偏移时保持 pending（不标已恢复）。
   //
-  // 所以恢复不是"写一次 scrollTop 就完事"，而是：只要用户自己还没滚动，
-  // 就一直维持"锚点行顶边落在它当初的偏移上"。用户一滚动即接管，不再干预。
+  // 这里**不再自己写 scrollTop**：位置写入只剩 `planLayout` 一条路径。
+  // 只要窗口/内容变化就再继续推进一次；恢复完成由 `restoredFor` 记账。
   useEffect(() => {
+    if (restoredFor.current === threadId) return;
+    const pending = pendingAnchorRef.current;
+    if (!pending) return;
+    requestRestore(pending);
+    planLayout();
     const el = elRef.current;
-    if (!el) return;
-    const held = heldAnchor.current;
-    if (!held || restoredFor.current !== threadId) return;
-
-    let frame: number | null = null;
-    const realign = () => {
-      frame = null;
-      const node = elRef.current;
-      if (!node || heldAnchor.current !== held) return;
-      if (userTookOver.current) return;
-      const row = Array.from(node.querySelectorAll<HTMLElement>("[data-item-id]")).find(
-        (n) => n.dataset.itemId === held.itemId,
-      );
-      if (!row) return;
-      const base = node.getBoundingClientRect().top - node.scrollTop;
-      const next = restoreScrollTop(
-        { id: held.itemId, top: row.getBoundingClientRect().top - base },
-        held,
-      );
-      if (next === null) return;
-      // 亚像素与行内重排不算漂移，避免无意义地反复写 scrollTop。
-      if (Math.abs(node.scrollTop - next) < 1) return;
-      // 记下这次是**我们自己**写的：紧随其后的 `scroll` 事件不是用户意图。
-      node.scrollTop = next;
-      selfScrolling.current = node.scrollTop;
-      // scroll 在后续渲染步骤异步派发，不能用 0ms 定时器提前清标记。
-      // 由 onUserScroll 消费；用户真滚动到不同位置仍立即接管。
-    };
-    const schedule = () => {
-      if (frame !== null) return;
-      frame = requestAnimationFrame(realign);
-    };
-    // 用户自己的滚动即交还控制权：此后位置归他。
-    //
-    // **必须排除我们自己写入引起的事件**：真实浏览器在程序化设置 `scrollTop`
-    // 之后同样会派发 `scroll`（异步）。若一律当成用户接管，这个校正会在恢复的
-    // 那一刻就把自己关掉，锚点上方内容一变高就再也没人管——这正是"偏差有点大"
-    // 的直接原因（实测停在 1012，应为 1312）。jsdom 不派发该事件，所以单元测试
-    // 曾经全绿。
-    const onUserScroll = () => {
-      const written = selfScrolling.current;
-      selfScrolling.current = null;
-      // 位置正是我们刚写下的值 ⇒ 这是自己的回声，不是用户。
-      if (written !== null && Math.abs(el.scrollTop - written) < 1) return;
-      userTookOver.current = true;
-    };
-    el.addEventListener("scroll", onUserScroll, { passive: true });
-
-    let observer: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== "undefined") {
-      observer = new ResizeObserver(schedule);
-      // 观察 spacer：它们的高度代表「未挂载区间」的布局变化。未挂载区没有节点
-      // 可观察，spacer 是唯一可用的信号。
-      for (const sp of el.querySelectorAll("[data-spacer]")) observer.observe(sp);
-      // 观察挂载区：图片异步加载、工具卡展开会让已挂载条目变高。
-      for (const child of el.querySelectorAll("[data-item-id]")) observer.observe(child);
+    // 已经对好位（协调器消费了 pending）就结算本次恢复，并记住这条锚点供
+    // 后续「上方增高」纠正使用 —— 否则锚点上方图片迟到时视口会整体位移。
+    if (el && !hasPendingRestore()) {
+      restoredFor.current = threadId;
+      heldAnchor.current = pending;
+      pendingAnchorRef.current = null;
+      // 恢复完立刻放弃跟随，否则下一条 delta 会把人拽回底部。
+      releaseFollow();
     }
-    // 没有 `ResizeObserver` 的环境（旧 WebView、测试）退化为轮询：只比总高度，
-    // 便宜且足以覆盖"图片加载后内容变高"。有观察者时轮询不启动。
-    let poll: number | null = null;
-    if (!observer) {
-      let lastHeight = el.scrollHeight;
-      poll = window.setInterval(() => {
-        const h = el.scrollHeight;
-        if (h === lastHeight) return;
-        lastHeight = h;
-        schedule();
-      }, 100);
-    }
-    schedule();
-    return () => {
-      el.removeEventListener("scroll", onUserScroll);
-      if (frame !== null) cancelAnimationFrame(frame);
-      if (poll !== null) window.clearInterval(poll);
-      observer?.disconnect();
-    };
-    // `win.start`/`win.end` 必须在依赖里：锚点常常不在首屏挂载区（长会话尤其如此），
-    // `heldAnchor` 是在**窗口变更后**那个 commit 才被写上的，本 effect 若只在
-    // `threadId`/`items.length` 变化时跑，它会在「此时 `heldAnchor` 还是 null」的
-    // commit 里早退、从此再也建不起观察者——恢复位置写对了，但锚点上方内容变高
-    // 后再也没人校正（实测停在 1012，应为 1312）。
-  }, [threadId, items.length, syncing, win.start, win.end]);
+  }, [
+    threadId,
+    win.start,
+    win.end,
+    items.length,
+    syncing,
+    requestRestore,
+    planLayout,
+    releaseFollow,
+    hasPendingRestore,
+  ]);
 
   useEffect(() => {
     const el = elRef.current;
@@ -908,7 +929,12 @@ export function ChatView({
       // 上报 `null` 会被读成「用户看的是最新」，把该会话原有的记录抹掉。
       // 不报，等内容到了自然会再采集一次。
       if (boxes.length === 0) return;
-      report(owner, findAnchor(boxes, node.scrollTop));
+      const next = findAnchor(boxes, node.scrollTop);
+      report(owner, next);
+      // 用户自己滚到的新位置就是新的阅读锚点：此后锚点**上方**内容长高
+      // （图片迟到、工具卡展开）必须把它纠正回来，否则视口会整体位移。
+      // 贴底时不持锚点——那是「跟随」而不是「阅读中某一屏」。
+      if (next !== null) holdAnchorRef.current?.(next);
     };
 
     const onScroll = () => {
@@ -981,6 +1007,11 @@ export function ChatView({
     syncing,
     scrollToBottom,
     followIfAtBottom,
+    // spacer 的中位数一变，`scrollHeight` 就在**这次提交**里变了：内容变高而
+    // 视口没动，等于把贴底位置甩到下面（实测流式时 gap 280px）。跟随必须跟着
+    // 这次高度变化再跑一遍，否则「内容增长」与「高度校正」成为两个互不相干的
+    // 渲染周期，后者会把前者的贴底成果冲掉。
+    spacerMedian,
   ]);
 
   // 未挂载区间的高度估算。`win.end` 是**排他**终点且含尾部那条，而
@@ -988,15 +1019,26 @@ export function ChatView({
   // 渲染）。所以尾部下方未挂载的只有 `[stop, total - 1)` 这一段：
   //   - `end === total`（跟随中）-> `stop === total - 1` -> 下方为 0
   //   - `end < total`          -> `stop === end`         -> 下方 `total - 1 - end` 条
-  const medianH = windowBook.median();
+  // `heightRevision` 是本渲染的依赖：账本每次真实变化都会换一个值，spacer 据此
+  // 在**同一个布局周期**里跟上新的中位数，而不是等下一次窗口移动。
+  const medianH = spacerMedian;
   const spacerTop = win.start * medianH;
   const windowStop = Math.min(win.end, Math.max(items.length - 1, 0));
-  const spacerBottom = Math.max(0, items.length - 1 - windowStop) * medianH;
+  const bottomSpacerCount = Math.max(0, items.length - 1 - windowStop);
+  const spacerBottom = bottomSpacerCount * medianH;
+  // 「spacer 是否真的占位」决定中位数变化要不要触发渲染（见上面记账 effect）。
+  const spacerVisible = spacerTop > 0 || spacerBottom > 0;
+  // 布局期直写 spacer 高度用的句柄，与上面两个数量配合。
+  const spacerTopRef = useRef<HTMLDivElement | null>(null);
+  const spacerBottomRef = useRef<HTMLDivElement | null>(null);
 
   return (
     <div
       ref={setScroller}
       data-thread-id={threadId ?? undefined}
+      // 稳定的「这是转录滚动容器」标记：设计/验收脚本按它取元素（`data-thread-id`
+      // 只表达归属，换会话就变，且旁支的合成 id 也不适合当选择器）。
+      data-transcript-scroller=""
       className="flex min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-4 py-3"
     >
       {/* `structuralVersion` travels as a **prop**, not a `key`. `items` is the
@@ -1021,7 +1063,13 @@ export function ChatView({
           而 spacer 没有内容、`min-height: auto` 也解析成 0，于是它会被压成 0 高度
           ——占位完全失效，`scrollHeight` 只剩已挂载部分，滚动条比例失真，滚到
           未挂载区间就是一片空白（真实浏览器实测：样式 53984px，实际 0px）。 */}
-      <div data-spacer="top" aria-hidden="true" className="shrink-0" style={{ height: spacerTop }} />
+      <div
+        ref={spacerTopRef}
+        data-spacer="top"
+        aria-hidden="true"
+        className="shrink-0"
+        style={{ height: spacerTop }}
+      />
       <HistoryWindow
         items={items}
         total={items.length}
@@ -1036,12 +1084,14 @@ export function ChatView({
         <LiveTail
           key={tail.id ?? "tail"}
           item={tail}
+          index={items.length - 1}
           threadId={threadId}
           call={effectiveCall}
           query={query}
         />
       )}
       <div
+        ref={spacerBottomRef}
         data-spacer="bottom"
         aria-hidden="true"
         className="shrink-0"

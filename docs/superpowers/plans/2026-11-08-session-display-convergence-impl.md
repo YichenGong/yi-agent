@@ -243,7 +243,7 @@ export interface TranscriptPositionIndex { rebuild(ids:readonly string[],book:He
 export function createTranscriptPositionIndex():TranscriptPositionIndex;
 ```
 
-- [ ] **Step 1 — 写失败测试**：相同高度不 bump，非有限/0 不入账；布局 owner 改变重新建 book；index 在高度估计边界返回正确 index，空资料不 focus。挂载行非 tail 增长触发一次 heightRevision 及 spacer 更新。
+- [x] **Step 1 — 写失败测试**：相同高度不 bump，非有限/0 不入账；布局 owner 改变重新建 book；index 在高度估计边界返回正确 index，空资料不 focus。挂载行非 tail 增长触发一次 heightRevision 及 spacer 更新。
 
 ```ts
 it("height changes have an observable revision", () => {
@@ -257,8 +257,8 @@ it("height changes have an observable revision", () => {
 });
 ```
 
-- [ ] **Step 2 — 验证红**：`cd desktop && npm test -- src/lib/heightBook.test.ts src/lib/transcriptPositionIndex.test.ts src/hooks/useTranscriptScroll.test.tsx`，真实 D08 resize/image fixture 不得只 mock scrollHeight。
-- [ ] **Step 3 — 最小实现**：新 book memo 的 key 包含 slot/host/thread/epoch/有效宽度/字体等排版设置。ResizeObserver 只 observe 挂载消息和 viewport，window commit 更换观察集合，cleanup disconnect；每帧合并尺寸变化，positive measure 入账。每个 layout commit 更新上一次几何，即使 win.start/end 没变。
+- [x] **Step 2 — 验证红**：`cd desktop && npm test -- src/lib/heightBook.test.ts src/lib/transcriptPositionIndex.test.ts src/hooks/useTranscriptScroll.test.tsx`，真实 D08 resize/image fixture 不得只 mock scrollHeight。
+- [x] **Step 3 — 最小实现**：新 book memo 的 key 包含 slot/host/thread/epoch/有效宽度/字体等排版设置。ResizeObserver 只 observe 挂载消息和 viewport，window commit 更换观察集合，cleanup disconnect；每帧合并尺寸变化，positive measure 入账。每个 layout commit 更新上一次几何，即使 win.start/end 没变。
 
 ```ts
 if (!Number.isFinite(height) || height <= 0 || heights.get(id) === height) return false;
@@ -268,8 +268,8 @@ heights.set(id,height); sortedCache=null; revision += 1; return true;
 ```
 
 observer 回调只安排协调器布局，不直接再写位置。窗口 stalled 用 indexAt(scrollTop) 发一次 focus；不可布局期间停止观测循环，visibilitychange/viewport resize 恢复。历史数缩小时只在可信基线证明目标不存在时释放 pending anchor。
-- [ ] **Step 4 — 验证绿与变异**：上述单测、D04/D05/D07/D08 browser cases、三个旧 browser scripts、tsc；分别回退 owner key、record revision、每次布局维护几何，相关测试必须红，恢复后绿。
-- [ ] **Step 5 — 提交**：全局门禁后 `git add desktop/src docs/project-management/desktop.md && git commit -m "fix: scope transcript heights and observe mounted rows"`。
+- [ ] **Step 4 — 验证绿与变异**：上述单测、D04/D05/D07/D08 browser cases、三个旧 browser scripts、tsc；分别回退 owner key、record revision、每次布局维护几何，相关测试必须红，恢复后绿。**已完成**：单测、三个旧 browser scripts（`session-completeness` D01/D02/D05/D09 4/4、`transcript-window` 4/4、`stream-live` 2/2）、tsc、以及三处变异全部取得红证据（owner key→`39200 to be 8400`、record revision→5 例、每次布局记账→2 例）。**未完成**：D04/D07/D08 用例仍随 A5 Step 1–2 补齐。
+- [x] **Step 5 — 提交**：全局门禁后 `git add desktop/src docs/project-management/desktop.md && git commit -m "fix: scope transcript heights and observe mounted rows"`。
 
 ### Task A5：D 组组合回归、报告与 WKWebView 交接
 
@@ -291,7 +291,7 @@ interface DisplayProbe {
 // window.displayProbe: DisplayProbe; fixture uses real ChatView + index.css.
 ```
 
-- [ ] **Step 1 — 写失败断言**：fixture 支持600/3000条、每条8行确定性文本、820px viewport、A/B切换、分帧回放与图片/代码块增高；关闭 `overflow-anchor`。按下面步骤逐例测试，不用追加 scroll 去“催一下”。
+- [x] **Step 1 — 写失败断言**：fixture 支持600/3000条、每条8行确定性文本、820px viewport、A/B切换、分帧回放与图片/代码块增高；关闭 `overflow-anchor`。按下面步骤逐例测试，不用追加 scroll 去“催一下”。
 
 | IDs | 精确操作与断言 |
 | --- | --- |
@@ -316,9 +316,9 @@ assert.equal(s.count,600); assert.ok(s.mounted<=400);
 ```
 
 将 `waitUntil`、`evaluate` 和子进程清理写入本脚本（基于已读 `transcript-window-check.mjs` 的CDP协议），不能依赖另一个 fixture 的全局 probe。新增 npm script `test:browser:session-completeness`。固定端口1452/CDP9362，可由 `SESSION_COMPLETENESS_PORT`/`SESSION_COMPLETENESS_DEBUG_PORT`覆盖。
-- [ ] **Step 2 — 证明判别性**：在临时回退代码中执行新脚本，D01/D05必须红；对A3补偿根因按单点变异取得证据。若当前主线某场景已通过，把它记为兼容场景，不虚报新增修复。
-- [ ] **Step 3 — 完成脚本与报告**：缺Chrome退出非零；Runtime.exceptionThrown使失败；finally TERM→有界KILL所有自己spawn的进程并删临时profile。报告写 `.artifacts/session-completeness/display.json`，字段为ID/pass/geometry/steps/commit，不含用户正文。同步README命令与macOS人工表，保持全部未测真机行 `[ ]`。
-- [ ] **Step 4 — 全部绿**：`cd desktop && npm test && npx tsc --noEmit && npm run build && npm run test:browser:session-completeness && npm run test:browser:session-view && npm run test:browser:transcript-window && npm run test:browser:stream-live`，随后Rust全局门禁。将D组逐行证据写入测试文档，不用“脚本退出0”替代单行结果。
+- [x] **Step 2 — 证明判别性**：在临时回退代码中执行新脚本，D01/D05必须红；对A3补偿根因按单点变异取得证据。若当前主线某场景已通过，把它记为兼容场景，不虚报新增修复。
+- [x] **Step 3 — 完成脚本与报告**：缺Chrome退出非零；Runtime.exceptionThrown使失败；finally TERM→有界KILL所有自己spawn的进程并删临时profile。报告写 `.artifacts/session-completeness/display.json`，字段为ID/pass/geometry/steps/commit，不含用户正文。同步README命令与macOS人工表，保持全部未测真机行 `[ ]`。
+- [ ] **Step 4 — 全部绿**：`cd desktop && npm test && npx tsc --noEmit && npm run build && npm run test:browser:session-completeness && npm run test:browser:session-view && npm run test:browser:transcript-window && npm run test:browser:stream-live`，随后Rust全局门禁。将D组逐行证据写入测试文档，不用“脚本退出0”替代单行结果。**已完成部分（2026-11-08）**：`npx vitest run` 191 文件 / 2783 passed（连跑两次稳定）、`npx tsc --noEmit`、`npm run build`、`session-completeness` 9/9、`transcript-window` 4/4、`stream-live` 2/2，逐行证据写入 [docs/testing/session-completeness.md](../../testing/session-completeness.md)。**未完成**：`test:browser:session-view` 的 `user scroll takes control from drift correction`（`expected 2000, got 2240`）在 A3/A4 基线与当前工作区同样失败（已逐一 checkout 验证），属既有基线问题，故该项仍不勾。
 - [ ] **Step 5 — 独立WKWebView验收与提交**：用户授权测试安装后才打独立app，设独立bundle id及绝对 `YI_AGENT_HOME`。执行D01/D05/D06/D07，分别切session与切app/window；记录锚点偏移/截图/commit。未有真机结果不得勾选显示feature。提交 `test: cover session display convergence in real browsers`，不自动合main或替换正式app。
 
 ## 自审覆盖与收尾

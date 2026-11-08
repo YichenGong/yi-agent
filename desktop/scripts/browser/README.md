@@ -110,3 +110,47 @@ headless Chrome，退出时先 TERM 后超时 KILL，并删除临时 profile。�
 
 这仍然**不是**原生 WKWebView 真机验收：Chrome 的排版引擎与 WebKit 不同，IME 与
 真实的触控滚动只能人工验证。README 与验收文档必须把两者分开记录。
+
+# 显示收敛 D01–D09（真实浏览器回归）
+
+```sh
+cd desktop
+npm run test:browser:session-completeness
+```
+
+覆盖 [显示收敛 spec](../../../docs/superpowers/specs/2026-11-08-session-completeness-repair-design.md)
+§8 的 D 组 9 条。fixture 用 **3000 条 × 8 行**确定性文本 + 820px 视口，渲染**真实**
+`ChatView` 与项目 CSS，并关闭 `overflow-anchor`——Chrome 自带 scroll anchoring
+会替组件粘住位置，不关就把缺陷盖住了。
+
+| ID | 断言要点 |
+| --- | --- |
+| D01 | A→B→A 后一次 `scrollTop=60802`，无需额外滚动即可覆盖视口；挂载 ≤ 400 |
+| D02 | 3000 条滚到历史顶部：视口有可视行且挂载 ≤ 400 |
+| D03 | `focus(100)` 后一路向下拖：视口不空白、窗口跟到尾部、恢复跟随意图、停止滚动后几何不振荡 |
+| D04 | 等长 A/B 切换不继承位置、B 缩短 8 条后 window 不越过新末尾、改宽度（560/900）后仍覆盖且 ≤ 400 |
+| D05 | 读者上翻后下方内容增高：读者那一行的偏移漂移 ≤ 2px |
+| D06 | 跟随时 tail 与非 tail 增长都保持贴底；释放跟随（滚轮上翻）后上方增高不移动读者锚点 |
+| D07 | 晚到目标：`focus(300)`→`focus(0)`→`focus(300)` 后目标挂载且对位，且不报显示错误 |
+| D08 | 历史远离 tail + 迟到增高/折叠/改宽度：挂载 ≤ 400、无横向溢出 |
+| D09 | 静止 500ms 后 `scrollTop` 不自行变化 |
+
+环境变量：`SESSION_COMPLETENESS_PORT`（默认 1452）、
+`SESSION_COMPLETENESS_DEBUG_PORT`（默认 9362）、`CHROME_BIN`。
+报告写 `.artifacts/session-completeness/display.json`（仓库根，已 gitignore），
+字段为 ID / pass / geometry / steps / commit，不含会话正文。
+
+脚本在端口被占用时**立刻失败**而不是复用：上一次运行残留的 Vite 会让新脚本连到
+旧模块，得到"明明改好了却一直红"的假结论。缺 Chrome 时同样明确失败，不退化成
+jsdom 的"通过"。
+
+## macOS 人工验收（WKWebView，未执行）
+
+Chrome 不能替代原生 WebKit。下列行在真机/独立 app 上验收前**必须保持未勾选**：
+
+- [ ] D01 真实会话里拖动滚动条到中段，视口立即有内容（不切出再切回）
+- [ ] D03 从顶部一路拖到底，底部内容完整可见、无空白带
+- [ ] D05 上翻阅读历史时收到流式回复，读者那一行不跳动
+- [ ] D06 贴底时流式增长保持贴底；上翻后不被拽回底部
+- [ ] D07 搜索跳转到未挂载历史，目标行出现在视口内
+- [ ] D08 切会话/改窗口宽度后无横向滚动条、挂载条数不失控
