@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   DEFAULT_LIMITS,
   nextWindow,
@@ -11,6 +11,11 @@ import type { HeightBook } from "../lib/heightBook";
 
 export interface UseTranscriptWindowArgs {
   itemCount: number;
+  /**
+   * 当前展示的会话 id。窗口状态是「这次访问停在哪」的产物，**不属于组件生命周期**：
+   * 切换会话必须回到尾部首屏，不能继承上一条会话的中间窗口。
+   */
+  threadId?: string | null;
   /** 测量当前视口。未布局时返回 null（此时保持跟随，不翻页）。 */
   measure: () => VisibleRange | null;
   /** 一次性开窗请求；调用方负责在消费后清空。 */
@@ -45,6 +50,7 @@ export interface TranscriptWindowApi {
  */
 export function useTranscriptWindow({
   itemCount,
+  threadId,
   measure,
   focus = null,
   limits,
@@ -75,9 +81,20 @@ export function useTranscriptWindow({
     [initialSize, pageSize, buffer, maxMounted],
   );
 
-  const [state, setState] = useState<WindowState | null>(null);
-  const stateRef = useRef<WindowState | null>(null);
-  stateRef.current = state;
+  // 窗口状态**连同它属于哪条会话**一起存：只用 `WindowState` 无法区分
+  // 「上一条会话的中间窗口」和「本会话的位置」。真实浏览器实测（等长的 A/B
+  // 两条 1024 条会话）在 A 里上翻后切到 B，B 直接落在 A 的中间区间。
+  const [slot, setSlot] = useState<{ owner: string | null | undefined; window: WindowState | null }>(
+    () => ({ owner: threadId, window: null }),
+  );
+  const slotRef = useRef(slot);
+  slotRef.current = slot;
+  // rAF 回调可能在新会话已经提交之后才跑，必须读**当时**的会话 id。
+  const threadRef = useRef(threadId);
+  threadRef.current = threadId;
+  // 会话不匹配时同步按冷启动给窗口：不能先渲染旧窗口再等 effect 纠正，
+  // 那会闪一帧上一条会话的内容。
+  const state = slot.owner === threadId ? slot.window : null;
   // focus 用 ref 而不是 state：它只影响**一次**窗口计算，不需要触发渲染。
   // `appliedRef` 按对象身份去重——若调用方没及时把 `focus` 清空（清空时机
   // 在调用方，难免滞后），每次重算都会重新跳到同一位置，用户就再也滚不动了。
@@ -94,11 +111,13 @@ export function useTranscriptWindow({
       frameRef.current = null;
       // 把「挂载区相对序号」翻译成绝对 index：`measure` 只看得见挂载区，
       // 它数不出前面还有多少条。`nextWindow` 的截断判据用的是绝对 index。
+      const owner = threadRef.current;
+      const current = slotRef.current.owner === owner ? slotRef.current.window : null;
       const raw = measure();
-      const base = stateRef.current?.start ?? 0;
+      const base = current?.start ?? 0;
       const visible = raw ? { ...raw, first: base + raw.first, last: base + raw.last } : null;
       const next = nextWindow({
-        current: stateRef.current,
+        current,
         itemCount: itemCountRef.current,
         // 像素阈值随**当时**的真实中位数走：重尾分布下按条数判断会误触发。
         // 每次重算都重新取，中位数随测量收敛后阈值自动跟上。
@@ -108,19 +127,29 @@ export function useTranscriptWindow({
       });
       // 消费掉这次 focus：它只影响一次窗口计算。
       pendingRef.current = null;
-      const prev = stateRef.current;
       if (
-        prev !== null &&
-        prev.start === next.start &&
-        prev.end === next.end &&
-        prev.following === next.following
+        current !== null &&
+        current.start === next.start &&
+        current.end === next.end &&
+        current.following === next.following
       ) {
         return; // 无变化不触发渲染
       }
-      stateRef.current = next;
-      setState(next);
+      const nextSlot = { owner, window: next };
+      slotRef.current = nextSlot;
+      setSlot(nextSlot);
     });
   }, [measure, merged, book]);
+
+  // 切换会话：窗口状态与一次性请求都只属于上一次访问，必须丢弃。
+  // 用 layout effect（绘制前）而不是普通 effect，配合上面的渲染期同步回落，
+  // 保证这一帧也不会出现上一条会话的内容。
+  useLayoutEffect(() => {
+    if (slotRef.current.owner === threadId) return;
+    pendingRef.current = null;
+    appliedRef.current = null;
+    recompute();
+  }, [threadId, recompute]);
 
   // 条数变化（回放、流式增长、clear）都要重算。
   useEffect(() => {

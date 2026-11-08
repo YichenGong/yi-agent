@@ -1484,6 +1484,21 @@ describe("transcript windowing", () => {
     expect(parseFloat(bottom!.style.height)).toBe(0);
   });
 
+  it("spacer 必须不被 flex 压缩（shrink-0），否则占位高度归零", () => {
+    // 容器是 `flex flex-col overflow-y-auto`。flex 子项默认 `flex-shrink: 1`，
+    // 而 spacer 没有内容、`min-height: auto` 解析为 0，于是被压成 0 高度。
+    // 真实浏览器实测：`style.height = 53984px` 但 `getBoundingClientRect().height = 0`，
+    // 容器 `scrollHeight` 从 65833 掉到 11849 —— 未挂载区间完全不占位，滚进去
+    // 就是一片空白，窗口翻页的滚动几何也全错。
+    // jsdom 不做布局，测不出高度，只能把「不被压缩」这个约束钉在类名上。
+    const { container } = renderWith(manyItems(3000));
+    for (const which of ["top", "bottom"] as const) {
+      const spacer = container.querySelector(`[data-spacer='${which}']`) as HTMLElement;
+      expect(spacer).not.toBeNull();
+      expect(spacer.className).toContain("shrink-0");
+    }
+  });
+
   it("尾部那条只渲染一次（HistoryWindow 与 LiveTail 不重复）", () => {
     const { container } = renderWith(manyItems(3000));
     const ids = Array.from(container.querySelectorAll("[data-item-id]")).map((n) =>
@@ -1751,6 +1766,116 @@ describe("anchor restore with windowing", () => {
         await new Promise((r) => setTimeout(r, 400));
       });
       expect(state.scrollTop).toBe(PAD + 400 + 9 * ROW);
+    } finally {
+      proto.getBoundingClientRect = saved.rect;
+      for (const [name, desc] of [
+        ["scrollHeight", saved.sh],
+        ["clientHeight", saved.ch],
+        ["scrollTop", saved.st],
+      ] as const) {
+        if (desc) Object.defineProperty(HTMLElement.prototype, name, desc);
+      }
+    }
+  });
+
+  it("切换会话时窗口必须回到尾部首屏（ChatView 必须把 threadId 传给窗口 hook）", async () => {
+    // `useTranscriptWindow` 自己按 threadId 隔离窗口并不够：`ChatView` 若忘了把
+    // `threadId` 传下去，hook 收到的永远是 undefined，隔离逻辑就永远不触发，
+    // 而 hook 层的单测会自己传 threadId，照样全绿——这里才是接线的那道护栏。
+    //
+    // 真实浏览器实测（两条等长的 1024 条会话）：在 A 里上翻到历史中间后切到 B，
+    // B 直接落在 A 的中间区间（260 条），用户看不到最新内容。
+    const ROW = 40; // 与 `createHeightBook` 的 fallback 中位数一致，spacer 不随测量漂移
+    const VIEWPORT = 600;
+    const PAD = 12; // 容器 py-3
+    const state = { scrollTop: 0, scroller: null as HTMLElement | null };
+    const rect = (top: number, height: number) =>
+      ({ top, left: 0, bottom: top + height, right: 0, width: 0, height, x: 0, y: top, toJSON() {} }) as DOMRect;
+    const proto = HTMLElement.prototype as unknown as Record<string, unknown>;
+    const saved = {
+      rect: proto.getBoundingClientRect,
+      sh: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight"),
+      ch: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight"),
+      st: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop"),
+    };
+    const spacerOf = (which: string) =>
+      parseFloat(
+        (document.querySelector(`[data-spacer='${which}']`) as HTMLElement | null)?.style.height ??
+          "0",
+      ) || 0;
+    // 挂载区的真实几何：内容坐标 = 上方占位 + 行序号 * 行高。
+    proto.getBoundingClientRect = function (this: HTMLElement) {
+      if (this === state.scroller) return rect(0, VIEWPORT);
+      const rows = Array.from(document.querySelectorAll("[data-item-id]"));
+      const index = rows.indexOf(this);
+      if (index < 0) return rect(0, 0);
+      return rect(spacerOf("top") + PAD + index * ROW - state.scrollTop, ROW);
+    };
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        if (this !== state.scroller) return 0;
+        const rows = document.querySelectorAll("[data-item-id]").length;
+        return spacerOf("top") + spacerOf("bottom") + rows * ROW + PAD * 2;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this === state.scroller ? VIEWPORT : 0;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this === state.scroller ? state.scrollTop : 0;
+      },
+      set(this: HTMLElement, v: number) {
+        if (this !== state.scroller) return;
+        const rows = document.querySelectorAll("[data-item-id]").length;
+        const max = spacerOf("top") + spacerOf("bottom") + rows * ROW + PAD * 2 - VIEWPORT;
+        state.scrollTop = Math.max(0, Math.min(v, max));
+      },
+    });
+
+    try {
+      const makeSession = (prefix: string) =>
+        Array.from({ length: 300 }, (_, i) => ({
+          type: "userMessage" as const,
+          id: `${prefix}${i}`,
+          text: `${prefix} row ${i}`,
+        })) as Item[];
+      const listA = makeSession("a");
+      const listB = makeSession("b");
+      const mounted = (container: HTMLElement) =>
+        Array.from(container.querySelectorAll("[data-item-id]")).map(
+          (n) => n.getAttribute("data-item-id"),
+        );
+
+      const { container, rerender } = render(<ChatView items={listA} threadId="A" anchor={null} />);
+      state.scroller = container.firstElementChild as HTMLElement;
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 100));
+      });
+      expect(mounted(container)).toHaveLength(60);
+      expect(mounted(container)[mounted(container).length - 1]).toBe("a299");
+
+      // 滚到「挂载区顶边贴住视口顶」：这会触发向上分页 200 条。
+      state.scrollTop = spacerOf("top") + PAD;
+      await act(async () => {
+        state.scroller!.dispatchEvent(new Event("scroll"));
+        await new Promise((r) => setTimeout(r, 200));
+      });
+      const paged = mounted(container).length;
+      expect(paged).toBeGreaterThan(60);
+
+      // 换会话：必须回到 B 自己的尾部首屏，而不是继承 A 的这一窗。
+      rerender(<ChatView items={listB} threadId="B" anchor={null} />);
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 200));
+      });
+      expect(mounted(container)).toHaveLength(60);
+      expect(mounted(container)[mounted(container).length - 1]).toBe("b299");
     } finally {
       proto.getBoundingClientRect = saved.rect;
       for (const [name, desc] of [

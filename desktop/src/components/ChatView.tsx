@@ -569,6 +569,7 @@ export function ChatView({
   // 否则 `noUnusedLocals` 会报错。
   const windowApi = useTranscriptWindow({
     itemCount: items.length,
+    threadId,
     measure: measureVisible,
     book: windowBook,
   });
@@ -1015,8 +1016,12 @@ export function ChatView({
           <TranscriptPlaceholder kind="loading" />
         )
       ) : null}
-      {/* 未挂载历史的占位高度：滚动条比例因此真实，滚动仍由浏览器原生完成。 */}
-      <div data-spacer="top" aria-hidden="true" style={{ height: spacerTop }} />
+      {/* 未挂载历史的占位高度：滚动条比例因此真实，滚动仍由浏览器原生完成。
+          **必须 `shrink-0`**：容器是 `flex-col`，flex 子项默认 `flex-shrink: 1`，
+          而 spacer 没有内容、`min-height: auto` 也解析成 0，于是它会被压成 0 高度
+          ——占位完全失效，`scrollHeight` 只剩已挂载部分，滚动条比例失真，滚到
+          未挂载区间就是一片空白（真实浏览器实测：样式 53984px，实际 0px）。 */}
+      <div data-spacer="top" aria-hidden="true" className="shrink-0" style={{ height: spacerTop }} />
       <HistoryWindow
         items={items}
         total={items.length}
@@ -1036,7 +1041,12 @@ export function ChatView({
           query={query}
         />
       )}
-      <div data-spacer="bottom" aria-hidden="true" style={{ height: spacerBottom }} />
+      <div
+        data-spacer="bottom"
+        aria-hidden="true"
+        className="shrink-0"
+        style={{ height: spacerBottom }}
+      />
       {retrying && (
         <div className="my-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
           {RETRY_CAUSE_LABELS[retrying.cause]} — retrying {retrying.attempt}/

@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:browser:session-view": "node scripts/browser/session-view-check.mjs",
+    "test:browser:transcript-window": "node scripts/browser/transcript-window-check.mjs",
     "test:browser:stream-live": "node scripts/browser/stream-live-check.mjs",
     "test:browser:subagent-trace": "node scripts/browser/subagent-trace-check.mjs",
     "probe:plugin": "node scripts/plugins/probe.mjs --suite isolation --output .artifacts/plugins/probe.json",
