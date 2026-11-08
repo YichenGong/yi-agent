@@ -293,11 +293,11 @@ L3  workspace    全量
 [profile.default]
 default-filter = """
 not test(runtime_process_helper)
-and not (binary_id(yi-agent-llm::real_integration) and test(/^real_/))
-and not (binary_id(yi-agent::e2e_real) and test(/^real_/))
-and not (binary_id(yi-agent::e2e_complex) and test(/^real_/))
-and not (binary_id(yi-agent::subagent_real_e2e) and test(/^real_/))
-and not (binary_id(yi-agent::model_catalog_live_reload_e2e) and test(/^real_/))
+and not (binary_id(yi-agent-llm::real_integration) and test(/^real_(anthropic|openai)_/))
+and not (binary_id(yi-agent::e2e_real) and test(/^e2e_/))
+and not (binary_id(yi-agent::e2e_complex) and test(/^complex_/))
+and not (binary_id(yi-agent::subagent_real_e2e) and test(/^real_subagent_/))
+and not (binary_id(yi-agent::model_catalog_live_reload_e2e) and test(/^changing_models_json_/))
 """
 slow-timeout = { period = "60s", terminate-after = 3 }
 fail-fast = false
@@ -316,10 +316,11 @@ test-group = 'live-api'
 slow-timeout = { period = "300s", terminate-after = 2 }
 ```
 
-**为什么排除项要五个 binary_id 各写一条**：实测单纯 `not test(/^real_/)` 会误伤
-非 live 二进制里的 `real_` 开头正常测试（`yi-agent-runtime`、`yi-agent::eval_baseline`、
-`frontend_runtime_lease`、`managed_production_integration` 等）。用 `binary_id`
-限定作用域后，`eval_baseline` 的 32 个测试完好无损。
+**为什么五条排除项的前缀各不相同**：live 测试的命名不统一（`real_anthropic_` /
+`e2e_` / `complex_` / `real_subagent_` / `changing_models_json_`）。实测用统一的
+`not test(/^real_/)` 只挡住了 `real_integration` 一个二进制，
+`--run-ignored all` 从 33 只降到 25 而非 15。加上 `binary_id` 限定后，
+五个二进制分别剩 `0 / 3 / 3 / 6 / 3` = 15，各二进制的正常测试一个不少。
 
 **必须写的两个值**：`[profile.live]` 这个 profile 名（`just test-live` 用
 `--profile live` 选择），以及 `default-filter` 的覆盖（否则继承 default 的排除项，
@@ -393,29 +394,42 @@ live 测试。它们靠 `#[ignore]` 默认不跑。若有人输入 `--run-ignore
 若把 `subagent_real_e2e` 整个排除，会连带丢掉它的 6 个正常测试（3 个 `common::tests`
 helper + 3 个 git repo fixture）。
 
-**可行的写法**（已实测，2026-11-08 / nextest 0.9.150）：单纯用
-`not test(/^real_/)` **不行**——全 workspace 里有多个非 live 二进制也存在 `real_`
-开头的正常测试（`yi-agent-runtime`、`yi-agent::eval_baseline`、
-`frontend_runtime_lease`、`managed_production_integration` 等），会被一并误杀。
-必须用 `binary_id` 限定作用域：
+**可行的写法**（已实测，2026-11-08 / nextest 0.9.150）：必须按**每个二进制各自的
+测试名前缀**排除，因为 live 测试的命名前缀并不统一：
+
+| 二进制 | live 测试名前缀 | 数量 | 该二进制的正常测试 |
+|---|---|---|---|
+| `yi-agent-llm::real_integration` | `real_anthropic_` / `real_openai_` | 6 | 0 |
+| `yi-agent::e2e_real` | `e2e_` | 5 | 3 |
+| `yi-agent::e2e_complex` | `complex_` | 4 | 3 |
+| `yi-agent::subagent_real_e2e` | `real_subagent_` | 2 | 6 |
+| `yi-agent::model_catalog_live_reload_e2e` | `changing_models_json_` | 1 | 3 |
+
+**关键陷阱**：一开始想用统一的 `not test(/^real_/)`，实测发现它只挡住
+`real_integration` 一个二进制。因为 `e2e_`、`complex_`、`changing_models_json_`
+开头的测试根本不以 `real_` 开头。测量结果：加了 `^real_` 排除后
+`--run-ignored all` 从 33 只降到 25，而不是期望的 15。
+
+正确写法（五个二进制各用各自的前缀）：
 
 ```toml
 default-filter = """
 not test(runtime_process_helper)
-and not (binary_id(yi-agent-llm::real_integration) and test(/^real_/))
-and not (binary_id(yi-agent::e2e_real) and test(/^real_/))
-and not (binary_id(yi-agent::e2e_complex) and test(/^real_/))
-and not (binary_id(yi-agent::subagent_real_e2e) and test(/^real_/))
-and not (binary_id(yi-agent::model_catalog_live_reload_e2e) and test(/^real_/))
+and not (binary_id(yi-agent-llm::real_integration) and test(/^real_(anthropic|openai)_/))
+and not (binary_id(yi-agent::e2e_real) and test(/^e2e_/))
+and not (binary_id(yi-agent::e2e_complex) and test(/^complex_/))
+and not (binary_id(yi-agent::subagent_real_e2e) and test(/^real_subagent_/))
+and not (binary_id(yi-agent::model_catalog_live_reload_e2e) and test(/^changing_models_json_/))
 """
 ```
 
-验证结果：
+验证结果（`--run-ignored all`，五个二进制）：`0 / 3 / 3 / 6 / 3` = **15**，
+即 33 − 18。18 个 live 全部挡住，各二进制的正常测试一个不少。
 
-- `cargo nextest list -p yi-agent --test subagent_real_e2e -E
-  'not (binary_id(yi-agent::subagent_real_e2e) and test(/^real_/))'` → **6 个**
-  （即只挡掉 2 个 live，保留 6 个正常）。
-- 同一 filter 用在 `--test eval_baseline` → **32 个**，完好无损，证明作用域正确。
+同理，单纯 `not test(/^real_/)` 不加 `binary_id` 时也会误伤非 live 二进制里的
+`real_` 开头正常测试（`yi-agent-runtime`、`yi-agent::eval_baseline`、
+`frontend_runtime_lease`、`managed_production_integration` 等），所以 `binary_id`
+限定是必需的。
 
 **注意 filter 的作用域**：`default-filter` 影响所有 profile。实施时必须跑一次全量
 `nextest list` 对比该 filter 前后的数量差，差值必须正好等于 live 测试数（当前 18）。
