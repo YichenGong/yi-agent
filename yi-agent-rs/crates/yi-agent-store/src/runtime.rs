@@ -1436,6 +1436,17 @@ impl RuntimeCoordinator {
         .await
     }
 
+    /// A wake-up receiver for live admission changes, if this coordinator has a
+    /// live source.
+    ///
+    /// The daemon uses this to retry its queue as soon as a save lands instead of
+    /// polling. `None` = static configuration, nothing to wake for.
+    pub fn live_admission_wakeup(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.live_admission
+            .as_ref()
+            .map(|source| source.subscribe())
+    }
+
     /// The live resident subagent capacity. Exists so tests assert the value
     /// actually reached the coordinator instead of re-asserting the constant.
     pub fn resident_capacity(&self) -> Option<u16> {
@@ -3945,6 +3956,85 @@ impl RuntimeCoordinator {
                 .set_max_direct_children(usize::from(limits.direct_children));
         }
         Ok(())
+    }
+
+    /// Retries admission for resident children that are queued for capacity.
+    ///
+    /// A raised limit must reach the *original* queue: the contract is "wake the
+    /// tasks already waiting, do not wait for a new user message". Every
+    /// candidate here was refused at spawn time and is durable as `queued`, so
+    /// this only re-runs the same admission path — it invents no client request
+    /// and touches no remote-interaction timestamp.
+    ///
+    /// Failures are counted, not propagated: one task whose workspace cannot be
+    /// provisioned must not strand the rest of the queue.
+    pub async fn wake_queued_residents(&self) -> usize {
+        if self.live_admission.is_none() {
+            return 0;
+        }
+        let waiting: std::collections::HashSet<TaskId> = self
+            .resident_waiting
+            .lock()
+            .expect("runtime resident wait mutex poisoned")
+            .iter()
+            .cloned()
+            .collect();
+        if waiting.is_empty() {
+            return 0;
+        }
+        // Clone the handles and drop the map guard before awaiting, for the same
+        // reason `refresh_live_admission` does: a session attaching concurrently
+        // must not wait for this whole pass.
+        let supervisors: Vec<(RootSessionId, Arc<AsyncMutex<AgentSupervisor>>)> = self
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .iter()
+            .map(|(session, handle)| (session.clone(), Arc::clone(handle)))
+            .collect();
+
+        let mut admitted = 0;
+        for (session, handle) in supervisors {
+            // A queued id belongs to exactly one supervisor. Look it up under a
+            // short lock, then release it before the admission path takes the
+            // same lock again.
+            let queued: Vec<TaskId> = {
+                let supervisor = handle.lock().await;
+                waiting
+                    .iter()
+                    .filter(|task| supervisor.task(task).is_some() && !supervisor.has_worker(task))
+                    .cloned()
+                    .collect()
+            };
+            for task in queued {
+                // Skip tasks another pass already admitted while we walked the
+                // map; `start_worker` would otherwise report "already owns a
+                // worker" and be counted as a failure.
+                let still_waiting = self
+                    .resident_waiting
+                    .lock()
+                    .expect("runtime resident wait mutex poisoned")
+                    .contains(&task);
+                if !still_waiting {
+                    continue;
+                }
+                match self.start_worker(&session, &task).await {
+                    Ok(()) => admitted += 1,
+                    Err(RuntimeCoordinatorError::ResidentCapacityExhausted) => {
+                        // Still full: leave it queued and stop scanning this
+                        // session rather than retrying the same refusal.
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "could not admit a queued resident child after a capacity change"
+                        );
+                    }
+                }
+            }
+        }
+        admitted
     }
 
     fn ensure_admitting(&self) -> Result<(), RuntimeCoordinatorError> {

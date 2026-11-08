@@ -331,6 +331,124 @@ async fn raising_capacity_admits_the_queued_child() {
     );
 }
 
+/// The host's wake pass must admit a queued child on its own.
+///
+/// `raising_capacity_admits_the_queued_child` retries by hand, which only proves
+/// the admission path re-reads the source. The daemon never does that: it has no
+/// request to retry, so a save has to become a wake-up. This drives the real
+/// pair the daemon calls -- refresh, then wake -- and asserts the worker started
+/// without anyone touching the task.
+#[tokio::test]
+async fn a_capacity_save_wakes_the_queued_child_without_any_request() {
+    let fixture = fixture(AdmissionLimits {
+        direct_children: 5,
+        resident_subagents: 1,
+    })
+    .await;
+
+    let first = fixture
+        .spawn("first")
+        .await
+        .expect("first child is admitted");
+    let second = fixture
+        .spawn("second")
+        .await
+        .expect("second child is accepted");
+    assert!(fixture.started(&first));
+    assert!(!fixture.started(&second), "capacity 1 refuses the second");
+    assert_eq!(
+        fixture.coordinator.task_state(&second).unwrap(),
+        "queued",
+        "the refused child must be visibly queued, which is what a wake-up scans"
+    );
+
+    // The save, then exactly what the daemon's loop does on a settings wake-up.
+    fixture.limits.save(AdmissionLimits {
+        direct_children: 5,
+        resident_subagents: 2,
+    });
+    fixture
+        .coordinator
+        .refresh_live_admission()
+        .await
+        .expect("a healthy source applies cleanly");
+    let admitted = fixture.coordinator.wake_queued_residents().await;
+    assert_eq!(admitted, 1, "the wake pass must admit the one queued child");
+
+    assert!(
+        fixture.started(&second),
+        "the queued child must run with no client request: that is the whole \
+         point of the save reaching a daemon that only polls"
+    );
+    let state = fixture.coordinator.task_state(&second).unwrap();
+    assert!(
+        state != "cancelled" && state != "failed",
+        "a wake-up must not disturb the child's state, got {state}"
+    );
+}
+
+/// A wake pass with nothing queued must be a cheap no-op, not an error.
+///
+/// The daemon calls it on every settings change, and most changes (theme, a
+/// prompt edit) have nothing to do with capacity.
+#[tokio::test]
+async fn a_wake_pass_with_no_queued_work_admits_nothing() {
+    let fixture = fixture(AdmissionLimits {
+        direct_children: 5,
+        resident_subagents: 2,
+    })
+    .await;
+    fixture.spawn("only").await.expect("one child");
+    fixture
+        .coordinator
+        .refresh_live_admission()
+        .await
+        .expect("a healthy source applies cleanly");
+    assert_eq!(
+        fixture.coordinator.wake_queued_residents().await,
+        0,
+        "nothing is queued, so nothing is admitted"
+    );
+}
+
+/// A lowered capacity must leave the queue queued, not cancel it.
+///
+/// The wake pass runs after every settings change, including one that shrinks
+/// capacity. It must not turn "still too full" into a failed task.
+#[tokio::test]
+async fn a_wake_pass_cannot_admit_past_a_lowered_capacity() {
+    let fixture = fixture(AdmissionLimits {
+        direct_children: 5,
+        resident_subagents: 1,
+    })
+    .await;
+    let first = fixture.spawn("first").await.expect("first child");
+    let second = fixture.spawn("second").await.expect("second accepted");
+    assert!(fixture.started(&first));
+    assert!(!fixture.started(&second));
+
+    fixture.limits.save(AdmissionLimits {
+        direct_children: 5,
+        resident_subagents: 1,
+    });
+    fixture
+        .coordinator
+        .refresh_live_admission()
+        .await
+        .expect("a healthy source applies cleanly");
+    assert_eq!(
+        fixture.coordinator.wake_queued_residents().await,
+        0,
+        "capacity is still full, so the wake pass admits nothing"
+    );
+    assert_eq!(
+        fixture.coordinator.task_state(&second).unwrap(),
+        "queued",
+        "a refused wake-up must keep the child queued"
+    );
+    assert!(!fixture.started(&second));
+}
+
 /// A source failure must refuse the admission, not silently use a stale limit.
 ///
 /// Falling back to the last known value would make a corrupt settings file look

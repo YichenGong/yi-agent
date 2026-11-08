@@ -300,9 +300,94 @@ pub struct TuiLiveSettings {
     binding: yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding,
 }
 
+/// 三个可热更新的 TUI 行为开关，加标题开关。
+///
+/// 只有真正由渲染/事件循环消费的字段才在这里：`max_turns`、`compact.ratio`
+/// 之类属于会话侧，与 TUI 本帧无关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiLiveControls {
+    pub notifications: bool,
+    pub notification_method: crate::tui::notify::Method,
+    pub notification_condition: crate::tui::notify::Condition,
+    pub terminal_title: bool,
+}
+
+impl TuiLiveControls {
+    /// 从进程启动时的配置快照取初值。
+    ///
+    /// 用启动快照而不是立刻读盘：本函数在渲染第一帧之前调用，多一次文件
+    /// 读取换不到任何东西，而 `RuntimeConfig` 已经用同一套归一化规则解析过
+    /// 这三个值（非法值已按默认处理）。
+    pub fn from_config(config: &TuiConfigSnapshot) -> Self {
+        Self {
+            notifications: config.notifications,
+            notification_method: crate::tui::notify::Method::parse(&config.notification_method)
+                .unwrap_or(crate::tui::notify::Method::Auto),
+            notification_condition: crate::tui::notify::Condition::parse(
+                &config.notification_condition,
+            )
+            .unwrap_or(crate::tui::notify::Condition::Unfocused),
+            terminal_title: config.terminal_title,
+        }
+    }
+}
+
 impl TuiLiveSettings {
     pub fn new(binding: yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding) -> Self {
         Self { binding }
+    }
+
+    /// 从一份已解析的设置里读出 TUI 的三个行为开关。
+    ///
+    /// 与 `RuntimeConfig` 的解析规则逐字一致（字符串 `"false"` 才是关闭，
+    /// 键缺失保持默认 true）：两处若不一致，保存后 `/config` 显示的值与
+    /// 实际行为就会分叉。
+    fn controls_from(&self, settings: &yi_agent_runtime::settings::Settings) -> TuiLiveControls {
+        let effective = self.binding.sources.resolve(settings);
+        let text = |key: &str| {
+            effective
+                .values
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        TuiLiveControls {
+            notifications: !matches!(text("tui.notifications").as_deref(), Some("false")),
+            notification_method: text("tui.notification_method")
+                .and_then(|value| crate::tui::notify::Method::parse(&value))
+                .unwrap_or(crate::tui::notify::Method::Auto),
+            notification_condition: text("tui.notification_condition")
+                .and_then(|value| crate::tui::notify::Condition::parse(&value))
+                .unwrap_or(crate::tui::notify::Condition::Unfocused),
+            terminal_title: !matches!(text("tui.terminal_title").as_deref(), Some("false")),
+        }
+    }
+
+    /// 读一次最新设置并求出三个行为开关。
+    ///
+    /// 只在收到失效信号后调用（见 `LiveUiControls::poll`），不是每帧一次：
+    /// 每帧读盘会把 30hz 的渲染变成 30 次文件 I/O。
+    pub fn refresh_controls(&self) -> TuiLiveControls {
+        // 优先用**已发布**快照：观察线程和本地提交都已经把触发这次唤醒的那份
+        // 发布好了，再 `refresh()` 只会多读一次盘，并把「本次唤醒对应哪份内容」
+        // 变成两次独立读取之间的猜测。只有从未发布过（观察器还没跑第一轮）时
+        // 才真的读一次。
+        match self.binding.live.published() {
+            Some(snapshot) => self.controls_from(&snapshot.settings),
+            None => self.controls_from(&self.binding.live.refresh().settings),
+        }
+    }
+
+    /// 变化信号。本地保存与观察到的外部改动都会推进它。
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.binding.live.subscribe()
+    }
+
+    /// 起观察线程并拿到租约。宿主必须持有到事件循环结束。
+    pub fn start_observing(
+        &self,
+    ) -> yi_agent_runtime::live_settings::observer::SettingsObservationLease {
+        self.binding.live.start_observing()
     }
 
     /// Current effective values plus the origin of each one.

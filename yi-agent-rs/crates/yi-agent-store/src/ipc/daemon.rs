@@ -174,7 +174,44 @@ impl Daemon {
                 .expect("daemon reconciliation runtime must initialize");
             let mut last_schedule_minute = None;
             let mut last_runtime_dir_check: Option<Instant> = None;
+            // Live admission wake-up. This daemon is a std thread driving a
+            // current-thread runtime in short bursts, not an async service, so
+            // the change is picked up by a non-blocking check at the top of each
+            // pass rather than by an async `select!`. The accept poll is 10ms, so
+            // "as soon as a save lands" costs at most that much -- not the 1s
+            // observer period and not a new user message.
+            //
+            // The very first tick must not count as a change: subscribing yields
+            // an already-changed value, and reacting to it would refresh once for
+            // nothing at startup.
+            let mut live_admission_wakeup = coordinator.live_admission_wakeup();
+            if let Some(receiver) = live_admission_wakeup.as_mut() {
+                receiver.borrow_and_update();
+            }
             while !thread_stop.load(Ordering::Acquire) {
+                // Retry the queue the moment capacity can have changed. Reading
+                // the new limits and re-running admission are two steps on
+                // purpose: the limit that admitted a task is the one that was in
+                // force at that grant, not a value sampled before it.
+                if let Some(receiver) = live_admission_wakeup.as_mut()
+                    && receiver.has_changed().unwrap_or(false)
+                {
+                    receiver.borrow_and_update();
+                    if let Err(error) = runtime.block_on(coordinator.refresh_live_admission()) {
+                        tracing::error!(
+                            error = %error,
+                            "daemon could not apply the changed admission limits"
+                        );
+                    } else {
+                        let admitted = runtime.block_on(coordinator.wake_queued_residents());
+                        if admitted > 0 {
+                            tracing::info!(
+                                admitted,
+                                "admitted queued resident children after a capacity change"
+                            );
+                        }
+                    }
+                }
                 // The directory this daemon serves can be removed underneath it
                 // -- `git worktree remove --force` on the project does exactly
                 // that, and the socket survives in $TMPDIR when the runtime path

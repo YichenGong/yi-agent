@@ -36,6 +36,28 @@ use crate::session::ThreadSession;
 #[cfg(test)]
 const REMOTE_TOUCH_WINDOW: Duration = Duration::from_secs(5 * 60);
 
+/// 保活策略的三个输入值，取自**同一份**设置。
+///
+/// 拆成三次读取会让主循环读到「新开关 + 旧宽限」，那一拍输入从未真实存在过。
+/// 所以解析放在一个纯函数里，一次取一份 `Settings` 全部算完，调用方没有机会
+/// 中途换版。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PowerInputs {
+    pub(crate) enabled: bool,
+    pub(crate) grace_secs: u64,
+    pub(crate) remote_secs: u64,
+}
+
+/// 从一份设置里读出保活策略的三个输入。
+pub(crate) fn power_inputs(settings: &yi_agent_runtime::settings::Settings) -> PowerInputs {
+    let (grace_min, remote_min) = yi_agent_runtime::settings::power_windows_minutes(settings);
+    PowerInputs {
+        enabled: yi_agent_runtime::settings::prevent_idle_sleep_enabled(settings),
+        grace_secs: grace_min * 60,
+        remote_secs: remote_min * 60,
+    }
+}
+
 /// 查 daemon 的回复截止时间。**必须**远小于 10s tick。
 pub(crate) const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -202,6 +224,47 @@ impl Drop for BusySampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 保活三参数：同一快照 ----
+
+    /// The three values must come from one `Settings`, never three reads.
+    ///
+    /// Reading them separately lets a save land in between, and the tick then runs
+    /// on "new switch + old window" -- a combination that never existed in any
+    /// file. A pure function over one snapshot makes that impossible by shape.
+    #[test]
+    fn the_three_power_inputs_come_from_one_settings_snapshot() {
+        let mut settings = yi_agent_runtime::settings::Settings::default();
+        settings.power.prevent_idle_sleep = Some("false".into());
+        settings.power.idle_grace_minutes = Some(5);
+        settings.power.remote_touch_minutes = Some(2);
+        let inputs = power_inputs(&settings);
+        assert_eq!(
+            inputs,
+            PowerInputs {
+                enabled: false,
+                grace_secs: 300,
+                remote_secs: 120,
+            }
+        );
+    }
+
+    /// Defaults must still apply when the keys are absent: the whole point of
+    /// "live" is that an untouched file behaves exactly as before.
+    #[test]
+    fn absent_power_keys_fall_back_to_the_documented_defaults() {
+        let settings = yi_agent_runtime::settings::Settings::default();
+        let inputs = power_inputs(&settings);
+        assert!(inputs.enabled, "sleep prevention defaults to on");
+        assert_eq!(
+            inputs.grace_secs,
+            yi_agent_runtime::settings::POWER_IDLE_GRACE_MINUTES_DEFAULT * 60
+        );
+        assert_eq!(
+            inputs.remote_secs,
+            yi_agent_runtime::settings::POWER_REMOTE_TOUCH_MINUTES_DEFAULT * 60
+        );
+    }
 
     // ---- Task 8 Step 3：纯函数口径（6 条） ----
 

@@ -311,6 +311,41 @@ fn apply_focus_event(event: &Event, focused: &std::sync::atomic::AtomicBool) {
 }
 
 /// 当前是否应当发送通知。`focused` 为真表示窗口在前台。
+/// Applies a freshly read set of live controls to the loop's effectors.
+///
+/// Kept out of the loop body so the transition rules are testable without a
+/// terminal. Two rules are load-bearing:
+///
+/// * Turning notifications **off** drops the pending candidate. It was collected
+///   under the old switch; delivering it afterwards would notify about activity
+///   the user already asked to be told nothing about. Re-enabling never replays
+///   it either -- that candidate is gone, not queued.
+/// * Turning notifications on, or changing the method/condition, reconfigures the
+///   notifier in place. A failed backend stays failed (see
+///   [`crate::tui::notify::Notifier::configure`]).
+fn apply_live_controls(
+    controls: &mut crate::tui::slash::TuiLiveControls,
+    next: crate::tui::slash::TuiLiveControls,
+    loop_bk: &mut LoopBookkeeping,
+    title: &mut crate::tui::title::TitleHandle,
+) {
+    if *controls == next {
+        return;
+    }
+    let notifications_were_on = controls.notifications;
+    loop_bk
+        .notifier
+        .configure(next.notification_method, next.notification_condition);
+    if notifications_were_on && !next.notifications {
+        // 关掉时丢弃候选：它是旧开关下攒的，之后补发等于「关了还弹」。
+        loop_bk.notifications.discard();
+    }
+    // 标题开关每次都设：`set_enabled` 自己会 diff（关闭时只在写过的情况下
+    // 清一次，重开时让下一帧重写一遍），重复调用不会多发字节。
+    title.set_enabled(next.terminal_title);
+    *controls = next;
+}
+
 fn should_notify(condition: crate::tui::notify::Condition, focused: bool) -> bool {
     match condition {
         crate::tui::notify::Condition::Always => true,
@@ -393,6 +428,11 @@ impl NotificationState {
     /// 取出并清空。绘制完成后调用。
     fn take(&mut self) -> Option<PendingNotification> {
         self.pending.take()
+    }
+
+    /// 丢弃候选，不发出去。用户刚把通知关掉时调用。
+    fn discard(&mut self) {
+        self.pending = None;
     }
 
     #[cfg(test)]
@@ -1080,7 +1120,10 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
     let mut session_ui = SessionUi::new(model);
     let mut side_session = SideSession::new(theme);
     let mut popup_stack = PopupStack::new();
-    let notifications_enabled = config.notifications;
+    // 三个终端行为开关的可变镜像。`config` 是启动快照，保存后它不会变，
+    // 所以渲染与事件路径必须读这里。`live_controls` 的 `None` 表示宿主没有
+    // 运行期设置源（旧行为）：镜像就冻结在启动值上。
+    let mut controls = crate::tui::slash::TuiLiveControls::from_config(config);
     let focused = std::sync::atomic::AtomicBool::new(true);
     let notifier = {
         let method = crate::tui::notify::Method::parse(&config.notification_method)
@@ -1101,8 +1144,28 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
         )
     };
     let mut loop_bk = LoopBookkeeping::new(runtime_intent, &process_manager, notifier);
+    // 观察线程的租约必须活到本循环结束：`Drop` 即停线程，挂在某个帧或某次
+    // 请求上会让「别的进程改了设置」在本进程里永远看不到。
+    let mut settings_lease = config.live.as_ref().map(|live| live.start_observing());
+    let mut settings_wake = config.live.as_ref().map(|live| live.subscribe());
+    if let Some(receiver) = settings_wake.as_mut() {
+        // 启动时先清掉可能已经积压的序号：启动快照已经读过了，重放一次没有意义。
+        receiver.borrow_and_update();
+    }
 
     loop {
+        // 设置失效 → 重算三个终端行为开关。放在帧首、绘制之前，这样本帧
+        // 画出来的就是新值；通知候选也在同一步清掉（见下面 `NotificationState`）。
+        if let Some(receiver) = settings_wake.as_mut()
+            && receiver.has_changed().unwrap_or(false)
+        {
+            receiver.borrow_and_update();
+            if let Some(live) = config.live.as_ref() {
+                let next = live.refresh_controls();
+                apply_live_controls(&mut controls, next, &mut loop_bk, title);
+            }
+        }
+
         // 当前可见的是哪一份视图。每帧重算:back/打开旁支只改状态,不重启循环。
         let in_side = side_session.in_side();
 
@@ -1230,7 +1293,7 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
             // 而 `push_event` 会立刻压一条 `Separator`。
             loop_bk
                 .notifications
-                .observe(&event, history, notifications_enabled);
+                .observe(&event, history, controls.notifications);
             history.push_event(event, draw_text_width);
             // 回合结束:弹出下一条待发消息,立即发送并「转正」进 history。
             // 发送与转正是同一个动作,不再依赖 driver 是否取走。
@@ -1449,9 +1512,12 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
         })?;
 
         // 通知只在两帧之间发：插在帧中间会把 ANSI 序列切断，留下渲染残影。
+        //
+        // 发送前再读一次镜像，而不是复用入队时的值：候选可能攒了几帧，期间
+        // 用户刚把通知关掉，此时发出去就是「关了以后还弹」。
         if let Some(pending) = loop_bk.notifications.take() {
             let is_focused = focused.load(std::sync::atomic::Ordering::Relaxed);
-            if should_notify(loop_bk.notifier.condition(), is_focused) {
+            if controls.notifications && should_notify(loop_bk.notifier.condition(), is_focused) {
                 let _ = loop_bk.notifier.notify(&pending.text);
             }
         }
@@ -1641,6 +1707,13 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
             }
             _ => {}
         }
+    }
+
+    // 观察线程随事件循环结束一起收掉。用阻塞版：本函数就在阻塞线程上跑
+    // （`run_tui` 由 `spawn_blocking` 承载），没有 reactor 可供 spawn_blocking。
+    // 只 `drop` 也能让线程退出，但那就把「线程真的停了」变成退出路径上的猜测。
+    if let Some(lease) = settings_lease.take() {
+        lease.shutdown_blocking();
     }
 
     // Messages submitted during the last turn never got their chance to run.
@@ -14221,6 +14294,211 @@ mod notification_tests {
         let taken = state.take();
         assert!(taken.is_some());
         assert_eq!(state.pending_text(), None);
+    }
+
+    // ---- live control changes ------------------------------------------------
+
+    /// Builds the two effectors `apply_live_controls` mutates: a notifier whose
+    /// backend name we can read back, and a title handle backed by a probe.
+    fn controls_fixture() -> (
+        LoopBookkeeping,
+        crate::tui::title::TitleHandle,
+        crate::tui::title::RecordingSink,
+    ) {
+        let sink = crate::tui::title::RecordingSink::default();
+        let probe = sink.clone();
+        let title = crate::tui::title::TitleHandle::with_sink(
+            true,
+            false,
+            std::path::Path::new("/work/app"),
+            Box::new(sink),
+        );
+        let process_manager = yi_agent_tools::ProcessManager::new(std::env::temp_dir());
+        let notifier = crate::tui::notify::Notifier::new(
+            crate::tui::notify::Method::Bel,
+            crate::tui::notify::Condition::Unfocused,
+            &crate::tui::notify::TerminalEnv::from_process(),
+        );
+        let loop_bk = LoopBookkeeping::new(None, &process_manager, notifier);
+        (loop_bk, title, probe)
+    }
+
+    fn controls(
+        notifications: bool,
+        method: crate::tui::notify::Method,
+        condition: crate::tui::notify::Condition,
+        terminal_title: bool,
+    ) -> crate::tui::slash::TuiLiveControls {
+        crate::tui::slash::TuiLiveControls {
+            notifications,
+            notification_method: method,
+            notification_condition: condition,
+            terminal_title,
+        }
+    }
+
+    #[test]
+    fn turning_notifications_off_drops_the_pending_candidate() {
+        // 候选是在旧开关下攒的。关掉之后再送出去，用户看到的就是
+        // 「已经关掉了却还弹」。
+        use yi_agent_core::DoneReason;
+        let (mut loop_bk, mut title, _probe) = controls_fixture();
+        let history = HistoryState::new();
+        loop_bk.notifications.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        assert!(loop_bk.notifications.pending_text().is_some());
+
+        let mut current = controls(
+            true,
+            crate::tui::notify::Method::Bel,
+            crate::tui::notify::Condition::Unfocused,
+            true,
+        );
+        apply_live_controls(
+            &mut current,
+            controls(
+                false,
+                crate::tui::notify::Method::Bel,
+                crate::tui::notify::Condition::Unfocused,
+                true,
+            ),
+            &mut loop_bk,
+            &mut title,
+        );
+        assert_eq!(
+            loop_bk.notifications.pending_text(),
+            None,
+            "the candidate must be discarded, not queued for later"
+        );
+    }
+
+    #[test]
+    fn turning_notifications_back_on_does_not_replay_the_dropped_candidate() {
+        use yi_agent_core::DoneReason;
+        let (mut loop_bk, mut title, _probe) = controls_fixture();
+        let history = HistoryState::new();
+        loop_bk.notifications.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        let mut current = controls(
+            true,
+            crate::tui::notify::Method::Bel,
+            crate::tui::notify::Condition::Unfocused,
+            true,
+        );
+        let off = controls(
+            false,
+            crate::tui::notify::Method::Bel,
+            crate::tui::notify::Condition::Unfocused,
+            true,
+        );
+        apply_live_controls(&mut current, off, &mut loop_bk, &mut title);
+        apply_live_controls(
+            &mut current,
+            controls(
+                true,
+                off.notification_method,
+                off.notification_condition,
+                true,
+            ),
+            &mut loop_bk,
+            &mut title,
+        );
+        assert_eq!(
+            loop_bk.notifications.pending_text(),
+            None,
+            "re-enabling must not replay activity from while it was off"
+        );
+    }
+
+    #[test]
+    fn a_method_change_reconfigures_the_notifier_in_place() {
+        let (mut loop_bk, mut title, _probe) = controls_fixture();
+        assert_eq!(loop_bk.notifier.effective_backend(), "bel");
+        let mut current = controls(
+            true,
+            crate::tui::notify::Method::Bel,
+            crate::tui::notify::Condition::Unfocused,
+            true,
+        );
+        apply_live_controls(
+            &mut current,
+            controls(
+                true,
+                crate::tui::notify::Method::Osc9,
+                crate::tui::notify::Condition::Always,
+                true,
+            ),
+            &mut loop_bk,
+            &mut title,
+        );
+        assert_eq!(loop_bk.notifier.effective_backend(), "osc9");
+        assert_eq!(
+            loop_bk.notifier.condition(),
+            crate::tui::notify::Condition::Always
+        );
+    }
+
+    #[test]
+    fn a_title_switch_change_reaches_the_writer() {
+        let (mut loop_bk, mut title, probe) = controls_fixture();
+        title.sync(true);
+        let mut current = controls(
+            true,
+            crate::tui::notify::Method::Bel,
+            crate::tui::notify::Condition::Unfocused,
+            true,
+        );
+        apply_live_controls(
+            &mut current,
+            controls(
+                true,
+                crate::tui::notify::Method::Bel,
+                crate::tui::notify::Condition::Unfocused,
+                false,
+            ),
+            &mut loop_bk,
+            &mut title,
+        );
+        assert_eq!(
+            probe.calls(),
+            vec!["● app".to_string(), String::new()],
+            "disabling the title must blank what was written"
+        );
+        title.sync(true);
+        assert_eq!(
+            probe.calls().len(),
+            2,
+            "a disabled title must stay silent afterwards"
+        );
+    }
+
+    #[test]
+    fn identical_controls_are_a_no_op() {
+        // 每帧都可能走到这里（虽然只在收到失效信号后再读）。值没变时不该
+        // 反复 reconfigure 或反复 clear 标题。
+        let (mut loop_bk, mut title, probe) = controls_fixture();
+        title.sync(false);
+        let same = controls(
+            true,
+            crate::tui::notify::Method::Bel,
+            crate::tui::notify::Condition::Unfocused,
+            true,
+        );
+        let mut current = same;
+        for _ in 0..3 {
+            apply_live_controls(&mut current, same, &mut loop_bk, &mut title);
+        }
+        assert_eq!(probe.calls(), vec!["app".to_string()]);
     }
 
     #[test]

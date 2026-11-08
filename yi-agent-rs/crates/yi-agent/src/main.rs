@@ -903,6 +903,12 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             // invoked `serve` must record the same self-ignore so the project
             // state it creates never dirties the checkout.
             ignore_project_local_runtime_state(&workdir);
+            // The daemon is a standard thread plus intermittent
+            // `runtime.block_on` calls, so nothing polls the settings file on
+            // its own. Without this lease a save made by another process (the
+            // settings page, another sidecar) would not reach the queued
+            // residents until a restart.
+            let mut settings_lease = observe_live_settings_for_daemon(cli);
             let daemon = yi_agent_store::ipc::Daemon::start_with_factory(
                 &runtime_dir,
                 &database,
@@ -921,6 +927,11 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
                 .wait()
                 .map_err(|error| anyhow::anyhow!("runtime daemon failed: {error}"));
             supervisor.stop();
+            // 同步退出路径：这里没有 reactor，用阻塞版等观察线程真的结束，
+            // 而不是把「线程停了」变成退出时的猜测。
+            if let Some(lease) = settings_lease.take() {
+                lease.shutdown_blocking();
+            }
             result
         }
         DaemonAction::Status | DaemonAction::Stop => control_daemon_client(action, &runtime),
@@ -937,6 +948,29 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
 /// built before the daemon starts, that aborted the whole runtime attach on
 /// launch. `worker_factory` then picks the subagent entry (or the catalog
 /// default) from the config it is handed.
+/// Starts the settings observation thread on behalf of a daemon-hosting process.
+///
+/// The daemon's main loop is a standard thread with intermittent
+/// `runtime.block_on` calls, so the file is never read unless something asks.
+/// This lease is that something: it refreshes the shared source once a second,
+/// which is what turns "another process saved settings" into a wake-up for
+/// queued residents.
+///
+/// Returns `None` when the settings file cannot be resolved leniently. A broken
+/// settings file must not stop the daemon from serving -- the startup
+/// configuration is still valid, it simply will not be refreshed.
+///
+/// Loading the binding a second time is deliberate and cheap: `LiveSettings`
+/// is keyed on the absolute path in a process-wide registry, so this resolves to
+/// the very instance the worker factory and its workers read. A second source
+/// cannot appear here.
+fn observe_live_settings_for_daemon(
+    cli: &Cli,
+) -> Option<yi_agent_runtime::live_settings::observer::SettingsObservationLease> {
+    let (_config, binding) = config::load_lenient_with_binding(cli).ok()?;
+    Some(binding.live.start_observing())
+}
+
 fn build_daemon_worker_factory(
     cli: &Cli,
     runtime_socket: std::path::PathBuf,

@@ -147,8 +147,8 @@ pub(crate) mod transport;
 // 这条链路必须是 `pub`。
 #[allow(unused_imports)]
 pub(crate) use transport::{
-    parse_relay_url, pump_git_diff_notifications, pump_stdout, pump_theme_notifications,
-    read_lines, serve, serve_scoped, serve_scoped_core, serve_stdio,
+    parse_relay_url, pump_git_diff_notifications, pump_settings_notifications, pump_stdout,
+    pump_theme_notifications, read_lines, serve, serve_scoped, serve_scoped_core, serve_stdio,
 };
 // `lib.rs` 以 `pub use server::{run, serve_stdio_with_relay}` 把它们交给 CLI，
 // 这条链路必须一路 `pub`。`cargo fix` 会把它当"未用"删掉（lib target 里确实没

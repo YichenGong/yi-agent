@@ -129,6 +129,11 @@ pub fn run_managed_daemon(
     // The daemon resolves its own source (the launcher passes one in) so every
     // worker it starts follows a settings save at its next safe point. `None`
     // keeps the historical static factory for callers that have no binding.
+    // The lease is taken *before* the binding is handed to the factory, from a
+    // clone: `worker_factory_with_binding` consumes its argument.
+    let settings_lease = live_settings
+        .as_ref()
+        .map(|binding| binding.live.start_observing());
     let factory = yi_agent_subagent::attach::worker_factory_with_binding(
         &invocation,
         runtime_dir.clone(),
@@ -143,9 +148,15 @@ pub fn run_managed_daemon(
     // it, and passing the socket path would publish every route into a partition
     // nobody reads.
     let _supervisor = yi_agent_runtime::supervise::serve(&invocation.workdir, &runtime_dir);
-    daemon
+    let result = daemon
         .wait()
-        .map_err(|error| anyhow::anyhow!("the managed daemon stopped: {error}"))
+        .map_err(|error| anyhow::anyhow!("the managed daemon stopped: {error}"));
+    // 同步退出路径，没有 reactor：阻塞等待观察线程结束，而不是留下一个
+    // 正在退出的进程里的孤儿线程。
+    if let Some(lease) = settings_lease {
+        lease.shutdown_blocking();
+    }
+    result
 }
 
 #[cfg(test)]

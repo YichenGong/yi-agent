@@ -20,6 +20,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub mod binding;
+pub mod observer;
 pub mod prompt;
 pub mod sources;
 
@@ -292,6 +293,14 @@ pub struct LiveSettings {
     path: PathBuf,
     gate: Mutex<RefreshState>,
     watch: tokio::sync::watch::Sender<u64>,
+    /// 只由**观察到的**变化触发：`refresh()` 发现内容真的变了才发。
+    ///
+    /// 与 [`Self::watch`] 分开是必要的，不是冗余。本地 `commit()` 会在同一段
+    /// gate 内把新快照发布成 `published`，于是紧接着的那次观察 `refresh()` 判定
+    /// 「没变化」、不会走这里。启动它的宿主因此不会把「自己刚提交的版本」再播报
+    /// 一遍——广播去重靠的是这条因果，不是一个事后比较的闩锁（那种闩锁在
+    /// 「提交完、还没广播」的窗口里必然被观察线程抢先）。
+    external: tokio::sync::watch::Sender<u64>,
     sequence: AtomicU64,
 }
 
@@ -308,10 +317,12 @@ impl LiveSettings {
             return existing;
         }
         let (watch, _receiver) = tokio::sync::watch::channel(0);
+        let (external, _external_receiver) = tokio::sync::watch::channel(0);
         let instance = Arc::new(Self {
             path: path.clone(),
             gate: Mutex::new(RefreshState::default()),
             watch,
+            external,
             sequence: AtomicU64::new(0),
         });
         registry.insert(path, Arc::downgrade(&instance));
@@ -343,9 +354,35 @@ impl LiveSettings {
         let changed = state.changed_since_last_publish(&snapshot);
         drop(state);
         if changed {
+            // **外部信号必须先发**：宿主用两条通道区分「自己刚提交的」与「观察到
+            // 的」。先发外部信号，等待它的消费者就能在看到新快照后立刻广播；随后
+            // 那条全量信号只会让消费者更新基线，不会重复播报。
+            //
+            // 反过来（先全量、后外部）会留下一个真实窗口：消费者被全量信号唤醒时
+            // 外部信号还没发出，它会把这次变化判成「本地提交」而只更新基线，于是
+            // 这次外部变化永远不会被广播。
+            //
+            // 只有走到这里才算「本进程观察到了一次变化」：本地提交已提前把
+            // `published` 换掉，它的下一次 refresh 判定为「没变」，不会误报。
+            self.notify_external();
             self.notify();
         }
         snapshot
+    }
+
+    /// 当前**已发布**的快照，不读文件。
+    ///
+    /// 生产消费者收到失效信号后应当 [`refresh`](Self::refresh) 去读最新值；
+    /// 本方法只用于诊断与测试——它要回答的是"观察线程有没有发布过"，而
+    /// `refresh()` 自己会重读文件，用它判断等于把被测对象当成判据。
+    ///
+    /// 还没发布过时返回 `None`（不是空快照：那会把"未读取"伪装成"内容是空的"）。
+    pub fn published(&self) -> Option<Arc<SettingsSnapshot>> {
+        self.gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .published
+            .clone()
     }
 
     /// 与 [`crate::settings::write_to`] 共用同一把写锁与同一个提交点。
@@ -381,10 +418,23 @@ impl LiveSettings {
         self.watch.subscribe()
     }
 
+    /// **观察到**变化的信号（不含本进程自己刚提交的版本）。
+    ///
+    /// 宿主要让客户端「重新 read」时订阅它：本地写入应当由写请求自己的应答 +
+    /// 紧邻的那条通知负责，走这条通道只会重复播报同一个版本。
+    pub fn subscribe_external(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.external.subscribe()
+    }
+
     fn notify(&self) {
         let next = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         // `send_replace` 即使当前没有订阅者也成功，不是错误。
         self.watch.send_replace(next);
+    }
+
+    fn notify_external(&self) {
+        let next = self.sequence.load(Ordering::Relaxed);
+        self.external.send_replace(next);
     }
 }
 

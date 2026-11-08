@@ -201,16 +201,28 @@ pub struct TitleState {
 }
 
 /// 标题的写入策略。
+///
+/// 三个跳过原因拆成三个字段而不是一个 `Option<DisabledReason>`，因为它们的
+/// **可变性不同**：`enabled` 来自设置文件，一次保存就可能改；`multiplexed`
+/// 是本进程的环境事实，只有重启才会变；`write_failed` 是终端已经拒绝过
+/// OSC 2 之后的粘性状态。合成一个字段时，「先关再开」会把粘性失败写回
+/// `None`，于是热更新等于凭空重试一次终端明确不接受的写入。
 pub struct TitleWriter {
-    /// 三种跳过原因的唯一来源。`None` = 正常可用。
-    disabled_reason: Option<DisabledReason>,
+    /// 用户开关（`tui.terminal_title`）。热更新只改这一项。
+    enabled: bool,
+    /// tmux / zellij 内不可写。环境事实，设置改不动。
+    multiplexed: bool,
+    /// 写过一次失败，本会话自禁。粘性，设置改不动。
+    write_failed: bool,
     sink: Box<dyn TitleSink>,
 }
 
 impl std::fmt::Debug for TitleWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TitleWriter")
-            .field("disabled_reason", &self.disabled_reason)
+            .field("enabled", &self.enabled)
+            .field("multiplexed", &self.multiplexed)
+            .field("write_failed", &self.write_failed)
             .finish_non_exhaustive()
     }
 }
@@ -226,22 +238,52 @@ impl TitleWriter {
     /// 判定顺序固定为 `enabled` → `multiplexed`：配置关且身处 tmux 时报告
     /// `Off`——用户明确关掉的东西，没必要再报告环境限制。
     pub fn with_sink(enabled: bool, multiplexed: bool, sink: Box<dyn TitleSink>) -> Self {
-        let disabled_reason = if !enabled {
-            Some(DisabledReason::Off)
-        } else if multiplexed {
-            Some(DisabledReason::Multiplexer)
-        } else {
-            None
-        };
         Self {
-            disabled_reason,
+            enabled,
+            multiplexed,
+            write_failed: false,
             sink,
         }
     }
 
+    /// 当前跳过原因。顺序固定为「用户开关 → 写失败 → 多路复用器」。
+    ///
+    /// `WriteFailed` 排在 `Multiplexer` 之前是因为它只会出现在曾真正尝试
+    /// 写入的 writer 上（多路复用器分支从不写），顺序对生产无影响，但让
+    /// 「用户关掉」始终压过两种自禁——用户明确关掉的东西，没必要再报告
+    /// 环境限制或历史故障。
+    fn disabled_reason(&self) -> Option<DisabledReason> {
+        if !self.enabled {
+            Some(DisabledReason::Off)
+        } else if self.write_failed {
+            Some(DisabledReason::WriteFailed)
+        } else if self.multiplexed {
+            Some(DisabledReason::Multiplexer)
+        } else {
+            None
+        }
+    }
+
+    /// Re-evaluates the config switch without touching the sink.
+    ///
+    /// Settings are live: a save can turn the title on or off while the session
+    /// runs. Two states stay sticky on purpose:
+    ///
+    /// * `Multiplexer` — an environment fact that no setting can change.
+    /// * `WriteFailed` — the terminal already refused OSC 2 once. Re-enabling
+    ///   after a save would retry a write that the terminal has already
+    ///   demonstrated it does not accept, and the retry would print garbage into
+    ///   the frame. It is the one skip reason a setting must not override.
+    ///
+    /// Turning the switch off always wins, even over those two: nothing is
+    /// written, so there is nothing to protect.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
     /// 当前状态，供 `/config` 渲染。
     pub fn status(&self) -> TitleStatus {
-        self.disabled_reason
+        self.disabled_reason()
             .map_or(TitleStatus::On, DisabledReason::to_status)
     }
 
@@ -255,7 +297,7 @@ impl TitleWriter {
     ///    恰好一样」。
     /// 4. 写。失败则自禁并吞掉错误——调用方不该因标题失败而中断。
     pub fn sync(&mut self, state: &mut TitleState, project: &str, running: bool) -> io::Result<()> {
-        if self.disabled_reason.is_some() {
+        if self.disabled_reason().is_some() {
             return Ok(());
         }
         if state.observed_running == Some(running) {
@@ -278,7 +320,7 @@ impl TitleWriter {
                     error = %error,
                     "terminal title write failed; disabling for this session"
                 );
-                self.disabled_reason = Some(DisabledReason::WriteFailed);
+                self.write_failed = true;
                 Ok(())
             }
         }
@@ -290,10 +332,15 @@ impl TitleWriter {
     /// `run_tui` 的 `cleanup_error`」。那会让上百种不支持 OSC 2 的终端在每次
     /// 正常退出时都返回非零，被 shell 的 `set -e`、CI 脚本当成崩溃。
     ///
-    /// 第一行为同样是失效短路：配置关闭或身处 tmux 时我们从没写过，也就
-    /// 不该在退出时写空串去覆盖用户终端。
+    /// 判据是「我们真的写过东西」，**不是**禁用原因。两者在静态装配下等价
+    /// （关闭/tmux 时从未写过），但运行期设置把开关关掉之后 reason 变成
+    /// `Off` 而终端里正摆着我们写过的标题——那一刻恰恰必须清掉。用 reason
+    /// 当判据会让这条路径永远短路，屏幕上留着旧项目名直到退出。
+    ///
+    /// 反过来，从没写过时（开机就关、tmux、写失败）`written` 是 `None`，
+    /// 于是不会写空串去覆盖用户自己的标题。
     pub fn clear(&mut self, state: &mut TitleState) {
-        if self.disabled_reason.is_some() {
+        if state.written.is_none() {
             return;
         }
         if state.written.as_deref() == Some("") {
@@ -356,6 +403,24 @@ impl TitleHandle {
     #[cfg(test)]
     pub fn status(&self) -> TitleStatus {
         self.writer.status()
+    }
+
+    /// Applies a live `tui.terminal_title` value.
+    ///
+    /// After a save disables the title we must also *clear* what we wrote: a
+    /// stale project name would otherwise sit in the terminal for the rest of
+    /// the session, and the user asked for it to stop appearing. Clearing only
+    /// happens if we actually wrote something (`TitleState::written`), so a
+    /// title that was never shown is never overwritten either.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.writer.set_enabled(enabled);
+        if !enabled {
+            self.clear();
+        }
+        // 重新打开时必须让下一帧真正写一次：`sync` 以「运行态未变」为
+        // 第一道闸，而关闭期间运行态很可能没变，否则标题会一直空着。
+        // 置 `None` 只让下一帧重算一次，不改变任何判定语义。
+        self.state.observed_running = None;
     }
 
     /// 同步标题。错误在 writer 内部已吞掉，这里也不返回。
@@ -615,11 +680,14 @@ mod tests {
     }
 
     #[test]
-    fn clear_is_a_no_op_when_already_empty() {
+    fn clear_writes_at_most_one_blank_after_a_title_was_written() {
+        // 判据是 `written`，所以「从没写过」不发字节（见下一条），而「写过」
+        // 只清一次：连续两次 clear 不该再发一条空串。
         let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        writer.sync(&mut state, "p", false).unwrap();
         writer.clear(&mut state);
         writer.clear(&mut state);
-        assert_eq!(probe.calls(), vec![String::new()]);
+        assert_eq!(probe.calls(), vec!["p".to_string(), String::new()]);
     }
 
     #[test]
@@ -697,6 +765,115 @@ mod tests {
         );
         handle.clear();
         assert_eq!(probe.calls().last().map(String::as_str), Some(""));
+    }
+
+    // ---- live re-evaluation of `tui.terminal_title` -----------------------
+
+    #[test]
+    fn turning_the_title_off_clears_what_was_written() {
+        // 关掉之后终端里不该还留着项目名：用户要求的正是「不再出现」。
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        writer.sync(&mut state, "p", true).unwrap();
+        writer.set_enabled(false);
+        writer.clear(&mut state);
+        assert_eq!(
+            probe.calls(),
+            vec!["● p".to_string(), String::new()],
+            "disabling must blank the already-written title"
+        );
+    }
+
+    #[test]
+    fn turning_the_title_off_before_any_write_does_not_touch_the_terminal() {
+        // 从没写过就没有可清的东西：此时写空串会覆盖用户自己的标题。
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        writer.set_enabled(false);
+        writer.clear(&mut state);
+        assert_eq!(probe.calls(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn re_enabling_does_not_wait_for_the_running_flag_to_flip() {
+        // 关闭期间运行态往往没变；`sync` 的第一道闸是「运行态未变」，
+        // 不重置它就永远不会重写，标题会一直空着。
+        let sink = RecordingSink::default();
+        let probe = sink.clone();
+        let mut handle =
+            TitleHandle::with_sink(true, false, Path::new("/work/app"), Box::new(sink));
+        handle.sync(false);
+        handle.set_enabled(false);
+        handle.set_enabled(true);
+        handle.sync(false);
+        assert_eq!(
+            probe.calls(),
+            vec!["app".to_string(), String::new(), "app".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_write_failure_survives_turning_the_title_back_on() {
+        // 终端已经拒绝过 OSC 2。设置保存不该让程序再赌一次：那不是配置问题，
+        // 是这台终端不支持的证据。
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        probe.fail_next();
+        writer.sync(&mut state, "p", true).unwrap();
+        assert_eq!(writer.status(), TitleStatus::WriteFailed);
+
+        writer.set_enabled(false);
+        writer.set_enabled(true);
+        writer.sync(&mut state, "p", false).unwrap();
+        assert_eq!(
+            probe.calls().len(),
+            1,
+            "a failed write must not be retried after a save: {:?}",
+            probe.calls()
+        );
+        assert_eq!(writer.status(), TitleStatus::WriteFailed);
+    }
+
+    #[test]
+    fn the_multiplexer_guard_survives_turning_the_title_back_on() {
+        let (mut writer, probe, mut state) = writer_with_probe(true, true);
+        writer.set_enabled(false);
+        writer.set_enabled(true);
+        writer.sync(&mut state, "p", true).unwrap();
+        assert_eq!(probe.calls(), Vec::<String>::new());
+        assert_eq!(writer.status(), TitleStatus::Multiplexer);
+    }
+
+    #[test]
+    fn the_user_switch_outranks_both_sticky_reasons() {
+        // 用户关掉了：报 off，而不是拿环境/历史故障当解释。
+        let failed = {
+            let (mut writer, probe, mut state) = writer_with_probe(true, false);
+            probe.fail_next();
+            writer.sync(&mut state, "p", true).unwrap();
+            writer
+        };
+        let mut failed = failed;
+        failed.set_enabled(false);
+        assert_eq!(failed.status(), TitleStatus::Off);
+
+        let mut multiplexed = TitleWriter::new(true, true);
+        multiplexed.set_enabled(false);
+        assert_eq!(multiplexed.status(), TitleStatus::Off);
+    }
+
+    #[test]
+    fn clearing_on_disable_is_idempotent() {
+        // 一帧内同一设置变化可能被处理两次（本地提交 + 外部观察）。
+        let sink = RecordingSink::default();
+        let probe = sink.clone();
+        let mut handle =
+            TitleHandle::with_sink(true, false, Path::new("/work/app"), Box::new(sink));
+        handle.sync(false);
+        handle.set_enabled(false);
+        handle.set_enabled(false);
+        assert_eq!(
+            probe.calls(),
+            vec!["app".to_string(), String::new()],
+            "the second disable must not write another blank"
+        );
     }
 
     /// `cargo test` 的 stdout 不是 TTY，这条恰好覆盖 `StdoutSink` 的第一道

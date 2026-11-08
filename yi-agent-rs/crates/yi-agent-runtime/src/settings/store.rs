@@ -257,6 +257,18 @@ fn changed_keys(old: &Value, new: &Value) -> Vec<String> {
         .collect()
 }
 
+/// 两份**已归一化**设置之间的逻辑变化键（按 `FIELDS` 顺序）。
+///
+/// 观察路径拿到的是一对类型化快照，而不是原始文档，所以不能直接喂给
+/// [`changed_keys`]。类型化设置序列化后的形状与原始文档同构（`Option` 渲染成
+/// `null`，而 `null` 在 `validate_value` 里就是「未设置」），故转回 `Value` 后
+/// 复用同一套判定——**不另写一份**差异算法，否则两条路径迟早给出不同的键集。
+pub fn changed_keys_between(old: &Settings, new: &Settings) -> Vec<String> {
+    let old = serde_json::to_value(old).unwrap_or(Value::Null);
+    let new = serde_json::to_value(new).unwrap_or(Value::Null);
+    changed_keys(&old, &new)
+}
+
 /// `group.field` 的原始值；分组缺失或不是对象都表示未设置。
 fn raw_field<'a>(raw: &'a Value, key: &str) -> Option<&'a Value> {
     let (group, field) = key.split_once('.')?;

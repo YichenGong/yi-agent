@@ -51,6 +51,35 @@ async fn ask(
         .await
 }
 
+/// Read the next matching frame, but fail if it does not arrive within `within`.
+///
+/// `next_notification` above waits `EVENT_WAIT` (30s), which is longer than the
+/// power ticker (10s). Anything the power tick happens to refresh would then
+/// pass a "did the observer publish this?" assertion. A bound below 10s is what
+/// makes those two paths distinguishable.
+async fn next_notification_within(
+    h: &mut Harness,
+    method: &str,
+    within: std::time::Duration,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            panic!("no {method} frame within {within:?}");
+        }
+        let Some(frame) = h
+            .try_read_value(left.min(std::time::Duration::from_millis(200)))
+            .await
+        else {
+            continue;
+        };
+        if frame.get("method") == Some(&serde_json::json!(method)) {
+            return frame;
+        }
+    }
+}
+
 /// Read the next frame whose `method` matches, ignoring interleaved responses.
 async fn next_notification(h: &mut Harness, method: &str) -> serde_json::Value {
     h.read_matching(64, |v| v.get("method") == Some(&serde_json::json!(method)))
@@ -366,6 +395,231 @@ async fn config_read_without_a_binding_keeps_its_historic_shape() {
     let view = value.get("result").expect("an answer");
     assert!(view.get("live_apply").is_none(), "{view}");
     assert!(view.get("max_turns").is_some(), "{view}");
+
+    h.shutdown().await;
+}
+
+/// 另一个进程改了 `settings.json`：观察器在下个周期看到它，宿主广播
+/// `settings/changed`，客户端据此重新 read。
+///
+/// 这条不能靠「本进程的写请求」冒充：写请求自己会广播，即使跨进程观察完全没
+/// 接线也照样绿。所以这里**只**改文件，不经任何 RPC。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_external_edit_reaches_clients_through_the_observer() {
+    let (mut h, dir, binding) = with_live().await;
+    let path = dir.path().join("settings.json");
+
+    // 先落一个基线并经 RPC 读一次。这次读本身可能已经触发一条失效帧
+    // （服务启动时还没发布过快照），所以把它收掉，后面的断言才有唯一对应的
+    // 变化——否则「收到第一条通知」可能属于基线而不是被测的那次编辑。
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({"agent": {"max_turns": 5}})).unwrap(),
+    )
+    .unwrap();
+    let _ = ask(&mut h, 30, "settings/read", serde_json::json!({})).await;
+    let baseline = next_notification(&mut h, "settings/changed").await;
+    let baseline_revision = baseline["params"]["revision"].clone();
+
+    // 外部替换（模拟另一个进程保存）。只有一个字节变了：5 → 6。
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({"agent": {"max_turns": 6}})).unwrap(),
+    )
+    .unwrap();
+
+    // 等到一条属于新版本的帧，而不是「下一条恰好到达的帧」。
+    //
+    // 上限 4 秒，**故意短于 10 秒的保活拍**：那条拍也会 `refresh()` 并触发同一条
+    // 外部信号，若这里等 30 秒，"观察器没接线" 也会因为保活拍而通过（实测：变异成
+    // 不启动观察器后，本用例在 10.13s 绿）。4 秒只可能由观察器周期（1 秒）满足。
+    let mut note = next_notification_within(
+        &mut h,
+        "settings/changed",
+        std::time::Duration::from_secs(4),
+    )
+    .await;
+    while note["params"]["revision"] == baseline_revision {
+        note = next_notification_within(
+            &mut h,
+            "settings/changed",
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+    }
+    assert_eq!(
+        note["params"]["changed_keys"],
+        serde_json::json!(["agent.max_turns"]),
+        "{note}"
+    );
+    assert!(note["params"]["revision"].is_string(), "{note}");
+    // 只允许出现键名。值本身不许出现在帧里——注意不能拿单个字符判，
+    // `revision` 是哈希，本来就可能含 `6`。
+    let rendered = note.to_string();
+    assert!(
+        !rendered.contains("\"agent\"") && !rendered.contains(":6"),
+        "the notification must not carry values: {note}"
+    );
+
+    // 观察器确实发布了新值（而不只是广播了一条空帧）。
+    assert_eq!(
+        binding.live.published().map(|s| s.settings.agent.max_turns),
+        Some(Some(6))
+    );
+
+    h.shutdown().await;
+}
+
+/// A health-only change must still reach clients, with an empty key set.
+///
+/// Breaking the file keeps the last good content, so `revision` and every setting
+/// value are unchanged -- the only difference is `health`. A notification keyed
+/// on the revision alone would drop this frame, and a client would keep showing
+/// "healthy" for a file that no longer parses. `changed_keys: []` is exactly the
+/// legal shape for "re-read and look at health".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_health_regression_is_broadcast_even_with_no_changed_keys() {
+    let (mut h, dir, binding) = with_live().await;
+    let path = dir.path().join("settings.json");
+
+    // Baseline: a valid file, read once, and its frame consumed.
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({"agent": {"max_turns": 5}})).unwrap(),
+    )
+    .unwrap();
+    let _ = ask(&mut h, 40, "settings/read", serde_json::json!({})).await;
+    let baseline = next_notification(&mut h, "settings/changed").await;
+    let healthy_revision = baseline["params"]["revision"].clone();
+
+    // Now corrupt it. Same settings, same revision: only health moves.
+    std::fs::write(&path, b"{ this is not json").unwrap();
+
+    let mut note = next_notification_within(
+        &mut h,
+        "settings/changed",
+        std::time::Duration::from_secs(4),
+    )
+    .await;
+    // 保活拍也会读盘，所以只认「健康确实降级」之后的那一帧。
+    while note["params"]["revision"] != healthy_revision {
+        note = next_notification_within(
+            &mut h,
+            "settings/changed",
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+    }
+    assert_eq!(
+        note["params"]["changed_keys"],
+        serde_json::json!([]),
+        "a health-only change carries no logical keys: {note}"
+    );
+    assert_eq!(
+        note["params"]["revision"], healthy_revision,
+        "the revision must not move when the content is unchanged: {note}"
+    );
+
+    // 发布出来的快照确实是降级态，而不是我们只看了一条空帧。
+    let published = binding.live.published().expect("the observer published");
+    assert_eq!(
+        published.health.state,
+        yi_agent_runtime::live_settings::HealthState::Degraded
+    );
+    assert_eq!(published.settings.agent.max_turns, Some(5));
+
+    h.shutdown().await;
+}
+
+/// The pump's start-up handshake must be baseline → subscribe → catch up.
+///
+/// Both naive orders have a real window, so the ordering is the guarantee and a
+/// source assertion is what can pin it:
+///
+/// * subscribe-then-baseline: the baseline read already returns the new content,
+///   so when `changed()` fires the comparison says "no difference" and the frame
+///   is dropped.
+/// * baseline-then-subscribe without the catch-up: `refresh()` publishes *then*
+///   notifies, so a publish that lands before the subscription is invisible to
+///   `changed()` forever.
+///
+/// Timing that window from a test would need to suspend the task between two
+/// adjacent statements, which no public API allows; asserting the sequence reads
+/// the actual guarantee instead of a proxy for it.
+#[test]
+fn the_notification_pump_subscribes_between_baseline_and_catch_up() {
+    let source = include_str!("../transport/notifications.rs");
+    let body = source
+        .split("pub(crate) async fn pump_settings_notifications(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("pump_settings_notifications must exist");
+    let baseline = body
+        .find("let mut last = live.published()")
+        .expect("the pump must take a baseline before subscribing");
+    let subscribe = body
+        .find("let mut changes = live.subscribe_external()")
+        .expect("the pump must subscribe to external changes");
+    let catch_up = body
+        .find("// 补齐")
+        .expect("the pump must catch up on content published before its subscription");
+    let pump_loop = body.find("loop {").expect("the pump must loop");
+    assert!(
+        baseline < subscribe,
+        "the baseline must be read before subscribing, otherwise the first wake-up \
+         has nothing to compare against"
+    );
+    assert!(
+        subscribe < catch_up && catch_up < pump_loop,
+        "the catch-up must run after subscribing and before the loop: it is what \
+         recovers a publish that landed inside the window"
+    );
+    assert!(
+        !body[..subscribe].contains("changes.changed()"),
+        "no frame may be emitted before the baseline exists"
+    );
+}
+
+/// 本地 `settings/write` 只广播一次：观察器读到同一版本时不得再播一遍。
+///
+/// 两个独立通道（本地提交自己播、外部观察另外播）很容易写成双播——用户在设置页
+/// 每保存一次就收到两条同版本帧。这里按顺序取两帧：第二帧若是同版本
+/// `settings/changed` 就变红。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_write_is_not_broadcast_twice() {
+    let (mut h, _dir, _binding) = with_live().await;
+
+    ask(
+        &mut h,
+        31,
+        "settings/write",
+        serde_json::json!({"patch": {"agent.max_turns": 42}}),
+    )
+    .await;
+    let first = next_notification(&mut h, "settings/changed").await;
+    let first_revision = first["params"]["revision"].clone();
+
+    // 观察器周期是 1 秒：给足两轮，任何重复广播都必然落在这个窗口里。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+    while std::time::Instant::now() < deadline {
+        match h
+            .try_read_value(std::time::Duration::from_millis(150))
+            .await
+        {
+            Some(frame) => {
+                if frame.get("method") == Some(&serde_json::json!("settings/changed")) {
+                    panic!("the same commit was broadcast twice: {frame}");
+                }
+            }
+            None => continue,
+        }
+    }
+    // 第一帧仍然是那次提交。
+    assert_eq!(
+        first["params"]["changed_keys"],
+        serde_json::json!(["agent.max_turns"])
+    );
+    assert!(first_revision.is_string());
 
     h.shutdown().await;
 }
