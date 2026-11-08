@@ -3294,6 +3294,7 @@ pub(crate) fn test_side_registry(
 
 #[cfg(test)]
 mod assembly;
+mod compact_blocking;
 #[cfg(test)]
 mod image;
 #[cfg(test)]
