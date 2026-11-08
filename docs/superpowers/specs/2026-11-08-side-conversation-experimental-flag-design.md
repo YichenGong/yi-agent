@@ -100,10 +100,17 @@ pub(crate) type SideGate = Arc<dyn Fn() -> bool + Send + Sync>;
 ```
 
 `protocol::SIDE_CONVERSATION_V1` 这个 `bool` 常量**保留**，但语义收窄为「本协议
-版本支持旁支协议」，不再是下发的值。`server/tests/side.rs` 里
-`side_initialize_advertises_capability_and_a_host_id` 现按常量断言，改为断言
-「与注入的 gate 值一致」——这是本功能唯一必须改动的既有测试，且改动是把
-断言换成语义更强的形式（同时覆盖 true 与 false 两条）。
+版本支持旁支协议」，不再是下发的值。**受影响的既有测试恰好两处**，且都是把
+断言换成语义更强的形式：
+
+- `server/tests/side.rs:176`（`side_initialize_advertises_capability_and_a_host_id`）
+- `server/tests/side.rs:281`（`side_handshake_and_list_work_together`）
+
+改法：这两条用例的 harness 默认开（见 §6「测试装配的既有缺口」），因此断言
+「能力位等于注入的 gate 值」即等价于今天的 `== SIDE_CONVERSATION_V1`。另需
+**新增**一条关掉的用例（`Harness::with_side_flag(false)`），断言能力位为 false
+且 `sideHostInstanceId` 仍是非空字符串。`protocol.rs:2165` 的
+`assert!(SIDE_CONVERSATION_V1)` 不用改——它断言的是常量本身。
 
 注意 `sideHostInstanceId` **照旧下发**：宿主身份与能力是两件事，前端用前者区分
 「重连」与「宿主换代」。只翻能力位而不给 id，客户端会丢掉全部本地基线。
@@ -142,16 +149,49 @@ pub async fn close_all(&self) { ... }
 ```
 
 实现取自 `shutdown()` 的主体（逐个 `close` → 撤销 replay token → 清空
-`sides` / `parents`），但：
+`sides` / `parents`），但有四个**必须**处理的差异，否则「立即关闭」会漏：
 
-- **不置 `closed`**；
-- 每条单独的关闭用 `close(side_id, None)` 的语义要小心：`expected` 是 CAS 值，
-  传 `None` 只匹配「当前无活跃轮」。有在途轮的旁支会得到 `CloseConflict`。
-  所以 `close_all` 走 `runner.close()` 直接关闭（与 `shutdown()` 一致），
-  再逐个 `release_side_snapshots`、发布 `side/closed`，最后清空两张表。
+**(a) 不能置 `closed`**
+开关可逆，关掉之后用户还能再打开。
+
+**(b) 不能清 `ParentSlot::Creating` 占位**
+`create()` 的成功路径会先把 `parents[parent]` 写成 `Ready`。若 `close_all` 直接
+清空 `parents`，在途的创建会在清空之后把 `Ready` 写回去——**开关已关，却又冒出
+一条活旁支**。所以 `close_all` 只移除 `ParentSlot::Ready`，保留 `Creating`；
+等它落定后由下一轮清扫处理。
+
+**(c) 必须有 epoch 护栏（关键，`shutdown()` 不需要是因为它不可逆）**
+`create_inner` 是**在完成文件操作之后**才 `sides.insert(...)`（见
+`registry.rs` 中 `sides.insert(side_id, ...)` 那一段），因此在途创建能在
+`close_all` 清空之后重新插入。修法：
+
+```rust
+// 新增字段
+sweep_epoch: AtomicU64,
+
+// close_all 第一件事
+self.sweep_epoch.fetch_add(1, Ordering::SeqCst);
+
+// create_inner：在 reserve_slot **之前**记下当前 epoch，
+// 在 sides.insert 之前复核；不一致就丢弃刚建好的 runner 并返回
+// SideClosing 错误（parents 不会写成 Ready，`create` 的 Err 分支会移除占位）。
+```
+
+这条测试必须有鉴别力：`close_all` 与 `open` 并发跑若干轮，断言最终
+`side_count() == 0`。没有 epoch 时该断言会间歇失败。
+
+**(d) 清扫要扫到空为止（有界）**
+第一轮清扫期间可能有 `Creating` 落定成 `Ready`。所以 `close_all` 用有界循环
+（例如最多 3 轮，每轮 drain 一次 `sides` 并重查 `parents` 里是否有 `Ready`），
+而不是一次 drain 就返回。超过上限记 `tracing::warn!` 并把剩余条数写进日志——
+静默留下一条活旁支是这个功能最不该有的失败模式。
 
 **必须发布 `side/closed`**：它是终态，客户端靠它丢弃该 generation 的本地内容。
 不发布会让前端停在一条永远不会更新的视图上。
+
+**关闭失败不阻断**：某条 `runner.close()` 返回 `Err` 时记日志并继续关其余，
+registry 保持可用。`close_all` 自身返回 `()`，不返回 Result——调用方是后台
+任务，没有可用的补救动作。
 
 ### 3.5 TUI
 
@@ -171,12 +211,42 @@ pub async fn close_all(&self) { ... }
 （`hidden_commands_report_a_reason_not_unknown`：已知但未接线的命令要报明原因，
 不能报「未知命令」——那会把「本版本没有」误报成「你打错了」）。
 
-因此需要改的是**帮助与补全**，让 `/side` 不再出现在本版本不可用的目录里：
+因此需要改的是**帮助与补全**，让 `/side` 不再出现在本版本不可用的目录里。
 
-- `help_text(None)` 的「旁问」段：flag 关时不输出整段（否则用户看到一个永远
-  报错的命令）；
-- `help_text(Some("side" | "btw" | "back" | "side-close"))`：仍能查到，但说明里
-  追加一行「本版本未启用旁问」。
+这里有个必须先解决的测试装配问题：`help_text` 是纯函数（无参数、不读能力位），
+若它直接调 `yi_agent_flags::is_enabled`，则 `yi-agent` crate 的 lib 测试
+（`cargo test -p yi-agent --lib`）里 build_kind 恒为 `release`，`help_text` 会
+永远走「未启用」分支，**现有 5 条帮助测试立刻变红**（
+`full_help_lists_side_commands_once_without_the_alias`、
+`contextual_help_resolves_side_commands_but_not_the_alias_entry` 等）。
+
+解法：给 `help_text` 加一个显式的能力参数，并把现有签名改成薄包装：
+
+```rust
+pub fn help_text(target: Option<&str>) -> String {
+    help_text_with(target, side_enabled())
+}
+pub fn help_text_with(target: Option<&str>, side_enabled: bool) -> String { ... }
+```
+
+- `side_enabled()` 是 `yi-agent` crate 内的私有函数，读
+  `yi_agent_flags::is_enabled(registry::SIDE_CONVERSATION_FLAG)`。
+- 现有调用点（`app.rs:4689` 的 `SlashCommand::Help`）与现有测试**全部不改**，
+  因为它们走的是薄包装。生产环境里 `main` 已注入真实 build_kind，行为正确。
+- 新增的开关测试直接调 `help_text_with`，不依赖全局状态——这样它既能测「关」
+  也能测「开」，且不受 `release` 的硬闸影响。
+
+改动点：
+- 目录（`help_text_with(None, false)`）：不输出整个「旁问」段，否则用户看到
+  一个永远报错的命令。
+- 上下文帮助（`help_text_with(Some("side" | "btw" | "back" | "side-close"), false)`）：
+  仍能查到，但说明后追加一行「本版本未启用旁问」。
+- **主视图补全面板**：`PopupScope::Main` 用的是
+  `SlashCommand::completable()`（`slash.rs:203`）——那是 `SlashCommand` 的静态
+  缓存，而 `/side`、`/back`、`/side-close` **不是** `SlashCommand` 变体（它们
+  在 `handle_key` 之前就被拦截了），所以补全面板里本来就没有它们。
+  **确认无需改动**。这条写在这里是为了避免实施时误以为要动 `completable()`：
+  动它会破坏 `OnceLock` 的静态缓存语义（每按键重算）。
 
 `classify_conversation_input` **不改**：它已经是纯函数且不知道能力位，改动它会
 破坏 §4.1 的既有分类契约。判定留在调用方（`side_capable`），这是仓库现有的分层。
@@ -194,11 +264,16 @@ pub async fn close_all(&self) { ... }
 新增：若 `side_conversation` 变 `false`，对**本地槽位**的 binding 直接
 `dropHost`，把旁支视图一起清掉。
 
-- 只处理本地槽位：远端项目的 side flag 由那台机器的 `initialize` 决定，本机拨
-  开关不该影响远端（沿用 spec 2026-11-03 §5.2 的口径）。
+- 只处理本地槽位（`LOCAL_SLOT === "local"`，`desktop/src/lib/slots.ts:11`）：远端
+  项目的 side flag 由那台机器的 `initialize` 决定，本机拨开关不该影响远端（沿用
+  spec 2026-11-03 §5.2 的口径）。`sideStoreRef.current.bindingsForSlot(LOCAL_SLOT)`
+  就能拿到要清的绑定，不需要新增查询接口。
 - 不清会怎样：宿主已经把旁支都关了，界面却还挂着一个点不动、永远
   `side_not_found` 的视图。这正是 `remote_ssh` 关掉时 `removeRemotes()` 要解决
   的同一类问题。
+- **旁支视图正在前台时必须先返回主会话**，否则用户会盯着一个已销毁的视图。
+  `remote_ssh` 那段已经示范了同一手法（活动槽位是远端时回退）。这里对应的是
+  「当前视图是旁支」：先 `selectMain`，再 `dropHost`。
 
 ## 4. 数据流
 
@@ -249,6 +324,9 @@ pub async fn close_all(&self) { ... }
 - flag 开：既有 side 测试**不改**即全绿（证明没有回归）
 - `close_all` 后能再次 `open` 成功；`shutdown()` 后不能（两条测试并列，
   后者是既有语义的保护，防止有人图省事把两者合并）
+- `close_all` 与并发 `open` 竞争后 `side_count() == 0`（epoch 护栏的鉴别测试，
+  去掉护栏即间歇失败）
+- `close_all` 保留 `ParentSlot::Creating`：在途创建落定后不会留下活旁支
 
 **TUI**
 - flag 关：`help_text(None)` 不含 `/side` / `/btw` / `/back` / `/side-close`
