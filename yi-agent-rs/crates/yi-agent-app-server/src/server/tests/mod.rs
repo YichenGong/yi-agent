@@ -772,6 +772,86 @@ impl Harness {
         )
     }
 
+    /// 旁问开关按值注入。scope 固定 `Admin`。
+    ///
+    /// 走注入而不是写 `flags.json`：后者要求 build kind 为 `dev` 且共享进程级
+    /// `YI_AGENT_HOME`，并行测试必然互相污染（同 `with_lead_flag` 的理由）。
+    ///
+    /// 不传注册表（`None`）：`serve()` 会按实例家目录自建一份，与既有
+    /// `with_scope` 同一形状。需要注入注册表的用例走下面那个构造器。
+    #[allow(dead_code)]
+    pub(crate) async fn with_side_flag(enabled: bool) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman_in(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            Scope::Admin,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            None,
+            None,
+            None,
+            Arc::new(move || enabled),
+        )
+    }
+
+    /// 三个维度都可指定：scope、注册表、旁问开关。
+    ///
+    /// `side/*` 的闸门测试要同时钉「权限档不构成回答」与「关掉时方法不存在」，
+    /// 必须能同时控制前两者。
+    pub(crate) async fn with_scope_side_flag_and_registry(
+        scope: Scope,
+        registry: Arc<crate::side_conversation::SideRegistry>,
+        side_enabled: bool,
+    ) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman_in(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            scope,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            Some(registry),
+            None,
+            None,
+            Arc::new(move || side_enabled),
+        )
+    }
+
     pub(crate) async fn with_cfg_and_lead(cfg: RuntimeConfig, enabled: bool) -> Self {
         Self::with_config_lead_and_scope(
             cfg,
