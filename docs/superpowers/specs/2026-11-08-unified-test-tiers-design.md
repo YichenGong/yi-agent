@@ -60,8 +60,8 @@ fixture，nextest 的进程模型下 `--exact` 行为不同」。
 
 **病因 5：有两个 live 测试二进制没有任何入口覆盖。**
 
-`crates/yi-agent/tests/model_catalog_live_reload_e2e.rs` 有 2 个 `#[ignore]` 的
-live 测试，`justfile` 里没有任何 recipe 指向它。它会静默地永远不跑。
+`crates/yi-agent/tests/model_catalog_live_reload_e2e.rs` 有 1 个 `#[ignore]` 的
+live 测试，`justfile` 里没有任何指向它的 recipe。它会静默地永远不跑。
 
 **病因 6：命名冲突。**
 
@@ -170,11 +170,12 @@ live 测试，`justfile` 里没有任何 recipe 指向它。它会静默地永�
 - *保留 `cargo test --test-threads=3`*：零风险，但两个 runner 并存，超时语义不一致。
 - *迁移但保持串行*：放弃已确认可行的并发收益（90s → 38s）。
 
-### D4：live 需要独立的超时预算
+### D4：live 需要独立 profile（不是可选优化，是必需）
 
-**决策**：为 live 增加独立 profile，`slow-timeout = { period = 300s, terminate-after = 2 }`。
+**决策**：新增 `[profile.live]`，`inherits = "default"`，但**用不同的
+`default-filter`**，并配 `slow-timeout = { period = "300s", terminate-after = 2 }`。
 
-**理由**：这是 D3 引入的**必须修**的新问题。现状 `[profile.default]` 是
+**理由一：超时预算。** 这是 D3 引入的**必须修**的问题。现状 `[profile.default]` 是
 `slow-timeout = { period = 60s, terminate-after = 3 }`，即 **180 秒终止**。而 live
 测试自身预算是 **300 秒**：
 
@@ -188,19 +189,29 @@ live 测试，`justfile` 里没有任何 recipe 指向它。它会静默地永�
 若不抬预算，300 秒预算的合法测试会在 180 秒被 nextest 杀掉，报一个看似「不稳定」
 的假红。
 
-**数值推导**：`period = 300s, terminate-after = 2` → 累计 600 秒终止，是 300 秒
-自身预算的 2 倍，留足余量；第 1 个周期只标 SLOW，不会误杀。
+**理由二：`default-filter` 必须按照 profile 分开（决定性原因）。**
+R1 要求在 default profile 里排除 live 测试，防止 `--run-ignored all` 误拉起。
+但实测发现：**`default-filter` 会让 `test-live` 自己也取不到测试**。
+一旦 default profile 排除了 live，`--run-ignored only` 和 `-E` 都无法找回它们
+（实测均为 0 个）。所以必须有一个不排除 live 的 profile 供 `test-live` 使用。
 
-**实测确认（2026-11-08，nextest 0.9.150）**：`slow-timeout` **可以**写在
-`[[profile.default.overrides]]` 里，无需独立 profile。但格式必须带单位：
+即：**独立 profile 不是风格选择，是两个需求（防误跑 + 能主动跑）的唯一共存方式。**
+
+**实测确认（2026-11-08，nextest 0.9.150）**：
+
+| 配置 | `--run-ignored only` 下的测试数 | 判定 |
+|---|---|---|
+| default profile 排除 live | **0** | `test-live` 失效 |
+| default profile 排除 + `-E 'test(/^real_/)'` | **0** | 覆盖不了 |
+| 独立 `[profile.live]` 不排除 | **18**（6+5+4+2+1） | 正确 |
+
+**`slow-timeout` 的格式**（实测）：`terminate-after` 是整数（周期数），`period`
+必须带单位的字符串。写错在解析阶段直接失败，不会静默降级——这点是安全的。
 
 ```toml
 slow-timeout = { period = "300s", terminate-after = 2 }   # 正确
 slow-timeout = { period = 300, terminate-after = 2 }      # 报错：expected a duration
 ```
-
-`terminate-after` 是整数（周期数），`period` 是字符串（带时长单位）。两者格式不同，
-写错会在解析阶段直接失败而非静默降级——这点是安全的。
 
 ### D5：统一 key 检查，消除三套逻辑
 
@@ -255,7 +266,7 @@ L3  workspace    全量
 | 命令 | 范围 | 保真度 | 用途 | 实测/预期耗时 |
 |---|---|---|---|---|
 | `just check-fast` | L0 | — | 改完看能否编过 | 分钟级（编译为主） |
-| `just test-crate <c>` | L1 | mock+proc | 只改了一个 crate | 约 37 秒（supervisors 451 个） |
+| `just test-crate <c>` | L1 | mock+proc | 只改了一个 crate | 约 37 秒（supervisors 514 个） |
 | `just test-affected` | L2 | mock+proc | 改了几处，想知道牵动谁 | 视闭包大小 |
 | `just test` | L3 | mock+proc | 收尾 / 合并前 | 约 821 秒 |
 | `just test-live [suite]` | — | live | 主动验证真实 API | 分钟级，花钱 |
@@ -266,39 +277,66 @@ L3  workspace    全量
 
 | suite | 目标二进制 | `#[ignore]` 数 | 现有覆盖 |
 |---|---|---|---|
-| `llm` | `yi-agent-llm/tests/real_integration.rs` | 7 | `test-real-llm` |
-| `e2e` | `yi-agent/tests/e2e_real.rs` | 6 | `test-real-e2e` |
-| `complex` | `yi-agent/tests/e2e_complex.rs` | 5 | `test-real-complex` |
+| `llm` | `yi-agent-llm/tests/real_integration.rs` | 6 | `test-real-llm` |
+| `e2e` | `yi-agent/tests/e2e_real.rs` | 5 | `test-real-e2e` |
+| `complex` | `yi-agent/tests/e2e_complex.rs` | 4 | `test-real-complex` |
 | `subagent` | `yi-agent/tests/subagent_real_e2e.rs` | 2 | `test-real-subagent` |
-| `catalog` | `yi-agent/tests/model_catalog_live_reload_e2e.rs` | 2 | **无（病因 5）** |
-| （无参数） | 以上全部 | 22 | `test-real-all` |
+| `catalog` | `yi-agent/tests/model_catalog_live_reload_e2e.rs` | 1 | **无（病因 5）** |
+| （无参数） | 以上全部 | 18 | `test-real-all` |
 
 ### nextest 配置
 
+两个 profile 的关键差异在 `default-filter`：
+
 ```toml
-# live：真实 LLM API。并发 3（已实测安全），超时抬到 600s。
+# ---- default profile：排除 live，防止 --run-ignored all 误跑真实 API ----
+[profile.default]
+default-filter = """
+not test(runtime_process_helper)
+and not (binary_id(yi-agent-llm::real_integration) and test(/^real_(anthropic|openai)_/))
+and not (binary_id(yi-agent::e2e_real) and test(/^e2e_/))
+and not (binary_id(yi-agent::e2e_complex) and test(/^complex_/))
+and not (binary_id(yi-agent::subagent_real_e2e) and test(/^real_subagent_/))
+and not (binary_id(yi-agent::model_catalog_live_reload_e2e) and test(/^changing_models_json_/))
+"""
+slow-timeout = { period = "60s", terminate-after = 3 }
+fail-fast = false
+
+# ---- live profile：**不**排除 live 测试，并发 3，超时 600s ----
+[profile.live]
+inherits = "default"
+default-filter = "not test(runtime_process_helper)"
+
 [test-groups.live-api]
 max-threads = 3
 
-[[profile.default.overrides]]
+[[profile.live.overrides]]
 filter = 'binary_id(yi-agent-llm::real_integration) + binary_id(yi-agent::e2e_real) + binary_id(yi-agent::e2e_complex) + binary_id(yi-agent::subagent_real_e2e) + binary_id(yi-agent::model_catalog_live_reload_e2e)'
 test-group = 'live-api'
 slow-timeout = { period = "300s", terminate-after = 2 }
 ```
 
-注：`overrides` 支持 `slow-timeout` 已实测确认（nextest 0.9.150），无需独立 profile。
-`period` 必须带单位字符串，`terminate-after` 为整数周期数。
+**为什么五条排除项的前缀各不相同**：live 测试的命名不统一（`real_anthropic_` /
+`e2e_` / `complex_` / `real_subagent_` / `changing_models_json_`）。实测用统一的
+`not test(/^real_/)` 只挡住了 `real_integration` 一个二进制，
+`--run-ignored all` 从 33 只降到 25 而非 15。加上 `binary_id` 限定后，
+五个二进制分别剩 `0 / 3 / 3 / 6 / 3` = 15，各二进制的正常测试一个不少。
+
+**必须写的两个值**：`[profile.live]` 这个 profile 名（`just test-live` 用
+`--profile live` 选择），以及 `default-filter` 的覆盖（否则继承 default 的排除项，
+test-live 会拿到 0 个测试）。
 
 ### 数据流（`test-live`）
 
 ```
 just test-live [suite]
   └─> 统一前置检查（key 并集；无 key 则打印 SKIPPED 并 exit 0）
-      └─> cargo nextest run --all-features \
-            --run-ignored only \
-            --profile live \            # 或 default + overrides
+      └─> cargo nextest run --all-features --profile live --run-ignored only \
             -p <crate> --test <binary>
 ```
+
+`--profile live` 是**必需的**，不是可选：default profile 的 `default-filter` 会排除
+live 测试，只有在 live profile 下 `--run-ignored only` 才能拿到它们（实测 18 个）。
 
 ### 错误处理
 
@@ -320,9 +358,16 @@ just test-live [suite]
    这条断言防的是病因 5（`model_catalog_live_reload_e2e` 无人覆盖）。
 3. **nextest 能跑 proc 测试**：`runtime-lifecycle-check` 的 263 个测试在 nextest 下
    全绿（已实测），删除 CI 重复步骤前必须再确认一次。
-4. **超时不误杀**：live profile 的 `slow-timeout` 累计值必须 > 300s（最长自身预算）。
-   可以写一条断言读取配置并比较，纳入 `just affected-check` 同类自测。
-5. **并发 3 的配置生效**：断言 `test-groups.live-api` 的 `max-threads == 3`。
+4. **超时不误杀**：`[profile.live]` 的 `slow-timeout` 累计值必须 > 300s（最长自身
+   预算）。可写一条断言读取配置并比较，纳入 `just affected-check` 同类自测。
+5. **并发 3 的配置生效**：断言 `[test-groups.live-api]` 的 `max-threads == 3`。
+6. **default profile 排除 live**：`cargo nextest list --all-features --workspace`
+   在 default profile 下不得包含任何 live 测试名。
+7. **live profile 能取到 live**：`cargo nextest list --all-features --profile live
+   --run-ignored only` 对 5 个二进制合计 18 个。**这条防的是 D4 理由二的陷阱**——
+   配置写错时 live profile 会静默继承 default 的排除项，返回 0。
+8. **排除项不误伤**：default profile 的测试总数在加排除前后差值必须为 0
+   （因为 live 默认本就不跑），而 `--run-ignored all` 下必须比未加排除时少正好 18 个。
 
 ## 风险
 
@@ -333,9 +378,74 @@ live 测试。它们靠 `#[ignore]` 默认不跑。若有人输入 `--run-ignore
 「为什么某个测试从没跑过」时最容易输入的命令），live 测试会被拉起并产生真实 API
 调用与费用。
 
-**缓解**：在 `nextest.toml` 的 `default-filter` 中加入排除项，把这 5 个二进制的
-ignored 测试显式排除。这与既有的 `runtime_process_helper` 排除是同一思路——
-**用 filter 而不是靠约定**。
+**缓解**：在 `nextest.toml` 的 `default-filter` 中加入按**测试名前缀**的排除项。
+
+**关键约束：必须按测试名排除，不能按 binary_id 排除。** 实测各 live 二进制里还有
+正常（非 `#[ignore]`）测试，按二进制整体排除会造成真实漏测：
+
+| 二进制 | normal（默认跑） | ignored（live） |
+|---|---|---|
+| `yi-agent-llm::real_integration` | 0 | 6 |
+| `yi-agent::e2e_real` | 3 | 5 |
+| `yi-agent::e2e_complex` | 3 | 4 |
+| `yi-agent::subagent_real_e2e` | **6** | 2 |
+| `yi-agent::model_catalog_live_reload_e2e` | **3** | 1 |
+
+若把 `subagent_real_e2e` 整个排除，会连带丢掉它的 6 个正常测试（3 个 `common::tests`
+helper + 3 个 git repo fixture）。
+
+**可行的写法**（已实测，2026-11-08 / nextest 0.9.150）：必须按**每个二进制各自的
+测试名前缀**排除，因为 live 测试的命名前缀并不统一：
+
+| 二进制 | live 测试名前缀 | 数量 | 该二进制的正常测试 |
+|---|---|---|---|
+| `yi-agent-llm::real_integration` | `real_anthropic_` / `real_openai_` | 6 | 0 |
+| `yi-agent::e2e_real` | `e2e_` | 5 | 3 |
+| `yi-agent::e2e_complex` | `complex_` | 4 | 3 |
+| `yi-agent::subagent_real_e2e` | `real_subagent_` | 2 | 6 |
+| `yi-agent::model_catalog_live_reload_e2e` | `changing_models_json_` | 1 | 3 |
+
+**关键陷阱**：一开始想用统一的 `not test(/^real_/)`，实测发现它只挡住
+`real_integration` 一个二进制。因为 `e2e_`、`complex_`、`changing_models_json_`
+开头的测试根本不以 `real_` 开头。测量结果：加了 `^real_` 排除后
+`--run-ignored all` 从 33 只降到 25，而不是期望的 15。
+
+正确写法（五个二进制各用各自的前缀）：
+
+```toml
+default-filter = """
+not test(runtime_process_helper)
+and not (binary_id(yi-agent-llm::real_integration) and test(/^real_(anthropic|openai)_/))
+and not (binary_id(yi-agent::e2e_real) and test(/^e2e_/))
+and not (binary_id(yi-agent::e2e_complex) and test(/^complex_/))
+and not (binary_id(yi-agent::subagent_real_e2e) and test(/^real_subagent_/))
+and not (binary_id(yi-agent::model_catalog_live_reload_e2e) and test(/^changing_models_json_/))
+"""
+```
+
+验证结果（`--run-ignored all`，五个二进制）：`0 / 3 / 3 / 6 / 3` = **15**，
+即 33 − 18。18 个 live 全部挡住，各二进制的正常测试一个不少。
+
+同理，单纯 `not test(/^real_/)` 不加 `binary_id` 时也会误伤非 live 二进制里的
+`real_` 开头正常测试（`yi-agent-runtime`、`yi-agent::eval_baseline`、
+`frontend_runtime_lease`、`managed_production_integration` 等），所以 `binary_id`
+限定是必需的。
+
+**注意 filter 的作用域**：`default-filter` 影响所有 profile。实施时必须跑一次全量
+`nextest list` 对比该 filter 前后的数量差，差值必须正好等于 live 测试数（当前 18）。
+
+**同时必须做的事（实测教训）**：一旦 default profile 排除 live，`test-live` 用
+`--run-ignored only` 也会拿到 **0 个**测试（`-E` 也覆盖不了）。所以 R1 的缓解措施
+与 `test-live` 必须**同时**落地：`[profile.live]` 覆盖 `default-filter` 为只排除
+`runtime_process_helper`。两者缺一不可，见 D4。
+
+**验证数据（2026-11-08）**：
+
+| 配置 | `--run-ignored all` 下的 live 数 | `--run-ignored only`（live profile）|
+|---|---|---|
+| 无排除 | 18（危险：会真实调用 API） | 18 |
+| 有排除 + 无 live profile | 0（挡住了）| **0（test-live 失效）** |
+| 有排除 + live profile | 0（挡住）| **18（正确）** |
 
 ### R2：live 测试的结果依赖外部服务
 
@@ -366,20 +476,26 @@ ignored 测试显式排除。这与既有的 `runtime_process_helper` 排除是�
 
 必须按此顺序，因为后者依赖前者的验证结果：
 
-1. ~~验证 nextest 能否在 override 中设置 `slow-timeout`~~ — **已实测完成（见 D4）**：
-   可以，`period` 需带单位字符串。
-2. 新增 `[test-groups.live-api]` 与超时配置（R1 的 `default-filter` 排除项一并加）。
-3. 新增 `just test-live [suite]`，内含统一 key 检查。
-4. 删除 4 个 `test-real-*` recipe（`test-real-all` 由 `just test-live` 无参替代）。
-5. 删除 CI macos job 的重复步骤 + 修正错误注释。
-6. 更新 `CLAUDE.md`：合并两个轴，消除命名冲突。
-7. 更新 `docs/project-management/tooling.md`。
+1. ~~验证 nextest 能否在 override 中设置 `slow-timeout`~~ — **已实测完成（见 D4）**。
+2. ~~验证 R1 的 filter 能否与 `test-live` 共存~~ — **已实测完成**：不能，必须配
+   `[profile.live]`（见 D4 理由二）。
+3. 修改 `.config/nextest.toml`：default profile 加 live 排除项 + 新增 `[profile.live]`
+   + `[test-groups.live-api]`。
+4. 新增 `just test-live [suite]`，内含统一 key 检查。
+5. 删除 4 个 `test-real-*` recipe（`test-real-all` 由 `just test-live` 无参替代）。
+6. 删除 CI macos job 的重复步骤 + 修正错误注释。
+7. 更新 `CLAUDE.md`：合并两个轴，消除命名冲突。
+8. 更新 `docs/project-management/tooling.md`。
 
 ## 验收
 
 - [ ] `just test-live` 无 key 时每个 suite 都打印 `SKIPPED` 并 `exit 0`
 - [ ] `just test-live llm` 在有 key 时真实执行
 - [ ] 上表 5 个 live 二进制全部被某个 suite 覆盖（含 `catalog`）
+- [ ] `cargo nextest list --profile live --run-ignored only` 对 5 个二进制合计 18 个
+- [ ] `cargo nextest list --workspace` 在 default profile 下不含任何 live 测试
+- [ ] `--run-ignored all` 下 live 测试被挡住（不再产生真实 API 调用）
+- [ ] default profile 加排除前后测试总数差值为 0（不误伤正常测试）
 - [ ] `just runtime-lifecycle-check` 与 nextest 跑同一批 263 个测试结果一致
 - [ ] CI macOS job 中 263 个测试只跑一遍
 - [ ] `CLAUDE.md` 里只有一个「分级」概念，无两个同名章节
