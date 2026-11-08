@@ -237,8 +237,24 @@ impl SlashCommand {
     }
 }
 
-/// Render the same command catalog used by slash completion and dispatch.
+/// 生产入口：按本进程的开关值渲染帮助。
 pub fn help_text(target: Option<&str>) -> String {
+    help_text_with(target, side_enabled())
+}
+
+/// 本进程是否启用旁问。
+///
+/// `main` 启动时已经注入了真实 build kind，所以 release 里恒假——硬闸也覆盖
+/// `/help`，不会出现「帮助说能用、敲了没用」。
+fn side_enabled() -> bool {
+    yi_agent_flags::is_enabled(yi_agent_flags::registry::SIDE_CONVERSATION_FLAG)
+}
+
+/// Render the same command catalog used by slash completion and dispatch.
+///
+/// `side_enabled` 显式传入而不是内部读全局：`help_text` 是纯函数，
+/// lib 测试里 build kind 恒为 `release`，内部读会让「开启」这一侧永远测不到。
+pub fn help_text_with(target: Option<&str>, side_enabled: bool) -> String {
     match target
         .map(|name| name.trim_start_matches('/'))
         .filter(|name| !name.is_empty())
@@ -264,7 +280,16 @@ pub fn help_text(target: Option<&str>) -> String {
                 // 旁支命令不是 `SlashCommand`:它们在 `handle_key` 之前就被
                 // 拦截了（否则运行中敲 `/side` 会先打断父会话）。但 `/help`
                 // 必须能查到它们，否则用户只能靠猜。
-                Some((usage, description)) => format!("/{usage}\n{description}"),
+                Some((usage, description)) => {
+                    if side_enabled {
+                        format!("/{usage}\n{description}")
+                    } else {
+                        // 用户可能从旧文档或别人那里得知 /side：查它要给出
+                        // 「本版本没有」而不是「未知命令」——后者会把
+                        // 「功能不存在」误报成「你打错了」。
+                        format!("/{usage}\n{description}\n（本版本未启用旁问）")
+                    }
+                }
                 None => format!("未知命令: /{name}\n使用 /help 查看可用命令。"),
             },
         },
@@ -282,9 +307,11 @@ pub fn help_text(target: Option<&str>) -> String {
                     command.description()
                 ));
             }
-            text.push_str("\n旁问:\n");
-            for (usage, description) in super::side::SIDE_HELP_ENTRIES {
-                text.push_str(&format!("  /{usage} {description}\n"));
+            if side_enabled {
+                text.push_str("\n旁问:\n");
+                for (usage, description) in super::side::SIDE_HELP_ENTRIES {
+                    text.push_str(&format!("  /{usage} {description}\n"));
+                }
             }
             text
         }
@@ -1376,7 +1403,8 @@ mod tests {
 
     #[test]
     fn full_help_lists_side_commands_once_without_the_alias() {
-        let help = help_text(None);
+        // 显式开：lib 测试的 build kind 是 release，`help_text` 里会判成关。
+        let help = help_text_with(None, true);
         assert!(help.contains("/side [问题]"), "目录必须列出 /side：{help}");
         assert!(help.contains("/back"), "目录必须列出 /back：{help}");
         assert!(
@@ -1396,12 +1424,42 @@ mod tests {
 
     #[test]
     fn contextual_help_resolves_side_commands_but_not_the_alias_entry() {
-        assert!(help_text(Some("side")).contains("/side [问题]"));
-        assert!(help_text(Some("back")).contains("返回主会话"));
-        assert!(help_text(Some("side-close")).contains("关闭当前旁问"));
+        // 显式开：lib 测试的 build kind 是 release。
+        assert!(help_text_with(Some("side"), true).contains("/side [问题]"));
+        assert!(help_text_with(Some("back"), true).contains("返回主会话"));
+        assert!(help_text_with(Some("side-close"), true).contains("关闭当前旁问"));
         // `/btw` 是别名：查它应给出 /side 的说明，而不是「未知命令」。
-        let btw = help_text(Some("btw"));
+        let btw = help_text_with(Some("btw"), true);
         assert!(btw.contains("/side [问题]"), "{btw}");
+    }
+
+    #[test]
+    fn help_omits_the_side_section_when_the_flag_is_off() {
+        let help = help_text_with(None, false);
+        for absent in ["/side", "/btw", "/back", "/side-close"] {
+            assert!(
+                !help.contains(absent),
+                "a disabled feature must not be listed as available: {absent} in {help}"
+            );
+        }
+        assert!(help.contains("/config"), "the rest of the catalog stays");
+    }
+
+    #[test]
+    fn contextual_help_still_explains_a_disabled_side_command() {
+        // 用户可能从旧文档或别人那里得知 /side。查它要给出「本版本没有」而不是
+        // 「未知命令」——后者会把「功能不存在」误报成「你打错了」。
+        let text = help_text_with(Some("side"), false);
+        assert!(text.contains("/side"), "{text}");
+        assert!(text.contains("本版本未启用"), "{text}");
+    }
+
+    #[test]
+    fn help_lists_side_commands_when_the_flag_is_on() {
+        let help = help_text_with(None, true);
+        assert!(help.contains("/side [问题]"), "{help}");
+        assert!(help.contains("/back"), "{help}");
+        assert!(help.contains("/side-close"), "{help}");
     }
 
     #[test]
