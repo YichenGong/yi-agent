@@ -389,16 +389,31 @@ pub(crate) async fn handle(
                 .await?;
                 return Ok(Flow::Continue);
             }
-            // compact 要调一次 provider 生成摘要,属于长请求;不设短超时。
-            let result = match reply_rx.await {
-                Ok(CompactOutcome::Compacted) => json!({"status": "compacted"}),
-                Ok(CompactOutcome::NotReduced) => json!({"status": "not_reduced"}),
-                Ok(CompactOutcome::Failed(message)) => {
-                    json!({"status": "failed", "error": message})
+            // 这段 `await` 会等到 provider 把摘要生成完(线上可达十几秒),**不能**
+            // 留在主循环里:主循环是单 task,内联 await 会把之后到达的所有请求
+            // (包括其它会话的 turn/start、thread/resume)一起串行排在后面——用户
+            // 看到的就是「一个会话 /compact,所有会话的 Send 都点不动」。这里只
+            // 把等待 detach 出去,与 `Domain::Plugin` 同一条纪律。
+            let hub = std::sync::Arc::clone(state.hub);
+            let client = state.client.clone();
+            let tid = thread_id.clone();
+            tokio::spawn(async move {
+                // compact 要调一次 provider 生成摘要,属于长请求;不设短超时。
+                let result = match reply_rx.await {
+                    Ok(CompactOutcome::Compacted) => json!({"status": "compacted"}),
+                    Ok(CompactOutcome::NotReduced) => json!({"status": "not_reduced"}),
+                    Ok(CompactOutcome::Failed(message)) => {
+                        json!({"status": "failed", "error": message})
+                    }
+                    Err(_) => json!({"status": "failed", "error": "thread driver dropped"}),
+                };
+                // 回包失败只影响这一次请求(那条连接自己的问题):这里没有主循环
+                // 的 `?` 可传播,写不进就记一行,别让 detached task 掀翻进程。
+                if let Err(error) = write_response(&hub, &client, ok_response(id, result)).await {
+                    tracing::debug!(%error, thread_id = %tid, "compact response write failed");
                 }
-                Err(_) => json!({"status": "failed", "error": "thread driver dropped"}),
-            };
-            write_response(state.hub, state.client, ok_response(id, result)).await?;
+            });
+            return Ok(Flow::Continue);
         }
         _ => return Ok(Flow::Unknown),
     }
