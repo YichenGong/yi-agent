@@ -4891,9 +4891,18 @@ fn daemon_status_at(socket: &std::path::Path) -> Result<String, String> {
     match response {
         yi_agent_store::ipc::IpcResponse::Status {
             high_water_event_id,
-        } => Ok(format!(
-            "daemon 运行中（event high-water: {high_water_event_id}）"
-        )),
+            live_apply_version,
+        } => {
+            // 「运行中」回答不了「改完设置是否立刻生效」——那正是用户会来问的
+            // 那一半。旧 daemon 不是错误，但不能被描述成会热加载。
+            let live = match live_apply_version {
+                Some(version) => format!("设置热生效: 支持（版本 {version}）"),
+                None => "设置热生效: 不支持（旧 daemon，只影响尚未开始的工作）".to_string(),
+            };
+            Ok(format!(
+                "daemon 运行中（event high-water: {high_water_event_id}）；{live}"
+            ))
+        }
         yi_agent_store::ipc::IpcResponse::Error { code, message } => {
             Err(format!("daemon 拒绝请求: {code:?} {message:?}"))
         }

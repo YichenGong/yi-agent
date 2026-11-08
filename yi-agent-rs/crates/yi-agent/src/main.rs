@@ -324,9 +324,20 @@ fn run_flags(action: &FlagsAction) -> Result<()> {
 /// does, then hands the inherited descriptor to the executor. No public RPC is
 /// involved, so a local process cannot ask this binary to execute anything.
 fn run_internal_executor(owner: String, models: Option<std::path::PathBuf>) -> Result<()> {
+    // Authorization first, and *before* any configuration read. Taking the
+    // descriptor later would mean a hand-started process had already resolved
+    // this machine's provider and credentials before being refused -- and the
+    // refusal is the actual security boundary, not a courtesy check.
+    let control = managed_runtime::take_executor_control()?;
     let overrides = yi_agent_runtime::config::ConfigOverrides::default();
-    let config = yi_agent_runtime::config::RuntimeConfig::load_lenient(&overrides)?;
-    managed_runtime::run_executor(owner, models, config)
+    // This process resolves its own settings source: the daemon that spawned us
+    // may have different overrides or environment, and a shared file path does
+    // not make those shared. Only this process's fixed sources apply here.
+    let (config, binding) = yi_agent_runtime::config::RuntimeConfig::load_lenient_with_binding(
+        &overrides,
+        &yi_agent_runtime::settings::settings_path(),
+    )?;
+    managed_runtime::run_executor_with_control(control, owner, models, config, Some(binding))
 }
 
 /// Serves one runtime as its guardian, resolving the scope from the environment.
@@ -1032,7 +1043,21 @@ fn control_daemon_client(action: DaemonAction, runtime: &std::path::Path) -> Res
     match response {
         yi_agent_store::ipc::IpcResponse::Status {
             high_water_event_id,
-        } => println!("daemon running (event high-water: {high_water_event_id})"),
+            live_apply_version,
+        } => {
+            // Saying "running" alone hides the thing the user actually asked
+            // about: whether a settings save reaches work already in flight. An
+            // old daemon is not an error, but it must not be described as if it
+            // hot-reloads.
+            println!("daemon running (event high-water: {high_water_event_id})");
+            match live_apply_version {
+                Some(version) => println!("live settings apply: supported (version {version})"),
+                None => println!(
+                    "live settings apply: unsupported -- this daemon applies a save only to \
+                     work that has not started yet; restart it to pick up settings immediately"
+                ),
+            }
+        }
         yi_agent_store::ipc::IpcResponse::Stopping => println!("daemon stopping"),
         yi_agent_store::ipc::IpcResponse::UnsupportedProtocol { .. } => {
             anyhow::bail!("runtime daemon protocol is incompatible")

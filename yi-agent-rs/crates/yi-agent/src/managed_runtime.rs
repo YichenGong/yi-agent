@@ -16,25 +16,50 @@ use std::path::PathBuf;
 
 use yi_agent_subagent::executor::serve::{EXECUTOR_FD_ENV, serve_executor};
 
-/// Runs one client's executor until the daemon closes its control channel.
+/// Takes the inherited control descriptor, closing it on any later error.
 ///
-/// `owner` comes from the daemon's spawn command line; the descriptor comes from
-/// the same spawn. Neither is derived from anything a process could talk its way
-/// into: a wrong owner is refused by the executor itself against the descriptor's
-/// identity, and a missing descriptor is a hard error here.
-pub fn run_executor(
+/// Separate from [`run_executor_with_control`] so the production path can prove
+/// it refused an unauthorised start *before* reading configuration, creating a
+/// runtime socket directory, or building tools.
+pub fn take_executor_control() -> anyhow::Result<OwnedFd> {
+    Ok(inherited_descriptor()?)
+}
+
+/// Runs one executor on an already-taken control descriptor.
+///
+/// Taking an `OwnedFd` by value is the ordering guarantee, not a style choice:
+/// there is no way to reach this function without having authorised first, so a
+/// later refactor cannot accidentally load configuration (and thus this
+/// machine's credentials) before the refusal. The descriptor also closes on any
+/// error path below, which an `i32` would not.
+///
+/// The control channel carries work, never authority: the provider, the model
+/// and the credentials are decided here, from this machine's files. `binding`
+/// is this process's own settings source -- whatever the daemon that spawned us
+/// resolved is *not* inherited, because a shared settings path does not imply
+/// shared overrides or environment.
+pub fn run_executor_with_control(
+    control: OwnedFd,
     owner: String,
     config_path: Option<PathBuf>,
     invocation: yi_agent_runtime::config::RuntimeConfig,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> anyhow::Result<()> {
-    let control = inherited_descriptor()?;
-    // The factory is rebuilt *locally* from this machine's configuration. The
-    // control channel carries work, never authority to pick a provider, a model,
-    // or a credential.
     let models_path = config_path.unwrap_or_else(yi_agent_runtime::models::models_path);
     let runtime_socket = yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir);
-    let factory =
-        yi_agent_subagent::attach::worker_factory(&invocation, runtime_socket, &models_path)?;
+    // Hold the observation lease for as long as this executor runs: without it a
+    // settings save would only be seen when a worker happens to read on demand.
+    let _settings_lease = binding
+        .as_ref()
+        .map(|binding| binding.live.start_observing());
+    // `worker_factory_with_binding` consumes its argument, so hand it a clone and
+    // keep ours alive for the lease above.
+    let factory = yi_agent_subagent::attach::worker_factory_with_binding(
+        &invocation,
+        runtime_socket,
+        &models_path,
+        binding,
+    )?;
     // A managed executor always offers the gate: the daemon above it is the only
     // place a machine-wide limit can be enforced.
     serve_executor(control, owner, factory, true)?;

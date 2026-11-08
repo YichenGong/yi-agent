@@ -6,6 +6,21 @@ use super::*;
 /// reachable through `UnsupportedProtocol` rather than a bare parse failure.
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// The live-apply capability this daemon speaks, advertised on `Status`.
+///
+/// Absent (or not `1`) means "old daemon": it still answers every pre-existing
+/// command, but it does not re-read settings for work already in flight, so a
+/// save only reaches new work. Callers degrade to that promise instead of
+/// assuming a hot reload they will not get.
+///
+/// Deliberately **not** a `PROTOCOL_VERSION` bump. The field is additive and the
+/// response type has no `deny_unknown_fields`, so old clients parse new frames
+/// unchanged and new clients read old frames as `None` -- both directions are
+/// covered by tests. Bumping the wire version would instead make every older
+/// binary reject the daemon outright, which is not what "you may still use me,
+/// just without live apply" means.
+pub const LIVE_APPLY_VERSION: u8 = 1;
+
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 pub(crate) const MAX_PENDING_EVENT_FRAMES: usize = 1024;
@@ -321,6 +336,11 @@ impl SubscriptionFilters {
 pub enum IpcResponse {
     Status {
         high_water_event_id: i64,
+        /// `Some(1)` = this daemon applies settings to in-flight work.
+        ///
+        /// Omitted when unknown so an old client sees byte-identical frames.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_apply_version: Option<u8>,
     },
     Stopping,
     SessionCreated {

@@ -492,6 +492,47 @@ pub enum RuntimeProbe {
     Unknown,
 }
 
+/// What a daemon's `Status` frame says about live settings apply.
+///
+/// Separate from [`RuntimeProbe`] on purpose: "is the daemon usable" and "will
+/// my save reach work already in flight" are different questions with different
+/// consequences. An old daemon is perfectly usable -- it just only applies a
+/// save to work that has not started yet, and callers must say so rather than
+/// promise a hot reload they will not get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveApplyProbe {
+    /// The daemon reports a live-apply version this client understands.
+    Supported,
+    /// The daemon answered `Status` but did not advertise the capability.
+    Unsupported,
+    /// The daemon could not be asked (dead socket, error frame, no answer).
+    Unknown,
+}
+
+/// Asks a runtime socket whether it applies settings to in-flight work.
+///
+/// Uses the same read-only `Status` request as [`probe_runtime`], so it costs
+/// one round trip and has no side effects. A missing field is the normal case
+/// for an older daemon, not an error: the frame parses and the capability is
+/// simply absent.
+pub fn probe_live_apply(socket_path: &std::path::Path) -> LiveApplyProbe {
+    match send_request(socket_path, yi_agent_store::ipc::IpcRequest::Status) {
+        Ok(yi_agent_store::ipc::IpcResponse::Status {
+            live_apply_version, ..
+        }) => match live_apply_version {
+            Some(version) if version >= yi_agent_store::ipc::LIVE_APPLY_VERSION => {
+                LiveApplyProbe::Supported
+            }
+            // Present but older than what this client implements: the daemon
+            // speaks the feature, this binary does not know that dialect. Treat
+            // as unsupported rather than pretending to understand it.
+            Some(_) => LiveApplyProbe::Unsupported,
+            None => LiveApplyProbe::Unsupported,
+        },
+        Ok(_) | Err(_) => LiveApplyProbe::Unknown,
+    }
+}
+
 /// Probes a runtime socket with the cheapest read-only request a daemon serves.
 ///
 /// `Status` creates no session and writes no attachment, so probing is free of

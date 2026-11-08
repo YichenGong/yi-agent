@@ -1030,6 +1030,11 @@ pub(crate) fn respond(
             high_water_event_id: context.with_repository(|repository| {
                 repository.latest_event_id().map_err(IpcError::from)
             })?,
+            // This daemon refreshes its live-admission source and its workers'
+            // settings at each operation boundary (see `runtime.rs`), so it can
+            // honour "a save reaches in-flight work". Advertising it is what lets
+            // a client tell this apart from an older daemon that cannot.
+            live_apply_version: Some(crate::ipc::LIVE_APPLY_VERSION),
         }),
         IpcRequest::Stop => Ok(IpcResponse::Stopping),
         IpcRequest::CreateSession => {
