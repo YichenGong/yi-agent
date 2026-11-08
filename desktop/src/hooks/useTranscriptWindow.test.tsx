@@ -43,7 +43,15 @@ let currentFocus: FocusRequest | null = null;
 
 let externalBook: ReturnType<typeof createHeightBook> | null = null;
 
-function Harness({ itemCount, threadId }: { itemCount: number; threadId?: string }) {
+function Harness({
+  itemCount,
+  threadId,
+  anchorIds,
+}: {
+  itemCount: number;
+  threadId?: string;
+  anchorIds?: readonly string[];
+}) {
   // `book` 必须稳定：内联新建会让它每次渲染都是新对象，`merged`/`recompute`
   // 的身份随之改变，依赖它的 effect 就会每次渲染都重跑。
   const [book] = useState(() => externalBook ?? createHeightBook(40));
@@ -58,6 +66,7 @@ function Harness({ itemCount, threadId }: { itemCount: number; threadId?: string
     measure: measureStable,
     focus: currentFocus,
     book,
+    anchorIds,
   });
   last = state.window;
   requestFocus = state.requestFocus;
@@ -322,5 +331,45 @@ describe("useTranscriptWindow", () => {
     });
     await tick();
     expect(last.end - last.start).toBe(260);
+  });
+});
+
+describe("useTranscriptWindow: 视口落在未挂载区间", () => {
+  it("stalled 时按估算位置发一次 focus，而不是放弃", async () => {
+    // 场景：长会话里用户直接把滚动条拖到中段，视口落在**未挂载的 spacer** 里。
+    // 此刻 `measureTranscript` 的 `history` 为 null（没有任何历史行与视口相交），
+    // `estimateFocusIndex` 无从估算，旧实现只能 `stalled` —— 用户看到一片空白，
+    // 而且不滚动就不会有任何东西再来救（Spec §4.4 第 6 条）。
+    //
+    // 正确行为：用「当前 scrollTop 对应哪一条」的估算索引发**一次** focus，
+    // 把那一窗挂上来。
+    const book = createHeightBook();
+    // 每条 100px，3000 条；视口在 60_000px 处 ≈ 第 600 条。
+    for (let i = 0; i < 3000; i += 1) book.record(`m${i}`, 100);
+    externalBook = book;
+    render(<Harness itemCount={3000} anchorIds={Array.from({ length: 3000 }, (_, i) => `m${i}`)} />);
+    await tick();
+
+    // 视口在 spacer 里：没有任何行相交，history 为 null。
+    measure = () =>
+      ({
+        visible: null,
+        history: null,
+        tailVisible: false,
+        viewportTop: 60_000,
+        viewportBottom: 60_800,
+      }) as WindowMeasurement;
+
+    await act(async () => {
+      nudge();
+    });
+    await tick(6);
+
+    // 窗口必须被搬到估算位置附近（第 600 条左右），而不是停在尾部首屏。
+    const expected = 600;
+    expect(last.start).toBeLessThanOrEqual(expected);
+    expect(last.end).toBeGreaterThanOrEqual(expected);
+    // 不应报「无法显示」——那会让用户以为内容坏了。
+    expect(last.following).toBe(false);
   });
 });

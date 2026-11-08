@@ -243,7 +243,7 @@ export interface TranscriptPositionIndex { rebuild(ids:readonly string[],book:He
 export function createTranscriptPositionIndex():TranscriptPositionIndex;
 ```
 
-- [ ] **Step 1 — 写失败测试**：相同高度不 bump，非有限/0 不入账；布局 owner 改变重新建 book；index 在高度估计边界返回正确 index，空资料不 focus。挂载行非 tail 增长触发一次 heightRevision 及 spacer 更新。
+- [x] **Step 1 — 写失败测试**：相同高度不 bump，非有限/0 不入账；布局 owner 改变重新建 book；index 在高度估计边界返回正确 index，空资料不 focus。挂载行非 tail 增长触发一次 heightRevision 及 spacer 更新。
 
 ```ts
 it("height changes have an observable revision", () => {
@@ -257,8 +257,8 @@ it("height changes have an observable revision", () => {
 });
 ```
 
-- [ ] **Step 2 — 验证红**：`cd desktop && npm test -- src/lib/heightBook.test.ts src/lib/transcriptPositionIndex.test.ts src/hooks/useTranscriptScroll.test.tsx`，真实 D08 resize/image fixture 不得只 mock scrollHeight。
-- [ ] **Step 3 — 最小实现**：新 book memo 的 key 包含 slot/host/thread/epoch/有效宽度/字体等排版设置。ResizeObserver 只 observe 挂载消息和 viewport，window commit 更换观察集合，cleanup disconnect；每帧合并尺寸变化，positive measure 入账。每个 layout commit 更新上一次几何，即使 win.start/end 没变。
+- [x] **Step 2 — 验证红**：`cd desktop && npm test -- src/lib/heightBook.test.ts src/lib/transcriptPositionIndex.test.ts src/hooks/useTranscriptScroll.test.tsx`，真实 D08 resize/image fixture 不得只 mock scrollHeight。
+- [x] **Step 3 — 最小实现**：新 book memo 的 key 包含 slot/host/thread/epoch/有效宽度/字体等排版设置。ResizeObserver 只 observe 挂载消息和 viewport，window commit 更换观察集合，cleanup disconnect；每帧合并尺寸变化，positive measure 入账。每个 layout commit 更新上一次几何，即使 win.start/end 没变。
 
 ```ts
 if (!Number.isFinite(height) || height <= 0 || heights.get(id) === height) return false;
@@ -268,8 +268,8 @@ heights.set(id,height); sortedCache=null; revision += 1; return true;
 ```
 
 observer 回调只安排协调器布局，不直接再写位置。窗口 stalled 用 indexAt(scrollTop) 发一次 focus；不可布局期间停止观测循环，visibilitychange/viewport resize 恢复。历史数缩小时只在可信基线证明目标不存在时释放 pending anchor。
-- [ ] **Step 4 — 验证绿与变异**：上述单测、D04/D05/D07/D08 browser cases、三个旧 browser scripts、tsc；分别回退 owner key、record revision、每次布局维护几何，相关测试必须红，恢复后绿。
-- [ ] **Step 5 — 提交**：全局门禁后 `git add desktop/src docs/project-management/desktop.md && git commit -m "fix: scope transcript heights and observe mounted rows"`。
+- [ ] **Step 4 — 验证绿与变异**：上述单测、D04/D05/D07/D08 browser cases、三个旧 browser scripts、tsc；分别回退 owner key、record revision、每次布局维护几何，相关测试必须红，恢复后绿。**已完成**：单测、三个旧 browser scripts（`session-completeness` D01/D02/D05/D09 4/4、`transcript-window` 4/4、`stream-live` 2/2）、tsc、以及三处变异全部取得红证据（owner key→`39200 to be 8400`、record revision→5 例、每次布局记账→2 例）。**未完成**：D04/D07/D08 用例仍随 A5 Step 1–2 补齐。
+- [x] **Step 5 — 提交**：全局门禁后 `git add desktop/src docs/project-management/desktop.md && git commit -m "fix: scope transcript heights and observe mounted rows"`。
 
 ### Task A5：D 组组合回归、报告与 WKWebView 交接
 

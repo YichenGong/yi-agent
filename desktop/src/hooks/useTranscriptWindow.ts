@@ -9,6 +9,10 @@ import {
 import type { WindowMeasurement } from "../lib/transcriptGeometry";
 import type { HeightBook } from "../lib/heightBook";
 import {
+  createTranscriptPositionIndex,
+  type TranscriptPositionIndex,
+} from "../lib/transcriptPositionIndex";
+import {
   beginConvergence,
   decideConvergence,
   estimateFocusIndex,
@@ -34,6 +38,13 @@ export interface UseTranscriptWindowArgs {
   focus?: FocusRequest | null;
   limits?: Partial<WindowLimits>;
   book: HeightBook;
+  /**
+   * 当前条目 id 顺序（只读，长度应等于 `itemCount`）。
+   *
+   * 用于「视口落在未挂载区间」时把偏移换算成条号。缺省时该能力降级为不做——
+   * 调用方没给顺序就无从判断第几条是谁，不能靠猜。
+   */
+  anchorIds?: readonly string[];
   /**
    * 当前是否处于「跟随尾部」意图（来自 ScrollCoordinator，见 Spec §4.3）。
    *
@@ -83,6 +94,7 @@ export const DISPLAY_STALLED_MESSAGE = "阅读位置暂时无法定位，可点�
  * 锚点/搜索跳转翻译成一次性的 `FocusRequest`。
  */
 export function useTranscriptWindow({
+  anchorIds,
   itemCount,
   threadId,
   measure,
@@ -152,6 +164,20 @@ export function useTranscriptWindow({
   // `recompute` 的身份 -> 依赖它的 effect 再跑 -> 又一次重算，形成自激。
   const displayErrorRef = useRef(displayError);
   displayErrorRef.current = displayError;
+
+  /**
+   * 「当前 scrollTop 对应哪一条」的索引（Spec §4.4 第 6 条）。
+   *
+   * 只有在 `measure` 完全量不出历史区（视口落在未挂载的 spacer 里）时才用得上：
+   * 这时没有任何行可以采信，`estimateFocusIndex` 也无从估算，必须靠高度账本把
+   * 偏移换算成条号，否则窗口只能停在原处——用户看到一片空白，不滚动就永远不救。
+   */
+  const positionIndexRef = useRef<TranscriptPositionIndex>(createTranscriptPositionIndex());
+  /**
+   * 调用方给的 id 顺序。`itemCount` 不足以判断「第几条是谁」，所以需要真实的
+   * id 列表；缺失时退回 `estimateFocusIndex`（旧路径），不假装能定位。
+   */
+
 
   const recompute = useCallback((reason: "user" | "layout" | "commit" | "items" = "layout") => {
     // 用户手势开启**新**周期：预算与「无进展」判定都要重新计，否则用户滚一下
@@ -227,7 +253,15 @@ export function useTranscriptWindow({
       }
       if (decision === "focus") {
         cycleRef.current = noteFocus(cycle);
-        const focused = estimateFocusIndex(visible, book.median(), itemCountRef.current);
+        // 先按「视口里真实存在的行」估算；量不出任何历史区时（视口落在未挂载的
+        // spacer 里）退回按高度账本换算条号。没有 id 顺序就仍然放弃——不能猜。
+        let focused = estimateFocusIndex(visible, book.median(), itemCountRef.current);
+        if (focused === null && anchorIds !== undefined) {
+          const index = positionIndexRef.current;
+          index.rebuild(anchorIds, book);
+          const at = index.indexAt(visible?.viewportTop ?? 0);
+          focused = at >= 0 ? at : null;
+        }
         if (focused !== null) {
           const before = Math.max(1, Math.floor(merged.pageSize / 4));
           appliedRef.current = { index: focused, before, after: merged.pageSize - before };
@@ -243,7 +277,7 @@ export function useTranscriptWindow({
         setDisplayError(null);
       }
     });
-  }, [measure, merged, book]);
+  }, [measure, merged, book, anchorIds]);
 
   // 切换会话：窗口状态与一次性请求都只属于上一次访问，必须丢弃。
   // 用 layout effect（绘制前）而不是普通 effect，配合上面的渲染期同步回落，

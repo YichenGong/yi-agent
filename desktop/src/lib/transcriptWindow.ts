@@ -220,14 +220,23 @@ export function nextWindow(input: NextWindowInput): WindowState {
   }
 
   // 实际 DOM 上限含恒挂的 LiveTail：tail 在窗口外时给它留 1 个名额。
-  const reservedTail = end < itemCount ? 1 : 0;
-  const capacity = Math.max(1, limits.maxMounted - reservedTail);
-  if (end - start > capacity) {
+  //
+  // **裁剪会改变 `end`，从而改变 tail 是否在窗口内**：原本贴到末尾（
+  // `end === itemCount`，tail 在窗口内、不占名额）的窗口被裁一刀后 `end` 退离
+  // 末尾，tail 立刻变回「第 N+1 条」并重新占用名额。所以这里必须**迭代到不动点**
+  // 而不是只算一次——单次计算会让最终 DOM 比预算多一条（真实回归：窗口 400 条
+  // 历史 + 恒挂 tail = 401，`mounted 401 must stay within the DOM budget`）。
+  for (;;) {
+    const reservedTail = end < itemCount ? 1 : 0;
+    const capacity = Math.max(1, limits.maxMounted - reservedTail);
+    if (end - start <= capacity) break;
     // 裁掉**远离视口**的一端，不按翻页方向裁：方向只决定往哪加，裁哪端要看
     // 用户实际在读哪里。按方向裁会立刻删掉刚补进来的那一页，表现为「翻不动」。
     const trimStart = decideTrimStart({ following, visible: input.visible, start, end, limits });
     if (trimStart) start = end - capacity;
     else end = start + capacity;
+    // 一轮裁剪至多把 `end` 推离末尾一次，因此最多再迭代一次就会在
+    // 「tail 占名额」的口径下收敛；`break` 由上面的容量判断给出。
   }
 
   end = Math.min(end, itemCount);

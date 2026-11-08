@@ -8,8 +8,22 @@
  * 「真实总高 − 估算总高」这个差值也能单测。
  */
 export interface HeightBook {
-  /** 记录一条真实测量值。非法值（NaN / 负数）被忽略。 */
-  record(id: string, height: number): void;
+  /**
+   * 记录一条真实测量值；返回「这次是否真的改变了账本」。
+   *
+   * 非法值（`NaN` / 非有限 / `<= 0`）与「与已记值相同」都返回 `false`：零高的
+   * 行到处都有（折叠条目、尚未布局），把它们当样本会把中位数拽向 0，spacer
+   * 随之塌陷，用户看到整段内容消失。
+   */
+  record(id: string, height: number): boolean;
+  /**
+   * 账本修订号：每有一次**真实变化** +1。
+   *
+   * Spec §4.4 第 2 条要求中位数变化形成**合并后**的 revision，让 spacer、测量
+   * 与补偿在同一个布局周期更新。下游按它判断「要不要重算」，而不是每帧重算或
+   * 靠比较中位数（中位数可能很晚才动）。
+   */
+  revision(): number;
   /** 一条 item 的高度估计：有测量用测量，否则用中位数兜底。 */
   estimate(id: string): number;
   /** 一段区间的总高度估计。同一个 id 只计一次。 */
@@ -23,6 +37,7 @@ export interface HeightBook {
 export function createHeightBook(fallback = 40): HeightBook {
   const heights = new Map<string, number>();
   let sortedCache: number[] | null = null;
+  let revision = 0;
 
   const median = (): number => {
     if (heights.size === 0) return fallback;
@@ -50,10 +65,16 @@ export function createHeightBook(fallback = 40): HeightBook {
 
   return {
     record(id, height) {
-      if (!Number.isFinite(height) || height < 0) return;
-      if (heights.get(id) === height) return;
+      // `<= 0` 而不是 `< 0`：0 高不是有效测量（折叠/未布局），见接口注释。
+      if (!Number.isFinite(height) || height <= 0) return false;
+      if (heights.get(id) === height) return false;
       heights.set(id, height);
       sortedCache = null;
+      revision += 1;
+      return true;
+    },
+    revision() {
+      return revision;
     },
     estimate,
     estimateRange,

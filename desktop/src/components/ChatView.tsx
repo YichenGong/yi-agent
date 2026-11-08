@@ -588,8 +588,13 @@ export function ChatView({
   const tail = items.length > 0 ? items[items.length - 1] : undefined;
   const effectiveCall = call ?? NO_CALL;
 
-  // 未挂载区的高度估算：一条会话只建一本，存活到会话结束。
-  const windowBook = useMemo(() => createHeightBook(), []);
+  // 未挂载区的高度估算（Spec §4.4 第 1 条）。
+  //
+  // 账本属于**布局归属**而不是组件实例：上一条会话的消息高度对这条毫无意义，
+  // 沿用就会让短会话继承长会话的中位数，切过去的第一屏 spacer 按错误高度预留，
+  // 滚动条比例与跳转位置一起失真（实测换会话后 spacer 仍是 5600px）。
+  // `layoutOwnerKey` 变化即换新账本；旧的那本随闭包被回收，不做全局缓存。
+  const windowBook = useMemo(() => createHeightBook(), [layoutOwnerKey]);
 
   // 测量当前视口。`elRef` 在下面才声明，但闭包只在 rAF 里执行，那时已赋值。
   // 测量当前视口。`elRef` 在下面才声明，但闭包只在 rAF 里执行，那时已赋值。
@@ -611,12 +616,25 @@ export function ChatView({
   // 值，且值恒为 null，等于给 hook 加一条走不通的分支。
   // `requestFocus` 由 Task 10（锚点恢复）与 Task 11（搜索跳转）消费；现在不取，
   // 否则 `noUnusedLocals` 会报错。
+  // 条目 id 顺序：视口落进未挂载区间时，用它把 `scrollTop` 换算成条号并发一次
+  // focus。依赖 `items.length` 而不是 `items`：`items` 是同一个数组实例原地变化，
+  // 按引用比较永远不会更新；长度变化已经覆盖「结构性增删」，而纯文本增长不影响
+  // 条号对应关系。
+  const anchorIds = useMemo(
+    () => items.map((it) => it.id ?? ""),
+    // `items` 是同一个数组实例原地变化（`Session.apply` 直接改它），按引用做依赖
+    // 等于永不更新；`items.length` 覆盖结构性增删，`structuralVersion` 覆盖「同长度
+    // 换槽」。纯文本增长不改变 id 顺序，不需要重建。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [items.length, structuralVersion, threadId],
+  );
   const windowApi = useTranscriptWindow({
     itemCount: items.length,
     threadId,
     measure: measureVisible,
     book: windowBook,
     following: isFollowing,
+    anchorIds,
   });
   const { window: win, nudge, requestFocus } = windowApi;
 
@@ -678,6 +696,17 @@ export function ChatView({
   // 改变几何，只在窗口区间变化时维护上一份几何，会把首次收敛的高度差一路攒到
   // 用户下次滚动（Spec §4.4 第 3 条）。
   useLayoutEffect(() => {
+    // 先记账、再写 spacer、最后决策：本次布局测到的真实高度就是这一帧的位置依据。
+    // 顺序不能换——先 `planLayout` 会把「还没校正的 scrollHeight」当成结论。
+    const measured = measureMountedHeights();
+    const top = spacerTopRef.current;
+    const bottom = spacerBottomRef.current;
+    if (top) top.style.height = `${win.start * measured}px`;
+    if (bottom) bottom.style.height = `${bottomSpacerCount * measured}px`;
+    // 只在 spacer 可见（即上下真的还有未挂载区间）时才让 React 记住新中位数：
+    // 跟随状态下两个 spacer 都是 0，高度与中位数无关，此刻 setState 只会凭空多
+    // 一次渲染去和贴底写入抢帧。
+    if (spacerVisible && measured !== spacerMedian) setSpacerMedian(measured);
     planLayout();
   });
 
@@ -686,21 +715,46 @@ export function ChatView({
     planLayout();
   };
 
-  // 把挂载区的真实高度写回 `HeightBook`：中位数越准，spacer 越准，分页后的视觉
-  // 跳动越小（设计 §2.4 的螺旋收敛）。
-  useEffect(() => {
+  /**
+   * 把挂载区的真实高度写回 `HeightBook`（Spec §4.4 第 2、3 条）。
+   *
+   * **每次布局提交都要做**，不能只在 `win.start/end` 变化时更新：图片迟到、首屏
+   * 测量落定、工具卡展开都不改变窗口区间，只在窗口变化时记账会让首次收敛出来的
+   * 中位数一直攒到用户滚动——表现就是「刚进会话高度不对，动一下才正常」。
+   *
+   * 但**不能因此每帧 setState**：它与「跟随贴底」的写入交错会让视口停在中间
+   * （实测流式时 gap 280px 不再贴底）。所以返回「中位数是否真的变了」，只在变了
+   * 时让调用方触发一次渲染；未变化时纯记账，不进入 React 更新。
+   */
+  const measureMountedHeights = useCallback((): number => {
     const el = elRef.current;
-    if (!el) return;
+    if (!el) return windowBook.median();
     for (const node of el.querySelectorAll<HTMLElement>("[data-item-id]")) {
       const id = node.dataset.itemId;
       if (!id) continue;
-      const h = node.getBoundingClientRect().height;
-      // **必须过滤 0**：未布局（首帧、jsdom、刚挂载还没排版）时高度是 0，而
-      // `HeightBook.record` 认为 0 合法（折叠条目确实可能为 0）会照收。大量 0
-      // 进来会把中位数拉到 0，spacer 归零，滚动条比例整个失真。
-      if (h > 0) windowBook.record(id, h);
+      // 零高与非有限值由 `HeightBook.record` 拒绝入账（见其接口注释）。
+      windowBook.record(id, node.getBoundingClientRect().height);
     }
-  }, [win.start, win.end, windowBook]);
+    return windowBook.median();
+  }, [windowBook]);
+
+  /**
+   * 已渲染 spacer 所用的中位数。
+   *
+   * 它是**渲染输入**（spacer 高度 = 条数 × 中位数），所以必须能触发渲染；但每帧
+   * 都 setState 会让「跟随贴底」的写入与这次渲染抢帧，实测流式时视口停在中间
+   * （gap 280px 而不是 0）。因此：
+   *   - 渲染期读 state，保证 React 重渲染时 spacer 不会回退到旧值；
+   *   - 每次布局提交**直接把最新高度写进 DOM**，不等下一次渲染。
+   * 布局 effect 在绘制前执行，所以即使中间有一次渲染把高度写成旧值，也会在
+   * 同一帧内被纠正，用户看不到跳动。
+   */
+  const [spacerMedian, setSpacerMedian] = useState(() => windowBook.median());
+  // 换 owner 会换一本**新的**账本，它的中位数从 fallback 重新开始；旧值留着会让
+  // spacer 停在旧会话的高度估算上。只在换 owner 时走一次渲染，之后靠布局期直写。
+  useLayoutEffect(() => {
+    setSpacerMedian(windowBook.median());
+  }, [layoutOwnerKey, windowBook]);
 
   // 采集用的元素句柄：与 `useStickToBottom` 的 ref 指向同一个 DOM 节点。
   const elRef = useRef<HTMLDivElement | null>(null);
@@ -913,6 +967,11 @@ export function ChatView({
     syncing,
     scrollToBottom,
     followIfAtBottom,
+    // spacer 的中位数一变，`scrollHeight` 就在**这次提交**里变了：内容变高而
+    // 视口没动，等于把贴底位置甩到下面（实测流式时 gap 280px）。跟随必须跟着
+    // 这次高度变化再跑一遍，否则「内容增长」与「高度校正」成为两个互不相干的
+    // 渲染周期，后者会把前者的贴底成果冲掉。
+    spacerMedian,
   ]);
 
   // 未挂载区间的高度估算。`win.end` 是**排他**终点且含尾部那条，而
@@ -920,10 +979,18 @@ export function ChatView({
   // 渲染）。所以尾部下方未挂载的只有 `[stop, total - 1)` 这一段：
   //   - `end === total`（跟随中）-> `stop === total - 1` -> 下方为 0
   //   - `end < total`          -> `stop === end`         -> 下方 `total - 1 - end` 条
-  const medianH = windowBook.median();
+  // `heightRevision` 是本渲染的依赖：账本每次真实变化都会换一个值，spacer 据此
+  // 在**同一个布局周期**里跟上新的中位数，而不是等下一次窗口移动。
+  const medianH = spacerMedian;
   const spacerTop = win.start * medianH;
   const windowStop = Math.min(win.end, Math.max(items.length - 1, 0));
-  const spacerBottom = Math.max(0, items.length - 1 - windowStop) * medianH;
+  const bottomSpacerCount = Math.max(0, items.length - 1 - windowStop);
+  const spacerBottom = bottomSpacerCount * medianH;
+  // 「spacer 是否真的占位」决定中位数变化要不要触发渲染（见上面记账 effect）。
+  const spacerVisible = spacerTop > 0 || spacerBottom > 0;
+  // 布局期直写 spacer 高度用的句柄，与上面两个数量配合。
+  const spacerTopRef = useRef<HTMLDivElement | null>(null);
+  const spacerBottomRef = useRef<HTMLDivElement | null>(null);
 
   return (
     <div
@@ -956,7 +1023,13 @@ export function ChatView({
           而 spacer 没有内容、`min-height: auto` 也解析成 0，于是它会被压成 0 高度
           ——占位完全失效，`scrollHeight` 只剩已挂载部分，滚动条比例失真，滚到
           未挂载区间就是一片空白（真实浏览器实测：样式 53984px，实际 0px）。 */}
-      <div data-spacer="top" aria-hidden="true" className="shrink-0" style={{ height: spacerTop }} />
+      <div
+        ref={spacerTopRef}
+        data-spacer="top"
+        aria-hidden="true"
+        className="shrink-0"
+        style={{ height: spacerTop }}
+      />
       <HistoryWindow
         items={items}
         total={items.length}
@@ -978,6 +1051,7 @@ export function ChatView({
         />
       )}
       <div
+        ref={spacerBottomRef}
         data-spacer="bottom"
         aria-hidden="true"
         className="shrink-0"
