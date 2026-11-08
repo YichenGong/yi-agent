@@ -574,6 +574,28 @@ describe("SettingsRuntimeTab concurrency", () => {
     await waitFor(() => expect(screen.getByText(/仅影响保存后新建会话/)).toBeTruthy());
   });
 
+  it("does not let the success toast hide a failed follow-up read", async () => {
+    // spec §8.2：读取失败要显示错误，不能被旧的成功提示掩盖。保存成功后的权威读
+    // 若失败，用户必须看到"保存了，但没能确认当前值"，而不是绿灯。
+    let saved = false;
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") {
+        if (saved) throw new Error("settings read timed out");
+        return { live_apply_version: 1, fields: [field({ value: 200 })], path: "/x/settings.json" };
+      }
+      saved = true;
+      return { ok: true, live_apply_version: 1, changed_keys: ["agent.max_turns"] };
+    });
+    render(<SettingsRuntimeTab call={call} />);
+    const input = (await screen.findByLabelText("最大轮次")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "201" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/ }));
+
+    await waitFor(() => expect(screen.getByText(/settings read timed out/)).toBeTruthy());
+    // 不能同时挂着"已保存…"的成功提示。
+    expect(screen.queryByText(/支持热更新的同实例会话/)).toBeNull();
+  });
+
   it("keeps the draft and shows the error when a read fails", async () => {
     // A failed refresh must not wipe what the user typed, and must not leave the
     // last success message standing as if nothing happened.

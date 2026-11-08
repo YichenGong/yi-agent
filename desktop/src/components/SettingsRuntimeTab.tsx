@@ -259,8 +259,14 @@ export function SettingsRuntimeTab({
       // 保存后一次权威读：回执里的 revision 是本次提交版本，之后可能已被别的
       // 进程推进，所以直接问当前值而不是把回执当成新状态。
       invalidatedDuringSave.current = false;
+      // 权威读在前、成功文案在后是有意为之，但读失败不能被成功文案盖掉：
+      // spec §8.2 要求后续 read 失败必须可见，否则用户看到绿灯却不知道界面上的
+      // 值可能已经不是当前值。`load` 失败时它已经把错误写进 notice，这里只在
+      // notice 仍然干净（没有新的失败）时才写成功文案。
       await load();
-      setNotice({ ok: true, text: describeSuccess(receipt, patch) });
+      setNotice((current) =>
+        current && !current.ok ? current : { ok: true, text: describeSuccess(receipt, patch) },
+      );
     } catch (error) {
       // 服务端把 `invalid_setting` 的原因放在 message 里，直接内联显示。
       // 必须先过 formatError：RPC 失败给的是 `{code, message}` 对象，
