@@ -3486,18 +3486,31 @@ fn run_tui_agent(
         // clear/MCP）提交新快照;调度任务在下面独立 spawn,不排在主
         // `DriverControl` 队列后面,所以主任务跑到一半也能开旁支。
         let side_pool = Arc::new(yi_agent_tools::SideBlockingPool::new(8, 2, 8, 2));
-        let side_instance_home = crate::side_driver::side_host_root(&snapshot_workdir);
-        let side_resources = yi_agent_runtime::side_conversation::SideHostResources::new(
-            side_instance_home,
-            Arc::clone(&side_pool),
-        );
         let mut side_commands_tx_for_driver = None;
         let mut side_commands_tx_for_tui_exit: Option<
             tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>,
         > = None;
         let mut side_driver_join_for_exit: Option<tokio::task::JoinHandle<()>> = None;
+        // 旁问是实验功能：关掉时不建 resources、不 spawn driver，直接走既有的
+        // `disabled()` 降级路径。这条路径本来就在 resources 初始化失败时使用，
+        // 所以 TUI 各处（`side_capable` 的所有分支）都已按能力缺失处理过。
+        //
+        // 判定必须在**构造 resources 之前**：`SideHostResources::new` 会建宿主
+        // 目录并取文件锁，关掉的构建不该留下这些副作用。
+        let side_enabled =
+            yi_agent_flags::is_enabled(yi_agent_flags::registry::SIDE_CONVERSATION_FLAG);
+        let side_resources = if side_enabled {
+            let side_instance_home = crate::side_driver::side_host_root(&snapshot_workdir);
+            yi_agent_runtime::side_conversation::SideHostResources::new(
+                side_instance_home,
+                Arc::clone(&side_pool),
+            )
+            .map(Some)
+        } else {
+            Ok(None)
+        };
         let (side_publisher, side_runtime) = match side_resources {
-            Ok(resources) => {
+            Ok(Some(resources)) => {
                 let publisher = Arc::new(yi_agent_runtime::side_conversation::SideSourcePublisher::new(
                     side_startup_source(
                         &agent_config,
@@ -3520,6 +3533,8 @@ fn run_tui_agent(
                     crate::tui::app::SideRuntime::new(handles.commands, handles.events),
                 )
             }
+            // 开关关掉（`Ok(None)`）：静默降级，这是正常路径而不是故障。
+            Ok(None) => (None, crate::tui::app::SideRuntime::disabled()),
             Err(error) => {
                 // 旁支不可用不该阻止主 TUI 启动:能力缺失会由 `/side` 明确告知。
                 tracing::warn!(%error, "side conversations unavailable; continuing without them");
