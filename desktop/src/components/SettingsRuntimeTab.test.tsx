@@ -319,6 +319,124 @@ describe("SettingsRuntimeTab concurrency", () => {
     });
   });
 
+  it("refreshes in place without unmounting the form or stealing focus", async () => {
+    // 后台刷新（别的窗口/手机/观察器保存）**不是**首次加载：它不该把表单换
+    // 回「读取中…」。那不是视觉小事——输入框被卸载重挂会丢焦点、丢选区，
+    // 用户在打字时别人保存一次，光标就跳走了。
+    let invalidate: (() => void) | null = null;
+    const subscribe = (listener: () => void) => {
+      invalidate = listener;
+      return () => {
+        invalidate = null;
+      };
+    };
+    // 两个字段：用户改 A，远端改 B。这样才能区分「原地刷新」与「整块重建」，
+    // 也不会因为同字段冲突（那是另一条测试的语义）而看不出刷新结果。
+    const remote: Record<string, number> = { "agent.max_turns": 200, "compact.ratio": 80 };
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") {
+        // 给刷新加一点延迟，否则「闪一下」可能被批处理吃掉，测试就抓不到。
+        await new Promise((r) => setTimeout(r, 20));
+        return {
+          live_apply_version: 1,
+          fields: [
+            field({ key: "agent.max_turns", label: "最大轮次", value: remote["agent.max_turns"] }),
+            field({
+              key: "compact.ratio",
+              group: "compact",
+              label: "压缩比例",
+              value: remote["compact.ratio"],
+              default: "80",
+            }),
+          ],
+          path: "/x/settings.json",
+        };
+      }
+      return { ok: true, live_apply_version: 1 };
+    });
+    render(<SettingsRuntimeTab call={call} subscribe={subscribe} />);
+    const input = (await screen.findByLabelText("最大轮次")) as HTMLInputElement;
+    input.focus();
+    fireEvent.change(input, { target: { value: "640" } });
+
+    remote["compact.ratio"] = 50;
+    invalidate!();
+
+    // 刷新过程中表单必须还在（不能出现「读取中…」整块替换）。
+    await new Promise((r) => setTimeout(r, 6));
+    expect(screen.queryByText("读取中…")).toBeNull();
+    expect(screen.getByLabelText("最大轮次")).toBe(input);
+    expect(document.activeElement).toBe(input);
+
+    // 刷新完成后：未编辑的字段跟随远端，草稿仍在原位、焦点未丢。
+    await waitFor(() => expect(screen.getByText("已设为 50")).toBeTruthy());
+    expect(screen.getByLabelText("最大轮次")).toBe(input);
+    expect(input.value).toBe("640");
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("keeps its subscription while a save is in flight", async () => {
+    // 保存开始/结束不能让订阅退订重订：那两次重订之间到达的通知永久丢失，而
+    // 「保存期间别人也保存了」正是最需要补读的时刻。这里直接断言订阅次数——
+    // 用一个在极短窗口里插入通知的测试抓不住它（重订发生在同一次渲染提交内）。
+    const pendingSave = deferred<unknown>();
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") {
+        return { live_apply_version: 1, fields: [field({ value: 200 })], path: "/x/settings.json" };
+      }
+      return pendingSave.promise;
+    });
+    let subscribes = 0;
+    const subscribe = () => {
+      subscribes += 1;
+      return () => {};
+    };
+    render(<SettingsRuntimeTab call={call} subscribe={subscribe} />);
+    await screen.findByLabelText("最大轮次");
+    expect(subscribes).toBe(1);
+
+    const input = screen.getByLabelText("最大轮次") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "201" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/ }));
+    await new Promise((r) => setTimeout(r, 10));
+    // 保存进行中：仍然只订阅过一次。
+    expect(subscribes).toBe(1);
+
+    pendingSave.resolve({ ok: true, live_apply_version: 1, changed_keys: ["agent.max_turns"] });
+    await waitFor(() => expect(screen.getByRole("button", { name: /^保存$/ })).toBeTruthy());
+    await new Promise((r) => setTimeout(r, 10));
+    // 保存结束：仍然只有一次。
+    expect(subscribes).toBe(1);
+  });
+
+  it("clears the submitted draft even when the follow-up read fails", async () => {
+    // 保存已经成功、宿主也回了回执，但紧接着的权威读失败（例如另一进程正在写）。
+    // 此时那几项**已经不是未保存状态**了。若只在读成功后才清理草稿，界面会一直
+    // 挂着「（未保存）」并启用保存按钮，用户会以为保存没生效而反复点。
+    let saved = false;
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") {
+        if (saved) throw new Error("settings read timed out");
+        return { live_apply_version: 1, fields: [field({ value: 200 })], path: "/x/settings.json" };
+      }
+      saved = true;
+      return { ok: true, live_apply_version: 1, changed_keys: ["agent.max_turns"] };
+    });
+    render(<SettingsRuntimeTab call={call} />);
+    const input = (await screen.findByLabelText("最大轮次")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "201" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/ }));
+
+    // 草稿必须已被确认清理：保存按钮回到禁用，且不再标「（未保存）」。
+    await waitFor(() => {
+      const btn = screen.getByRole("button", { name: /^保存$/ }) as HTMLButtonElement;
+      expect(btn.disabled).toBe(true);
+    });
+    const saveBtn = screen.getByRole("button", { name: /^保存$/ }) as HTMLButtonElement;
+    expect(saveBtn.disabled).toBe(true);
+    expect(screen.queryByText(/（未保存）/)).toBeNull();
+  });
+
   it("adopts a remote change for a field the user has not touched", async () => {
     let invalidate: (() => void) | null = null;
     const subscribe = (listener: () => void) => {

@@ -166,10 +166,20 @@ export function SettingsRuntimeTab({
    * 保存本身会触发一次通知；立刻重读会和「保存结束的权威读」抢同一个状态。
    */
   const invalidatedDuringSave = useRef(false);
+  /** 保存中标志的镜像，供订阅回调读取，避免把 `saving` 放进 effect 依赖。 */
+  const savingRef = useRef(saving);
+  savingRef.current = saving;
 
-  const load = useCallback(async () => {
+  /**
+   * 读设置。
+   *
+   * `showSpinner` 只在**首次加载**为真：后台刷新（失效通知、保存后的权威读）必须
+   * 原地更新。把表单换回「读取中…」会卸载再重挂输入框——用户在打字时别人保存
+   * 一次，光标和选区就丢了，滚动位置也会跳回顶部。
+   */
+  const load = useCallback(async (showSpinner = false) => {
     const requestId = ++latestRead.current;
-    setLoading(true);
+    if (showSpinner) setLoading(true);
     try {
       const parsed = parseRuntimeSettings(await call("settings/read", {}));
       // 迟到的旧读：它描述的已经不是当前状态，直接丢弃。
@@ -193,20 +203,24 @@ export function SettingsRuntimeTab({
   }, [call]);
 
   useEffect(() => {
-    void load();
+    void load(true);
   }, [load]);
 
   // 别的进程/窗口保存后就重读。通知只表示「失效」，值仍从 settings/read 取。
+  //
+  // `saving` 走 ref 而不是依赖项：把它放进依赖会让保存开始/结束各退订重订一次，
+  // 那两次重订之间到达的通知就永久丢了——而「保存期间别人也保存了」恰恰是最需要
+  // 补读的时刻。
   useEffect(() => {
     if (!subscribe) return;
     return subscribe(() => {
-      if (saving) {
+      if (savingRef.current) {
         invalidatedDuringSave.current = true;
         return;
       }
       void load();
     });
-  }, [subscribe, load, saving]);
+  }, [subscribe, load]);
 
   const grouped = useMemo(() => {
     // 手机端先摘掉桌面专属组，再排其余：`extra` 是把不在 `GROUP_ORDER` 里的
@@ -227,12 +241,15 @@ export function SettingsRuntimeTab({
   const save = async (patch: Record<string, string | null>) => {
     if (Object.keys(patch).length === 0) return;
     // 发起保存时快照代数：保存期间若有新编辑，代数会变，那些键不能被清掉。
-    // 快照在 `setDraftState` 之前取，保证拿到的是提交那一刻的状态。
-    let editsAtSubmit: Record<string, number> = {};
-    setDraftState((state) => {
-      editsAtSubmit = { ...state.edits };
-      return state;
-    });
+    //
+    // 直接取本次渲染闭包里的状态：`save` 由当前渲染创建，`patch` 也来自同一份
+    // 状态，所以这就是「提交那一刻」的代数。
+    //
+    // **不能**写在 `setDraftState` 的 updater 里顺便取出：updater 何时执行由
+    // React 决定（批处理、重渲染时机），把取值当它的副作用就是在依赖内部实现
+    // 细节——取到的可能是空对象，于是每个提交键都被判成「代数未变」而被清掉，
+    // 保存期间的新输入随之消失。
+    const editsAtSubmit: Record<string, number> = { ...draftState.edits };
     setSaving(true);
     setNotice(null);
     try {
