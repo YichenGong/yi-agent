@@ -91,6 +91,26 @@ pub fn verify_bundle(bundle_root: &Path) -> RuntimeArtifact {
     verify_in(bundle_root, manifest)
 }
 
+/// The bundle root that owns a macOS `Resources` directory.
+///
+/// Tauri's `resource_dir()` resolves to `exe_dir/../Resources`, i.e.
+/// `<Foo.app>/Contents/Resources` — one level deeper than the `Contents`
+/// directory the previous rule assumed. Stopping at `Contents` made every
+/// lookup ask for `Contents/Contents/Resources/runtime-sidecar.json`, so a
+/// perfectly good bundle was reported as unverifiable and the shell sent no
+/// `expected_runtime` at all.
+///
+/// The parent's name is checked rather than counted: a dev build's cargo output
+/// has a `Resources`-like directory with no `Contents` above it, and inventing
+/// `<somewhere>` from it would name a bundle root that cannot exist.
+pub fn bundle_root_from_resources(resources: &Path) -> Option<PathBuf> {
+    let contents = resources.parent()?;
+    if contents.file_name()? != "Contents" {
+        return None;
+    }
+    contents.parent().map(Path::to_path_buf)
+}
+
 /// The verification itself, split from file reading so tests can drive it with a
 /// real binary in a temp directory.
 pub fn verify_in(bundle_root: &Path, manifest: BundledArtifactManifest) -> RuntimeArtifact {
@@ -271,6 +291,54 @@ mod tests {
     #[test]
     fn a_dev_build_reports_unknown_instead_of_guessing() {
         assert!(!dev_artifact().is_verified());
+    }
+
+    /// macOS `resource_dir()` returns `<Foo.app>/Contents/Resources`, but a
+    /// manifest is resolved from the *bundle root*. One `parent()` stops at
+    /// `Contents`, so every lookup then asked for
+    /// `Contents/Contents/Resources/runtime-sidecar.json` and reported the
+    /// runtime as unverifiable.
+    #[test]
+    fn a_macos_resources_dir_resolves_to_its_bundle_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("Foo.app");
+        let resources = bundle.join("Contents/Resources");
+        std::fs::create_dir_all(&resources).unwrap();
+
+        assert_eq!(bundle_root_from_resources(&resources), Some(bundle));
+    }
+
+    /// A `Resources` directory with no `Contents` above it (a dev build's cargo
+    /// output) must yield no bundle root rather than a path that cannot exist.
+    /// `verify_bundle` then answers `Unknown`, which is the honest dev answer.
+    #[test]
+    fn a_resources_dir_without_contents_has_no_bundle_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = dir.path().join("Resources");
+        std::fs::create_dir_all(&resources).unwrap();
+
+        let root = bundle_root_from_resources(&resources);
+        assert!(root.is_none(), "{root:?}");
+    }
+
+    /// The whole chain, from the directory Tauri hands us: a real tree with a
+    /// real sidecar and manifest must come back verified.
+    #[test]
+    fn a_bundle_is_verified_from_the_resources_dir_tauri_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("Foo.app");
+        let digest = write_sidecar(&bundle, b"daemon bytes");
+        let resources = bundle.join("Contents/Resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        let manifest = manifest_for(&digest, EXPECTED_BUILD_ID);
+        std::fs::write(
+            resources.join("runtime-sidecar.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let root = bundle_root_from_resources(&resources).unwrap();
+        assert!(verify_bundle(&root).is_verified());
     }
 
     #[test]
