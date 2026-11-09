@@ -7189,3 +7189,153 @@ fn foreground_root_lifecycle_recovery_round_trip_on_the_wire() {
         "recovery must not start a worker"
     );
 }
+
+/// A managed daemon on a real socket admits the desktop's *project* attach.
+///
+/// This is the wire-level shape of the desktop failure. Delegation setup begins
+/// with a project attach, whose key is its own idempotency string and therefore
+/// resolves to nothing in the guardian's ledger. Before the request could name
+/// the App run it speaks for, the daemon refused it with `no root authorization
+/// matches this capability` -- and because that is the *first* step, no
+/// conversation root was ever created and `spawn_agent` never reached the tool
+/// list.
+///
+/// Driving the real `Daemon` rather than the coordinator is what makes this an
+/// end-to-end check: the request has to survive the wire (serde), reach `respond`,
+/// and then be judged by the same ledger the guardian feeds.
+#[test]
+fn a_managed_daemon_admits_a_project_attach_over_the_wire_when_it_names_its_client() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let scope = directory.path().to_string_lossy().into_owned();
+
+    // The guardian's half. A managed daemon takes its generation from the
+    // guardian's ledger, so the two values are the same by construction -- and a
+    // ledger for another generation is refused, which is the cross-generation
+    // replay the design forbids rather than something a fixture should paper over.
+    let generation = "wire-generation-1".to_string();
+    let mut guardian = yi_agent_lifecycle::authorization::AuthorizationLedger::new(
+        scope.clone(),
+        generation.clone(),
+    );
+    let mut verifier = yi_agent_lifecycle::authorization::AuthorizationLedger::verifier(
+        scope,
+        generation,
+        guardian.generation_secret(),
+    );
+
+    // The guardian authorizes the App run and hands the binding to the daemon's
+    // half. Its root id belongs to the conversation root this project attach will
+    // *later* be followed by, so the project attach must not adopt it.
+    let authorization = guardian
+        .issue(
+            "app-run-1",
+            "0b7c1d2e-3f40-4a51-b662-738495a6b7c8",
+            yi_agent_lifecycle::types::LeaseMode::Business,
+        )
+        .expect("a business client is authorizable");
+    yi_agent_lifecycle::authorization::AuthorizationLedger::apply(
+        &mut verifier,
+        yi_agent_lifecycle::authorization::AuthorizationUpdate::Bind(Box::new(authorization)),
+    )
+    .expect("the verifier accepts its guardian's binding");
+
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let daemon = Daemon::start_with_factory_and_authority(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(StaticWorkspaceService),
+            starts: Arc::clone(&starts),
+        }),
+        yi_agent_store::foreground::ForegroundActivation::Disabled,
+        Some(verifier),
+        None,
+    )
+    .unwrap();
+
+    let workspace = directory.path().join("project");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "project:4242:/p:wire".into(),
+            workspace: workspace.clone(),
+            extra_roots: Vec::new(),
+            client_run_id: Some("app-run-1".into()),
+        },
+    )
+    .unwrap();
+    let IpcResponse::ApplicationRootAttached { root_task_id, .. } = response else {
+        panic!("a project attach naming an authorized client must be admitted, got {response:?}");
+    };
+    assert_ne!(
+        root_task_id, "0b7c1d2e-3f40-4a51-b662-738495a6b7c8",
+        "a project attach opens a connection: it must not claim the conversation's root"
+    );
+}
+
+/// The same wire, with no client named: still refused, byte for byte.
+///
+/// The fix must not turn "name a client" into "name anything". An unattributed
+/// attach on a managed daemon is exactly what the gate exists to refuse.
+#[test]
+fn a_managed_daemon_still_refuses_a_project_attach_that_names_no_client() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let scope = directory.path().to_string_lossy().into_owned();
+
+    let generation = "wire-generation-2".to_string();
+    let guardian = yi_agent_lifecycle::authorization::AuthorizationLedger::new(
+        scope.clone(),
+        generation.clone(),
+    );
+    let verifier = yi_agent_lifecycle::authorization::AuthorizationLedger::verifier(
+        scope,
+        generation,
+        guardian.generation_secret(),
+    );
+
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let daemon = Daemon::start_with_factory_and_authority(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(StaticWorkspaceService),
+            starts: Arc::clone(&starts),
+        }),
+        yi_agent_store::foreground::ForegroundActivation::Disabled,
+        Some(verifier),
+        None,
+    )
+    .unwrap();
+
+    let workspace = directory.path().join("project");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "project:4242:/p:wire-unattributed".into(),
+            workspace,
+            extra_roots: Vec::new(),
+            client_run_id: None,
+        },
+    )
+    .expect("the daemon answers every request; a refusal is an error frame");
+    // `send_request` hands back whatever frame the daemon sent, so the refusal is
+    // asserted on the frame rather than as a transport error.
+    let IpcResponse::Error { code, message } = response else {
+        panic!("an unattributed attach on a managed daemon must be refused, got {response:?}");
+    };
+    // The code is the pre-existing one for an admission refusal; what this test
+    // pins is that the fix did not turn "name nothing" into "name anything". The
+    // wire message is deliberately stripped for admission errors, so the code is
+    // the assertion that survives -- see `ipc_error_message`.
+    assert_eq!(
+        code,
+        IpcErrorCode::Internal,
+        "an unattributed attach must still be refused (message: {message:?})"
+    );
+}
