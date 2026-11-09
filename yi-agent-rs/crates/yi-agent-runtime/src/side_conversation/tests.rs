@@ -272,7 +272,7 @@ fn side_registry_is_empty_and_not_a_filtered_ordinary_registry() {
         "a side must expose no tools at all, got {:?}",
         registry.names()
     );
-    assert!(SideToolPolicy::default().allowed_names().is_empty());
+    assert!(SideToolPolicy.allowed_names().is_empty());
 }
 
 /// Taking a snapshot must never rewrite the parent. The old implementation

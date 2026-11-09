@@ -3707,7 +3707,6 @@ fn run_tui_agent(
                 let handles = crate::side_driver::spawn_side_driver(
                     Arc::clone(&publisher),
                     resources,
-                    Arc::clone(&side_pool),
                 );
                 side_commands_tx_for_driver = Some(handles.commands.clone());
                 side_commands_tx_for_tui_exit = Some(handles.commands.clone());

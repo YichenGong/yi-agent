@@ -15,6 +15,7 @@
 //! Nothing here depends on `yi-agent-app-server`: both hosts consume these
 //! primitives directly, so the dependency never has to be inverted later.
 
+pub mod cleanup;
 pub mod ledger;
 pub mod policy;
 pub mod resources;
@@ -27,6 +28,7 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
+pub use cleanup::{SideCleanupReceipt, SideCleanupState};
 pub use ledger::{AcceptedRequest, SideIdleDeadline, SideRequestLedger};
 pub use policy::{SideToolPolicy, SideToolSetupFactory, build_side_tool_setup};
 pub use resources::{

@@ -3288,7 +3288,6 @@ pub(crate) fn test_side_registry(
     Arc::new(crate::side_conversation::SideRegistry::new(
         Arc::new(StubSideResolver { gate }),
         resources,
-        pool,
     ))
 }
 

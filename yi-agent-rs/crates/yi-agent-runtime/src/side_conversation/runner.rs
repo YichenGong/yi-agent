@@ -29,7 +29,6 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use yi_agent_core::managed_run::{BudgetedAgentEvent, ManagedRunControl, ManagedRunLimits};
 use yi_agent_core::{Agent, AgentConfig, AgentEvent, Session, TokenUsage, forkable_messages};
-use yi_agent_tools::SideReadAccess;
 
 use super::policy::SideToolSetupFactory;
 use super::resources::PreparedSideResources;
@@ -345,10 +344,6 @@ impl SideConversationRunner {
     /// every work handle are gone.
     pub fn resource_dir(&self) -> &std::path::Path {
         self.resources.lease.dir()
-    }
-
-    pub fn access(&self) -> &Arc<SideReadAccess> {
-        &self.resources.access
     }
 
     /// A copy of the side's own history, marker included.

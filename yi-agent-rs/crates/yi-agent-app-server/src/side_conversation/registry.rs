@@ -31,7 +31,6 @@ use yi_agent_runtime::side_conversation::{
 };
 
 use yi_agent_runtime::side_conversation::{SideError, SideErrorReason, SideUsage};
-use yi_agent_tools::SideBlockingPool;
 
 use super::replay::SIDE_ITEM_FLUSH_INTERVAL;
 use super::source::SideParentResolver;
@@ -291,7 +290,6 @@ enum ParentSlot {
 pub struct SideRegistry {
     resolver: Arc<dyn SideParentResolver>,
     resources: Arc<SideHostResources>,
-    pool: Arc<SideBlockingPool>,
     parents: Mutex<HashMap<String, ParentSlot>>,
     sides: Mutex<HashMap<String, Arc<Mutex<SideEntry>>>>,
     tombstones: Mutex<HashMap<String, Tombstone>>,
@@ -323,15 +321,13 @@ pub struct SideRegistry {
 }
 
 impl SideRegistry {
-    pub fn new(
-        resolver: Arc<dyn SideParentResolver>,
-        resources: Arc<SideHostResources>,
-        pool: Arc<SideBlockingPool>,
-    ) -> Self {
+    /// The host is constructed without a blocking pool: a side copies no files,
+    /// so nothing here needs one. Cleanup uses the pool owned by
+    /// [`SideHostResources`], which already outlives every side.
+    pub fn new(resolver: Arc<dyn SideParentResolver>, resources: Arc<SideHostResources>) -> Self {
         Self {
             resolver,
             resources,
-            pool,
             parents: Mutex::new(HashMap::new()),
             sides: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
@@ -558,7 +554,7 @@ impl SideRegistry {
             model: source.config.model.clone(),
             reasoning_effort: source.config.gen_params.reasoning_effort.clone(),
             preserve_thinking: source.config.preserve_thinking,
-            tool_names: yi_agent_runtime::side_conversation::SideToolPolicy::default()
+            tool_names: yi_agent_runtime::side_conversation::SideToolPolicy
                 .allowed_names()
                 .iter()
                 .map(|name| (*name).to_string())

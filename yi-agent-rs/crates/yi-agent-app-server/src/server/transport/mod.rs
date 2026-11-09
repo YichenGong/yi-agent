@@ -226,7 +226,7 @@ where
                 cfg.clone(),
             ));
             Arc::new(crate::side_conversation::SideRegistry::new(
-                resolver, resources, pool,
+                resolver, resources,
             ))
         }
     };

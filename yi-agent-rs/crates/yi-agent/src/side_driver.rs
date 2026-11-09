@@ -127,7 +127,6 @@ pub struct SideDriver {
     events: mpsc::Sender<ConversationEvent>,
     publisher: Arc<SideSourcePublisher>,
     resources: Arc<SideHostResources>,
-    pool: Arc<yi_agent_tools::SideBlockingPool>,
     ledger: SideRequestLedger,
     slot: Option<Arc<SideResourceLease>>,
     runner: Option<SideConversationRunner>,
@@ -149,7 +148,6 @@ impl SideDriver {
     pub fn spawn(
         publisher: Arc<SideSourcePublisher>,
         resources: Arc<SideHostResources>,
-        pool: Arc<yi_agent_tools::SideBlockingPool>,
         commands: mpsc::Receiver<SideDriverCommand>,
         events: mpsc::Sender<ConversationEvent>,
     ) -> tokio::task::JoinHandle<()> {
@@ -158,7 +156,6 @@ impl SideDriver {
             events,
             publisher,
             resources,
-            pool,
             ledger: SideRequestLedger::new(),
             slot: None,
             runner: None,
@@ -792,11 +789,10 @@ pub struct SideDriverHandles {
 pub fn spawn_side_driver(
     publisher: Arc<SideSourcePublisher>,
     resources: Arc<SideHostResources>,
-    pool: Arc<yi_agent_tools::SideBlockingPool>,
 ) -> SideDriverHandles {
     let (commands_tx, commands_rx) = mpsc::channel(SIDE_COMMAND_CHANNEL);
     let (events_tx, events_rx) = mpsc::channel(SIDE_EVENT_CHANNEL);
-    let join = SideDriver::spawn(publisher, resources, pool, commands_rx, events_tx);
+    let join = SideDriver::spawn(publisher, resources, commands_rx, events_tx);
     SideDriverHandles {
         commands: commands_tx,
         events: events_rx,
@@ -817,7 +813,7 @@ pub fn side_host_root(workdir: &std::path::Path) -> PathBuf {
 /// 恒为空:旁支只回答进入时的对话快照,不读文件、不联网、不调 MCP。保留这个
 /// 函数是让界面文案从策略取值,而不是在 UI 里另写一份"能干什么"。
 pub fn allowed_side_tools() -> Vec<&'static str> {
-    SideToolPolicy::default().allowed_names().to_vec()
+    SideToolPolicy.allowed_names().to_vec()
 }
 
 #[cfg(test)]

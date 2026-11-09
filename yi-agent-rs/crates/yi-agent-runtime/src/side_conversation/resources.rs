@@ -1,33 +1,39 @@
-//! Per-side directories, attachment copies and resource slots.
+//! Per-side resource slots and their cleanup.
 //!
-//! A side keeps its own copy of every attachment it still needs under
-//! `side-conversations/<hostInstanceId>/<sideId>/`, plus a bounded read
-//! authorisation for exactly those files. Three invariants hold here:
+//! A side no longer gets a private directory or attachment copies: it answers from
+//! the conversation snapshot, and anything it needs is already embedded in that
+//! snapshot. What remains here is the accounting that keeps repeated open/close
+//! honest. Three invariants hold:
 //!
 //! 1. **A slot is real.** A side holds one of eight slots from creation until its
-//!    directory is actually deleted, so repeatedly opening and closing cannot
-//!    escape the quota.
+//!    (possibly absent) tree is actually gone, so cycling open/close cannot escape
+//!    the quota.
 //! 2. **Cleanup never blocks its initiator.** The last owner's `Drop` submits a
-//!    bounded job to the host's blocking pool; it never calls `remove_dir_all`
-//!    inline, and the job keeps the slot and the host lock until the delete really
-//!    finished.
-//! 3. **A dead host can be reclaimed, a live one cannot.** Startup only removes old
-//!    host directories whose exclusive lock it can actually take — never by PID or
-//!    timestamp.
+//!    bounded job to the host's blocking pool; it never deletes inline.
+//! 3. **A failed delete keeps the slot.** Removing the slot on failure would report
+//!    a free slot over a directory that still exists; only a confirmed delete (or
+//!    a confirmed "nothing to delete") frees it, and a receipt says which happened.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use yi_agent_core::{ContentBlock, ManagedRunLimits, RunBudget, Session, measure_message_size};
-use yi_agent_tools::{SideBlockingPool, SideFileAlias, SideReadAccess, SideRoots};
+use yi_agent_core::{ContentBlock, Session, measure_message_size};
+use yi_agent_tools::SideBlockingPool;
 
+use super::cleanup::{self, SideCleanupReceipt, SideCleanupState};
 use super::source::EffectiveSideSource;
 use super::{SideError, SideErrorReason, SideResult};
+
+/// How one slot's tree is deleted.
+///
+/// Always [`remove_tree`] in production; a test injects a failure so the
+/// "a failed delete keeps its slot" rule is provable without a real IO error.
+type RemoveTree = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
 
 /// Resource slots one host may hand out.
 ///
@@ -35,7 +41,7 @@ use super::{SideError, SideErrorReason, SideResult};
 /// client cannot escape the quota by cycling open/close.
 pub const SIDE_RESOURCE_SLOTS: usize = 8;
 
-/// The per-side binary ceiling: copied file bytes plus decoded inline images.
+/// The per-side binary ceiling: decoded inline images in the inherited snapshot.
 pub const SIDE_BINARY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Directory name under the instance home.
@@ -47,10 +53,11 @@ fn resource_limit(detail: impl std::fmt::Display) -> SideError {
 }
 
 /// Everything the resource layer produced for one side.
+#[derive(Debug)]
 pub struct PreparedSideResources {
-    pub access: Arc<SideReadAccess>,
     pub lease: Arc<SideResourceLease>,
-    /// Binary bytes committed to the side's budget.
+    /// Binary bytes committed to the side's budget: the decoded inline media
+    /// already carried by the snapshot. No attachment file is copied any more.
     pub binary_bytes: usize,
 }
 
@@ -69,6 +76,10 @@ pub struct SideHostResources {
     host_dir: PathBuf,
     _lock: HostLock,
     pool: Arc<SideBlockingPool>,
+    /// How a slot's tree is deleted. Production always uses [`remove_tree`]; the
+    /// indirection exists so a test can prove a failed delete keeps its slot
+    /// instead of waiting for a real filesystem error that cannot be provoked.
+    remove: RemoveTree,
     /// One entry per held slot. The map holds only a `Weak` reference: owning the
     /// lease here would keep its refcount above zero forever, so cleanup could
     /// never run and the slot would leak.
@@ -86,6 +97,23 @@ impl SideHostResources {
     /// Create a host behind an `Arc`, take its directory lock and reclaim any
     /// provably dead older host.
     pub fn new(instance_home: PathBuf, pool: Arc<SideBlockingPool>) -> SideResult<Arc<Self>> {
+        Self::assemble(instance_home, pool, Arc::new(|dir: &Path| remove_tree(dir)))
+    }
+
+    #[cfg(test)]
+    pub fn new_with_cleanup(
+        instance_home: PathBuf,
+        pool: Arc<SideBlockingPool>,
+        remove: RemoveTree,
+    ) -> SideResult<Arc<Self>> {
+        Self::assemble(instance_home, pool, remove)
+    }
+
+    fn assemble(
+        instance_home: PathBuf,
+        pool: Arc<SideBlockingPool>,
+        remove: RemoveTree,
+    ) -> SideResult<Arc<Self>> {
         let host_instance_id = uuid::Uuid::new_v4().to_string();
         let root = instance_home.join(SIDE_CONVERSATIONS_DIR);
         std::fs::create_dir_all(&root).map_err(|error| {
@@ -107,6 +135,7 @@ impl SideHostResources {
             host_dir,
             _lock: lock,
             pool,
+            remove,
             slots: Mutex::new(HashMap::new()),
             live_cleanups: Arc::new(AtomicUsize::new(0)),
             completed_cleanups: Arc::new(AtomicUsize::new(0)),
@@ -161,65 +190,96 @@ impl SideHostResources {
             host: Arc::downgrade(self),
             released: AtomicBool::new(false),
         });
+        let (receipt, keepalive) = cleanup::channel();
         slots.insert(
             side_id.to_string(),
             SlotEntry {
                 dir,
                 lease: Arc::downgrade(&lease),
+                receipt,
+                _keepalive: keepalive,
             },
         );
         Ok(lease)
     }
 
-    /// Prepare a side's directory and read authorisation from its source.
+    /// Account for one side's binary footprint.
+    ///
+    /// Deliberately does no IO: the snapshot already holds every embedded image it
+    /// will ever use, and an attachment that only has a path is *not* re-read. The
+    /// old implementation created a private directory and copied catalog files,
+    /// which both created a second copy of user data and gave the side a file path
+    /// it could re-open. `cancel` is still honoured so a side cancelled during
+    /// preparation fails instead of starting.
     pub async fn prepare(
         self: &Arc<Self>,
         lease: Arc<SideResourceLease>,
         source: &EffectiveSideSource,
         cancel: CancellationToken,
     ) -> SideResult<PreparedSideResources> {
-        let plan = plan_copies(source)?;
-        let dir = lease.dir.clone();
-        let side_id = lease.side_id.clone();
-        let pool = Arc::clone(&self.pool);
-        // The lease is the work's owner: a cancelled side cannot leave an
-        // untracked reader behind, and the slot survives until the copy ends.
-        let owner = Arc::clone(&lease) as Arc<dyn Send + Sync>;
-        let copy_source = CopySource {
-            provider_primary: source.primary.clone(),
-            created_roots: source.roots.clone(),
-            current_roots: Arc::clone(&source.current_roots),
-            inline_bytes: inline_binary_bytes(source),
-        };
-
-        let job = {
-            let plan = plan.clone();
-            let dir = dir.clone();
-            move || copy_attachments(&copy_source, &plan, &dir)
-        };
-        let (aliases, binary_bytes) = pool
-            .run(&side_id, cancel, owner, job)
-            .await
-            .map_err(|error| resource_limit(format!("准备旁支资源失败：{error}")))?;
-
-        // The side inherits the parent's roots. The private copy directory is not
-        // added: copies are reachable only through their registered alias, which
-        // stays bound to the original's authorisation.
-        let mut access = SideReadAccess::new(
-            source.primary.clone(),
-            source.roots.clone(),
-            Arc::clone(&source.current_roots),
-        )
-        .map_err(|error| resource_limit(format!("建立旁支读取授权失败：{error}")))?;
-        access
-            .set_attachment_aliases(aliases)
-            .map_err(|error| resource_limit(format!("登记旁支附件映射失败：{error}")))?;
-
+        if cancel.is_cancelled() {
+            return Err(resource_limit("旁支在资源准备期间被取消"));
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(resource_limit("宿主正在关闭，不再接受新的旁支"));
+        }
+        let binary_bytes = inline_binary_bytes(source);
+        if binary_bytes > SIDE_BINARY_BUDGET_BYTES {
+            return Err(resource_limit(format!(
+                "继承的内嵌媒体已超过 {SIDE_BINARY_BUDGET_BYTES} 字节预算"
+            )));
+        }
         Ok(PreparedSideResources {
-            access: Arc::new(access),
             lease,
             binary_bytes,
         })
+    }
+
+    /// The cleanup receipt for `side_id`, if the host still tracks that slot.
+    pub fn cleanup_receipt(&self, side_id: &str) -> SideResult<SideCleanupReceipt> {
+        let slots = self.slots.lock().unwrap();
+        let entry = slots.get(side_id).ok_or_else(|| {
+            SideError::new(
+                SideErrorReason::SourceChanged,
+                format!("旁支 {side_id} 没有可跟踪的资源槽"),
+            )
+        })?;
+        Ok(SideCleanupReceipt::new(entry.receipt.subscribe()))
+    }
+
+    /// Retry a cleanup that failed, provided no owner still holds the lease.
+    ///
+    /// Only legal once the last lease is gone: retrying while an owner is alive
+    /// would delete a directory under a live side. Returns the (possibly still
+    /// pending) receipt so the caller waits on the real outcome instead of
+    /// assuming the retry succeeded.
+    pub fn retry_cleanup(self: &Arc<Self>, side_id: &str) -> SideResult<SideCleanupReceipt> {
+        let (dir, sender, has_owner) = {
+            let slots = self.slots.lock().unwrap();
+            let entry = slots.get(side_id).ok_or_else(|| {
+                SideError::new(
+                    SideErrorReason::SourceChanged,
+                    format!("旁支 {side_id} 没有可重试的资源槽"),
+                )
+            })?;
+            (
+                entry.dir.clone(),
+                entry.receipt.clone(),
+                entry.lease.strong_count() > 0,
+            )
+        };
+        if has_owner {
+            return Err(resource_limit("旁支仍有持有者在运行，不能重试清理"));
+        }
+        if sender.borrow().is_complete() {
+            return Ok(SideCleanupReceipt::new(sender.subscribe()));
+        }
+        // `Ok` cannot fail here: the slot keeps a receiver alive on purpose.
+        let _ = sender.send(SideCleanupState::Pending);
+        self.live_cleanups.fetch_add(1, Ordering::SeqCst);
+        let receiver = sender.subscribe();
+        self.submit_cleanup(side_id.to_string(), dir, sender);
+        Ok(SideCleanupReceipt::new(receiver))
     }
 
     /// Refuse new slots and wait (bounded) for live cleanup.
@@ -263,150 +323,19 @@ impl SideHostResources {
     }
 }
 
-/// A held slot: its directory and a non-owning handle to its lease.
+/// A held slot: its (possibly never created) directory, a non-owning handle to its
+/// lease, and the sender that publishes the cleanup outcome.
+///
+/// The receiver lives in the receipt handed to callers, so the slot does **not**
+/// keep a receiver alive: a caller that dropped its receipt must not be able to
+/// prevent the sender from being dropped with the slot.
 struct SlotEntry {
     dir: PathBuf,
     lease: Weak<SideResourceLease>,
-}
-
-/// What a copy job needs from the source, without keeping the session alive.
-struct CopySource {
-    provider_primary: PathBuf,
-    /// The roots the parent authorised when the side was created. Copies are read
-    /// through a handle authorised by exactly these, never by re-opening a path.
-    created_roots: Vec<PathBuf>,
-    current_roots: Arc<dyn SideRoots>,
-    /// Decoded bytes already consumed by the history's inline images.
-    inline_bytes: usize,
-}
-
-/// One attachment to copy.
-#[derive(Clone, Debug)]
-struct CopyPlan {
-    original: PathBuf,
-    copy_name: String,
-}
-
-/// Resolve the catalog against the safe history and name each copy.
-///
-/// An attachment is copied only when its host-generated manifest marker is still
-/// present in the forkable prefix: if the parent's manifest line was trimmed away,
-/// the model cannot see the reference and copying the file would only add an
-/// unreachable duplicate. Natural-language text is never scanned for paths — the
-/// marker is a generated attachment path the host supplies.
-fn plan_copies(source: &EffectiveSideSource) -> SideResult<Vec<CopyPlan>> {
-    let session = source
-        .session
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let retained = yi_agent_core::forkable_messages(&session);
-    let retained_text: String = retained
-        .iter()
-        .flat_map(|message| message.content.iter())
-        .filter_map(|block| match block {
-            ContentBlock::Text(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let mut plans = Vec::with_capacity(source.attachments.0.len());
-    for (index, attachment) in source.attachments.0.iter().enumerate() {
-        if !retained_text.contains(&attachment.manifest_marker) {
-            continue;
-        }
-        let file_name = attachment
-            .original
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("attachment-{index}"));
-        plans.push(CopyPlan {
-            original: attachment.original.clone(),
-            // Keep the index so two attachments sharing a basename cannot collide.
-            copy_name: format!("{index}-{file_name}"),
-        });
-    }
-    Ok(plans)
-}
-
-/// Copy every planned attachment from an authorised handle, never by path.
-///
-/// The read is bounded by `remaining + 1`, so an overflowing file is detected from
-/// the bytes actually read rather than from a metadata length that may have
-/// changed since.
-fn copy_attachments(
-    source: &CopySource,
-    plan: &[CopyPlan],
-    dir: &Path,
-) -> std::io::Result<(Vec<SideFileAlias>, usize)> {
-    std::fs::create_dir_all(dir)?;
-    // Two handles: one reads the originals under the parent's authorisation, one
-    // registers the copies that were just written.
-    let reader = SideReadAccess::new(
-        source.provider_primary.clone(),
-        source.created_roots.clone(),
-        Arc::clone(&source.current_roots),
-    )?;
-
-    if source.inline_bytes > SIDE_BINARY_BUDGET_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "inherited inline images already exceed the {SIDE_BINARY_BUDGET_BYTES}-byte budget"
-            ),
-        ));
-    }
-    let mut total = 0usize;
-    let mut aliases = Vec::with_capacity(plan.len());
-    for item in plan {
-        let remaining = SIDE_BINARY_BUDGET_BYTES.saturating_sub(source.inline_bytes + total);
-        if remaining == 0 {
-            // Refuse before creating anything: a zero-byte placeholder in the
-            // side's directory would look like a copy that succeeded.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "the side's 64 MiB budget is already spent; refusing {}",
-                    item.original.display()
-                ),
-            ));
-        }
-        let mut input = reader.open_regular(&item.original)?;
-        let copy = dir.join(&item.copy_name);
-        let mut output = std::fs::File::create(&copy)?;
-        let copied = std::io::copy(&mut input.by_ref().take(remaining as u64 + 1), &mut output)?;
-        if copied as usize > remaining {
-            drop(output);
-            // Never leave a truncated copy behind: the alias would otherwise
-            // serve a file that looks complete.
-            let _ = std::fs::remove_file(&copy);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "attachment exceeds the side's 64 MiB budget: {}",
-                    item.original.display()
-                ),
-            ));
-        }
-        drop(output);
-        total += copied as usize;
-        aliases.push(SideFileAlias {
-            original: item.original.clone(),
-            copy,
-        });
-    }
-
-    // Validate the finished set against the shared accounting rules as well, so a
-    // future change to one path cannot drift from the other.
-    let budget = RunBudget::new(ManagedRunLimits {
-        binary_bytes: SIDE_BINARY_BUDGET_BYTES,
-        ..ManagedRunLimits::side_defaults()
-    });
-    let held = budget
-        .reserve_binary(source.inline_bytes + total)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
-    drop(held);
-    Ok((aliases, total))
+    receipt: watch::Sender<SideCleanupState>,
+    /// Keeps one receiver alive so publishing a terminal state never fails for
+    /// lack of listeners. It holds no lease, so it cannot delay cleanup.
+    _keepalive: watch::Receiver<SideCleanupState>,
 }
 
 /// Decoded size of every inline base64 image in the inherited history.
@@ -462,39 +391,70 @@ impl Drop for SideResourceLease {
             // The host is gone; its whole tree is reclaimed at the next start.
             return;
         };
+        // Pick up this slot's own sender so the outcome reaches its receipt. A
+        // missing entry means the slot was already freed; nothing to publish.
+        let Some(sender) = host
+            .slots
+            .lock()
+            .unwrap()
+            .get(&self.side_id)
+            .map(|entry| entry.receipt.clone())
+        else {
+            return;
+        };
         host.live_cleanups.fetch_add(1, Ordering::SeqCst);
+        host.submit_cleanup(self.side_id.clone(), self.dir.clone(), sender);
+    }
+}
 
-        let dir = self.dir.clone();
-        let side_id = self.side_id.clone();
-        let live = Arc::clone(&host.live_cleanups);
-        let completed = Arc::clone(&host.completed_cleanups);
-        let failed = Arc::clone(&host.failed_cleanups);
+impl SideHostResources {
+    /// Queue one bounded delete and publish its outcome.
+    ///
+    /// The job holds a strong host handle, so the host (and its directory lock)
+    /// stays alive until the delete finishes. The slot is removed only after a
+    /// confirmed delete: on failure it stays, so the quota keeps counting a
+    /// directory that still exists.
+    fn submit_cleanup(
+        self: &Arc<Self>,
+        side_id: String,
+        dir: PathBuf,
+        sender: watch::Sender<SideCleanupState>,
+    ) {
+        let live = Arc::clone(&self.live_cleanups);
+        let completed = Arc::clone(&self.completed_cleanups);
+        let failed = Arc::clone(&self.failed_cleanups);
         let failed_outside = Arc::clone(&failed);
         let live_outside = Arc::clone(&live);
-        let weak = Arc::downgrade(&host);
+        // A clone for the closed-pool path: the job closure consumes its own.
+        let sender_outside = sender.clone();
+        let weak = Arc::downgrade(self);
+        let keep_alive: Arc<dyn Send + Sync> = Arc::clone(self) as Arc<dyn Send + Sync>;
+        let remove = Arc::clone(&self.remove);
 
-        // The job holds a strong handle, so the host (and its directory lock) stays
-        // alive until the directory is really gone, and the `Weak` upgrade below
-        // always succeeds.
-        let keep_alive: Arc<dyn Send + Sync> = Arc::clone(&host) as Arc<dyn Send + Sync>;
-        let submitted = host.pool.submit_detached(keep_alive, move || {
-            match remove_tree(&dir) {
+        let submitted = self.pool.submit_detached(keep_alive, move || {
+            let outcome = match remove(&dir) {
                 Ok(()) => {
                     completed.fetch_add(1, Ordering::SeqCst);
+                    SideCleanupState::Complete
                 }
                 Err(error) => {
                     // Diagnostics never include file contents.
                     tracing::warn!(
                         side_id = %side_id,
                         dir = %dir.display(),
-                        "side cleanup failed, leaving it for startup reclamation: {error}"
+                        "side cleanup failed, keeping its slot for a retry: {error}"
                     );
                     failed.fetch_add(1, Ordering::SeqCst);
+                    SideCleanupState::Failed {
+                        code: "cleanup_failed".into(),
+                    }
                 }
-            }
-            // Free the slot last: `slots_in_use` must never report a slot as free
-            // while its directory still exists.
-            if let Some(host) = weak.upgrade() {
+            };
+            let complete = outcome.is_complete();
+            // Publish before freeing the slot, so a caller that sees a free slot
+            // can never observe a still-pending receipt.
+            let _ = sender.send(outcome);
+            if complete && let Some(host) = weak.upgrade() {
                 let mut slots = host.slots.lock().unwrap();
                 let matching = slots
                     .get(&side_id)
@@ -507,10 +467,13 @@ impl Drop for SideResourceLease {
             live.fetch_sub(1, Ordering::SeqCst);
         });
         if !submitted {
-            // The pool is closed: keep the slot and let startup reclaim the tree,
-            // rather than reporting a release that did not happen.
+            // The pool is closed: keep the slot and report the failure on the
+            // receipt rather than claiming a release that did not happen.
             failed_outside.fetch_add(1, Ordering::SeqCst);
             live_outside.fetch_sub(1, Ordering::SeqCst);
+            let _ = sender_outside.send(SideCleanupState::Failed {
+                code: "cleanup_pool_closed".into(),
+            });
         }
     }
 }

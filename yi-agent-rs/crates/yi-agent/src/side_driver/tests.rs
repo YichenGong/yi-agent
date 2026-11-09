@@ -108,7 +108,7 @@ fn fixture() -> Fixture {
     )));
     let pool = Arc::new(yi_agent_tools::SideBlockingPool::new(8, 2, 8, 2));
     let resources = SideHostResources::new(dir.path().to_path_buf(), Arc::clone(&pool)).unwrap();
-    let handles = spawn_side_driver(publisher, resources, pool);
+    let handles = spawn_side_driver(publisher, resources);
     Fixture {
         _dir: dir,
         provider,

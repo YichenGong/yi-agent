@@ -120,7 +120,7 @@ async fn registry_fixture_with_provider(
         Arc::clone(&pool),
     )
     .expect("host resources");
-    let registry = SideRegistry::new(resolver, resources, pool);
+    let registry = SideRegistry::new(resolver, resources);
     (project, home, registry)
 }
 
@@ -373,7 +373,7 @@ async fn side_open_during_a_parent_turn_does_not_touch_parent_files() {
         Arc::clone(&pool),
     )
     .expect("host resources");
-    let registry = SideRegistry::new(resolver, resources, pool);
+    let registry = SideRegistry::new(resolver, resources);
 
     let summary = registry.open("p1").await.expect("父运行中必须能开旁支");
     assert_eq!(summary.parent_thread_id, "p1");
