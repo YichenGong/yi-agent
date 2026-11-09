@@ -1,8 +1,8 @@
 # desktop（Tauri GUI）
 
-## 一次性对话快照旁问（规格已复核、计划已写，未实现）
+## 一次性对话快照旁问（自动检查通过，真实设备验收未执行）
 
-- [ ] 桌面/手机离开销毁与全新重入 — [plan](../superpowers/plans/2026-11-09-side-snapshot-lifecycle-impl.md) · [复核](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md) · [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §4、§6–§9。完成判据：`cd desktop && npx tsc --noEmit && npx vitest run src/hooks/useSideConversationController.test.tsx src/App.test.tsx` 覆盖返回、切会话/项目、迟到 open、断网退出重试、新代零旧正文/草稿；再执行 spec §9 桌面与手机同宿主联合验收。旧记录中“返回保留/后台续聊”的行为与断言将被覆盖，历史自动检查不证明本项完成。
+- [ ] 桌面/手机离开销毁与全新重入 — [plan](../superpowers/plans/2026-11-09-side-snapshot-lifecycle-impl.md) · [复核](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md) · [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §4、§6–§9。自动部分已完成：`src/hooks/useSideConversationController.ts` 的 `leaveSide(reason)` 统一返回、导航、卸载三条出口，退出即撤本地正文与首问意图；退出票据协调器记录精确票据，握手就绪后先 flush，迟到 open 补 `side/exit` 而不提问。判据：`cd desktop && npx tsc --noEmit` exit 0；`npx vitest run` 194 文件 / 2850 测试全通过（含 `useSideConversationController.test.tsx` 42 例与 `App.test.tsx` 293 例）；`npm run build` exit 0。Rust 侧 `just ci` exit 0（6325 passed + 50 passed）。仍阻塞：spec §9 的桌面真机 + 手机同宿主 relay 联合验收未执行（手机后台/短断线与断网重连时序依赖真实网络），本项保持未完成，不以 jsdom 代替。
 
 ## 模块说明
 

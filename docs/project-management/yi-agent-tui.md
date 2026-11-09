@@ -1,8 +1,8 @@
 # yi-agent-tui
 
-## 一次性旁问退出（规格已复核、计划已写，未实现）
+## 一次性旁问退出（自动检查通过，真实终端验收未执行）
 
-- [ ] `/back` 与 `/side-close` 退出即销毁 — [plan](../superpowers/plans/2026-11-09-side-snapshot-lifecycle-impl.md) · [复核](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md) · [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §4、§8、§9。完成判据：`cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::side` 与 driver/输入循环集成验证运行中退出、Creating 中退出、父任务继续、重入新快照、帮助不再承诺保留；新测试与真实终端验收尚未执行。
+- [ ] `/back` 与 `/side-close` 退出即销毁 — [plan](../superpowers/plans/2026-11-09-side-snapshot-lifecycle-impl.md) · [复核](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md) · [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §4、§8、§9。自动部分已完成：`crates/yi-agent/src/side_driver.rs` 的 `SideDriverCommand::Leave { entry_id }` 校验当前 entry 后取消构造/runner 并在 10 秒窗口内排空销毁，`entry_matches` 让旧 entry 的迟到提交不落到新代；`tui/app.rs::leave_side_session` 清空 history/input/usage/pending 并投递 `Leave`。判据：`cargo test -p yi-agent --all-features --bins side_driver::tests::` 12 passed（含 `a_late_frame_from_an_older_entry_does_not_rebuild_a_view`、`leave_during_creation_cancels_and_creates_nothing`）；`cargo nextest run --all-features --profile ci -p yi-agent -E 'test(side_repair_pasted_back_needs_enter_and_sends_leave)'` 通过，`tui::app::notification_tests::side_repair_pasted_back_needs_enter_and_sends_leave` 断言 `/back` 必须发 `Leave` 且不触发父 interrupt/审批。变异证明见 [验收记录](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-acceptance.md) §3（`/back` 只导航 → 该用例变红；去掉旧 entry 检查 → 迟到帧用例变红）。工作树内 `just ci` exit 0（6325 passed + 50 passed）覆盖该 12 例。仍阻塞：真实终端路径未验收，本项保持未完成。
 
 ## 模块说明
 

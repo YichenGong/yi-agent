@@ -1,7 +1,7 @@
 # 一次性对话快照旁问设计
 
 日期：2026-11-09
-状态：规格已复核并完成[实施计划](../plans/2026-11-09-side-snapshot-lifecycle-impl.md)，尚未实现。复核记录见[审查记录](../reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md)。
+状态：规格已复核，[实施计划](../plans/2026-11-09-side-snapshot-lifecycle-impl.md) 的 Task 1–12 已落地，Task 13 的自动检查与垂直集成已通过；**真实设备（TUI 终端 / 桌面 / 手机同 relay）与 release 构建验收未执行**，详见[验收记录](../reviews/2026-11-09-side-snapshot-lifecycle-acceptance.md)。复核记录见[审查记录](../reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md)。
 
 ## 1. 用户确认与目标
 

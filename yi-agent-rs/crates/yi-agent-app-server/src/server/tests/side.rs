@@ -578,3 +578,822 @@ async fn unknown_entry_ticket_is_entry_expired() {
 
     h.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// 垂直集成:真实主循环 + 真实旁支注册表 + 可观察 provider
+//
+// 上面那些用例钉的是协议形状;这一节钉的是 spec §5.1/§5.3 的**链路事实**:
+// 父在跑、进度未落盘时旁支就能看到它;旁支的请求里没有工具、也不再写父历史;
+// 退出之后本代的 stream/资源槽真的归零,重入拿到的是新快照。
+//
+// 为什么必须拼到主循环这一层:每一环单独都有单元测试,但把它们串起来会多出
+// 「父的快照何时重发布」「哪一份活父表被 resolver 查询」这类只有装配才暴露的
+// 接线错误——正是本任务要防的回归。
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex as StdMutex;
+
+use yi_agent_core::provider::{ProviderEvent, ProviderRequest, StopReason, TokenUsage};
+
+/// 记录每一份真正发往 provider 的请求。
+///
+/// 断言必须落在 `ProviderRequest` 上而不是旁支内部状态:spec §5.3 要求的是
+/// 「模型收到的历史里没有它不该有的东西」,内部 session 对不对只是手段。
+struct RecordingRequestProvider {
+    seen: Arc<StdMutex<Vec<ProviderRequest>>>,
+    /// 父与旁支共用一份记录表时,按 system prompt 里的旁支政策区分两者。
+    reply: &'static str,
+}
+
+#[async_trait::async_trait]
+impl yi_agent_core::Provider for RecordingRequestProvider {
+    async fn call_stream(
+        &self,
+        req: ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        // 标题生成走同一条 provider;它既不是父回合也不是旁问,记进去会让
+        // 「第几条请求是哪一轮」变得依赖时序。
+        let is_title = req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS);
+        if !is_title {
+            self.seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(req);
+        }
+        Ok(Box::pin(futures::stream::iter(vec![
+            ProviderEvent::TextDelta(self.reply.to_string()),
+            ProviderEvent::Usage(TokenUsage {
+                input_tokens: 11,
+                output_tokens: 3,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                reasoning_tokens: None,
+            }),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ])))
+    }
+}
+
+/// 一份旁支请求的判据:它带着旁支政策,而不是父的系统提示。
+fn is_side_request(req: &ProviderRequest) -> bool {
+    req.system
+        .as_deref()
+        .is_some_and(|system| system.contains(yi_agent_core::SIDE_SYSTEM_POLICY))
+}
+
+fn rendered(req: &ProviderRequest) -> String {
+    serde_json::to_string(
+        &req.messages
+            .iter()
+            .map(|m| (m.role, &m.content))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+}
+
+/// 父侧的假工具:只为了让「旁支请求里工具集为空」这条断言不是空集对空集。
+struct RecordingParentTool;
+
+#[async_trait::async_trait]
+impl yi_agent_core::Tool for RecordingParentTool {
+    fn name(&self) -> &str {
+        "parent_tool"
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    fn description(&self) -> &str {
+        "parent-only tool"
+    }
+    async fn call(&self, _args: serde_json::Value) -> yi_agent_core::ToolResult {
+        yi_agent_core::ToolResult::text("parent tool ran")
+    }
+}
+
+/// 带一个父工具的装配工厂。父会话因此有真实工具,旁支仍然必须是零工具。
+fn build_recording_parent(
+    provider: Arc<dyn yi_agent_core::Provider>,
+) -> impl Fn(
+    Option<yi_agent_core::Session>,
+    &std::path::Path,
+    crate::thread_store::ThreadMode,
+) -> anyhow::Result<crate::server::BuiltAgent>
++ Send
++ Sync
++ 'static {
+    move |session, _cwd, _mode| {
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        registry.register(Arc::new(RecordingParentTool));
+        let config = yi_agent_core::AgentConfig {
+            model: crate::test_support::TEST_MODEL.to_string(),
+            ..yi_agent_core::AgentConfig::default()
+        };
+        let mut agent =
+            yi_agent_core::Agent::new(Arc::clone(&provider), Arc::new(registry), config.clone());
+        if let Some(session) = session {
+            crate::server::turn::apply_session(&mut agent, Some(session));
+        }
+        Ok(crate::server::BuiltAgent {
+            agent,
+            provider: Arc::clone(&provider),
+            config,
+            decision_tx: None,
+            decision_rx: None,
+            catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
+            sandbox: yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                true,
+            ),
+        })
+    }
+}
+
+/// 父/旁支共用的最近一条 user 文本,用来判断「这一轮问的是什么」。
+fn last_user_text(req: &ProviderRequest) -> String {
+    req.messages
+        .iter()
+        .rev()
+        .find(|m| m.role == yi_agent_core::message::Role::User)
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    yi_agent_core::message::ContentBlock::Text(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+/// 等一帧满足条件的通知;超时即失败。用于等 `side/turnCompleted`。
+async fn wait_side_turn_completed(h: &mut Harness, side_id: &str) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "side/turnCompleted 没有在预算内到达");
+        let Some(v) = h.try_read_value(left.min(Duration::from_secs(5))).await else {
+            continue;
+        };
+        if v.get("method").and_then(|m| m.as_str()) == Some("side/turnCompleted")
+            && v["params"]["side_id"].as_str() == Some(side_id)
+        {
+            return v;
+        }
+    }
+}
+
+/// 一条完整的真实链路:父在跑且进度只在内存里 → 旁支看得到它,但看不到之后
+/// 新增的进展;旁支请求零工具;父历史逐字节不变;退出后本代资源归零,重入是
+/// 新快照。
+///
+/// 这条用例替代「各自在替身上过一遍」的十几个小断言:它只有把 start / turn /
+/// refresh / prepare / open / turnStart / exit 串在**同一个宿主**上才成立。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_side_sees_the_live_progress_and_dies_on_exit_without_touching_the_parent() {
+    use crate::server::tests::read_response;
+
+    let home = tempfile::TempDir::new().unwrap();
+    let live = Arc::new(crate::side_conversation::LiveSideParents::new());
+    let (registry, resources) =
+        crate::server::tests::live_parent_side_registry(home.path(), Arc::clone(&live));
+    let host_id = registry.host_instance_id().to_string();
+    // 注册表要留一份句柄:验收必须断言「退出之后既没有活代,也没有残留占位」,
+    // 而 `side_count`/`tombstone_count` 只在注册表上可读。把它整个 move 进
+    // Harness 就只能靠槽位间接推断,那证明不了代次真的被摘掉了。
+    let registry_view = Arc::clone(&registry);
+    let seen: Arc<StdMutex<Vec<ProviderRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(RecordingRequestProvider {
+        seen: Arc::clone(&seen),
+        reply: "收到",
+    });
+    let mut h = Harness::with_live_side_registry(
+        Scope::Admin,
+        registry,
+        Arc::clone(&live),
+        build_recording_parent(provider),
+    )
+    .await;
+    initialize(&mut h).await;
+
+    // 1. 父会话真的跑起来:开局就发布,于是 `/side` 不依赖磁盘。
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let started = read_response(&mut h, 2).await;
+    let thread_id = started["result"]["thread_id"]
+        .as_str()
+        .expect("thread/start returns an id")
+        .to_string();
+    assert!(
+        live.get(&thread_id).is_some(),
+        "thread/start 之后必须立刻是活跃父:旁支只能从它取快照"
+    );
+
+    // 2. 父跑第一轮:进度 A 进的是内存 session,此刻还没有任何旁支。
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "进度A:已经改完 side_driver"}],
+            }
+        })
+        .to_string(),
+    )
+    .await;
+    let _ = read_response(&mut h, 3).await;
+    let parent_turn = h.read_until_turn_completed().await;
+    // 旁支的存在与退出都不得动父那一轮。父的回合状态是 `completed`,
+    // 没有任何一次 `turn/interrupt` 落到它身上:计数为 0 的证据就是它自己
+    // 正常跑完,而不是被打断后仍报完成。
+    assert_eq!(
+        parent_turn["params"]["status"],
+        serde_json::json!("completed"),
+        "旁支不得打断父回合: {parent_turn}"
+    );
+    // 父请求带着真实工具集:旁支那条 `tools==[]` 才有对照物。
+    let parent_requests: Vec<ProviderRequest> = {
+        let guard = seen.lock().unwrap();
+        guard
+            .iter()
+            .filter(|r| !is_side_request(r))
+            .cloned()
+            .collect()
+    };
+    assert!(
+        parent_requests
+            .iter()
+            .any(|r| !r.tools.is_empty() && last_user_text(r).contains("进度A")),
+        "父回合必须带着它自己的工具集跑过一次: {parent_requests:?}"
+    );
+
+    // 3. prepare → open:票据是唯一入口。
+    let prepared = call(
+        &mut h,
+        4,
+        "side/prepare",
+        serde_json::json!({"parentThreadId": thread_id}),
+    )
+    .await;
+    let entry_id = prepared["result"]["entryId"]
+        .as_str()
+        .expect("prepare issues a ticket")
+        .to_string();
+    let opened = call(
+        &mut h,
+        5,
+        "side/open",
+        serde_json::json!({"parentThreadId": thread_id, "entryId": entry_id}),
+    )
+    .await;
+    let side_id = opened["result"]["side_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("open must return a side: {opened}"))
+        .to_string();
+
+    // 4. 旁支首问。命中快照里的 A,且请求里没有任何工具。
+    let first = call(
+        &mut h,
+        6,
+        "side/turnStart",
+        serde_json::json!({
+            "sideId": side_id,
+            "text": "现在做到哪一步了?",
+            "clientRequestId": uuid::Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert!(first.get("result").is_some(), "旁支必须受理首问: {first}");
+    let _ = wait_side_turn_completed(&mut h, &side_id).await;
+
+    let first_side = {
+        let guard = seen.lock().unwrap();
+        guard
+            .iter()
+            .filter(|r| is_side_request(r))
+            .find(|r| last_user_text(r).contains("现在做到哪一步了?"))
+            .cloned()
+            .expect("旁支首问必须真的发到 provider")
+    };
+    assert!(
+        first_side.tools.is_empty(),
+        "旁支请求不得携带任何工具: {:?}",
+        first_side
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        rendered(&first_side).contains("进度A"),
+        "旁支必须看到父未落盘的进度 A: {}",
+        rendered(&first_side)
+    );
+
+    // 5. 父继续:新增 B。已开的旁支**不跟随**。
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "进度B:顺手修了 help 文案"}],
+            }
+        })
+        .to_string(),
+    )
+    .await;
+    let _ = read_response(&mut h, 7).await;
+    let parent_turn_b = h.read_until_turn_completed().await;
+    assert_eq!(
+        parent_turn_b["params"]["status"],
+        serde_json::json!("completed"),
+        "旁支两轮问答之后父那一轮仍须是正常完成: {parent_turn_b}"
+    );
+
+    // 6. 父历史:边问边比,旁支不能改父一个字。
+    let parent_after_b = live
+        .get(&thread_id)
+        .expect("父仍在驱动中")
+        .snapshot()
+        .await
+        .expect("父快照可用");
+    let parent_before_side = serde_json::to_string(
+        &parent_after_b
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .messages()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        parent_before_side.contains("进度B"),
+        "父的 B 必须已进入它自己的快照: {parent_before_side}"
+    );
+
+    let second = call(
+        &mut h,
+        8,
+        "side/turnStart",
+        serde_json::json!({
+            "sideId": side_id,
+            "text": "那 B 呢?",
+            "clientRequestId": uuid::Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert!(second.get("result").is_some(), "{second}");
+    let _ = wait_side_turn_completed(&mut h, &side_id).await;
+
+    let second_side = {
+        let guard = seen.lock().unwrap();
+        guard
+            .iter()
+            .filter(|r| is_side_request(r))
+            .find(|r| last_user_text(r).contains("那 B 呢?"))
+            .cloned()
+            .expect("旁支第二问必须真的发到 provider")
+    };
+    assert!(
+        !rendered(&second_side).contains("进度B"),
+        "同一代旁支不得看到进入之后的新进展: {}",
+        rendered(&second_side)
+    );
+    assert!(
+        second_side.tools.is_empty(),
+        "第二问同样零工具: {:?}",
+        second_side
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let parent_after_side = serde_json::to_string(
+        &live
+            .get(&thread_id)
+            .expect("父仍在驱动中")
+            .snapshot()
+            .await
+            .expect("父快照可用")
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .messages()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        parent_before_side, parent_after_side,
+        "旁支的两轮问答不得改动父历史(逐字节)"
+    );
+
+    // 7. 退出:同义于 /back,销毁本代。必须先等到 Closed 才谈重入。
+    let exited = call(
+        &mut h,
+        9,
+        "side/exit",
+        serde_json::json!({
+            "hostInstanceId": host_id,
+            "parentThreadId": thread_id,
+            "entryId": entry_id,
+        }),
+    )
+    .await;
+    let exit_state = exited["result"]["state"].as_str().map(str::to_string);
+    assert!(
+        matches!(exit_state.as_deref(), Some("closing") | Some("closed")),
+        "{exited}"
+    );
+
+    // `closed` 之前不得放行第二环境。
+    //
+    // 这条在这里只做**观察**,不下断言:探测用的 open 一旦成功,它自己就是一条
+    // 新的活代,会占掉资源槽,把这个用例后面对「槽位归零」的验收污染成假的。
+    // 确定性证明在 registry 的单元测试里——`exit_during_creation_cancels_before_the_question`
+    // 用门控 resolver 把构造卡住,于是「closing 期间 open 必被拒」不依赖时序。
+    if exit_state.as_deref() == Some("closing") {
+        assert!(
+            registry_view.side_count().await <= 1,
+            "同一父不得同时存在两代旁支"
+        );
+    }
+
+    // 本代必须真的从注册表里摘掉:槽位归零只说明资源回收了,一个仍挂在
+    // `sides`/`parents` 里的死代会让后续 `side/list` 报一个永远 Creating 的
+    // 环境,而那正是「按了退出却没退出去」。排空的第 6 步交回槽位、第 7 步才
+    // 摘代次,所以两个条件要一起等。
+    wait_for_side_gone(&resources, &registry_view).await;
+    // 排空之后不得再有清理任务在跑:槽位归零只说明账平了,残留的清理任务
+    // 仍可能持有目录句柄。
+    assert_eq!(resources.live_cleanups(), 0, "退出之后不得残留清理任务");
+
+    // 8. 关闭之后不得留下可读的本代内容。
+    let read = call(
+        &mut h,
+        10,
+        "side/readItems",
+        serde_json::json!({"sideId": side_id}),
+    )
+    .await;
+    let reason = read["error"]["data"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        matches!(reason, "side_closing" | "side_not_found"),
+        "退出之后不得再读到本代正文: {read}"
+    );
+
+    // 9. 重入是全新环境:含 B,不含旧旁问。
+    let prepared = call(
+        &mut h,
+        11,
+        "side/prepare",
+        serde_json::json!({"parentThreadId": thread_id}),
+    )
+    .await;
+    let entry2 = prepared["result"]["entryId"].as_str().unwrap().to_string();
+    let reopened = call(
+        &mut h,
+        12,
+        "side/open",
+        serde_json::json!({"parentThreadId": thread_id, "entryId": entry2}),
+    )
+    .await;
+    let side2 = reopened["result"]["side_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("重入必须成功: {reopened}"))
+        .to_string();
+    assert_ne!(side2, side_id, "重入必须是新的一代");
+
+    let third = call(
+        &mut h,
+        13,
+        "side/turnStart",
+        serde_json::json!({
+            "sideId": side2,
+            "text": "重新看一下进度",
+            "clientRequestId": uuid::Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert!(third.get("result").is_some(), "{third}");
+    let _ = wait_side_turn_completed(&mut h, &side2).await;
+
+    let third_side = {
+        let guard = seen.lock().unwrap();
+        guard
+            .iter()
+            .filter(|r| is_side_request(r))
+            .rfind(|r| last_user_text(r).contains("重新看一下进度"))
+            .cloned()
+            .expect("重入后的首问必须真的发到 provider")
+    };
+    assert!(
+        rendered(&third_side).contains("进度B"),
+        "新快照必须包含父在此期间的进展 B: {}",
+        rendered(&third_side)
+    );
+    assert!(
+        !rendered(&third_side).contains("现在做到哪一步了?"),
+        "新环境不得继承上一次旁问: {}",
+        rendered(&third_side)
+    );
+
+    // 10. 退出这一代,把资源槽交回去。
+    let _ = call(
+        &mut h,
+        14,
+        "side/exit",
+        serde_json::json!({
+            "hostInstanceId": host_id,
+            "parentThreadId": thread_id,
+            "entryId": entry2,
+        }),
+    )
+    .await;
+    wait_for_side_gone(&resources, &registry_view).await;
+    assert_eq!(
+        registry_view.side_count().await,
+        0,
+        "两代先后退出后不得留下活代"
+    );
+    assert!(
+        registry_view.tombstone_count().await >= 2,
+        "两次退出都必须留下墓碑:重放的迟到请求要能拿到确定的答案,而不是被当成从未存在"
+    );
+
+    h.shutdown().await;
+}
+
+/// 同一宿主的第二端(手机 / 另一台桌面)只能看,不能开、不能问、不能退。
+///
+/// 这是 spec §7「同父多端」与 §8.1 权限划分合成的验收:第一端 Control 建环境、
+/// 提问;第二端 Observe 必须能 `side/list` 与 `side/readItems`(否则它连「有没有
+/// 旁支在跑」都看不到),但 `prepare`/`open`/`turnStart`/`exit` 一律在 dispatch
+/// 处被拒。最后第一端退出,两端都必须看到本代消失。
+#[tokio::test]
+async fn a_second_client_reads_the_same_generation_but_cannot_control_it() {
+    use crate::server::tests::read_response;
+
+    let home = tempfile::TempDir::new().unwrap();
+    let live = Arc::new(crate::side_conversation::LiveSideParents::new());
+    let (registry, resources) =
+        crate::server::tests::live_parent_side_registry(home.path(), Arc::clone(&live));
+    let host_id = registry.host_instance_id().to_string();
+    let registry_view = Arc::clone(&registry);
+    let seen: Arc<StdMutex<Vec<ProviderRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(RecordingRequestProvider {
+        seen: Arc::clone(&seen),
+        reply: "收到",
+    });
+    // 两条连接共用同一个 registry 与同一个活父表:这才是「同一台宿主的两个端」。
+    //
+    // 第二条连接用 Observe 建:它的 agent 工厂不会被调用(`prepare`/`open` 在
+    // dispatch 处就被拒),共享的是同一份宿主资源。
+    let mut control = Harness::with_live_side_registry(
+        Scope::Control,
+        Arc::clone(&registry),
+        Arc::clone(&live),
+        build_recording_parent(provider),
+    )
+    .await;
+    let mut observe = Harness::with_scope_and_side_registry(Scope::Observe, registry).await;
+    initialize(&mut control).await;
+    initialize(&mut observe).await;
+
+    // 父在 Control 连接上跑起来,进度 A 只在内存里。
+    control
+        .send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let started = read_response(&mut control, 2).await;
+    let thread_id = started["result"]["thread_id"].as_str().unwrap().to_string();
+    control
+        .send(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": "进度A:跨端验收"}],
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = read_response(&mut control, 3).await;
+    let _ = control.read_until_turn_completed().await;
+
+    let prepared = call(
+        &mut control,
+        4,
+        "side/prepare",
+        serde_json::json!({"parentThreadId": thread_id}),
+    )
+    .await;
+    let entry_id = prepared["result"]["entryId"].as_str().unwrap().to_string();
+    let opened = call(
+        &mut control,
+        5,
+        "side/open",
+        serde_json::json!({"parentThreadId": thread_id, "entryId": entry_id}),
+    )
+    .await;
+    let side_id = opened["result"]["side_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("Control 端必须能建立环境: {opened}"))
+        .to_string();
+
+    let asked = call(
+        &mut control,
+        6,
+        "side/turnStart",
+        serde_json::json!({
+            "sideId": side_id,
+            "text": "现在做到哪一步了?",
+            "clientRequestId": uuid::Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert!(asked.get("result").is_some(), "{asked}");
+
+    // 等旁支这一轮真的跑完。不能用 `side/turnCompleted` 通知:两条 Harness 各自
+    // 起一个 serve,`attach_hub` 是后装覆盖先装,通知只会送到其中一条连接。这是
+    // 测试装配的假象(生产里一个进程只有一个 hub),所以这里改用事实证据:
+    // provider 收到了那条请求,且注册表把它记成了已受理。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let answered = {
+            let guard = seen.lock().unwrap();
+            guard
+                .iter()
+                .filter(|r| is_side_request(r))
+                .any(|r| last_user_text(r).contains("现在做到哪一步了?"))
+        };
+        let accepted = registry_view
+            .accepted_requests(&side_id)
+            .await
+            .map(|table| !table.is_empty())
+            .unwrap_or(false);
+        if answered && accepted {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "旁支首问没有在预算内被受理"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Observe 端:读得到同一代,读得到正文。
+    let listed = call(
+        &mut observe,
+        10,
+        "side/list",
+        serde_json::json!({"parentThreadId": thread_id}),
+    )
+    .await;
+    let listed_sides = listed["result"]["sides"]
+        .as_array()
+        .unwrap_or_else(|| panic!("Observe 必须能列: {listed}"));
+    assert_eq!(listed_sides.len(), 1, "{listed}");
+    assert_eq!(listed_sides[0]["side_id"], serde_json::json!(side_id));
+
+    let read = call(
+        &mut observe,
+        11,
+        "side/readItems",
+        serde_json::json!({"sideId": side_id}),
+    )
+    .await;
+    assert!(
+        read.get("result").is_some(),
+        "Observe 必须能读到同一代正文: {read}"
+    );
+    let body = serde_json::to_string(&read["result"]["items"]).unwrap();
+    assert!(body.contains("现在做到哪一步了?"), "{body}");
+
+    // Observe 端:任何 Control 动作都必须在 dispatch 处被拒(-32014),
+    // 而不是走到注册表里再报一个「找不到」——那会让客户端以为旁支消失了。
+    let refused = [
+        (
+            "side/prepare",
+            serde_json::json!({"parentThreadId": thread_id}),
+        ),
+        (
+            "side/open",
+            serde_json::json!({"parentThreadId": thread_id, "entryId": entry_id}),
+        ),
+        (
+            "side/turnStart",
+            serde_json::json!({
+                "sideId": side_id,
+                "text": "越权提问",
+                "clientRequestId": uuid::Uuid::new_v4().to_string(),
+            }),
+        ),
+        (
+            "side/exit",
+            serde_json::json!({
+                "hostInstanceId": host_id,
+                "parentThreadId": thread_id,
+                "entryId": entry_id,
+            }),
+        ),
+    ];
+    for (offset, (method, params)) in refused.into_iter().enumerate() {
+        let v = call(&mut observe, 20 + offset as u64, method, params).await;
+        assert_eq!(
+            v["error"]["code"],
+            serde_json::json!(-32014),
+            "{method} 必须在 Observe 端被拒: {v}"
+        );
+    }
+    // 越权尝试不得改变本代:它还活着,还能继续答。
+    assert_eq!(registry_view.side_count().await, 1, "越权请求不得动到本代");
+
+    // Control 端退出:两端看到的本代都必须消失。
+    let exited = call(
+        &mut control,
+        30,
+        "side/exit",
+        serde_json::json!({
+            "hostInstanceId": host_id,
+            "parentThreadId": thread_id,
+            "entryId": entry_id,
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            exited["result"]["state"].as_str(),
+            Some("closing") | Some("closed")
+        ),
+        "{exited}"
+    );
+    wait_for_side_gone(&resources, &registry_view).await;
+    assert_eq!(registry_view.side_count().await, 0);
+
+    for (h, name) in [(&mut control, "Control"), (&mut observe, "Observe")] {
+        let listed = call(
+            h,
+            40,
+            "side/list",
+            serde_json::json!({"parentThreadId": thread_id}),
+        )
+        .await;
+        assert_eq!(
+            listed["result"]["sides"],
+            serde_json::json!([]),
+            "{name} 端不得再看到已退出的本代: {listed}"
+        );
+        let read = call(
+            h,
+            41,
+            "side/readItems",
+            serde_json::json!({"sideId": side_id}),
+        )
+        .await;
+        let reason = read["error"]["data"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            matches!(reason, "side_closing" | "side_not_found"),
+            "{name} 端退出后不得再读到正文: {read}"
+        );
+    }
+
+    control.shutdown().await;
+    observe.shutdown().await;
+}
+
+/// 等「槽位归零且代次摘掉」同时成立。
+///
+/// 排空不是一次原子的:第 6 步交回资源槽,第 7 步才从 `sides`/`parents` 摘代次
+/// 并写墓碑。只等槽位会落在这两步之间——单独跑常常撞不上,并发跑就稳定变红。
+/// 验收要的是「退出真的完成」,所以两个条件都要等。
+async fn wait_for_side_gone(
+    resources: &Arc<yi_agent_runtime::side_conversation::SideHostResources>,
+    registry: &Arc<crate::side_conversation::SideRegistry>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if resources.slots_in_use() == 0 && registry.side_count().await == 0 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "退出之后必须同时满足槽位归零与代次摘除,实际槽位 {} 个、活代 {} 个",
+        resources.slots_in_use(),
+        registry.side_count().await
+    );
+}

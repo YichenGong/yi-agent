@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust/Tokio、现有 core/runtime/app-server/CLI；React 19、TypeScript、Vitest；现有 JSON-RPC、ts-rs 和 nextest。无新依赖。
 
-**Status:** 计划已写，未执行。依据 [spec](../specs/2026-11-09-side-snapshot-lifecycle-design.md) 与 [复核记录](../reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md)。本文代码为待实现接口及关键测试/算法，不是已验证补丁。
+**Status:** Task 1–12 已完成（其 Step 复选框未逐条回填：那些步骤是跨多次会话完成的，回填需要逐条重验，不以推测打勾；代码与测试证据见验收记录）。Task 13 的 Step 1（垂直集成）、Step 2（变异证明）、Step 3（自动检查）已执行并记录在 [验收记录](../reviews/2026-11-09-side-snapshot-lifecycle-acceptance.md)；**Step 4（真实交互验收）未执行**，因此对应 feature 保持未完成，Step 5 的文档同步未做完成态标记，Step 6 未开始。依据 [spec](../specs/2026-11-09-side-snapshot-lifecycle-design.md) 与 [复核记录](../reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md)。
 
 ## Global Constraints
 
@@ -791,7 +791,7 @@ Draining完成: joined+cleanup Complete才清slot，通知1秒有界
 **Interfaces:**
 - 消费全部前置接口；不新增机制。验收记录只记实际执行的命令、退出码、场景证据和未验边界，不沿用历史just ci或测试数量。
 
-- [ ] **Step 1 — 补垂直集成 RED。** stdio真实生产start链：父stream在barrier保持运行，追加一条完整进度A未落盘，prepare/open/首问记录ProviderRequest有A；父追加B，side追问不含B；running exit→stream dropped/joined/slot零；新票重入含B且不含旧旁问。两连接共同open，Control退出使两端本代失效；Observe read允许但prepare/turn/exit拒绝。测试provider复用server已有mock，不走真实付费API。
+- [x] **Step 1 — 补垂直集成 RED。** stdio真实生产start链：父stream在barrier保持运行，追加一条完整进度A未落盘，prepare/open/首问记录ProviderRequest有A；父追加B，side追问不含B；running exit→stream dropped/joined/slot零；新票重入含B且不含旧旁问。两连接共同open，Control退出使两端本代失效；Observe read允许但prepare/turn/exit拒绝。测试provider复用server已有mock，不走真实付费API。
 
 ```text
 必须断言：父interrupt计数=0；父序列化历史与预期一致；
@@ -799,7 +799,7 @@ side request.tools=[]；side1第二问无B；side2含B无side1问答；
 closed响应之前不放行第二环境；最后本代资源槽、replay快照、转发owner归零。
 ```
 
-- [ ] **Step 2 — RED/GREEN 与变异证明。** 单独临时变异下列生产分支，每次运行对应新测试必须失败，再恢复并复跑通过；不提交变异，不用git reset覆盖他人改动。
+- [x] **Step 2 — RED/GREEN 与变异证明。** 单独临时变异下列生产分支，每次运行对应新测试必须失败，再恢复并复跑通过；不提交变异，不用git reset覆盖他人改动。
 
 | 变异 | 必须击中的断言 |
 |---|---|
@@ -810,7 +810,7 @@ closed响应之前不放行第二环境；最后本代资源槽、replay快照�
 | unknown票据open当首次创建 | Task7淘汰/撤销票据拒绝 |
 | 去掉旧entry/generation检查 | Task8/10/12旧事件不复活或杀新代 |
 
-- [ ] **Step 3 — 完整自动检查。** 依次运行并记录：
+- [x] **Step 3 — 完整自动检查。** 依次运行并记录：
 
 ```bash
 cd yi-agent-rs
@@ -824,9 +824,9 @@ npm run build
 
 不并行全workspace cargo test；just ci是唯一CI入口，不能用几条范围tests代替。失败诊断后修复、独占重跑，记录真实结果。live API仅从 `just test-live` 入口运行，配置来自实例默认model；无key为SKIPPED，不写已通过。
 
-- [ ] **Step 4 — 真实交互验收（用户可见路径）。** dev实验开关开启、主长任务→/side问进展→连续追问→主继续→side不刷新→回答中/back→确认真实本代stream和资源结束→再进取得新进展。桌面、手机同宿主、TUI各做；手机后台/短断线不exit，断网明确退出重连先补exit；切项目/父不混client；同机关flag不影响远端。release不开入口/RPC -32601。不通过只能保留未完成，不伪称真机测试由jsdom覆盖；不能控制供应商远端物理计算的限制写入记录。
+- [ ] **Step 4 — 真实交互验收（用户可见路径）。 阻塞：本机无可用真机/relay 环境，TUI 终端、桌面、手机同宿主、release 构建均未执行；见 [验收记录](../reviews/2026-11-09-side-snapshot-lifecycle-acceptance.md) §5。** dev实验开关开启、主长任务→/side问进展→连续追问→主继续→side不刷新→回答中/back→确认真实本代stream和资源结束→再进取得新进展。桌面、手机同宿主、TUI各做；手机后台/短断线不exit，断网明确退出重连先补exit；切项目/父不混client；同机关flag不影响远端。release不开入口/RPC -32601。不通过只能保留未完成，不伪称真机测试由jsdom覆盖；不能控制供应商远端物理计算的限制写入记录。
 
-- [ ] **Step 5 — 同步文档状态并提交。** 自动和真实验收全部满足才将对应feature `[ ]`→`[x]`，附测试名/命令/代码位置，重新计算README计数；若真机/模型不可用，保持对应验收未完成并明确阻塞。更新spec/plan状态只反映已执行事实。使用统一门禁，message：`test: verify disposable side snapshot lifecycle across clients`。
+- [ ] **Step 5 — 同步文档状态并提交。 已完成：模块文档、README 计数、spec/plan 状态、验收记录均已更新，feature 复选框按「真机未验收」保持 `[ ]`。未完成：本步骤要求「自动和真实验收全部满足」，真实验收未执行。** 自动和真实验收全部满足才将对应feature `[ ]`→`[x]`，附测试名/命令/代码位置，重新计算README计数；若真机/模型不可用，保持对应验收未完成并明确阻塞。更新spec/plan状态只反映已执行事实。使用统一门禁，message：`test: verify disposable side snapshot lifecycle across clients`。
 - [ ] **Step 6 — 集成收尾。** 加载 requesting-code-review 与 finishing-a-development-branch；取得用户/看板合并授权与merge slot后回main `git merge --no-ff feat/side-snapshot-lifecycle`，合并结果再`cd yi-agent-rs && just ci`及desktop检查。成功才移除implementation worktree和分支；先`just reclaim`预演，只按项目规则回收垃圾，不盲目cargo clean。不在本文编写阶段自动合并。
 
 ## Spec 覆盖与完成判据映射
