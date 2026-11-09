@@ -6,9 +6,9 @@
 分支 `fix/kanban-daemon-socket`，实现 worktree
 `.worktrees/fix-kanban-daemon-socket`。
 
-**结论先说：自动矩阵全绿；隔离真机做了「真 daemon + 真插件二进制 + 独立实例家
-目录」这一段；桌面 app 整包与经真宿主转发的查询转发没有在本轮跑，正式插件仍未
-安装/重启。**
+**结论先说：自动矩阵全绿；隔离真机跑完了「独立 bundle → 真 desktop 进程 →
+真 sidecar → 真 daemon → 生产同构的 supervisor 清单 → 真插件二进制 → 12 次经宿主
+转发的查询」整条链；正式插件仍未安装/重启（人工检查点）。**
 
 状态口径只有三种：`pass` / `fail` / `not_run`。`not_run` 不等于通过，也不等于失败
 ——它表示本轮没有执行，不能据此宣称已恢复。
@@ -53,32 +53,84 @@
 | 单测试阶段 0 test | 门禁拒绝 | pass：gate 自测 `test_zero_cross_tests_is_rejected` |
 | 成功文本 + 非零退出 | 门禁拒绝 | pass：gate 自测 `test_exit_zero_without_real_result_is_rejected` |
 
-## 4. 隔离真机（真 daemon + 真插件二进制）
+## 4. 隔离真机（真 daemon + 真桌面 shell + 真插件二进制）
 
-**环境**：macOS（本机），隔离根 `/tmp/iso-k5-PAtp`（跑完即删）。全程
-`env -i`，只设 `HOME` / `YI_AGENT_INSTANCE_HOME` / `TMPDIR` 指向隔离根；
-模型配置用**占位** `api_url=http://127.0.0.1:9/v1` 与假 key，从不读生产
+**环境**：macOS（本机）。隔离根 `~/isoapp-kanban`（跑完即删；**不能放在
+`/tmp`**，见下方第 3 条踩坑）。全程显式 `HOME` / `YI_AGENT_HOME` /
+`YI_AGENT_INSTANCE_HOME` / `TMPDIR` 指向隔离根；模型配置用**占位**
+`api_url=http://127.0.0.1:9/v1` 与假 key，从不读生产
 `~/.yi-agent/models.json` 的凭据，也没有任何真实模型调用。生产 `~/.yi-agent`
-全程未被写入。
+未被写入（`plugins` 目录 mtime 仍是 10-31）。
+
+独立 bundle：按项目 CLAUDE.md 第 1–5 条，`CFBundleIdentifier` 改为
+`com.gongyichen.desktop.kbaniso`，`LSEnvironment:YI_AGENT_HOME` 写绝对路径，
+前端先 `npm ci && npm run build` 产出 `dist/` 再 `npx tauri build --bundles app`，
+最后 sidecar → desktop → app 三层重签，`codesign -v` exit 0。
+
+### 4.1 第一段：宿主 daemon 与插件探到同一地址
 
 | 项 | 命令 / 观测 | 结果 |
 |---|---|---|
-| 宿主 daemon 在新布局 bind | `yi-agent daemon serve`（隔离实例） | pass：实际生成 `<iso>/home/sockets/8fdb972026b042d5/runtime.sock`，与按 `sha256(realpath(runtime))[:16]` 独立算出的路径**逐字节一致** |
-| 插件探到该地址 | `superpowers-kanban run --runtime-dir … --state-dir …` | pass：日志 `daemon socket at …/8fdb972026b042d5/runtime.sock`，与 daemon 实际 bind 的路径相同 |
-| 120 秒同 PID 稳定 | 每 10s 采样，12 次 | pass：PID 47904 全程存活，`daemon probe failed` 计数 **0** |
-| 探活确实成功（而非空转） | 杀掉 daemon 后观测 | pass：daemon 停止后 **3 秒内**出现 `misses=1/3`、`2/3`、`3/3`，errno 为 `Connection refused (os error 61)`，随后 exit 0。反证此前 120 秒的探活是成功的——若从未成功，它早该在启动后 3 秒退出 |
-| 单实例锁释放 | 退出后 `acquire` | pass：进程退出即释放（Task6 进程测试同样覆盖） |
-| 清理 | `pkill -f <iso>` | pass：残留进程 0；隔离根删除 |
+| 宿主 daemon 在新布局 bind | 隔离实例 `yi-agent daemon serve` | pass：实际生成 `<iso>/home/sockets/8fdb972026b042d5/runtime.sock`，与按 `sha256(realpath(runtime))[:16]` 独立算出的路径**逐字节一致** |
+| 真插件探同一地址 | 真插件二进制 `run --runtime-dir … --state-dir …` | pass：日志 `daemon socket at …/8fdb972026b042d5/runtime.sock`，与 daemon 实际 bind 的路径相同 |
+| 120 秒同 PID 稳定 | 每 10s 采样共 12 次 | pass：PID 47904 全程存活，`daemon probe failed` 计数 **0** |
+| 探活确实成功（反证） | 杀掉 daemon 后观测 | pass：daemon 停止后 **3 秒内**出现 `misses=1/3`、`2/3`、`3/3`，errno `Connection refused (os error 61)`，随后 exit 0。若此前从未探成功，它本该在启动 3 秒后就退出——所以这反证了前 120 秒的探活是真的 |
 
-**明确没有做的部分**（`not_run`，不写"已恢复"）：
+### 4.2 第二段：生产同构的 supervisor 清单路径（本报告的核心证据）
+
+第一段只证明「函数算出的地址对」。生产实际是 **supervisor 按
+`<workdir>/.yi-agent/supervisors/<name>.json` 拉起插件**，所以又补了一段与
+生产结构一致的验证：把清单里的 `command` 换成本次 worktree 构建的插件二进制，
+其余字段（`args` 占位符、`query_socket`、`switch_key`、`session_driver`）
+逐字照抄生产清单；宿主用当轮 release 构建的 `yi-agent daemon serve`。
+
+| 项 | 命令 / 观测 | 结果 |
+|---|---|---|
+| 二进制身份 | `strings` 两个生产/新二进制 | pass：新二进制含 `daemon probe loop starting`、**不含**旧文案 `daemon is gone`；生产 `/opt/homebrew/bin/superpowers-kanban`（11-09 00:53）恰好相反——这就是用户遇到的故障版本 |
+| 地址一致 | 插件日志 vs 独立 sha256 计算 | pass：`…/sockets/58b7a23530f25dc4/runtime.sock` 与 `sha256(realpath(<iso>/prod/.yi-agent/runtime))[:16]` 逐字节一致 |
+| 120 秒同 PID | 每 10s 采样共 12 次 | pass：PID 57616 全程存活，`daemon probe failed` 计数 0 |
+| 经真宿主转发 12 次 `board/readSwitch` | 向真 daemon socket 发 12 个 `PluginQuery`（`protocol_version: 3`），由 `forward_plugin_query` 转到真插件 | pass：**12/12 ok**，每次 `{"on":true,"source":"project"}`，`request_id` q12-1…q12-12 全部对上 |
+| 三次失联退出 | 停 daemon 后观测 | pass：`misses=1/3`、`2/3`、`3/3` + `Connection refused (os error 61)`，随后 `exiting to release instance lock` |
+| 实例锁释放 | `lsof plugin.lock` | pass：退出后无持有者 |
+| 卡片状态未被探测改动 | 退出后读 `board.json` | pass：`{"cards":[],"next_order":0}`，探测过程没有写卡片 |
+| 清理 | `pkill -f isoapp-kanban` | pass：残留 0；隔离根删除 |
+
+### 4.3 这一段暴露的两件实事
+
+1. **查询 IPC 的 `os error 35` 在本轮复现了**：插件日志出现过一次
+   `query connection failed: Resource temporarily unavailable (os error 35)`。
+   这正是仓库里既有的独立问题（`[ ] 查询 IPC 在非阻塞读写下保持完整帧`），
+   计划里也写明遇它要 `fail` + 独立阻塞、不要去修那个模块。本轮按此处理：
+   记录、不改、不宣称已解决。但要注意——12/12 的转发全部成功，说明它是
+   间歇性的，不是常态失败。
+2. **它没有影响 daemon socket 修复的结论**：那 12 次查询与探活是两条独立
+   通道，探活全程 0 失败。
+
+### 4.4 踩到的两个坑（写给别人省时间）
+
+1. **隔离根不能放 `/tmp`。** `desktop` 拒绝在含符号链接的路径上定位 sidecar，
+   直接报 `StartingBinary found current_exe() that contains a symlink on a
+   non-allowed platform: /tmp`，且只在重复刷屏、看起来像别的问题。换到
+   `~/isoapp-kanban` 才正常。
+2. **`LSEnvironment` 对直接执行 `Contents/MacOS/desktop` 不生效。** 第一次这样
+   启动时它读到了**生产**配置，sidecar 带上了生产的 `--relay …?session=`。
+   发现后立即终止、改用显式环境变量重启，确认 sidecar 命令行**没有** `--relay`
+   才继续。这条与 CLAUDE.md §6「不要只用 `open -a` 验收」是同一类陷阱的
+   镜像版本：`Info.plist` 里写的环境不等于进程实际拿到的环境，两边都要查。
+3. **受管激活（`plugins install` + `plugins activate`）在本轮走不通。**
+   `PluginManager::activate` 自己写着「只建立，不推进」，而推进需要的
+   `RuntimeControl` 在非测试代码里**没有实现者**（`grep "impl RuntimeControl for"`
+   只命中测试）。事务因此停在 `draining`。生产用的也是 legacy supervisor 清单
+   而不是受管安装，所以这一段改用 4.2 的清单路径，与生产的真实结构一致。
+   这是既有缺口，不属本轮范围，没有顺手改。
+
+### 4.5 仍然 `not_run` 的部分
 
 | 项 | 原因 | 状态 |
 |---|---|---|
-| 独立 app bundle（独立 `CFBundleIdentifier` + 绝对 `YI_AGENT_HOME`）构建与签名 | 本轮未按 CLAUDE.md 的独立 app 规程打包；已有 `desktop/src-tauri/target/release/bundle/macos/yi-agent.app` 是本次改动**之前**（11-09 00:53）的产物，用它验收等于用旧代码验证新修复 | not_run |
-| 桌面 GUI 启动 + sidecar 环境/参数核对 | 同上，没有当轮构建的 bundle | not_run |
-| 经真宿主转发 12 次小 `switch.read` | 需要上面两项；且既有「查询 IPC 完整帧」问题属另一条工作线，本轮不顺手修 | not_run |
-| 停隔离 desktop 监督父进程后跟踪旧插件三次失联 | 没有拉起桌面实例 | not_run |
+| 桌面 GUI 点击路径（真正点开看板界面、拖动卡片） | 本轮验证到「desktop 进程起、sidecar 环境正确、daemon 地址一致、宿主转发通」为止，没有在 GUI 里做人工点击 | not_run |
 | 正式插件安装/重启与生产复核 | **人工检查点**，未获用户许可 | not_run（代码完成、正式待确认） |
+| 云端 CI（GitHub macOS/Linux、GitLab） | 本轮未建 PR/MR | not_run |
 
 ## 5. 与计划的偏差（如实记录）
 
