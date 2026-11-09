@@ -145,7 +145,14 @@
    直接失败；改为 `chunks(2)`。
 4. **`plugins/contracts/README.md` 的期望计数是既存漂移**（旧值 9/24、42/42），按
    实测校正为 14/26、56/56。
-5. **Task1 还包含一处计划外但必要的修复**：runner 的 `driver_observation.rs` 引用
+5. **跨端契约测试的 5 秒子进程预算在负载下会假红。** 在 `just plugin-check`
+   （同时跑 `cargo test --workspace` 等 5 个子门禁）里出现过一次
+   `contract child timed out after 5s`，而同一门禁单独跑稳定通过。这不是被测
+   逻辑的问题，是预算按空闲机器定的。已改为统一的 `CONTRACT_CHILD_TIMEOUT`
+   （60 秒），并在超时信息里带上是**哪个**子进程（原来只说"timed out"，看不出
+   卡在哪一侧）。仍然是**有界**失败：真挂死的子进程一样会被杀并让测试红。
+   改后连跑两轮 `just plugin-check` 全绿。
+6. **Task1 还包含一处计划外但必要的修复**：runner 的 `driver_observation.rs` 引用
    的是已迁移的 `../contract/driver-protocol.json`，基线本身就编不过；
    `service.rs` 两处 `driver_step` 缺 `&no_caps()`。这两处不修，runner 的任何测试
    都跑不起来。

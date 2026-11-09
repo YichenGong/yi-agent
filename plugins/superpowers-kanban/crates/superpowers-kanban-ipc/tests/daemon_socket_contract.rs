@@ -416,7 +416,7 @@ fn cross_process_daemon_socket_contract() {
         .arg("2f")
         .env_clear()
         .env("YI_AGENT_INSTANCE_HOME", "/");
-    let output = run_contract_child(command, std::time::Duration::from_secs(5));
+    let output = run_contract_child(command, CONTRACT_CHILD_TIMEOUT);
     assert!(output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
@@ -532,7 +532,7 @@ fn cross_process_daemon_socket_contract() {
         .env_clear()
         .env("YI_AGENT_INSTANCE_HOME", "/")
         .current_dir(&dedicated);
-    let host_out = run_contract_child(host, std::time::Duration::from_secs(5));
+    let host_out = run_contract_child(host, CONTRACT_CHILD_TIMEOUT);
     assert!(
         host_out.status.success(),
         "{}",
@@ -548,7 +548,7 @@ fn cross_process_daemon_socket_contract() {
         .env("KANBAN_CONTRACT_DELETE_CWD", "1")
         .env("YI_AGENT_INSTANCE_HOME", "/")
         .current_dir(&dedicated);
-    let plugin_out = run_contract_child(plugin, std::time::Duration::from_secs(10));
+    let plugin_out = run_contract_child(plugin, CONTRACT_CHILD_TIMEOUT);
     assert!(
         plugin_out.status.success(),
         "{}",
@@ -596,11 +596,28 @@ fn cross_process_daemon_socket_contract() {
     );
 }
 
+/// How long a contract child may take before it is killed.
+///
+/// Generous on purpose. These children are real processes doing real path
+/// canonicalisation, and the whole file runs inside `just plugin-check` next to
+/// four other gates plus `cargo test --workspace`. A 5s budget was measured
+/// flaking there while the same test passed in isolation — the work was fine,
+/// the machine was busy. The budget stays bounded so a genuinely hung child
+/// still fails the test, just not within a window sized for an idle machine.
+const CONTRACT_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn run_contract_child(
     mut command: std::process::Command,
     timeout: std::time::Duration,
 ) -> std::process::Output {
     use std::io::Read as _;
+
+    // Captured before spawn: a timeout must say *which* child hung.
+    let label = format!(
+        "{} {:?}",
+        command.get_program().to_string_lossy(),
+        command.get_args().collect::<Vec<_>>()
+    );
 
     let mut stdout = tempfile::tempfile().expect("stdout tempfile");
     let mut stderr = tempfile::tempfile().expect("stderr tempfile");
@@ -620,7 +637,7 @@ fn run_contract_child(
             let _ = child.wait();
             let mut text = String::new();
             stderr.read_to_string(&mut text).ok();
-            panic!("contract child timed out after {timeout:?}; stderr: {text}");
+            panic!("contract child timed out after {timeout:?}: {label}; stderr: {text}");
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
@@ -655,7 +672,7 @@ fn compare_case(
     host.arg(&hex)
         .env_clear()
         .env("YI_AGENT_INSTANCE_HOME", home);
-    let host_out = run_contract_child(host, std::time::Duration::from_secs(5));
+    let host_out = run_contract_child(host, CONTRACT_CHILD_TIMEOUT);
     assert!(
         host_out.status.success(),
         "{}",
@@ -667,7 +684,7 @@ fn compare_case(
         .env_clear()
         .env("KANBAN_CONTRACT_RUNTIME_HEX", &hex)
         .env("YI_AGENT_INSTANCE_HOME", home);
-    let plugin_out = run_contract_child(plugin, std::time::Duration::from_secs(10));
+    let plugin_out = run_contract_child(plugin, CONTRACT_CHILD_TIMEOUT);
     assert!(
         plugin_out.status.success(),
         "{}",
@@ -708,7 +725,7 @@ fn run_env_case(
     if let Some(v) = tmpdir {
         host.env("TMPDIR", v);
     }
-    let out = run_contract_child(host, std::time::Duration::from_secs(5));
+    let out = run_contract_child(host, CONTRACT_CHILD_TIMEOUT);
     assert!(
         out.status.success(),
         "{}",
@@ -759,7 +776,7 @@ fn run_plugin_env_case(
     if let Some(v) = tmpdir {
         plugin.env("TMPDIR", v);
     }
-    let out = run_contract_child(plugin, std::time::Duration::from_secs(10));
+    let out = run_contract_child(plugin, CONTRACT_CHILD_TIMEOUT);
     assert!(
         out.status.success(),
         "{}",
@@ -785,7 +802,7 @@ fn run_home_case(
     host.arg(&hex)
         .env_clear()
         .env("YI_AGENT_INSTANCE_HOME", home);
-    let out = run_contract_child(host, std::time::Duration::from_secs(5));
+    let out = run_contract_child(host, CONTRACT_CHILD_TIMEOUT);
     assert!(
         out.status.success(),
         "{}",
@@ -812,7 +829,7 @@ fn run_plugin_home_case(
         .env_clear()
         .env("KANBAN_CONTRACT_RUNTIME_HEX", &hex)
         .env("YI_AGENT_INSTANCE_HOME", home);
-    let out = run_contract_child(plugin, std::time::Duration::from_secs(10));
+    let out = run_contract_child(plugin, CONTRACT_CHILD_TIMEOUT);
     assert!(
         out.status.success(),
         "{}",
