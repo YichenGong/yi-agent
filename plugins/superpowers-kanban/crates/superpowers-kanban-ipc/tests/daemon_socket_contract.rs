@@ -76,7 +76,7 @@ fn short_and_deep_use_instance_socket_directory() {
     }
     for runtime in [canonical_root.join("r"), deep.join("r")] {
         let path = daemon_socket_with_home(&runtime, &h).unwrap();
-        assert!(path.starts_with(&h.join("sockets")), "{path:?}");
+        assert!(path.starts_with(h.join("sockets")), "{path:?}");
         assert!(path.ends_with("runtime.sock"));
         assert!(path.as_os_str().as_encoded_bytes().len() <= 103);
     }

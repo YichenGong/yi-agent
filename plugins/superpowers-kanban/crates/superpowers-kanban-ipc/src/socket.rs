@@ -119,17 +119,6 @@ mod tests {
         CONTRACT[start..].split('"').next().unwrap().to_string()
     }
 
-    fn contract_usize(key: &str) -> usize {
-        let needle = format!("\"{key}\": ");
-        let start = CONTRACT.find(&needle).expect("contract key") + needle.len();
-        CONTRACT[start..]
-            .split(|c: char| !c.is_ascii_digit())
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap()
-    }
-
     fn long_state_dir() -> PathBuf {
         PathBuf::from(contract_str("state_dir"))
     }

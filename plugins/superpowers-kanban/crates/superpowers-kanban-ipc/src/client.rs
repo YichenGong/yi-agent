@@ -96,7 +96,7 @@ pub fn socket_path(runtime_dir: &Path) -> Result<PathBuf, crate::daemon_socket::
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-fn next_request_id() -> String {
+pub(crate) fn next_request_id() -> String {
     NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string()
 }
 
@@ -143,6 +143,27 @@ pub fn decode_response(line: &[u8], expected_request_id: &str) -> Result<Reply, 
         });
     }
     Ok(envelope.result)
+}
+
+/// `Status` 的唯一有界入口：连接、写、读共享一个预算。
+///
+/// 只允许 Status。批量/会话创建走原有的 [`send`]（无预算），它们的返回语义
+/// 不在这里改变——本次修复只针对探活无限阻塞。
+pub fn send_status_with_budget(
+    socket: &Path,
+    budget: std::time::Duration,
+) -> Result<Reply, ClientError> {
+    let started = std::time::Instant::now();
+    let deadline = started.checked_add(budget).ok_or_else(|| {
+        ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "probe budget overflow",
+        ))
+    })?;
+    let request_id = next_request_id();
+    let request = encode_request(&request_id, Command::Status)?;
+    let response = crate::status_io::exchange(socket, &request, deadline)?;
+    decode_response(&response, &request_id)
 }
 
 /// Sends one request and returns the reply. One connection per request, which
@@ -239,9 +260,9 @@ mod tests {
             matches!(
                 error,
                 ClientError::ProtocolVersion {
-                    found: other,
+                    found,
                     expected: PROTOCOL_VERSION
-                }
+                } if found == other
             ),
             "{error:?}"
         );

@@ -28,7 +28,7 @@ pub(super) fn connect_before(socket: &Path, deadline: Instant) -> Result<OwnedFd
     check_address(bytes)?;
 
     // 每次尝试都重新读 deadline：重试不是延期，只是换一个 fd 继续。
-    let mut last_error: Option<std::io::Error> = None;
+    // 积压时 Retry 会在 sleep 后重新判断 deadline，绝不让单次尝试越界。
     loop {
         if Instant::now() >= deadline {
             return Err(ClientError::Timeout {
@@ -37,24 +37,17 @@ pub(super) fn connect_before(socket: &Path, deadline: Instant) -> Result<OwnedFd
         }
         match connect_once(bytes, deadline) {
             Ok(fd) => return Ok(fd),
-            Err(AttemptError::Retry(error)) => {
-                last_error = Some(error);
+            Err(AttemptError::Retry) => {
                 if Instant::now() >= deadline {
                     return Err(ClientError::Timeout {
                         stage: ProbeStage::Connect,
                     });
                 }
-                // 积压时换一个 fd 重试；固定小睡避免把 CPU 打满。
+                // 固定小睡避免把 CPU 打满。
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(AttemptError::Fatal(error)) => return Err(ClientError::Io(error)),
         }
-    }
-    #[allow(unreachable_code)]
-    {
-        Err(ClientError::Io(last_error.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "connect never attempted")
-        })))
     }
 }
 
@@ -78,7 +71,8 @@ fn check_address(bytes: &[u8]) -> Result<(), ClientError> {
 }
 
 enum AttemptError {
-    Retry(std::io::Error),
+    /// 换一个 fd 重试即可；具体 errno 不参与判定，也不对外暴露。
+    Retry,
     Fatal(std::io::Error),
 }
 
@@ -101,7 +95,7 @@ fn connect_once(bytes: &[u8], deadline: Instant) -> Result<OwnedFd, AttemptError
     }
 
     let address = sockaddr(bytes);
-    let length = unsafe { libc::socklen_t::try_from(std::mem::size_of_val(&address)).unwrap() };
+    let length = libc::socklen_t::try_from(std::mem::size_of_val(&address)).unwrap();
     // SAFETY: `address` 是本栈上初始化完整的 sockaddr_un，长度与实际填充一致；
     // `fd` 由 OwnedFd 唯一持有，调用期间有效。
     let outcome =
@@ -132,12 +126,10 @@ fn connect_once(bytes: &[u8], deadline: Instant) -> Result<OwnedFd, AttemptError
         }
         // Linux 在 backlog 满时给 EAGAIN：这个 fd 从未握手，不能拿 SO_ERROR=0
         // 当成功，必须丢掉换一个新的。
-        Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
-            Err(AttemptError::Retry(error))
-        }
+        Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => Err(AttemptError::Retry),
         Some(code) if code == libc::EINTR => {
             // 中断时连接状态未知：关掉这个 fd，在外层按原 deadline 重建。
-            Err(AttemptError::Retry(error))
+            Err(AttemptError::Retry)
         }
         Some(code) if code == libc::EISCONN => Ok(fd),
         _ => Err(AttemptError::Fatal(error)),
@@ -280,10 +272,167 @@ where
     }
 }
 
+/// 用同一个 deadline 执行一次「写完整一帧 + 读完整一帧」。
+///
+/// 真实实现由一个非阻塞 `OwnedFd` 驱动；fake 只在单元测试里用，不暴露给外部。
+pub(super) fn exchange(
+    socket: &Path,
+    request: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>, ClientError> {
+    let fd = connect_before(socket, deadline)?;
+    let mut io = FdIo { fd };
+    exchange_connected(&mut io, request, deadline)
+}
+
+/// 一次完整的请求/应答交换。写满整个 request，读到第一条完整帧（含 LF）为止。
+pub(super) fn exchange_connected(
+    io: &mut impl ProbeIo,
+    request: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>, ClientError> {
+    write_all(io, request, deadline)?;
+    read_one_frame(io, deadline)
+}
+
+pub(super) trait ProbeIo {
+    fn send(&mut self, bytes: &[u8]) -> std::io::Result<usize>;
+    fn recv(&mut self, bytes: &mut [u8]) -> std::io::Result<usize>;
+    fn wait(&mut self, write: bool, deadline: Instant) -> Result<(), ClientError>;
+}
+
+struct FdIo {
+    fd: OwnedFd,
+}
+
+impl ProbeIo for FdIo {
+    fn send(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            let rc = unsafe {
+                libc::send(
+                    self.fd.as_raw_fd(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(rc as usize)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // macOS 已在连接时设置 SO_NOSIGPIPE；这里仍是裸 send，避免 SIGPIPE。
+            let rc =
+                unsafe { libc::send(self.fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), 0) };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(rc as usize)
+        }
+    }
+
+    fn recv(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let rc = unsafe {
+            libc::recv(
+                self.fd.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                0,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(rc as usize)
+    }
+
+    fn wait(&mut self, write: bool, deadline: Instant) -> Result<(), ClientError> {
+        let events = if write { libc::POLLOUT } else { libc::POLLIN };
+        let stage = if write {
+            ProbeStage::Write
+        } else {
+            ProbeStage::Read
+        };
+        wait_ready(self.fd.as_raw_fd(), events, deadline, stage).map(|_| ())
+    }
+}
+
+fn write_all(io: &mut impl ProbeIo, bytes: &[u8], deadline: Instant) -> Result<(), ClientError> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout {
+                stage: ProbeStage::Write,
+            });
+        }
+        match io.send(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(ClientError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "socket accepted zero bytes",
+                )));
+            }
+            Ok(written) => offset += written,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                io.wait(true, deadline)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(ClientError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+fn read_one_frame(io: &mut impl ProbeIo, deadline: Instant) -> Result<Vec<u8>, ClientError> {
+    let mut buffer = Vec::new();
+    let mut chunk = vec![0_u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout {
+                stage: ProbeStage::Read,
+            });
+        }
+        let read = match io.recv(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                io.wait(false, deadline)?;
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(ClientError::Io(error)),
+        };
+        if read == 0 {
+            return Err(ClientError::Truncated);
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+            let body_len = index + 1;
+            if body_len - 1 > crate::wire::MAX_FRAME_BYTES {
+                return Err(ClientError::FrameTooLarge {
+                    bytes: body_len - 1,
+                    limit: crate::wire::MAX_FRAME_BYTES,
+                });
+            }
+            return Ok(buffer[..body_len].to_vec());
+        }
+        if buffer.len() > crate::wire::MAX_FRAME_BYTES {
+            return Err(ClientError::FrameTooLarge {
+                bytes: buffer.len(),
+                limit: crate::wire::MAX_FRAME_BYTES,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead as _, Write as _};
     use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn short_root(prefix: &str) -> tempfile::TempDir {
@@ -294,17 +443,6 @@ mod tests {
     }
 
     /// 反复连接，直到内核 backlog 拒绝为止。
-    fn fill_backlog(path: &Path) -> Vec<std::os::unix::net::UnixStream> {
-        let mut streams = Vec::new();
-        for _ in 0..512 {
-            match std::os::unix::net::UnixStream::connect(path) {
-                Ok(stream) => streams.push(stream),
-                Err(_) => break,
-            }
-        }
-        streams
-    }
-
     #[test]
     fn nul_is_rejected_before_connect() {
         use std::os::unix::ffi::OsStringExt;
@@ -462,6 +600,197 @@ mod tests {
             other => panic!("expected Timeout(Read), got {other:?}"),
         }
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// 部分写 + EINTR：必须写满整个 request，且所有 wait 用的是同一个 deadline。
+    #[test]
+    fn short_writes_and_interrupted_io_complete_one_frame() {
+        struct Fake {
+            sent: Vec<u8>,
+            waits: Vec<(bool, Instant)>,
+            sends: usize,
+            recved: bool,
+            recv_offset: usize,
+        }
+        impl ProbeIo for Fake {
+            fn send(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.sends += 1;
+                if self.sends == 1 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                let take = bytes.len().min(1);
+                self.sent.extend_from_slice(&bytes[..take]);
+                Ok(take)
+            }
+            fn recv(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                // 第一拍 WouldBlock，之后每次只吐 2 字节，直到整帧发完。
+                if !self.recved {
+                    self.recved = true;
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                const BODY: &[u8] = b"{\"ok\":true}\n";
+                if self.recv_offset >= BODY.len() {
+                    return Ok(0);
+                }
+                let take = bytes.len().min(2).min(BODY.len() - self.recv_offset);
+                bytes[..take].copy_from_slice(&BODY[self.recv_offset..self.recv_offset + take]);
+                self.recv_offset += take;
+                Ok(take)
+            }
+            fn wait(&mut self, write: bool, deadline: Instant) -> Result<(), ClientError> {
+                self.waits.push((write, deadline));
+                Ok(())
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let request = b"hello-frame\n";
+        let mut fake = Fake {
+            sent: Vec::new(),
+            waits: Vec::new(),
+            sends: 0,
+            recved: false,
+            recv_offset: 0,
+        };
+        let frame = exchange_connected(&mut fake, request, deadline).unwrap();
+        assert_eq!(
+            fake.sent, request,
+            "every byte must be written exactly once"
+        );
+        assert!(!fake.waits.is_empty());
+        assert!(
+            fake.waits.iter().all(|(_, waited)| *waited == deadline),
+            "no wait may extend the original deadline"
+        );
+        assert!(frame.ends_with(b"\n"));
+    }
+
+    #[test]
+    fn write_stall_times_out_at_write_stage() {
+        struct Stall;
+        impl ProbeIo for Stall {
+            fn send(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+            fn recv(&mut self, _bytes: &mut [u8]) -> std::io::Result<usize> {
+                panic!("must not read while the write is stalled")
+            }
+            fn wait(&mut self, _write: bool, _deadline: Instant) -> Result<(), ClientError> {
+                Err(ClientError::Timeout {
+                    stage: ProbeStage::Write,
+                })
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let error = exchange_connected(&mut Stall, b"x", deadline).unwrap_err();
+        assert!(matches!(error, ClientError::Timeout { stage } if stage == ProbeStage::Write));
+    }
+
+    /// 对端半关闭后继续写必须报错，**不能**让进程被 SIGPIPE 杀死。
+    ///
+    /// Rust 运行时默认忽略 SIGPIPE，所以若只依赖默认行为，这个测试是假绿：
+    /// worker 子进程里显式恢复 `SIG_DFL`，再确认写到断开连接返回 BrokenPipe/
+    /// ConnectionReset 且进程正常退出（不是 signal 13）。
+    #[test]
+    fn broken_peer_does_not_raise_sigpipe() {
+        let root = short_root("kd-sigpipe");
+        let path = root.path().join("s.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "status_io::tests::sigpipe_worker",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("KANBAN_SIGPIPE_WORKER", "1")
+            .env("KANBAN_SIGPIPE_SOCKET", &path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sigpipe worker");
+
+        // worker 连上后喊 CONNECTED；父进程必须立刻断开它。
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            line.clear();
+            let read = stdout.read_line(&mut line).unwrap_or(0);
+            if read == 0 || line.contains("CONNECTED") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "worker never connected");
+        }
+        assert!(
+            line.contains("CONNECTED"),
+            "worker handshake missing: {line:?}"
+        );
+
+        let (peer, _) = listener.accept().expect("accept worker");
+        peer.shutdown(std::net::Shutdown::Both).ok();
+        drop(peer);
+
+        let status = child.wait().expect("worker exits");
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).ok();
+        assert!(
+            status.success(),
+            "worker died by signal {:?}; stderr: {stderr}",
+            std::os::unix::process::ExitStatusExt::signal(&status)
+        );
+        assert!(
+            stderr.contains("KANBAN_SIGPIPE_RESULT=broken"),
+            "stderr: {stderr}"
+        );
+    }
+
+    /// worker 半：只有带标记时才工作，其余运行立即返回。
+    #[test]
+    fn sigpipe_worker() {
+        if std::env::var_os("KANBAN_SIGPIPE_WORKER").is_none() {
+            return;
+        }
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let socket = PathBuf::from(std::env::var("KANBAN_SIGPIPE_SOCKET").unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let fd = connect_before(&socket, deadline).expect("worker connects");
+        let mut io = FdIo { fd };
+        println!("CONNECTED");
+        std::io::stdout().flush().unwrap();
+
+        // 等父进程关闭连接：recv 返回 0 即 EOF。不能读 stdin——父进程没有
+        // 给这个子进程接管道，等 stdin 会永远挂住。
+        let mut probe = [0_u8; 64];
+        loop {
+            assert!(Instant::now() < deadline, "peer never closed");
+            match io.recv(&mut probe) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    io.wait(false, deadline).ok();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("unexpected read error: {error}"),
+            }
+        }
+
+        // 对端已关；恢复默认 SIGPIPE 后写大帧。若实现漏了 MSG_NOSIGNAL /
+        // SO_NOSIGPIPE，这里会被信号 13 杀死，父进程看到 signal 13 而失败。
+        let payload = vec![b'x'; 1 << 20];
+        match write_all(&mut io, &payload, Instant::now() + Duration::from_secs(5)) {
+            Err(ClientError::Io(error))
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+                    || error.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                eprintln!("KANBAN_SIGPIPE_RESULT=broken");
+            }
+            other => {
+                eprintln!("KANBAN_SIGPIPE_RESULT=other {other:?}");
+                std::process::exit(3);
+            }
+        }
     }
 
     #[test]
