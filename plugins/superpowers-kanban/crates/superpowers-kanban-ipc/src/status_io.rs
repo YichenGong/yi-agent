@@ -550,10 +550,38 @@ mod tests {
         }
     }
 
+    /// 失败路径不能漏 fd。
+    ///
+    /// 必须**在独立子进程里**测：`/dev/fd` 是整个进程共享的，同进程里其他测试
+    /// 同时在开 socket 时，父进程的计数会随之增长，把一次真实泄漏掩盖成"竞争"，
+    /// 或者把无泄漏的并发误报成泄漏（实测跑整包时就是这样红的）。
     #[test]
     fn failed_attempts_close_descriptors() {
-        // 失败路径不能漏 fd。这里不统计进程全局 fd 数量（并发下会被别人影响），
-        // 而是对一个确定不存在的路径反复失败，再检查本进程 fd 目录没有增长。
+        if std::env::var_os("KANBAN_FD_WORKER").is_some() {
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "status_io::tests::fd_leak_worker",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("KANBAN_FD_WORKER", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .status()
+            .expect("spawn fd worker");
+        assert!(status.success(), "fd leak worker failed: {status:?}");
+    }
+
+    /// 只在子进程里跑：整个进程只有它自己，`/dev/fd` 计数才有意义。
+    #[test]
+    fn fd_leak_worker() {
+        if std::env::var_os("KANBAN_FD_WORKER").is_none() {
+            return;
+        }
         let root = short_root("kd-fds");
         let missing = root.path().join("nope.sock");
         let count = |dir: &str| std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0);
@@ -563,8 +591,8 @@ mod tests {
             assert!(outcome.is_err(), "connecting to a missing socket must fail");
         }
         let after = count("/dev/fd");
-        assert!(
-            after <= before + 2,
+        assert_eq!(
+            after, before,
             "descriptor leak: {before} -> {after} after 30 failed attempts"
         );
     }

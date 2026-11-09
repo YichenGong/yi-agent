@@ -27,7 +27,7 @@ fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
         return Err(format!("odd hex length: {text}"));
     }
     text.as_bytes()
-        .chunks_exact(2)
+        .chunks(2)
         .map(|pair| {
             let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
             u8::from_str_radix(pair, 16).map_err(|error| format!("invalid hex {pair}: {error}"))

@@ -319,9 +319,19 @@ plugin-ui-check:
     cd ../plugins/superpowers-kanban/ui && npx tsc --noEmit
     cd ../plugins/superpowers-kanban/ui && npx vitest run
 
+# 业务 daemon socket 的跨端契约门禁（Rust-only，不依赖 Node）。
+#
+# 插件不能依赖任何 `yi-agent-*` crate，所以它的地址解析是宿主 `scope.rs` 的
+# 独立复刻。只有让两侧**真实函数**在同一个进程对照里比较，才能保证它们不漂移：
+# 各跑各的单测在结构上允许两侧同时"自洽"却互相不兼容。
+plugin-daemon-socket-check:
+    bash ../scripts/plugins/check-daemon-socket-contract.sh
+
 # 公共契约（socket / driver / IPC）的唯一权威在 `plugins/contracts/`，
 # 宿主与插件两侧都读它。改动任何一侧都必须先改契约并让这里通过。
-plugin-contracts-check:
+plugin-contracts-check: plugin-daemon-socket-check
+    python3 ../scripts/plugins/check-daemon-socket-wiring.py
+    python3 -m unittest discover -s ../scripts/plugins -p 'test_check_daemon_socket_contract.py'
     node ../scripts/plugins/check-contracts.mjs
     node --test ../scripts/plugins/check-contracts.test.mjs
 

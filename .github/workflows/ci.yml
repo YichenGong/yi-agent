@@ -139,6 +139,19 @@ jobs:
         with:
           tool: nextest@0.9.150
 
+      # 不能假设 macOS runner 自带 just：缺了就会在下一步以"command not found"
+      # 的形式失败，而不是给出契约漂移的信号。
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # daemon socket 契约在 macOS 上最容易漂移：`/var` 与 `/private/var` 是同一
+      # 目录，两种拼写会算出两个 socket 路径。这个门禁只跑 Rust，不需要 Node。
+      - name: Check daemon socket contract
+        working-directory: yi-agent-rs
+        run: just plugin-daemon-socket-check
+
       - name: Run macOS-gated tests
         working-directory: yi-agent-rs
         run: |
