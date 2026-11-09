@@ -6255,7 +6255,10 @@ mod tests {
             "no card may be claimed while an upstream dependency is missing"
         );
         assert!(
-            service.driver_step(&[], &[], Some(0)).unwrap().is_none(),
+            service
+                .driver_step(&[], &[], Some(0), &no_caps())
+                .unwrap()
+                .is_none(),
             "the tick must yield no launch either"
         );
         // 看板本身仍可读，且卡片状态没被改动。
@@ -6300,7 +6303,7 @@ mod tests {
         service.enqueue_card_for_test("card-2");
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), &[], Some(0))
+                .driver_step(&busy(&["thread-1"]), &[], Some(0), &no_caps())
                 .unwrap()
                 .is_none(),
             "draining must stop new launches"

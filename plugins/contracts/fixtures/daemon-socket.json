@@ -1,0 +1,38 @@
+{
+  "_comment": "宿主业务 daemon 与插件客户端的 socket 地址契约。两端读同一份；任一侧规则漂移都会让测试失败。地址形如 <instance_home>/sockets/<canonical-runtime 的 SHA-256 前 16 hex>/runtime.sock，长度只取决于实例家目录，不取决于项目深度。",
+  "algorithm": "sha256-canonical-runtime-first8",
+  "instance_priority": [
+    "YI_AGENT_INSTANCE_HOME",
+    "YI_AGENT_HOME",
+    "HOME"
+  ],
+  "override_suffix": ".yi-agent",
+  "socket_directory": "sockets",
+  "socket_file": "runtime.sock",
+  "max_socket_path_bytes": 103,
+  "vectors": [
+    {
+      "runtime_hex": "2f",
+      "digest16": "8a5edab282632443",
+      "socket_hex": "2f736f636b6574732f386135656461623238323633323434332f72756e74696d652e736f636b"
+    }
+  ],
+  "case_ids": [
+    "short",
+    "deep",
+    "instance_priority",
+    "override_suffix",
+    "empty",
+    "relative",
+    "symlink",
+    "dot_segments",
+    "symlink_dotdot",
+    "missing_tail",
+    "isolated",
+    "tmpdir",
+    "non_utf8",
+    "deleted_cwd",
+    "limit_103",
+    "limit_104"
+  ]
+}

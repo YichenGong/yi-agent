@@ -358,9 +358,80 @@ superpowers-kanban list
 
 ---
 
+## 7.5 daemon socket 地址契约（连不上/反复退出先看这里）
+
+插件靠一条 **Unix socket** 探活宿主 daemon。地址不是"runtime 目录旁边的
+`runtime.sock`"，而是：
+
+```
+<实例家目录>/sockets/<runtime 目录的 SHA-256 前 16 hex>/runtime.sock
+```
+
+**实例家目录**的优先级（与宿主完全一致，没有其它回退）：
+
+| 顺序 | 变量 | 说明 |
+|---|---|---|
+| 1 | `YI_AGENT_INSTANCE_HOME` | 非空即原样使用。守护拉起 daemon 时显式设置。 |
+| 2 | `YI_AGENT_HOME` | 非空；末级不是 `.yi-agent` 时自动追加 `.yi-agent`。 |
+| 3 | `HOME` | 即 `$HOME/.yi-agent`。 |
+| — | 都没有 | 视为配置错误，**exit 1**，不创建任何状态。 |
+
+**没有 TMPDIR 回退。** 旧版本在路径过长时会回退到 `$TMPDIR/yi-agent-<hash>.sock`，
+那条规则已删除：回退会让插件与宿主落到两个不同的文件，表现为"daemon 明明活着，
+插件却三次探不到后退出"。路径超过 103 字节（`sun_path` 上限）时直接报错并打印
+实际字节数，**不会**偷偷换地址。
+
+### 两个 socket 不要混
+
+| 通道 | 路径 | 谁用 |
+|---|---|---|
+| **daemon socket**（本文） | `<实例家目录>/sockets/<hex16>/runtime.sock` | 插件探活宿主 daemon |
+| **query socket** | `<项目>/.yi-agent/superpowers-kanban/superpowers-kanban.sock`，过长时回退 `$TMPDIR/plugin-<hash>.sock` | 桌面/CLI 问插件看板状态 |
+
+两者规则不同、回退策略不同，日志里分别以 `daemon socket at` 与
+`query socket at` 打头，不要拿一个的地址去排查另一个。
+
+### 连不上时按顺序查，不要先删文件或 pkill
+
+1. **看插件日志里它探的到底是哪条路径。**
+   ```bash
+   tail -50 <项目根>/.yi-agent/logs/superpowers-kanban.log
+   ```
+   关注三行：`daemon socket at …`、`daemon probe loop starting runtime=… socket=…`、
+   失败时的 `daemon probe failed runtime=… socket=… misses=N/3: <errno>`。
+
+2. **核对实例家目录是否与宿主一致**（最常见：宿主用 `YI_AGENT_INSTANCE_HOME`
+   指向另一个实例，插件只拿到继承来的 `YI_AGENT_HOME`）。
+   ```bash
+   ps axo pid=,command= | grep '[a]pp-server --listen' | tr ' ' '\n' | grep -E 'YI_AGENT|instance'
+   ```
+
+3. **确认那条地址上真的有 socket 在监听**，而不是磁盘上的残留文件。
+   ```bash
+   lsof -U | grep runtime.sock          # 谁在监听
+   ls -l <插件日志里打印的那个路径>        # 文件是否存在
+   ```
+   `ls` 有文件但 `lsof` 没有 → 是上次崩溃留下的死文件，宿主启动时会自己清理。
+
+4. **只有确认没有进程在用、且地址确实陈旧时才删。** 直接 `rm` 活实例的 socket
+   会让它立刻对所有客户端不可达；`pkill` 会让监督器在 500ms 后重新拉起一个
+   新 PID，看起来"修好了"，实际上只是换了进程。
+
+### 旧宿主 + 新插件（或反过来）不兼容
+
+新布局与旧布局**没有任何兼容回退**。混装时插件会稳定探测失败并在三次失联后
+退出，日志里是 `misses=1/3 … 3/3` 加 `No such file or directory`。
+
+处理方式是**两侧一起升级**（第 9.1 节的顺序），不是指望插件"猜"旧地址。
+判断是否混装：对比插件日志里的 `socket=` 与宿主实际监听的路径；两者不一致就是。
+
+---
+
 ## 8. 排查
 
 | 现象 | 原因 | 处理 |
+|---|---|---|
+| 插件反复退出（`misses=3/3`） | daemon socket 地址不一致 | 见 7.5：比对日志里的 `socket=` 与 `lsof` |
 |---|---|---|
 | `command not found` | 二进制没进 PATH | 回到第 2 步 |
 | 进程没被拉起 | 清单没放对位置，或 `command` 路径不对 | 第 4 步；确认 daemon 在跑 |

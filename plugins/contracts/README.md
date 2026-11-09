@@ -73,10 +73,46 @@ node scripts/plugins/check-contracts.mjs        # 正/负样本，打印计数
 node --test scripts/plugins/check-contracts.test.mjs
 ```
 
-期望：`positive: 9, negative: 24, failures: 0` 与 42/42 通过。
+期望：`positive: 14, negative: 26, failures: 0` 与 56/56 通过（2026-11-09 实测）。
 
 `driver-protocol.json` 与 `plugin-socket.json` 不是 schema 黄金样本，不参与
 上面的正/负样本计数；它们由宿主与插件两侧的 Rust 测试各自断言。
+
+## daemon socket 契约（跨进程，必须真跑）
+
+`daemon-socket.json` 冻结宿主业务 daemon 的地址算法：
+
+```
+<canonical instance_home>/sockets/<canonical runtime 的 SHA-256 前 16 hex>/runtime.sock
+```
+
+实例家目录的优先级是 `YI_AGENT_INSTANCE_HOME` → `YI_AGENT_HOME`（末级不是
+`.yi-agent` 时追加）→ `$HOME/.yi-agent`。**没有 TMPDIR 回退**：回退会让插件与
+宿主再次落到不同文件，这正是要消灭的故障。
+
+为什么不能只靠"两侧各自单测"：插件不得依赖任何 `yi-agent-*` crate（它要能独立
+安装），所以地址解析是宿主 `lifecycle::scope` 的**独立复刻**。两份各自自洽的实现
+完全可能互相不兼容。因此门禁必须让两侧的**真实生产函数**在同一进程对照里比较：
+
+```bash
+bash scripts/plugins/check-daemon-socket-contract.sh
+```
+
+它按顺序执行 8 个 cargo 阶段：宿主 metadata、构建宿主 example、宿主与插件的
+fixture 单测、`--ignored` 的跨进程逐 case 对照、IPC 整包、runner 的 daemon
+liveness 进程测试、runner lib。单测试阶段要求"恰好 1 个 test 且真 ok"——0 test
+与 ignored 跳过都不算通过。
+
+一个容易踩的坑：run_one 的 `flags` 数组不能改成空数组再 `"${flags[@]}"` 展开。
+macOS 自带 Bash 3.2，在 `set -u` 下对空数组展开会报 unbound variable，且某些
+路径上还会错误地 exit 0。
+
+接线由静态守卫锁定（recipe 依赖、macOS job、GitLab 的 python3）：
+
+```bash
+python3 scripts/plugins/check-daemon-socket-wiring.py
+python3 -m unittest discover -s scripts/plugins -p 'test_check_daemon_socket_contract.py'
+```
 
 ### schema 负责什么、不负责什么
 

@@ -7,13 +7,44 @@ use crate::wire::{
     Command, MAX_FRAME_BYTES, PROTOCOL_VERSION, Reply, RequestEnvelope, ResponseEnvelope,
 };
 
+/// 探活卡在哪个阶段。超时诊断必须说清「连不上」还是「连上了但不说话」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeStage {
+    Connect,
+    Write,
+    Read,
+}
+
+impl std::fmt::Display for ProbeStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeStage::Connect => write!(f, "connect"),
+            ProbeStage::Write => write!(f, "write"),
+            ProbeStage::Read => write!(f, "read"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ClientError {
     Io(std::io::Error),
+    /// 共享预算耗尽；`stage` 说明卡在哪一步。
+    Timeout {
+        stage: ProbeStage,
+    },
     Malformed(String),
-    ProtocolVersion { found: u32, expected: u32 },
-    RequestIdMismatch { found: String, expected: String },
-    FrameTooLarge { bytes: usize, limit: usize },
+    ProtocolVersion {
+        found: u32,
+        expected: u32,
+    },
+    RequestIdMismatch {
+        found: String,
+        expected: String,
+    },
+    FrameTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
     Truncated,
 }
 
@@ -21,6 +52,9 @@ impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::Io(error) => write!(f, "ipc io error: {error}"),
+            ClientError::Timeout { stage } => {
+                write!(f, "ipc probe timeout during {stage}")
+            }
             ClientError::Malformed(message) => write!(f, "malformed ipc frame: {message}"),
             ClientError::ProtocolVersion { found, expected } => write!(
                 f,
@@ -48,17 +82,21 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
-/// The socket the daemon listens on for a given runtime directory.
+/// The socket the business daemon listens on for a given runtime directory.
 ///
-/// 复刻宿主的回退规则（`yi-agent-` 前缀、哈希 `runtime_dir`）：深路径下宿主的
-/// daemon 会把 socket 挪到临时目录，插件必须落到**同一处**才连得上。
-pub fn socket_path(runtime_dir: &Path) -> Result<PathBuf, crate::socket::SocketPathError> {
-    crate::socket::daemon_socket_for(runtime_dir)
+/// 宿主现在的布局是 `<instance_home>/sockets/<canonical runtime 的 SHA-256 前
+/// 16 hex>/runtime.sock`（见 [`crate::daemon_socket`]），**不再**把 socket 放在
+/// runtime 目录旁、也**不再**回退到 TMPDIR。旧注释描述的直通/TMPDIR 规则会让
+/// 排查者按错误地址去 lsof，所以一并删除。
+///
+/// 查询通道（`plugin-` 前缀、TMPDIR 回退）仍是另一套规则，见 [`crate::socket`]。
+pub fn socket_path(runtime_dir: &Path) -> Result<PathBuf, crate::daemon_socket::DaemonSocketError> {
+    crate::daemon_socket::daemon_socket_for(runtime_dir)
 }
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-fn next_request_id() -> String {
+pub(crate) fn next_request_id() -> String {
     NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string()
 }
 
@@ -107,6 +145,27 @@ pub fn decode_response(line: &[u8], expected_request_id: &str) -> Result<Reply, 
     Ok(envelope.result)
 }
 
+/// `Status` 的唯一有界入口：连接、写、读共享一个预算。
+///
+/// 只允许 Status。批量/会话创建走原有的 [`send`]（无预算），它们的返回语义
+/// 不在这里改变——本次修复只针对探活无限阻塞。
+pub fn send_status_with_budget(
+    socket: &Path,
+    budget: std::time::Duration,
+) -> Result<Reply, ClientError> {
+    let started = std::time::Instant::now();
+    let deadline = started.checked_add(budget).ok_or_else(|| {
+        ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "probe budget overflow",
+        ))
+    })?;
+    let request_id = next_request_id();
+    let request = encode_request(&request_id, Command::Status)?;
+    let response = crate::status_io::exchange(socket, &request, deadline)?;
+    decode_response(&response, &request_id)
+}
+
 /// Sends one request and returns the reply. One connection per request, which
 /// matches how the daemon serves non-subscription traffic.
 pub fn send(socket: &Path, command: Command) -> Result<Reply, ClientError> {
@@ -132,13 +191,19 @@ mod tests {
     use super::*;
     use crate::wire::Command;
 
+    /// 旧断言（socket 就在 runtime 目录旁）会把宿主的新布局永久锁死，必须替换。
+    /// 用纯入口而不是读继承的 HOME，断言才是确定的。
     #[test]
-    fn the_socket_lives_beside_its_runtime_directory() {
-        assert_eq!(
-            socket_path(std::path::Path::new("/project/.yi-agent/runtime"))
-                .expect("short path stays"),
-            std::path::PathBuf::from("/project/.yi-agent/runtime/runtime.sock")
-        );
+    fn the_socket_lives_in_the_instance_socket_directory() {
+        use crate::daemon_socket::daemon_socket_with_home;
+        let resolved = daemon_socket_with_home(
+            std::path::Path::new("/project/.yi-agent/runtime"),
+            std::path::Path::new("/instance"),
+        )
+        .expect("short path resolves");
+        assert!(resolved.starts_with("/instance/sockets"), "{resolved:?}");
+        assert_eq!(resolved.file_name().unwrap(), "runtime.sock");
+        assert_eq!(resolved.components().count(), 5, "{resolved:?}");
     }
 
     #[test]
@@ -195,9 +260,9 @@ mod tests {
             matches!(
                 error,
                 ClientError::ProtocolVersion {
-                    found: other,
+                    found,
                     expected: PROTOCOL_VERSION
-                }
+                } if found == other
             ),
             "{error:?}"
         );
