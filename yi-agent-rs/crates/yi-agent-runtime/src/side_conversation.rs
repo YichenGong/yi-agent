@@ -107,6 +107,15 @@ pub enum SideErrorReason {
     CloseConflict,
     SnapshotExpired,
     SideCreating,
+    /// A host entry ticket is unknown, expired, or already closed.
+    ///
+    /// Also the answer for a ticket issued by a *different* host instance: an
+    /// old ticket must never be mistaken for a usable one.
+    EntryExpired,
+    /// The host holds as many entry tickets as it will track.
+    EntryLimit,
+    /// The ticket exists but does not belong to this host or this parent.
+    EntryMismatch,
     RequestLimit,
     ResourceLimit,
     TurnFailed,
@@ -131,6 +140,9 @@ impl SideErrorReason {
             Self::CloseConflict => "close_conflict",
             Self::SnapshotExpired => "snapshot_expired",
             Self::SideCreating => "side_creating",
+            Self::EntryExpired => "entry_expired",
+            Self::EntryLimit => "entry_limit",
+            Self::EntryMismatch => "entry_mismatch",
             Self::RequestLimit => "request_limit",
             Self::ResourceLimit => "resource_limit",
             Self::TurnFailed => "turn_failed",

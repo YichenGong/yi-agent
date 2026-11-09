@@ -12,6 +12,7 @@ pub mod live_parents;
 pub mod registry;
 pub mod replay;
 pub mod source;
+pub mod tickets;
 
 pub use live_parents::{LiveParentSource, LiveSideParents, live_roots};
 pub use registry::{
@@ -28,4 +29,8 @@ pub use replay::{
 pub use source::{
     ColdParent, SIDE_COLD_ATTEMPTS, SideParentResolver, SideResolverFactory, ThreadStoreResolver,
     WorkspaceResolver, assemble_cold_source, read_cold_parent, source_from_live_agent,
+};
+pub use tickets::{
+    CLOSED_TICKET_TTL, ENTRY_TICKET_TTL, ENTRY_TICKETS_PER_HOST, ENTRY_TICKETS_PER_PARENT,
+    EntryTarget, EntryTickets, ExitReceipt, ExitState, SideGeneration,
 };
