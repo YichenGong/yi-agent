@@ -76,6 +76,9 @@ pub(crate) async fn driver_tick<F>(
     // 读进程环境会让测试撞上开发者真实的 `~/.yi-agent`，而且同一个进程里
     // 多实例（桌面壳 + sidecar）会读到同一个值。
     instance_home: &Path,
+    // 本进程正在驱动的父会话表（旁问来源）。驱动器起的会话同样是父会话，
+    // 必须能被 `/side` 看到；`None` = 宿主无旁问能力。
+    live_side_parents: Option<&Arc<crate::side_conversation::LiveSideParents>>,
 ) where
     F: Fn(
         Option<yi_agent_core::Session>,
@@ -170,6 +173,7 @@ pub(crate) async fn driver_tick<F>(
                 theme,
                 git_diff,
                 workspaces,
+                live_side_parents,
                 build_agent,
                 lead_inbox,
                 // 驱动器从不对组长投递,故回信登记表原样借入即可(签名要求)。

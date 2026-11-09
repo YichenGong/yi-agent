@@ -124,6 +124,7 @@ async fn agent_factory_failure_returns_internal_error() {
             remote_dir: PathBuf::new(),
             // 旁支宿主资源必须落在隔离目录:空 remote_dir + None 会让 serve()
             // 把 side-conversations/ 建到当前工作目录(源码树)。
+            live_side_parents: None,
             side_registry: Some(crate::server::tests::test_side_registry(
                 index_dir.path(),
                 None,
@@ -269,6 +270,7 @@ async fn driver_reports_finished_when_writer_fails() {
         None,
         built.sandbox.clone(),
         Arc::clone(&built.process_manager),
+        None,
     ));
 
     prompt_tx
@@ -350,6 +352,7 @@ async fn idle_driver_serves_a_session_command_without_a_new_turn() {
         None,
         built.sandbox.clone(),
         Arc::clone(&built.process_manager),
+        None,
     ));
 
     // 没有任何 turn/start:直接投一条 compact,必须在有限时间内拿到回复。

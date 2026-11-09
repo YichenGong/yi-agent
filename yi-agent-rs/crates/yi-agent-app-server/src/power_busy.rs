@@ -496,6 +496,7 @@ mod tests {
             model: "test".to_string(),
             active_turn_id: turn.map(str::to_string),
             turn_permit: None,
+            side_source: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             prompt_tx,

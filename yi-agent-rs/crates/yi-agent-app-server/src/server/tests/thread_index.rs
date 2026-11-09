@@ -596,6 +596,7 @@ async fn eof_exits_gracefully() {
             remote_dir: PathBuf::new(),
             // 旁支宿主资源必须落在隔离目录:空 remote_dir + None 会让 serve()
             // 把 side-conversations/ 建到当前工作目录(源码树)。
+            live_side_parents: None,
             side_registry: Some(crate::server::tests::test_side_registry(
                 index_dir.path(),
                 None,
@@ -694,6 +695,7 @@ async fn oversized_frame_returns_err() {
             remote_dir: PathBuf::new(),
             // 旁支宿主资源必须落在隔离目录:空 remote_dir + None 会让 serve()
             // 把 side-conversations/ 建到当前工作目录(源码树)。
+            live_side_parents: None,
             side_registry: Some(crate::server::tests::test_side_registry(
                 index_dir.path(),
                 None,

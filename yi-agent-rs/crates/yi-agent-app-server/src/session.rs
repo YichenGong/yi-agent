@@ -178,6 +178,14 @@ pub struct ThreadSession {
     // 字段只为 RAII 持有：值一旦 drop，flock 就释放。没有读取方是设计如此。
     #[allow(dead_code)]
     pub(crate) writer_lock: Option<Arc<crate::thread_store::ThreadWriterLock>>,
+    /// 本会话作为**父**会话对外发布的旁问来源。
+    ///
+    /// 纯 RAII 字段，与 `writer_lock` 同理：它必须活到 driver 退出为止，drop
+    /// 时按指针比较把自己从宿主表里摘掉。没有读取方——读它的是
+    /// `LiveSideParents`，不是这里的任何代码。旁问开关关闭的宿主恒 `None`，
+    /// 于是不会有「开关关了但表里还有条目」这种状态。
+    #[allow(dead_code)]
+    pub(crate) side_source: Option<Arc<crate::side_conversation::LiveParentSource>>,
 }
 
 impl ThreadSession {

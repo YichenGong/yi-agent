@@ -545,6 +545,9 @@ pub(crate) struct AppState<'a> {
     pub(crate) side_gate: &'a crate::side_gate::SideGate,
 
     // ---- 旁支会话(spec §8) ----
+    /// 本进程正在驱动的父会话表（旁问来源）。`thread/start` 与 `thread/resume`
+    /// 把发布器登记在这里，resolver 优先读它；`None` = 宿主无旁问能力。
+    pub(crate) live_side_parents: Option<&'a Arc<crate::side_conversation::LiveSideParents>>,
     /// 旁支注册表。`Arc` 是进程级唯一实例:`open` 必须让桌面与手机拿到**同一个**
     /// runner,按连接各建一份就会给同一个父开两条供应商流。
     pub(crate) side_registry: &'a Arc<crate::side_conversation::SideRegistry>,

@@ -8,10 +8,12 @@
 //! Kept separate from the runtime so the shared crate never has to know about
 //! `ThreadStore`, `Item`, or the app-server's persisted wire types.
 
+pub mod live_parents;
 pub mod registry;
 pub mod replay;
 pub mod source;
 
+pub use live_parents::{LiveParentSource, LiveSideParents, live_roots};
 pub use registry::{
     ClosedSide, ParentChangeGuard, SIDE_TOMBSTONE_TTL, SIDE_TOMBSTONES, SideEffectiveConfig,
     SideRegistry, SideSnapshot, SideSummary,

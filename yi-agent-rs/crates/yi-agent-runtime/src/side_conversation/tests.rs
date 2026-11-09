@@ -383,9 +383,17 @@ async fn a_side_freezes_the_parents_effective_config_and_keeps_no_live_source() 
         captured.config.model, "parent-actual-model",
         "the side must inherit the configuration the parent really used"
     );
+    let prompt = captured.config.system_prompt.clone().unwrap_or_default();
     assert!(
-        captured.config.system_prompt.as_deref() == Some("parent actual prompt"),
-        "the prompt must be the rendered one, not the assembly-time guess"
+        prompt.starts_with("parent actual prompt"),
+        "the prompt must be the rendered one, not the assembly-time guess: {prompt}"
+    );
+    // ...but it must still end with the side policy. The cache holds the
+    // *parent's* config, whose prompt tells the model to drive the parent's task;
+    // forwarding it verbatim would make the side resume that work.
+    assert!(
+        prompt.ends_with(yi_agent_core::SIDE_SYSTEM_POLICY),
+        "a cached parent prompt must not drop the side policy: {prompt}"
     );
     assert!(
         captured.effective_config.is_none(),

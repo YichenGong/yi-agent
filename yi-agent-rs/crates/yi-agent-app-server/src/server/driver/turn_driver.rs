@@ -108,6 +108,14 @@ pub(crate) async fn run_thread_driver(
     // this is the only place that knows. It is observed, never trusted blindly:
     // see `tools_stopped_since`.
     process_manager: Arc<yi_agent_tools::ProcessManager>,
+    // This conversation as a *parent*: the source a `/side` inherits, when the
+    // host has the side capability. `None` for a host without it, and for a
+    // conversation that had nothing forkable when its driver started.
+    //
+    // Owned by the driver for its whole life: dropping it removes the entry, so
+    // every exit path (return, panic, task abort) unpublishes without a cleanup
+    // call we could forget.
+    side_source: Option<Arc<crate::side_conversation::LiveParentSource>>,
 ) {
     // Foreground authority is per *process*, so it is resolved once -- lazily, from
     // the first root this thread is handed -- and kept for the life of the driver. A
@@ -173,6 +181,12 @@ pub(crate) async fn run_thread_driver(
                     for n in translator.reset_totals() {
                         let _ = write_notification(&hub, &n).await;
                     }
+                }
+                // 每个改过父会话来源的入口都要重发布：清空之后的历史为空，
+                // 重发布会让之后的 `/side` 得到明确的 parent_not_started，而不是
+                // 继承清空前的旧内容。
+                if let Some(source) = &side_source {
+                    source.refresh(&agent);
                 }
                 continue;
             }
@@ -526,6 +540,11 @@ pub(crate) async fn run_thread_driver(
             }
             agent = rebuilt;
             tracing::info!("MCP registry refreshed for this turn");
+            // 重建换了 provider 对象与工具集，来源必须整组替换：读侧不能看到
+            // 「新 provider + 旧 config」。
+            if let Some(source) = &side_source {
+                source.refresh(&agent);
+            }
         }
 
         // 每轮开跑前刷新 skills catalog:skills 热重载,让本轮看到最新的
@@ -534,6 +553,12 @@ pub(crate) async fn run_thread_driver(
             && let Some(new_prompt) = handle.current_system_prompt()
         {
             agent.set_system_prompt(Some(new_prompt));
+            // prompt 是旁支要继承的一部分。skills 热重载改了它，就必须让之后
+            // 打开的旁支看到新值，否则同一个父会话前后两个旁支会拿到不同口径
+            // 的 prompt 而没有任何标记。
+            if let Some(source) = &side_source {
+                source.refresh(&agent);
+            }
         }
 
         // The process groups already alive when this turn starts. Anything this
@@ -984,6 +1009,11 @@ pub(crate) async fn run_thread_driver(
                     let _ = write_notification(&hub, &n).await;
                 }
             }
+            // 与空闲路径同一规则：清空/压缩都换了父会话的可继承历史，来源必须
+            // 整组重发布，之后打开的旁支才是当前状态。
+            if let Some(source) = &side_source {
+                source.refresh(&agent);
+            }
             // 命令路径已 append 过最终状态;这里只需为这个 turn 发 Finished 让主循环清
             // active_turn_id,且**不要**再 append 一次(否则会用 turn 前的 session 覆盖)。
             let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
@@ -1041,6 +1071,12 @@ pub(crate) async fn run_thread_driver(
         // 收尾已把整轮 append 进主 jsonl；checkpoint 的使命结束。
         if let Err(e) = store.clear_partial(&thread_id) {
             eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+        }
+        // 本轮已经进了父会话的历史。下一次 `/side` 必须看到它——这不是「父变了
+        // 所以作废旧旁支」，而是「父有了新内容所以新旁支要包含它」。已打开的旁支
+        // 早已按快照冻结，不会因为这次发布而变。
+        if let Some(source) = &side_source {
+            source.refresh(&agent);
         }
         // Closed on the normal path too, and after the turn is persisted: a close that
         // ran first would tell the daemon the turn ended while it was still being

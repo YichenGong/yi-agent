@@ -349,3 +349,86 @@ async fn the_capability_bit_follows_the_flag_but_the_host_id_does_not() {
 
     h.shutdown().await;
 }
+
+/// 一个真实的父会话被本进程驱动时,旁问**不能**退化成再读一遍磁盘。
+///
+/// 断言三件事,任何一件失败都意味着用户会看到「旁问看不到当前进度」:
+///
+/// 1. `thread/start` 一返回,live 表里就有这个 thread——此刻用户可能刚敲 `/side`。
+/// 2. 一轮跑完之后,发布出来的快照包含这一轮的问答(文件副本尚未来得及被读)。
+/// 3. 会话从 `threads` 摘掉、driver 退出之后,表里不再残留它(否则 resolver
+///    会对着一个没有 driver 的旧发布器工作)。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_parent_publishes_its_progress_and_unpublishes_on_exit() {
+    use crate::server::tests::read_response;
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let started = read_response(&mut h, 2).await;
+    let thread_id = started["result"]["thread_id"]
+        .as_str()
+        .expect("thread/start returns an id")
+        .to_string();
+
+    // (1) 发布早于第一个回合：插入 `threads` 与发布是同一步。
+    let publisher = h
+        .live_side_parents
+        .get(&thread_id)
+        .expect("a started thread is a live parent at once");
+
+    // 一轮真实对话。
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "父会话的当前问题"}],
+            }
+        })
+        .to_string(),
+    )
+    .await;
+    let _ = read_response(&mut h, 3).await;
+    // 等 driver 把这一轮收尾并重发布。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut rendered = String::new();
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(source) = publisher.current() {
+            let session = source.session.lock().unwrap();
+            rendered = serde_json::to_string(&session.messages().to_vec()).unwrap();
+            if rendered.contains("父会话的当前问题") {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // (2) 这一轮真的进了发布出来的快照。
+    assert!(
+        rendered.contains("父会话的当前问题"),
+        "a live parent's committed turn must reach a later side: {rendered}"
+    );
+
+    // (3) 会话被删除 → driver 的接收端关闭 → 发布器随 driver 一起消失。
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 4, "method": "thread/delete",
+            "params": {"threadId": thread_id}
+        })
+        .to_string(),
+    )
+    .await;
+    let deleted = read_response(&mut h, 4).await;
+    assert!(deleted.get("result").is_some(), "{deleted}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && h.live_side_parents.get(&thread_id).is_some() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        h.live_side_parents.get(&thread_id).is_none(),
+        "an exited driver must not leave a live parent behind"
+    );
+
+    h.shutdown().await;
+}

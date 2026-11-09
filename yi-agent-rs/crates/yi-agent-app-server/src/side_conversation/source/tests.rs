@@ -333,3 +333,112 @@ async fn side_published_source_is_a_consistent_snapshot() {
 }
 
 use std::io::Write;
+
+/// A live parent is authoritative: the side must see what the running
+/// conversation has, not the last flush, and must reuse its provider object.
+#[tokio::test]
+async fn side_resolver_prefers_the_live_parent_and_reuses_its_provider() {
+    let dir = TempDir::new().unwrap();
+    let live = Arc::new(crate::side_conversation::LiveSideParents::new());
+
+    let agent = yi_agent_core::Agent::new(
+        Arc::new(CountingProvider),
+        Arc::new(yi_agent_core::ToolRegistry::new()),
+        yi_agent_core::AgentConfig {
+            model: "live-model".into(),
+            system_prompt: Some("live prompt".into()),
+            ..Default::default()
+        },
+    );
+    let session = agent.session_handle();
+    session
+        .lock()
+        .unwrap()
+        .push(yi_agent_core::Message::user("父已经提交的问题"));
+
+    let publisher = Arc::new(SideSourcePublisher::new(
+        source_from_live_agent(
+            &agent,
+            dir.path(),
+            vec![dir.path().to_path_buf()],
+            Default::default(),
+        )
+        .expect("a live source with history is valid"),
+    ));
+    live.publish("p1".into(), Arc::clone(&publisher));
+
+    // The parent commits another message after the publisher was installed.
+    session
+        .lock()
+        .unwrap()
+        .push(yi_agent_core::Message::assistant(vec![
+            yi_agent_core::ContentBlock::Text("父后来的一步".into()),
+        ]));
+
+    let resolver = WorkspaceResolver::new(
+        Arc::new(crate::workspace_index::WorkspaceIndex::new(
+            dir.path().to_path_buf(),
+        )),
+        base_config(dir.path()),
+        live,
+    );
+    let source = resolver.resolve("p1").await.unwrap();
+    let rendered =
+        serde_json::to_string(&source.session.lock().unwrap().messages().to_vec()).unwrap();
+    assert!(
+        rendered.contains("父后来的一步"),
+        "the side must inherit committed progress the file does not have yet: {rendered}"
+    );
+    assert_eq!(source.config.model, "live-model");
+}
+
+struct CountingProvider;
+
+#[async_trait::async_trait]
+impl yi_agent_core::Provider for CountingProvider {
+    async fn call_stream(
+        &self,
+        _req: yi_agent_core::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::ProviderEvent>,
+        yi_agent_core::ProviderError,
+    > {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+/// A cold parent must not rescan project rules or skills: those are external
+/// reads, and their content would make the side's prompt differ from the one the
+/// parent actually ran with.
+#[tokio::test]
+async fn side_cold_parent_does_not_scan_project_rules_or_skills() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(ThreadStore::new(dir.path()));
+    seed(&store, "p1", "父问题", "父回答");
+    // A rules file that would be picked up by a project scan.
+    std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "RULES_SENTINEL_SHOULD_NOT_APPEAR",
+    )
+    .unwrap();
+
+    let mut cfg = base_config(dir.path());
+    cfg.system_prompt = Some("user-configured prompt".into());
+    let resolver = ThreadStoreResolver::new(store, cfg, Default::default());
+    let source = resolver.resolve("p1").await.unwrap();
+
+    let prompt = source.config.system_prompt.clone().unwrap_or_default();
+    assert!(
+        prompt.contains("user-configured prompt"),
+        "the user's own prompt is inherited: {prompt}"
+    );
+    assert!(
+        prompt.ends_with(yi_agent_core::SIDE_SYSTEM_POLICY),
+        "the fixed side policy stays the tail: {prompt}"
+    );
+    assert!(
+        !prompt.contains("RULES_SENTINEL_SHOULD_NOT_APPEAR"),
+        "a cold side must not rescan project rules: {prompt}"
+    );
+}

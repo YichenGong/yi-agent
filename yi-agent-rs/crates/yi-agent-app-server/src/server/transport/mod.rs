@@ -191,6 +191,8 @@ where
         lead_replies,
         lead_control,
         lead_control_replies,
+        // 活跃父来源表:注入优先(测试可观察),否则本函数自建。
+        live_side_parents,
         // 旁支注册表:注入优先(测试),否则本函数自建(生产)。
         side_registry,
         // 结论由装配方算好：生产走 `from_process_environment`，测试直接给值。
@@ -207,6 +209,10 @@ where
     // 受管插件存储就是实例根：`plugins/v1/*` 的登记、授权、发布目录全在它下面。
     // 与 `watchman_home`（真实 `$HOME`，只用于登录项）刻意分开。
     let plugin_home = instance_home.clone();
+    // 活跃父来源表:一个进程一份。driver 在会话 attach / 每轮刷新后把发布器放进
+    // 这里,resolver 优先读它;只有父不在本进程驱动时才冷读磁盘。
+    let live_parents = live_side_parents
+        .unwrap_or_else(|| std::sync::Arc::new(crate::side_conversation::LiveSideParents::new()));
     // 旁支注册表:一个进程一份。注入的那份(测试)已经带好替身 resolver;生产
     // 在这里自建,resolver 用「按 threadId 定位 store 后严格冷读」那条路径。
     let side_registry = match side_registry {
@@ -224,6 +230,7 @@ where
             let resolver = std::sync::Arc::new(crate::side_conversation::WorkspaceResolver::new(
                 std::sync::Arc::clone(&workspaces),
                 cfg.clone(),
+                std::sync::Arc::clone(&live_parents),
             ));
             Arc::new(crate::side_conversation::SideRegistry::new(
                 resolver, resources,
@@ -891,6 +898,7 @@ where
                             pending_lead_replies: &mut pending_lead_replies,
                             remote_dir: &remote_dir,
                             relay_url: relay_url.as_deref(),
+                            live_side_parents: Some(&live_parents),
                             side_registry: &side_registry,
                             side_tasks: &mut side_tasks,
                             side_replay: &side_replay,
@@ -1198,6 +1206,7 @@ where
                     &lead_control_replies,
                     lead_agent_enabled,
                     &instance_home,
+                    Some(&live_parents),
                 )
                 .await;
 
@@ -1270,6 +1279,7 @@ where
                         theme: &theme,
                         git_diff: &git_diff_handle,
                         workspaces: &workspaces,
+                        live_side_parents: Some(&live_parents),
                         build_agent: &build_agent,
                         lead_inbox: &lead_inbox,
                         lead_replies: &lead_replies,
@@ -1334,6 +1344,7 @@ where
                     theme: &theme,
                     git_diff: &git_diff_handle,
                     workspaces: &workspaces,
+                    live_side_parents: Some(&live_parents),
                     build_agent: &build_agent,
                     lead_inbox: &lead_inbox,
                     lead_replies: &lead_replies,
@@ -1388,6 +1399,7 @@ where
                     theme: &theme,
                     git_diff: &git_diff_handle,
                     workspaces: &workspaces,
+                    live_side_parents: Some(&live_parents),
                     build_agent: &build_agent,
                     lead_inbox: &lead_inbox,
                     lead_replies: &lead_replies,

@@ -603,6 +603,12 @@ pub(crate) struct Harness {
     pub(crate) managed: crate::server::ManagedSlot,
     pub(crate) plugins_dir: tempfile::TempDir,
     pub(crate) daemon_calls: DaemonCalls,
+    /// 本进程正在驱动的父会话表，与宿主共享同一实例。
+    ///
+    /// 同一手法（`view_frames` / `managed`）：服务端发布，测试观察。自造一份
+    /// 会让「`thread/start` 之后旁问能立刻读到活跃父」这条断言在空表上永远
+    /// 失败得莫名其妙。
+    pub(crate) live_side_parents: Arc<crate::side_conversation::LiveSideParents>,
 }
 
 pub(crate) type WatchmanCalls = Arc<StdMutex<Vec<(bool, PathBuf)>>>;
@@ -1210,6 +1216,8 @@ impl Harness {
         // 与 `view_frames` 同一手法:服务端写入、测试观察。自造一份会让
         // 「握手装上了本会话的身份」这条断言在空槽位上永远成立。
         let managed: crate::server::ManagedSlot = Arc::new(StdMutex::new(None));
+        // 与 `view_frames` / `managed` 同一手法：宿主写入、测试观察。
+        let live_side_parents = Arc::new(crate::side_conversation::LiveSideParents::new());
         let handle = tokio::spawn(serve_scoped(
             server_r,
             server_w,
@@ -1242,6 +1250,7 @@ impl Harness {
                     .clone()
                     .unwrap_or_else(|| skills_home.path().to_path_buf()),
                 remote_dir: index_dir.path().to_path_buf(),
+                live_side_parents: Some(Arc::clone(&live_side_parents)),
                 side_registry,
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -1293,6 +1302,7 @@ impl Harness {
             managed,
             plugins_dir,
             daemon_calls,
+            live_side_parents,
         }
     }
 
@@ -2172,6 +2182,7 @@ fn tick_test_session(project: &Path, thread_id: &str, status: ThreadStatus) -> T
         model: "test".to_string(),
         active_turn_id: None,
         turn_permit: None,
+        side_source: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         prompt_tx,
@@ -2946,6 +2957,7 @@ impl MergedHarness {
                 remote_dir: PathBuf::new(),
                 // 与手工装配的 serve_stdio 用例同一个约束:空 remote_dir +
                 // `None` 会让 serve() 把旁支宿主目录建到当前工作目录。
+                live_side_parents: None,
                 side_registry: Some(test_side_registry(index_dir.path(), None)),
                 // 第二套 harness（`serve_scoped_with_loopback`）也要能跑 side
                 // 测试：默认开，关掉的用例自行构造。

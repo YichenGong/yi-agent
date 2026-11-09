@@ -248,11 +248,18 @@ impl SideSourcePublisher {
             let mut captured = source;
             // Freeze the configuration the parent actually runs with. Reading the
             // published cache costs one lock and never rescans project prompts.
+            //
+            // The cache holds the *parent's* config, whose prompt says "you are
+            // driving this task". Handing that over verbatim would let the side
+            // resume the parent's work, so the fixed side policy is appended here
+            // — the one place every snapshot path goes through, so a stored cache
+            // can never smuggle in a prompt without it.
             if let Some(cache) = &captured.effective_config {
-                captured.config = cache
+                let effective = cache
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
+                captured.config = yi_agent_core::side_agent_config(&effective);
             }
             captured.effective_config = None;
             // A fresh handle, so the side's history is independent even though the

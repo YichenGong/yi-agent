@@ -199,6 +199,7 @@ where
                 skills_home: crate::server::skills_home_dir(),
                 instance_home: crate::server::instance_home_dir(),
                 remote_dir: crate::server::instance_home_dir(),
+                live_side_parents: None,
                 side_registry: None,
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
