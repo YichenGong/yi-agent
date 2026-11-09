@@ -23,9 +23,10 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use yi_agent_runtime::side_conversation::{
-    CloseReason, SideConversationRunner, SideError, SideErrorReason, SideHostResources,
-    SideIdleDeadline, SideItem, SideRequestLedger, SideResourceLease, SideResult, SideRunnerEvent,
-    SideSourcePublisher, SideStatus, SideToolPolicy, SideToolSetupFactory, SideTranscript,
+    CloseReason, SIDE_STOP_GRACE, SideConversationRunner, SideError, SideErrorReason,
+    SideHostResources, SideIdleDeadline, SideItem, SideRequestLedger, SideResourceLease,
+    SideResult, SideRunnerEvent, SideSourcePublisher, SideStatus, SideToolPolicy,
+    SideToolSetupFactory, SideTranscript,
 };
 
 use crate::tui::side::{ConversationEvent, ConversationPayload, ConversationTarget, SideOperation};
@@ -46,13 +47,27 @@ const SIDE_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 /// TUI 发往旁支调度的命令。
 #[derive(Debug)]
 pub enum SideDriverCommand {
-    /// 打开旁支;`question` 非空时顺带作为第一轮问题。
+    /// 进入旁支;`question` 非空时顺带作为第一轮问题。
+    ///
+    /// `entry_id` 是**本次进入**的进程内标识。它与 `request_id` 分工不同：
+    /// `request_id` 去重一次提问，`entry_id` 决定「这条命令属于哪一次进入」。
+    /// 用户退出后迟到的创建完成、迟到的问题，都要靠它被识别成过期。
     Open {
+        entry_id: String,
         request_id: String,
         question: Option<String>,
     },
     /// 在已打开的旁支里提一个新问题。
-    Submit { request_id: String, text: String },
+    Submit {
+        entry_id: String,
+        request_id: String,
+        text: String,
+    },
+    /// 退出**一次进入**并销毁环境（`/back` 与 `/side-close` 同一条路）。
+    ///
+    /// 与 `Exit` 的区别是它只作用于这次进入：迟到/不匹配的 entry 不做事，
+    /// 也绝不结束整个 actor——否则用户在主视图里按一次返回，旁支功能就没了。
+    Leave { entry_id: String },
     /// 停止某个确定轮次。
     ///
     /// 除了 `turn_id`，还带上调用方**以为**在操作的目标：UI 手里的视图可能
@@ -63,11 +78,6 @@ pub enum SideDriverCommand {
     Interrupt {
         expected_target: ConversationTarget,
         turn_id: String,
-    },
-    /// 关闭旁支。两个字段都是调用方确认过的条件，任一不符就拒绝。
-    Close {
-        expected_target: ConversationTarget,
-        expected_active_turn_id: Option<String>,
     },
     /// 父会话即将 clear/delete:先建立逻辑屏障,主操作成功才提交作废。
     ParentBarrier {
@@ -117,8 +127,37 @@ impl Drop for ParentChangePermit {
 }
 
 struct ActiveTurn {
+    entry_id: String,
     turn_id: String,
     stream: futures::stream::BoxStream<'static, SideRunnerEvent>,
+}
+
+/// 一次「进入」的进行中构造。
+///
+/// 创建必须**可取消**（spec §8）：用户在快照/资源准备期间按返回，命令循环
+/// 仍要受理。所以构造跑在独立任务里，owner 只留缺席、取消 token 与进度。
+struct CreatingEntry {
+    entry_id: String,
+    cancel: CancellationToken,
+    /// 只被消费一次：等结果时 `take()` 出来，回包不可能被重复等待。
+    rx: Option<oneshot::Receiver<SideResult<Constructed>>>,
+    /// 构造期间到达的首问：只有这次进入仍然有效时才会被发出去。
+    pending_question: Option<(String, String)>,
+}
+
+/// 一次正在排空的退出。
+///
+/// 保留它的 `entry_id`：排空失败时错误必须指名是**哪一次进入**没清理干净，
+/// 而那时新的一次进入可能已经开始了。
+struct DrainingEntry {
+    entry_id: String,
+    handle: tokio::task::JoinHandle<SideResult<()>>,
+}
+
+/// 构造完成后的产物。
+struct Constructed {
+    runner: SideConversationRunner,
+    lease: Arc<SideResourceLease>,
 }
 
 /// 旁支调度任务持有的全部状态。
@@ -137,6 +176,22 @@ pub struct SideDriver {
     pending: Vec<Arc<SideItem>>,
     /// 下一次 flush 的最后期限。
     flush_at: Option<tokio::time::Instant>,
+    /// 当前**唯一**一次进入的标识（spec §8「UI 以本次入场 token 授权帧」）。
+    ///
+    /// 帧、提交、退出都要核对它：一个已经离开的进入所产生的迟到结果不能写进
+    /// 新视图，也不能被当成「用户对现在的旁支做了什么」。
+    entry_id: Option<String>,
+    /// 正在构造中的那次进入。
+    creating: Option<CreatingEntry>,
+    /// 正在排空的上一代环境（spec §6.1：清理未排空时拒绝新环境，不并行建）。
+    draining: Option<DrainingEntry>,
+    /// 仅测试用：构造前必须取得的一个许可。
+    ///
+    /// 生产里创建慢的原因是快照与资源准备（真 IO），测试不能靠「等一秒看看有
+    /// 没有输出」来判断命令循环是否被阻塞——那种断言既慢又假。这里用一个
+    /// 显式的门：测试拿走唯一许可，创建就停在**已知位置**，直到测试放行。
+    #[cfg(test)]
+    creation_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// 父变更屏障期间拒绝创建/提问。
     barrier: Option<CloseReason>,
     /// 屏障的最终结果回传端。
@@ -151,6 +206,30 @@ impl SideDriver {
         commands: mpsc::Receiver<SideDriverCommand>,
         events: mpsc::Sender<ConversationEvent>,
     ) -> tokio::task::JoinHandle<()> {
+        Self::spawn_inner(publisher, resources, commands, events, None)
+    }
+
+    /// 仅测试：带「构造门」启动，用来断言命令循环不被创建阻塞。
+    #[cfg(test)]
+    pub fn spawn_with_creation_gate(
+        publisher: Arc<SideSourcePublisher>,
+        resources: Arc<SideHostResources>,
+        commands: mpsc::Receiver<SideDriverCommand>,
+        events: mpsc::Sender<ConversationEvent>,
+        gate: Arc<tokio::sync::Semaphore>,
+    ) -> tokio::task::JoinHandle<()> {
+        Self::spawn_inner(publisher, resources, commands, events, Some(gate))
+    }
+
+    fn spawn_inner(
+        publisher: Arc<SideSourcePublisher>,
+        resources: Arc<SideHostResources>,
+        commands: mpsc::Receiver<SideDriverCommand>,
+        events: mpsc::Sender<ConversationEvent>,
+        // 生产构建里没有测试门，参数用不到；显式忽略而不是条件编译签名，
+        // 那样 `spawn` 与 `spawn_with_creation_gate` 才能共用一个实现。
+        #[cfg_attr(not(test), allow(unused_variables))] gate: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> tokio::task::JoinHandle<()> {
         let driver = Self {
             commands,
             events,
@@ -164,6 +243,11 @@ impl SideDriver {
             active: None,
             pending: Vec::new(),
             flush_at: None,
+            entry_id: None,
+            creating: None,
+            draining: None,
+            #[cfg(test)]
+            creation_gate: gate,
             barrier: None,
             barrier_outcome: None,
         };
@@ -188,6 +272,15 @@ impl SideDriver {
                 outcome = barrier_outcome(&mut self.barrier_outcome), if self.barrier_outcome.is_some() => {
                     self.settle_parent_barrier(outcome).await;
                 }
+                // 构造完成与命令**同等优先**：创建慢时命令循环仍要能受理退出
+                // （spec §8「side_driver 的命令循环不能 await 完整个 open 后才
+                // 看到退出」）。
+                done = creation_outcome(&mut self.creating), if self.creating.is_some() => {
+                    self.settle_construction(done).await;
+                }
+                drained = drain_outcome(&mut self.draining), if self.draining.is_some() => {
+                    self.settle_draining(drained).await;
+                }
                 frame = next_frame(&mut self.active), if self.active.is_some() => {
                     self.handle_frame(frame).await;
                 }
@@ -204,17 +297,30 @@ impl SideDriver {
     async fn handle_command(&mut self, command: SideDriverCommand) {
         match command {
             SideDriverCommand::Open {
+                entry_id,
                 request_id,
                 question,
             } => {
-                let outcome = self.open(request_id, question).await;
+                let outcome = self.open(entry_id, request_id, question).await;
                 self.report_operation_error(SideOperation::Open, outcome.err())
                     .await;
             }
-            SideDriverCommand::Submit { request_id, text } => {
+            SideDriverCommand::Submit {
+                entry_id,
+                request_id,
+                text,
+            } => {
+                if !self.entry_matches(&entry_id) {
+                    // 迟到的问题属于一次已经结束的进入：**不提交**，也不报错
+                    // （用户已经离开，报错只会在他现在看的东西上打字）。
+                    return;
+                }
                 let outcome = self.submit(request_id, text).await;
                 self.report_operation_error(SideOperation::Submit, outcome.err())
                     .await;
+            }
+            SideDriverCommand::Leave { entry_id } => {
+                self.leave(&entry_id).await;
             }
             SideDriverCommand::Interrupt {
                 expected_target,
@@ -245,21 +351,6 @@ impl SideDriver {
                 // 真正的结束由流自己上报:pump 在 join 完 core 任务后才发终态,
                 // 所以这里不伪造 Idle。
             }
-            SideDriverCommand::Close {
-                expected_target,
-                expected_active_turn_id,
-            } => {
-                if !self.target_matches(&expected_target) {
-                    self.report_stale_target(SideOperation::Close, &expected_target)
-                        .await;
-                    return;
-                }
-                let outcome = self
-                    .close(expected_active_turn_id, CloseReason::UserClosed)
-                    .await;
-                self.report_operation_error(SideOperation::Close, outcome.err())
-                    .await;
-            }
             SideDriverCommand::ParentBarrier { reason, reply } => {
                 self.begin_parent_barrier(reason, reply);
             }
@@ -267,48 +358,262 @@ impl SideDriver {
         }
     }
 
-    /// 打开旁支。
+    /// 进入旁支。
     ///
-    /// 已有旁支时重复 open 是幂等的:把现有 id 再报一次让 TUI 切过去,而不是
-    /// 造第二个 runner（单父单旁支）。
-    async fn open(&mut self, request_id: String, question: Option<String>) -> SideResult<()> {
+    /// 三种情形：
+    /// - 同一次进入再来一次（重复命令）：幂等，把现有 id 再报一遍让 TUI 切过去；
+    /// - 正在为**同一个** entry 构造：不重复 spawn，等它完成；
+    /// - 否则开始一次新进入，把构造放到独立任务里（命令循环立刻可继续）。
+    async fn open(
+        &mut self,
+        entry_id: String,
+        request_id: String,
+        question: Option<String>,
+    ) -> SideResult<()> {
         if let Some(reason) = self.barrier {
             return Err(SideError::new(
                 SideErrorReason::SideClosing,
                 format!("父会话正在变更（{}），请稍后再开旁支", reason.as_str()),
             ));
         }
+        // 同一个 entry 的重复 open：这一次进入已经在进行/已打开，不造第二套。
+        if self.entry_id.as_deref() == Some(entry_id.as_str()) {
+            if self.runner.is_some() {
+                self.announce_existing().await?;
+                if let Some(question) = question {
+                    self.submit(request_id, question).await?;
+                }
+                return Ok(());
+            }
+            // 构造还在路上：先记下首问，等构造完成再发。
+            if let Some(creating) = self.creating.as_mut() {
+                creating.pending_question = question.map(|q| (request_id, q));
+                return Ok(());
+            }
+        }
+        // 已有环境（另一次进入留在后台的）：复用同一代，不重建快照。
+        // `entry_id` 换成这次进入的，于是后续提交/退出都定位到本次停留。
         if self.runner.is_some() {
+            self.entry_id = Some(entry_id);
             self.announce_existing().await?;
             if let Some(question) = question {
                 self.submit(request_id, question).await?;
             }
             return Ok(());
         }
-
-        // 快照是唯一的读父入口:它给出独立 Session、固定 config 与同一 provider。
-        let snapshot = self.publisher.snapshot().await?;
-        let side_id = uuid::Uuid::new_v4().to_string();
-        let lease = self.resources.reserve_slot(&side_id)?;
-        let cancel = CancellationToken::new();
-        let prepared = self
-            .resources
-            .prepare(Arc::clone(&lease), &snapshot, cancel)
-            .await?;
-        // A side has no tools; the factory only carries its identity.
-        let tools = SideToolSetupFactory::new(side_id.clone());
-        let runner = SideConversationRunner::new(side_id.clone(), snapshot, prepared, tools)?;
-
-        self.transcript = Some(SideTranscript::side_defaults());
-        self.deadline = Some(SideIdleDeadline::new(tokio::time::Instant::now()));
-        self.slot = Some(lease);
-        self.runner = Some(runner);
-        self.announce_existing().await?;
-
-        if let Some(question) = question {
-            self.submit(request_id, question).await?;
+        // 上一代还在排空：拒绝新建。先放行会让同一父上出现第二套环境，
+        // 而旧那套的资源槽还没让出来（spec §6.1 唯一性）。
+        if let Some(draining) = self.draining.as_ref() {
+            return Err(SideError::new(
+                SideErrorReason::SideClosing,
+                format!("上一条旁问正在退出（{}），请稍后重试", draining.entry_id),
+            ));
         }
+        // 已有一次构造在跑（不同 entry）：拒绝第二个，绝不并行建两套。
+        if self.creating.is_some() {
+            return Err(SideError::new(
+                SideErrorReason::SideLimit,
+                "旁问正在创建，请稍候",
+            ));
+        }
+        self.entry_id = Some(entry_id.clone());
+        let cancel = CancellationToken::new();
+        let (tx, rx) = oneshot::channel();
+        let publisher = Arc::clone(&self.publisher);
+        let resources = Arc::clone(&self.resources);
+        let constructing_entry = entry_id.clone();
+        #[cfg(test)]
+        let gate = self.creation_gate.clone();
+        #[cfg(not(test))]
+        let gate = None;
+        // 快照与资源准备都可能慢；它们在独立任务里跑，命令循环继续受理退出。
+        let task_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(
+                construct_side(publisher, resources, constructing_entry, task_cancel, gate).await,
+            );
+        });
+        self.creating = Some(CreatingEntry {
+            entry_id,
+            cancel,
+            rx: Some(rx),
+            pending_question: question.map(|q| (request_id, q)),
+        });
         Ok(())
+    }
+
+    /// 构造任务的回包落定。
+    async fn settle_construction(&mut self, outcome: Option<SideResult<Constructed>>) {
+        let Some(creating) = self.creating.take() else {
+            return;
+        };
+        // 要发送的首问只在这里取；后面的分支都不会把它漏给别人。
+        let pending = creating.pending_question;
+        let Some(result) = outcome else {
+            // 构造任务消失（panic 或被丢弃）：当作失败，但只在这次进入仍然
+            // 有效时才报——用户已经离开的话，他不该收到一条「打开失败」。
+            if self.entry_matches(&creating.entry_id) {
+                self.entry_id = None;
+                let _ = self
+                    .dispatch_operation_error(
+                        ConversationTarget::Main,
+                        SideOperation::Open,
+                        "旁问创建被中断".to_string(),
+                    )
+                    .await;
+            }
+            return;
+        };
+        match result {
+            Ok(constructed) => {
+                // 用户已经离开：构造出来的东西**立刻销毁**，不 announce、不发首问。
+                if !self.entry_matches(&creating.entry_id) {
+                    let mut runner = constructed.runner;
+                    let _ = runner.close().await;
+                    drop(constructed.lease);
+                    return;
+                }
+                self.transcript = Some(SideTranscript::side_defaults());
+                self.deadline = Some(SideIdleDeadline::new(tokio::time::Instant::now()));
+                self.slot = Some(constructed.lease);
+                self.runner = Some(constructed.runner);
+                if let Err(error) = self.announce_existing().await {
+                    self.report_operation_error(SideOperation::Open, Some(error))
+                        .await;
+                    return;
+                }
+                if let Some((request_id, question)) = pending
+                    && let Err(error) = self.submit(request_id, question).await
+                {
+                    self.report_operation_error(SideOperation::Submit, Some(error))
+                        .await;
+                }
+            }
+            Err(error) => {
+                if !self.entry_matches(&creating.entry_id) {
+                    return;
+                }
+                self.entry_id = None;
+                self.report_operation_error(SideOperation::Open, Some(error))
+                    .await;
+            }
+        }
+    }
+
+    /// 退出一次进入（`/back`、`/side-close` 都走这里）。
+    ///
+    /// 与 `Close` 的差别：`Close` 是带轮次条件的老入口（保留兼容），`Leave`
+    /// 只认 entry，于是「用户确认的是哪一次进入」与「要销毁的是哪一套」是同
+    /// 一个判断。销毁本身放在独立任务里：runner close 要等 core 任务 join，
+    /// 最长 5 秒（`SIDE_STOP_GRACE`），命令循环不能在这段里失去对新的 `/side`
+    /// 与退出的受理能力。
+    async fn leave(&mut self, entry_id: &str) {
+        if !self.entry_matches(entry_id) {
+            // 过期 entry：这次进入已经结束。什么都不做——尤其绝不关闭现在这一
+            // 套（那是用户之后重新进入建出来的）。
+            return;
+        }
+        // 正在构造：取消它。构造完成分支会看到 entry 已失效，自己销毁产物。
+        if let Some(creating) = self.creating.as_mut() {
+            creating.cancel.cancel();
+            creating.pending_question = None;
+        }
+        self.entry_id = None;
+        // 立刻撤掉 UI 侧的授权与本地正文：界面不等资源排空，等待只在这里发生。
+        let Some(mut runner) = self.runner.take() else {
+            self.active = None;
+            self.pending.clear();
+            self.flush_at = None;
+            self.transcript = None;
+            self.deadline = None;
+            return;
+        };
+        let side_id = runner.side_id().to_string();
+        let generation = runner.generation();
+        self.active = None;
+        self.pending.clear();
+        self.flush_at = None;
+        self.transcript = None;
+        self.deadline = None;
+        // 槽位随 lease 的最后一个 owner 释放，不在取消那一刻先释放：先放占位
+        // 会允许同一父出现第二套环境（spec §6.1 唯一性）。
+        let slot = self.slot.take();
+        let events = self.events.clone();
+        // 终态帧仍标上**被退出那次进入**的 entry：它描述的是那一代的结局。
+        // TUI 本地此时已经清掉 entry，会按授权规则丢弃它——这正是对的，
+        // 界面不该为一次已经离开的进入再建视图；但事件本身仍需可追溯。
+        let closing_entry = Some(entry_id.to_string());
+        let started = tokio::time::Instant::now();
+        // 排空任务：runner close 自己完成 stop/join 与资源确认，之后才丢 lease。
+        let handle = tokio::spawn(async move {
+            let outcome = runner.close().await;
+            drop(runner);
+            drop(slot);
+            // 只有**真的**清理干净才发终态。失败不发 `SideClosed`：那会让
+            // 界面显示「已关闭」而资源还占着，重试也就没人会做了。失败由
+            // `settle_draining` 报一条主视图错误。
+            if outcome.is_ok() {
+                dispatch(
+                    &events,
+                    closing_entry,
+                    ConversationTarget::Side {
+                        side_id: side_id.to_string(),
+                        generation,
+                    },
+                    None,
+                    ConversationPayload::SideClosed(CloseReason::UserClosed),
+                )
+                .await
+                .ok();
+            } else {
+                tracing::warn!(
+                    side_id = %side_id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "side leave drain failed"
+                );
+            }
+            outcome
+        });
+        self.draining = Some(DrainingEntry {
+            entry_id: entry_id.to_string(),
+            handle,
+        });
+    }
+
+    /// 排空完成后的收尾。
+    ///
+    /// 成功才清掉「上一代尚未销毁」这个事实。失败保留提示：资源可能还占着，
+    /// 用户需要知道重试而不是以为已经干净了。
+    async fn settle_draining(&mut self, outcome: Option<SideResult<()>>) {
+        let Some(draining) = self.draining.take() else {
+            return;
+        };
+        let joined = outcome.unwrap_or_else(|| {
+            Err(SideError::new(
+                SideErrorReason::Cancelled,
+                "旁问退出任务被中断",
+            ))
+        });
+        if let Err(error) = joined {
+            tracing::warn!(
+                entry_id = %draining.entry_id,
+                reason = error.reason.as_str(),
+                message = %error.message,
+                "side leave drain failed"
+            );
+            let _ = self
+                .dispatch_operation_error(
+                    ConversationTarget::Main,
+                    SideOperation::Close,
+                    format!("旁问退出尚未确认（{}）", error.message),
+                )
+                .await;
+        }
+    }
+
+    /// 这条命令/帧是否属于当前这次进入。
+    fn entry_matches(&self, entry_id: &str) -> bool {
+        self.entry_id.as_deref() == Some(entry_id)
     }
 
     async fn announce_existing(&mut self) -> SideResult<()> {
@@ -320,8 +625,10 @@ impl SideDriver {
             runner.generation(),
             runner.status(),
         );
+        let entry = self.entry_id.clone();
         dispatch(
             &self.events,
+            entry,
             ConversationTarget::Side {
                 side_id: side_id.to_string(),
                 generation,
@@ -357,6 +664,9 @@ impl SideDriver {
             deadline.touch(tokio::time::Instant::now());
         }
         self.active = Some(ActiveTurn {
+            // 轮次挂到**当前这次进入**上：进入被结束之后，迟到的事件流不能
+            // 再往新视图里写上一轮的内容。
+            entry_id: self.entry_id.clone().unwrap_or_default(),
             turn_id: turn_id.clone(),
             stream,
         });
@@ -365,6 +675,14 @@ impl SideDriver {
 
     /// 处理一帧 runner 事件。
     async fn handle_frame(&mut self, frame: Option<SideRunnerEvent>) {
+        // 上一轮属于一次已经结束的进入：丢弃它的收尾副作用（不推 items、不改
+        // 状态），否则用户在新视图里会看到上一段旁支的尾巴。
+        if let Some(active) = self.active.as_ref()
+            && !self.entry_matches(&active.entry_id)
+        {
+            self.active = None;
+            return;
+        }
         let Some(frame) = frame else {
             // 流结束但没经过终态帧（例如通道被关）:仍要收尾,否则状态会停在
             // Running。
@@ -413,8 +731,10 @@ impl SideDriver {
             deadline.touch(tokio::time::Instant::now());
         }
         let (side_id, generation) = (runner.side_id().to_string(), runner.generation());
+        let entry = self.entry_id.clone();
         dispatch(
             &self.events,
+            entry.clone(),
             ConversationTarget::Side {
                 side_id: side_id.to_string(),
                 generation,
@@ -426,6 +746,7 @@ impl SideDriver {
         .ok();
         dispatch(
             &self.events,
+            entry,
             ConversationTarget::Side {
                 side_id: side_id.to_string(),
                 generation,
@@ -438,38 +759,18 @@ impl SideDriver {
     }
 
     /// 关闭旁支并等待真实任务结束。
-    async fn close(
-        &mut self,
-        expected_active_turn_id: Option<String>,
-        reason: CloseReason,
-    ) -> SideResult<()> {
+    ///
+    /// 无条件的：`/side-close`、`/back`、父变更、空闲回收、宿主退出都表达
+    /// 「这一代到此为止」，spec §4.3 明确不再二次询问「是否停止当前回答」。
+    /// 旧实现按调用方的 `active_turn_id` 拒绝一次「正在回答时的关闭」，那让
+    /// 用户按了返回却退不出去——正是这次要修的症状。
+    async fn close(&mut self, reason: CloseReason) -> SideResult<()> {
         let Some(mut runner) = self.runner.take() else {
             return Ok(());
         };
-        let actual = runner.active_turn_id().map(str::to_string);
-        // 没带轮次 id 不代表「旁支是空闲的」——只代表调用方**不知道**当前跑的是
-        // 哪一轮。TUI 拿到 turn id 是通过异步事件，用户提交问题后、那条事件被
-        // 消费前按 `/side-close`，本地就是 `None`。此时放行等于在用户没看到
-        // 任何确认的情况下，把一个正在回答的旁支连回答一起关掉。
-        //
-        // 只有「调用方认为空闲」且「实际也空闲」才是无条件关闭。
-        let unconfirmed_while_running = expected_active_turn_id.is_none() && actual.is_some();
-        if unconfirmed_while_running || expected_active_turn_id != actual {
-            // 条件冲突:把 runner 放回去,什么都不改。误停一个更新的轮次比拒绝
-            // 这次关闭糟得多。
-            self.runner = Some(runner);
-            // 两种冲突分开说：一种是「你确认的是旧轮次」，另一种是「你压根还
-            // 不知道它在跑」。后者的下一步动作不同（先看它跑完没有），用同一
-            // 句话会让人以为自己的确认过期了。
-            let message = if unconfirmed_while_running {
-                "旁支正在回答，请等它结束或先停止再关闭"
-            } else {
-                "旁支已经开始了新的一轮，请确认后再关闭"
-            };
-            return Err(SideError::new(SideErrorReason::CloseConflict, message));
-        }
         let side_id = runner.side_id().to_string();
         let generation = runner.generation();
+        let entry = self.entry_id.clone();
         let outcome = runner.close().await;
         self.active = None;
         self.pending.clear();
@@ -480,6 +781,7 @@ impl SideDriver {
         self.slot = None;
         dispatch(
             &self.events,
+            entry,
             ConversationTarget::Side {
                 side_id: side_id.to_string(),
                 generation,
@@ -526,7 +828,7 @@ impl SideDriver {
         if outcome != Some(ParentChangeOutcome::Commit) {
             return;
         }
-        let _ = self.close(None, reason).await;
+        let _ = self.close(reason).await;
     }
 
     /// TTL 到期:与显式关闭同一条路径,只是原因不同。
@@ -550,12 +852,25 @@ impl SideDriver {
             }
             return;
         }
-        let _ = self.close(None, CloseReason::Expired).await;
+        let _ = self.close(CloseReason::Expired).await;
     }
 
     async fn shutdown(&mut self) {
+        // 应用退出时，构造中的那一次也必须被取消：它的产物会在
+        // `settle_construction` 看到 entry 已失效后自行销毁。不取消就会留一个
+        // 没人要的环境在后台继续准备资源。
+        if let Some(creating) = self.creating.as_mut() {
+            creating.cancel.cancel();
+            creating.pending_question = None;
+        }
+        self.entry_id = None;
         // 退出必须真正停掉这一路:close 会 join 真实 core 任务。
-        let _ = self.close(None, CloseReason::HostShutdown).await;
+        let _ = self.close(CloseReason::HostShutdown).await;
+        // 上一代若还在排空，等它结束：进程退出前不该留下自认为「会自己收尾」
+        // 的任务。`close` 已经把本代停掉，这里等的只是另一次更早的退出。
+        if let Some(draining) = self.draining.take() {
+            let _ = tokio::time::timeout(SIDE_STOP_GRACE, draining.handle).await;
+        }
     }
 
     fn queue_items(&mut self, items: Vec<Arc<SideItem>>) {
@@ -599,8 +914,10 @@ impl SideDriver {
             return;
         };
         let (side_id, generation) = (runner.side_id().to_string(), runner.generation());
+        let entry = self.entry_id.clone();
         dispatch(
             &self.events,
+            entry,
             ConversationTarget::Side {
                 side_id: side_id.to_string(),
                 generation,
@@ -623,6 +940,7 @@ impl SideDriver {
         );
         dispatch(
             &self.events,
+            self.entry_id.clone(),
             ConversationTarget::Side {
                 side_id,
                 generation,
@@ -718,8 +1036,11 @@ impl SideDriver {
         operation: SideOperation,
         message: String,
     ) -> SideResult<()> {
+        // 错误帧**不**带 entry：它必须永远能被看见，哪怕它讲的是一次已经
+        // 结束的进入（那正是「你按的退出为什么没生效」）。
         dispatch(
             &self.events,
+            None,
             target,
             None,
             ConversationPayload::SideOperationError { operation, message },
@@ -732,6 +1053,83 @@ impl SideDriver {
     }
 }
 
+/// 在独立任务里建立一次旁支的运行时对象。
+///
+/// 单独成函数有两个原因：它要跑在 `tokio::spawn` 里（不能借 `&mut SideDriver`），
+/// 而取消必须在这里被**再次**检查——命令循环收到退出到取消生效之间还有几个
+/// await，只在上游判一次会让一个已经没人要的环境建出来。
+async fn construct_side(
+    publisher: Arc<SideSourcePublisher>,
+    resources: Arc<SideHostResources>,
+    entry_id: String,
+    cancel: CancellationToken,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+) -> SideResult<Constructed> {
+    // 测试门：拿不到许可就在这里等，取消则立刻退出。生产 `gate` 恒为 None。
+    //
+    // 必须与 `cancel` 同时等待：一个「卡在门上」的构造如果对取消失聪，测试就
+    // 只能靠超时判断，而那正好复现不了「退出能否取消创建」这条断言。
+    if let Some(gate) = gate {
+        let acquired = tokio::select! {
+            permit = gate.acquire_owned() => permit.is_ok(),
+            () = cancel.cancelled() => false,
+        };
+        if !acquired {
+            return Err(SideError::new(
+                SideErrorReason::Cancelled,
+                "旁支在创建期间被取消",
+            ));
+        }
+    }
+    // 快照是唯一的读父入口:它给出独立 Session、固定 config 与同一 provider。
+    let snapshot = publisher.snapshot().await?;
+    if cancel.is_cancelled() {
+        return Err(SideError::new(
+            SideErrorReason::Cancelled,
+            "旁支在创建期间被取消",
+        ));
+    }
+    let side_id = uuid::Uuid::new_v4().to_string();
+    let lease = resources.reserve_slot(&side_id)?;
+    let prepared = resources
+        .prepare(Arc::clone(&lease), &snapshot, cancel.clone())
+        .await?;
+    if cancel.is_cancelled() {
+        // 资源已经预留：丢掉 lease 让清理线程回收，绝不把半成品交给 owner。
+        return Err(SideError::new(
+            SideErrorReason::Cancelled,
+            "旁支在资源准备期间被取消",
+        ));
+    }
+    // 旁支没有工具；factory 只携带它的身份。
+    let tools = SideToolSetupFactory::new(side_id.clone());
+    let runner = SideConversationRunner::new(side_id, snapshot, prepared, tools)?;
+    let _ = entry_id;
+    Ok(Constructed { runner, lease })
+}
+
+/// 取一次构造结果；没在构造时返回一个永不就绪的 future（该分支同样被守卫关掉）。
+async fn creation_outcome(creating: &mut Option<CreatingEntry>) -> Option<SideResult<Constructed>> {
+    match creating.as_mut().and_then(|creating| creating.rx.take()) {
+        Some(rx) => rx.await.ok(),
+        // 守卫保证不会走到这里；返回 None 会被当作「构造任务消失」处理。
+        None => None,
+    }
+}
+
+/// 取一次排空结果；没有排空任务时永不就绪（该分支同时被守卫关掉）。
+async fn drain_outcome(draining: &mut Option<DrainingEntry>) -> Option<SideResult<()>> {
+    match draining.as_mut() {
+        Some(draining) => Some((&mut draining.handle).await.unwrap_or_else(|_| {
+            Err(SideError::new(
+                SideErrorReason::Cancelled,
+                "旁问退出任务被中断",
+            ))
+        })),
+        None => std::future::pending().await,
+    }
+}
+
 /// 把一条事件投给 TUI。
 ///
 /// 自由函数而不是 `&self` 方法:`run` 的 future 里持有 runner 的事件流,它只
@@ -739,12 +1137,14 @@ impl SideDriver {
 /// 不再是 `Send`。这里只借通道,而 `mpsc::Sender` 是 `Sync` 的。
 async fn dispatch(
     events: &mpsc::Sender<ConversationEvent>,
+    entry_id: Option<String>,
     target: ConversationTarget,
     turn_id: Option<String>,
     event: ConversationPayload,
 ) -> SideResult<()> {
     events
         .send(ConversationEvent {
+            entry_id,
             target,
             turn_id,
             event,

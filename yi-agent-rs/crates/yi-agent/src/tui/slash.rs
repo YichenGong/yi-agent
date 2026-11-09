@@ -824,8 +824,8 @@ fn to_completions(commands: &'static [SlashCommand]) -> &'static [Completion] {
 /// `/quit` (application exit stays reachable from every view — spec §6.2).
 /// `/btw` and `/side` are deliberately absent: a side cannot nest.
 pub const SIDE_COMPLETIONS: &[Completion] = &[
-    Completion::new("back", "返回主会话，保留旁问及其在途轮次"),
-    Completion::new("side-close", "关闭当前旁问（取消在途轮次）"),
+    Completion::new("back", "退出旁问并丢弃本次环境（会停止当前回答）"),
+    Completion::new("side-close", "退出旁问并丢弃本次环境（/back 同义）"),
     Completion::new("help", "旁支里可用的命令与只读工具"),
     Completion::new("config", "旁支继承的固定配置（只读）"),
     Completion::new("cost", "只统计旁支自身的用量"),
@@ -1645,8 +1645,8 @@ mod tests {
     fn contextual_help_resolves_side_commands_but_not_the_alias_entry() {
         // 显式开：lib 测试的 build kind 是 release。
         assert!(help_text_with(Some("side"), true).contains("/side [问题]"));
-        assert!(help_text_with(Some("back"), true).contains("返回主会话"));
-        assert!(help_text_with(Some("side-close"), true).contains("关闭当前旁问"));
+        assert!(help_text_with(Some("back"), true).contains("丢弃本次环境"));
+        assert!(help_text_with(Some("side-close"), true).contains("丢弃本次环境"));
         // `/btw` 是别名：查它应给出 /side 的说明，而不是「未知命令」。
         let btw = help_text_with(Some("btw"), true);
         assert!(btw.contains("/side [问题]"), "{btw}");
