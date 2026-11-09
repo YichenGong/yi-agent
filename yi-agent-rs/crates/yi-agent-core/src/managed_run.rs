@@ -425,6 +425,10 @@ pub struct ManagedRunControl {
     cancel: CancellationToken,
     root: JoinHandle<()>,
     children: ChildTasks,
+    /// Set once the root handle has been awaited to completion. A `JoinHandle`
+    /// must never be polled again after it resolves, so a bounded join that is
+    /// retried has to know whether there is anything left to wait for.
+    root_joined: bool,
 }
 
 impl ManagedRunControl {
@@ -437,6 +441,7 @@ impl ManagedRunControl {
             cancel,
             root,
             children,
+            root_joined: false,
         }
     }
 
@@ -444,6 +449,42 @@ impl ManagedRunControl {
     pub fn cancel(&self) {
         self.cancel.cancel();
         self.children.abort_all();
+    }
+
+    /// Whether the root task has been awaited to completion by a join.
+    ///
+    /// Exposed so a caller can tell "still waiting" from "already joined" without
+    /// re-polling the `JoinHandle`.
+    pub fn root_joined(&self) -> bool {
+        self.root_joined
+    }
+
+    /// Cancel, then wait up to `grace` for the root **and** its children, reporting
+    /// whether both really finished.
+    ///
+    /// Unlike [`Self::stop_and_join`], this never hides a timeout: `false` means an
+    /// owner is still alive (the root handle is kept, only aborted), so a caller
+    /// that must prove quiescence can retry against the same control instead of
+    /// claiming the resources were released.
+    pub async fn stop_and_join_bounded(&mut self, grace: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + grace;
+        self.cancel();
+        self.children.tracker.close();
+        if !self.root_joined {
+            if tokio::time::timeout_at(deadline, &mut self.root)
+                .await
+                .is_err()
+            {
+                // Abort, but keep the handle: the owner is still draining, and a
+                // later retry must be able to observe it finish.
+                self.root.abort();
+                return false;
+            }
+            self.root_joined = true;
+        }
+        tokio::time::timeout_at(deadline, self.children.tracker.wait())
+            .await
+            .is_ok()
     }
 
     /// Whether the real core loop task has already completed.
@@ -466,6 +507,9 @@ impl ManagedRunControl {
             self.root.abort();
             let _ = (&mut self.root).await;
         }
+        // Either branch awaited the handle to completion, so a later bounded join
+        // must not poll it again.
+        self.root_joined = true;
         // A forwarder is released once its tool future drops; the abort is the
         // backstop for anything still parked on the root's cancellation.
         self.children.abort_and_join().await;
@@ -603,5 +647,78 @@ mod tests {
             Arc::as_ptr(&shared),
             Arc::as_ptr(&event.shared())
         ));
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A control whose root ignores cancellation and parks on `gate`, so a
+    /// bounded join provably times out instead of reporting success by accident.
+    /// Returns the sender: dropping it releases the root.
+    fn gated_control() -> (ManagedRunControl, tokio::sync::oneshot::Sender<()>) {
+        let cancel = CancellationToken::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let root = tokio::spawn(async move {
+            let _ = rx.await;
+        });
+        (ManagedRunControl::new(cancel, root, ChildTasks::new()), tx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bounded_join_reports_false_when_the_root_does_not_finish() {
+        let (mut control, _gate) = gated_control();
+        assert!(
+            !control
+                .stop_and_join_bounded(Duration::from_millis(50))
+                .await,
+            "an unfinished root must not be reported as joined"
+        );
+        assert!(!control.root_joined(), "the owner must stay unconfirmed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_bounded_join_after_completion_is_not_a_panic() {
+        let cancel = CancellationToken::new();
+        let root = tokio::spawn(async {});
+        let mut control = ManagedRunControl::new(cancel, root, ChildTasks::new());
+        assert!(control.stop_and_join_bounded(Duration::from_secs(1)).await);
+        assert!(control.root_joined());
+        // The root handle is consumed: a retry must skip it rather than poll a
+        // finished JoinHandle again (which panics).
+        assert!(control.stop_and_join_bounded(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_after_the_owner_finishes_reaches_joined() {
+        let (mut control, gate) = gated_control();
+        assert!(
+            !control
+                .stop_and_join_bounded(Duration::from_millis(20))
+                .await
+        );
+        // The first attempt aborted the root; releasing the gate lets it really
+        // finish, and the retry must observe the same handle instead of leaking it.
+        drop(gate);
+        assert!(
+            control.stop_and_join_bounded(Duration::from_secs(5)).await,
+            "the retry must observe the now-finished root"
+        );
+        assert!(control.root_joined());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_existing_stop_and_join_also_records_the_joined_root() {
+        // Callers of the older API must not leave a handle that a later bounded
+        // join would poll a second time.
+        let cancel = CancellationToken::new();
+        let root = tokio::spawn(async {});
+        let mut control = ManagedRunControl::new(cancel, root, ChildTasks::new());
+        control.stop_and_join(Duration::from_secs(1)).await.unwrap();
+        assert!(control.root_joined());
+        assert!(control.stop_and_join_bounded(Duration::from_secs(1)).await);
     }
 }

@@ -191,6 +191,11 @@ struct TurnShared {
     stop: CancellationToken,
     /// Totals for the active turn, filled by the pump as replies arrive.
     usage: Mutex<SideTokenTotals>,
+    /// Test-only: pretend the bounded join timed out, so the "an unconfirmed join
+    /// must never be reported as closed" path is reachable without a real task
+    /// that ignores cancellation.
+    #[cfg(test)]
+    force_unjoined: std::sync::atomic::AtomicBool,
 }
 
 impl Default for TurnShared {
@@ -199,6 +204,8 @@ impl Default for TurnShared {
             quiescent: Quiescent::default(),
             stop: CancellationToken::new(),
             usage: Mutex::new(SideTokenTotals::default()),
+            #[cfg(test)]
+            force_unjoined: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -206,6 +213,11 @@ impl Default for TurnShared {
 /// The turn currently owned by the runner.
 struct ActiveTurn {
     turn_id: String,
+    /// The real core run, shared with its pump.
+    ///
+    /// Shared (not moved into the pump) so a close that did not observe the join
+    /// can retry against the **same** owner instead of losing track of it.
+    control: Arc<tokio::sync::Mutex<ManagedRunControl>>,
     /// Cancels this turn's tool IO and blocking work. Never the side's lifetime.
     io: CancellationToken,
     stopping: bool,
@@ -431,8 +443,10 @@ impl SideConversationRunner {
         let shared = Arc::new(TurnShared::default());
         self.status = SideStatus::Running;
         self.last_error = None;
+        let control = Arc::new(tokio::sync::Mutex::new(run.control));
         self.active = Some(ActiveTurn {
             turn_id: turn_id.clone(),
+            control: Arc::clone(&control),
             io: io.clone(),
             stopping: false,
             shared: Arc::clone(&shared),
@@ -445,7 +459,7 @@ impl SideConversationRunner {
             side_id,
             generation,
             turn_id,
-            control: run.control,
+            control,
             io,
             shared: Arc::clone(&shared),
             consumer_open: true,
@@ -487,7 +501,14 @@ impl SideConversationRunner {
         let shared = Arc::clone(&active.shared);
         shared.quiescent.wait().await;
 
-        let completion = shared.quiescent.take_completion().unwrap_or_default();
+        // A completion is taken exactly once. On a retry (a second `close` or
+        // `wait_quiescent` while an owner is still unwinding) there is nothing to
+        // take: the turn was already accounted, so re-running the accumulation
+        // would count its usage twice and overwrite the recorded join evidence
+        // with a default. Keep the earlier verdict instead.
+        let Some(completion) = shared.quiescent.take_completion() else {
+            return Ok(());
+        };
         let turn_usage = *shared
             .usage
             .lock()
@@ -522,7 +543,14 @@ impl SideConversationRunner {
         } else {
             self.status = SideStatus::Idle;
         }
-        self.active = None;
+        if completion.joined {
+            self.active = None;
+        }
+        // A completion that arrived without a confirmed join keeps its `active`
+        // entry on purpose: the owner is still unwinding, so this runner must not
+        // look idle-and-reusable. `close` turns that into an explicit failure, and
+        // the retained entry is what lets a retry keep waiting on the same owner
+        // instead of starting a second run.
         Ok(())
     }
 
@@ -542,6 +570,48 @@ impl SideConversationRunner {
         // The core task must be joined before this counts as closed; otherwise a
         // late tool result could still write into the side's session.
         self.wait_quiescent().await?;
+        if let Some(control) = self.active.as_ref().map(|turn| Arc::clone(&turn.control))
+            && !self.last_turn_joined
+        {
+            // The pump's join did not confirm the task ended. Retry against the
+            // same owner rather than claiming the close: a later close (or the
+            // host's exit retry) waits on this task instead of abandoning it.
+            // The same test hook applies: a task that will not unwind must keep
+            // failing the retry, not succeed just because the hook only covered
+            // the pump's first attempt.
+            #[cfg(test)]
+            let injected = self
+                .active
+                .as_ref()
+                .map(|turn| {
+                    turn.shared
+                        .force_unjoined
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                })
+                .unwrap_or(false);
+            #[cfg(not(test))]
+            let injected = false;
+            let joined = if injected {
+                false
+            } else {
+                control
+                    .lock()
+                    .await
+                    .stop_and_join_bounded(SIDE_STOP_GRACE)
+                    .await
+            };
+            if joined {
+                self.last_turn_joined = true;
+                self.active = None;
+                self.status = SideStatus::Closing;
+            } else {
+                self.status = SideStatus::Closing;
+                return Err(SideError::new(
+                    SideErrorReason::SideClosing,
+                    "core_join_unconfirmed",
+                ));
+            }
+        }
         {
             // Converge to the safe prefix: a forced abort can leave a trailing
             // assistant message whose tool_use has no result, which the provider
@@ -588,7 +658,7 @@ struct Pump {
     side_id: String,
     generation: u64,
     turn_id: String,
-    control: ManagedRunControl,
+    control: Arc<tokio::sync::Mutex<ManagedRunControl>>,
     io: CancellationToken,
     shared: Arc<TurnShared>,
     /// Whether forwarding is still useful; false once the consumer went away.
@@ -619,11 +689,11 @@ impl Pump {
                 biased;
                 _ = self.shared.stop.cancelled(), if !stop_handled => {
                     stop_handled = true;
-                    self.control.cancel();
+                    self.control.lock().await.cancel();
                 }
                 _ = &mut deadline, if !timed_out => {
                     timed_out = true;
-                    self.control.cancel();
+                    self.control.lock().await.cancel();
                 }
                 next = events.next() => {
                     let Some(queued) = next else { break };
@@ -667,7 +737,28 @@ impl Pump {
         // after this may callers see the turn as finished. Dropping the control
         // aborts, but does not wait, so publishing before this would let a caller
         // observe Idle while the task was still unwinding.
-        let joined = self.control.stop_and_join(SIDE_STOP_GRACE).await.is_ok();
+        //
+        // `stop_and_join_bounded` never hides a timeout: `false` means the owner
+        // is still draining. The completion is still published (so the runner can
+        // stop waiting), but with `joined: false`, and the runner keeps the active
+        // turn instead of clearing it: a caller then sees `Closing`/`Idle` with an
+        // unconfirmed join rather than a side it believes is safe to reuse.
+        #[cfg(test)]
+        let injected_unjoined = self
+            .shared
+            .force_unjoined
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let injected_unjoined = false;
+        let joined = if injected_unjoined {
+            false
+        } else {
+            self.control
+                .lock()
+                .await
+                .stop_and_join_bounded(SIDE_STOP_GRACE)
+                .await
+        };
         self.io.cancel();
         let error = if timed_out {
             Some(SideError::new(

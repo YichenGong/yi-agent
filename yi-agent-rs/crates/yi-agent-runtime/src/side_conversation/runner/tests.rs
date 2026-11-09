@@ -630,3 +630,88 @@ async fn side_stays_on_its_entry_snapshot_across_questions() {
         "the parent transcript must never receive side content: {rendered_parent}"
     );
 }
+
+/// Closing must prove the real core task ended. A close that returns Ok while the
+/// provider stream is still alive would let a late result write into a session the
+/// host already believes is gone.
+#[tokio::test(start_paused = true)]
+async fn side_close_proves_core_join_and_stream_drop() {
+    let fixture = Fixture::new();
+    let (source, provider) = source_with_pending_provider();
+    let mut runner = fixture.runner(source).await;
+    let events = runner
+        .start_turn("turn-a".into(), "问题".into())
+        .await
+        .unwrap();
+    provider.entered().await;
+
+    runner.close().await.unwrap();
+
+    assert!(provider.dropped(), "the provider stream must be torn down");
+    assert!(
+        runner.last_turn_was_joined(),
+        "close must observe the joined core task"
+    );
+    assert_eq!(runner.status(), SideStatus::Closed);
+    drop(events);
+}
+
+/// The failure this guards: an unconfirmed join reported as `Closed`. The owner is
+/// still alive, so the runner must keep its active entry, fail the close, and
+/// refuse new turns — but stay able to finish the same owner later.
+#[tokio::test(start_paused = true)]
+async fn side_close_refuses_to_claim_closed_when_the_join_is_unconfirmed() {
+    let fixture = Fixture::new();
+    let (source, provider) = source_with_pending_provider();
+    let mut runner = fixture.runner(source).await;
+    let events = runner
+        .start_turn("turn-a".into(), "问题".into())
+        .await
+        .unwrap();
+    provider.entered().await;
+    // Inject the timeout outcome: the same state a task that will not unwind
+    // produces, without a real task that ignores cancellation.
+    runner
+        .active
+        .as_ref()
+        .unwrap()
+        .shared
+        .force_unjoined
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let error = runner.close().await.unwrap_err();
+    assert_eq!(error.reason, SideErrorReason::SideClosing);
+    assert_eq!(error.message, "core_join_unconfirmed");
+    assert_eq!(
+        runner.status(),
+        SideStatus::Closing,
+        "an unconfirmed close is Closing, never Closed"
+    );
+    assert!(!runner.last_turn_was_joined(), "the join stays unconfirmed");
+
+    // The owner entry must survive, so a retry waits on the same task rather than
+    // starting a fresh run or losing track of it.
+    let retry = match runner.start_turn("turn-b".into(), "又问".into()).await {
+        Ok(_) => panic!("a closing side must refuse new turns"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            retry.reason,
+            SideErrorReason::TurnInProgress | SideErrorReason::SideClosing
+        ),
+        "a closing side must refuse new turns: {retry:?}"
+    );
+
+    // Once the join really completes, the same close succeeds.
+    runner
+        .active
+        .as_ref()
+        .unwrap()
+        .shared
+        .force_unjoined
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    runner.close().await.unwrap();
+    assert_eq!(runner.status(), SideStatus::Closed);
+    drop(events);
+}
