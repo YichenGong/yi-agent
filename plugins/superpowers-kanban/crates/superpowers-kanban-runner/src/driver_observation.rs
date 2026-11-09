@@ -263,7 +263,8 @@ mod tests {
     use super::{LoadedThreadFacts, parse_observation_input};
 
     /// 契约文件：宿主与插件两侧测试都用 `include_str!` 读同一份。
-    const DRIVER_CONTRACT: &str = include_str!("../contract/driver-protocol.json");
+    const DRIVER_CONTRACT: &str =
+        include_str!("../../../../contracts/fixtures/driver-protocol.json");
 
     /// 缺新字段 = 旧宿主，`loaded` 必须是 `None`；空完整数组 = 热表确实为空，
     /// 必须是 `Some([])`。这两者混淆一次，就会把「没能力回答」当成「一个都没加载」。

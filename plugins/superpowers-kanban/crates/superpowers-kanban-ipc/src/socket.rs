@@ -4,23 +4,21 @@
 //! `bind` 直接失败。宿主早已有回退规则；插件此前**没有**，于是查询 socket
 //! 在深路径下永远 bind 不上，看板 UI 全瞎。
 //!
-//! # 为什么这里有两套规则，且**不得合并**
+//! # 这里只剩查询通道；业务通道已搬到 [`crate::daemon_socket`]
 //!
 //! | 规则 | 前缀 | 哈希输入 | 谁用 |
 //! |---|---|---|---|
-//! | 宿主 daemon socket | `yi-agent-` | `runtime_dir` | 宿主 daemon、宿主所有客户端、**插件客户端** |
+//! | 宿主 daemon socket | 无前缀，`<instance_home>/sockets/<16hex>/runtime.sock` | canonical runtime | 宿主 daemon、**插件客户端**（见 [`crate::daemon_socket`]） |
 //! | 插件通道 socket | `plugin-` | **直接路径** | 宿主转发表、**插件服务端** |
 //!
-//! 两套规则用途不同、且必须与「另一边」逐字一致：
+//! 本模块只保留查询通道：[`plugin_socket_for`] 是插件与宿主转发表之间的约定，
+//! 哈希输入是**展开后的直接路径**——宿主拿到清单值、插件拿到
+//! `dir.join(file_name)`，当清单写 `{state_dir}/superpowers-kanban.sock` 时两者
+//! 逐字相同，于是哈希相同、结果相同。它仍有「太长就回退到 TMPDIR」的老规则，
+//! 与业务通道的「不设前缀、不回退、按实例家目录定位」是两件不同的事。
 //!
-//! * [`daemon_socket_for`] 复刻宿主 `yi-agent-store::ipc::socket_path_for`，
-//!   因为插件要连的是**宿主**的 daemon。哈希输入是 `runtime_dir`。
-//! * [`plugin_socket_for`] 是插件与宿主转发表之间的约定，哈希输入是
-//!   **展开后的直接路径**——宿主拿到清单值、插件拿到 `dir.join(file_name)`，
-//!   当清单写 `{state_dir}/superpowers-kanban.sock` 时两者逐字相同，
-//!   于是哈希相同、结果相同。
-//!
-//! 前缀不同是有意的：它让两个通道的 socket 永远不会撞名。
+//! 业务入口 [`daemon_socket_for`] 仅为兼容既有调用点保留，内部直接转调
+//! [`crate::daemon_socket::daemon_socket_for`]，返回业务错误类型。
 
 use std::path::{Path, PathBuf};
 
@@ -63,18 +61,16 @@ pub fn plugin_socket_for(direct: &Path) -> Result<PathBuf, SocketPathError> {
     )
 }
 
-/// 插件→daemon 的 socket：逐字复刻宿主 `socket_path_for`（哈希 `runtime_dir`）。
+/// 插件→宿主业务 daemon 的 socket（兼容入口）。
 ///
-/// 与 [`plugin_socket_for`] 的差异是**有意的**：这条连的是宿主的 daemon，
-/// 必须与宿主的命名（`yi-agent-` 前缀、哈希 `runtime_dir`）完全一致。
-pub fn daemon_socket_for(runtime_dir: &Path) -> Result<PathBuf, SocketPathError> {
-    let direct = runtime_dir.join("runtime.sock");
-    resolve(
-        &direct,
-        runtime_dir.as_os_str().as_encoded_bytes(),
-        "yi-agent-",
-        &std::env::temp_dir(),
-    )
+/// 真正的规则在 [`crate::daemon_socket`]：`<instance_home>/sockets/<16hex>/runtime.sock`，
+/// 前缀、TMPDIR 回退都不再参与。这里保留名字只为既有调用点不必同时改签名，
+/// 错误类型是业务侧的 [`crate::daemon_socket::DaemonSocketError`]，不与查询通道的
+/// [`SocketPathError`] 混用。
+pub fn daemon_socket_for(
+    runtime_dir: &Path,
+) -> Result<PathBuf, crate::daemon_socket::DaemonSocketError> {
+    crate::daemon_socket::daemon_socket_for(runtime_dir)
 }
 
 /// 共用内核：直通 → 回退 → 回退仍超长则报错。
@@ -110,9 +106,6 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 与宿主 `yi-agent-store::ipc` 测试里同一个深路径，用来锁住两侧一致。
-    const LONG_RUNTIME_DIR: &str = "/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.yi-agent/runtime";
 
     /// 宿主与插件共用的 socket 契约（同一份文件，位于
     /// `plugins/contracts/fixtures/`，两端各自读它）。
@@ -191,24 +184,20 @@ mod tests {
         );
     }
 
+    /// 业务地址已不再是 `yi-agent-` + TMPDIR 回退；旧布局的断言全部删除，
+    /// 只保留「兼容入口确实转调新规则」这一条（详细规则在新模块与公共夹具里测）。
     #[test]
-    fn the_daemon_rule_matches_the_host() {
-        let socket = daemon_socket_for(Path::new(LONG_RUNTIME_DIR)).expect("falls back");
-        assert_eq!(socket.parent().unwrap(), std::env::temp_dir());
+    fn the_daemon_entry_delegates_to_the_instance_socket_directory() {
+        let socket = crate::daemon_socket::daemon_socket_with_home(
+            Path::new("/tmp/project/.yi-agent/runtime"),
+            Path::new("/instance"),
+        )
+        .expect("resolves");
         assert_eq!(
-            socket.file_name().unwrap(),
-            "yi-agent-51bccf606c7e2ae7.sock",
-            "必须与宿主 socket_path_for 逐字一致"
+            socket.parent().unwrap().parent().unwrap().parent().unwrap(),
+            Path::new("/instance")
         );
-    }
-
-    #[test]
-    fn a_short_runtime_dir_keeps_the_socket_inside_it() {
-        let dir = Path::new("/tmp/project/.yi-agent/runtime");
-        assert_eq!(
-            daemon_socket_for(dir).expect("resolves"),
-            dir.join("runtime.sock")
-        );
+        assert_eq!(socket.file_name().unwrap(), "runtime.sock");
     }
 
     #[test]

@@ -48,12 +48,16 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
-/// The socket the daemon listens on for a given runtime directory.
+/// The socket the business daemon listens on for a given runtime directory.
 ///
-/// 复刻宿主的回退规则（`yi-agent-` 前缀、哈希 `runtime_dir`）：深路径下宿主的
-/// daemon 会把 socket 挪到临时目录，插件必须落到**同一处**才连得上。
-pub fn socket_path(runtime_dir: &Path) -> Result<PathBuf, crate::socket::SocketPathError> {
-    crate::socket::daemon_socket_for(runtime_dir)
+/// 宿主现在的布局是 `<instance_home>/sockets/<canonical runtime 的 SHA-256 前
+/// 16 hex>/runtime.sock`（见 [`crate::daemon_socket`]），**不再**把 socket 放在
+/// runtime 目录旁、也**不再**回退到 TMPDIR。旧注释描述的直通/TMPDIR 规则会让
+/// 排查者按错误地址去 lsof，所以一并删除。
+///
+/// 查询通道（`plugin-` 前缀、TMPDIR 回退）仍是另一套规则，见 [`crate::socket`]。
+pub fn socket_path(runtime_dir: &Path) -> Result<PathBuf, crate::daemon_socket::DaemonSocketError> {
+    crate::daemon_socket::daemon_socket_for(runtime_dir)
 }
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -132,13 +136,19 @@ mod tests {
     use super::*;
     use crate::wire::Command;
 
+    /// 旧断言（socket 就在 runtime 目录旁）会把宿主的新布局永久锁死，必须替换。
+    /// 用纯入口而不是读继承的 HOME，断言才是确定的。
     #[test]
-    fn the_socket_lives_beside_its_runtime_directory() {
-        assert_eq!(
-            socket_path(std::path::Path::new("/project/.yi-agent/runtime"))
-                .expect("short path stays"),
-            std::path::PathBuf::from("/project/.yi-agent/runtime/runtime.sock")
-        );
+    fn the_socket_lives_in_the_instance_socket_directory() {
+        use crate::daemon_socket::daemon_socket_with_home;
+        let resolved = daemon_socket_with_home(
+            std::path::Path::new("/project/.yi-agent/runtime"),
+            std::path::Path::new("/instance"),
+        )
+        .expect("short path resolves");
+        assert!(resolved.starts_with("/instance/sockets"), "{resolved:?}");
+        assert_eq!(resolved.file_name().unwrap(), "runtime.sock");
+        assert_eq!(resolved.components().count(), 5, "{resolved:?}");
     }
 
     #[test]
