@@ -1,8 +1,8 @@
 # yi-agent-tui
 
-## 一次性旁问退出（待审阅，未实现）
+## 一次性旁问退出（规格已复核、计划已写，未实现）
 
-- [ ] `/back` 与 `/side-close` 退出即销毁 — [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §4、§8、§9。完成判据：`cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::side` 与 driver/输入循环集成验证运行中退出、Creating 中退出、父任务继续、重入新快照、帮助不再承诺保留；新测试与真实终端验收尚未执行。
+- [ ] `/back` 与 `/side-close` 退出即销毁 — [plan](../superpowers/plans/2026-11-09-side-snapshot-lifecycle-impl.md) · [复核](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md) · [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §4、§8、§9。完成判据：`cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::side` 与 driver/输入循环集成验证运行中退出、Creating 中退出、父任务继续、重入新快照、帮助不再承诺保留；新测试与真实终端验收尚未执行。
 
 ## 模块说明
 

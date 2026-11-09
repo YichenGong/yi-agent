@@ -1,8 +1,8 @@
 # yi-agent-runtime（共享运行时）
 
-## 一次性对话快照旁问（待审阅，未实现）
+## 一次性对话快照旁问（规格已复核、计划已写，未实现）
 
-- [ ] 无工具快照问答与退出资源释放 — [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §5、§6、§9。完成判据：`cd yi-agent-rs && cargo test -p yi-agent-runtime --lib side_` 覆盖零工具、固定父快照、父历史不污染、取消并释放 runner/转录；新测试和真实验收尚未执行。旧只读工具白名单记录为历史基线，本项完成后不再适用。
+- [ ] 无工具快照问答与退出资源释放 — [plan](../superpowers/plans/2026-11-09-side-snapshot-lifecycle-impl.md) · [复核](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md) · [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §5、§6、§9。完成判据：`cd yi-agent-rs && cargo test -p yi-agent-runtime --lib side_` 覆盖零工具、固定父快照、父历史不污染、取消并释放 runner/转录；新测试和真实验收尚未执行。旧只读工具白名单记录为历史基线，本项完成后不再适用。
 
 ## 模块说明
 

@@ -35,7 +35,7 @@
 | tooling | 15 / 15 | [详情](./tooling.md) |
 | magpie-agent-yi-agent | 5 / 5 | [详情](./magpie-agent-yi-agent.md) |
 | remote-ssh | 31 / 34 | [详情](./remote-ssh.md) |
-临时旁问（三端）：新需求见[一次性对话快照旁问 spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md)（待用户审阅，未实施、未写 plan）：固定当前对话快照、允许追问、退出销毁、再进入新环境；对应待办分别登记在 runtime、app-server、desktop 和 TUI。旧[设计基线](../superpowers/specs/2026-11-03-side-conversation-design.md)、[实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md)及[修复 spec](../superpowers/specs/2026-11-05-side-conversation-repair-design.md)/[修复 plan](../superpowers/plans/2026-11-05-side-conversation-repair-impl.md)保留为历史记录，其中“返回保留/后台续聊/文件及网络只读工具”的行为与验收拟由新规格覆盖；真实联合验收仍未完成。
+临时旁问（三端）：新需求见[一次性对话快照旁问 spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md)（规格已复核，[plan](../superpowers/plans/2026-11-09-side-snapshot-lifecycle-impl.md) 已写、未实施；[审查记录](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md)）：固定当前对话快照、允许追问、退出销毁、再进入新环境；对应待办分别登记在 runtime、app-server、desktop 和 TUI。旧[设计基线](../superpowers/specs/2026-11-03-side-conversation-design.md)、[实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md)及[修复 spec](../superpowers/specs/2026-11-05-side-conversation-repair-design.md)/[修复 plan](../superpowers/plans/2026-11-05-side-conversation-repair-impl.md)保留为历史记录，其中“返回保留/后台续聊/文件及网络只读工具”的行为与验收拟由新规格覆盖；真实联合验收仍未完成。
 
 本轮同步复核以上四模块计数：统计模块文件中的 checklist 条目（包括子项及已放弃项），排除明确指向其他主条目的“不重复计数”交叉引用；运行参数即时生效的主条目保留计数。已完成数变化只校正索引滞后，未将本次旁问待办标为完成。
 
