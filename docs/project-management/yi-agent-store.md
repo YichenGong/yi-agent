@@ -42,3 +42,20 @@ yi-agent 的会话持久化 crate。目标是保存和恢复 `yi-agent-core::Ses
   `cargo test -p yi-agent-store --lib lifecycle`（10 passed，含
   `a_global_drain_refuses_every_client_not_only_the_departing_one`、
   `one_client_leaving_does_not_start_a_global_drain`、`open_clients_counts_only_those_still_admitting`）
+
+- [x] managed daemon 接纳以租约为据的 project attach（`authorize_attach_key`）—
+  project attach 的 key 是 `project:<pid>:<path>:<uuid>`，按设计解析不到任何绑定；
+  managed daemon 因此只能靠请求携带的 `client_run_id`，并且只在该 client 有
+  guardian 担保（root 绑定或 business 租约）时接纳，归属记为
+  `AttachOwner::Project(client)`。这条路径**不产生**任何 root：`authorized_root()`
+  返回 `None`，daemon 自铸 root id，install/bind/spawn 仍各自要求真 capability——
+  所以「client id 出现在请求里」最坏只换来一个 guardian 已为该 client 担保的连接。
+  `refresh_attach_authority` 的注释同步说明「authorized」现在含两类来源。判据：
+  `cargo test -p yi-agent-store --test managed_attach_authority`（16 passed，含真实
+  时序的 `a_managed_daemon_admits_a_project_attach_that_names_an_authorized_client`、
+  以及三个反向边界 `a_lease_opens_a_connection_but_authorizes_no_root`、
+  `releasing_the_lease_stops_the_project_attach`、
+  `a_managed_daemon_refuses_a_project_attach_naming_an_unknown_client`）；
+  `cargo nextest run --all-features -p yi-agent-store --test runtime_ipc`（118 passed，
+  真实 socket 用例 `a_managed_daemon_admits_a_project_attach_over_the_wire_when_it_names_its_client`
+  改用 `ClientLeased` 复现真实帧序）

@@ -238,3 +238,24 @@
   `a_guardian_starts_for_a_runtime_directory_too_deep_for_a_direct_socket`，用 90 字符深的
   runtime 目录跑真实 `ensure_managed`）。实测 A/B：未修复二进制 `refused:prepare:...did not become
   ready within 30s`（30.3s），修复后 8 个启动阶段全过（14.4s，`run --subagents` 与真实 TUI pty 两条路径各验一次）
+
+- [x] 租约作为独立的 attach 授权来源（`ClientLeased`）— 桌面端启动顺序由协议固定：
+  `_shell/prepare` 起 runtime → `FrontendLease::register` 登记 business 租约 →
+  `initialize` → 首个 `thread/start` 触发 project attach。attach 时**还没有任何 root
+  绑定**（会话的 capability 要等这一步之后才申请），而 attach 闸原先只看
+  `authorized_clients()`，它只从 `by_client`（root 绑定）派生——集合为空，attach 被拒
+  （`no root authorization matches this capability`），`attach_delegation` 降级，
+  `spawn_agent` 不进工具列表。修复在 `authorization.rs` 新增 `leased_clients` 与线协议
+  变体 `ClientLeased { client_run_id }`，`authorized_clients()` 返回
+  **root 授权 client ∪ 业务租约 client**；`holds_lease()` 让需要 root 的调用方能区分
+  「有租约」与「有 root」。安全边界逐条守住：`ClientLeased` 不授予任何 root
+  （`AttachOwner::Project::authorized_root()` 恒为 `None`，daemon 自铸 root id，
+  install/bind/spawn 仍要求真 capability）；`LeaseOnly` 观察者不推送；`RevokeClient`
+  同时清 `leased_clients` 并落 tombstone，迟到的 `ClientLeased` 被拒；未知 client
+  仍被拒。判据：`cargo test -p yi-agent-lifecycle`（148 passed，新增
+  `a_lease_opens_a_connection_but_authorizes_no_root`、
+  `releasing_the_lease_stops_the_project_attach`）；guardian 侧
+  `cargo nextest run --all-features -p yi-agent-supervisors --lib -E 'test(lease)'`
+  含 `registering_a_business_lease_tells_the_daemon_before_any_root_exists`
+  （注册后确实推出一帧 `ClientLeased`，且此刻 ledger 里没有任何 capability）与
+  `a_lease_only_observer_is_not_announced_to_the_daemon`

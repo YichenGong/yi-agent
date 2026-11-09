@@ -549,6 +549,7 @@ npx tauri build --bundles app
 | A9，§7.1 | 6 | 模型schema+反向授权+实际child echo+parentwait；变异红 |
 | A10，§7.2 | 7 | 本次隔离bundle真实窗口及真实模型，不用CLI替代 |
 | A11，§6 | 5 | 无scope提示、迟到隔离、显式retry、新turn重建、不重放 |
+| A12，§6.3 | 6 | 真实App顺序下首次project attach被接纳；回退租约授权来源则变红 |
 | §8交付 | 每Task、7 | 最新CI/desktop验证、文档计数、用户决定合并 |
 
 - [ ] 对照spec逐项确认，不能有只有plan文字而没有实际测试/验收的完成勾选。
@@ -558,3 +559,27 @@ npx tauri build --bundles app
 ## 文档交接
 
 此计划是作者自审后的实现指南，不是独立审查结论或已完成代码。执行可选择主会话逐任务推进，或在spawn工具实际可用时使用subagent-driven流程；当前会话不假称能派出审查子代理。无论采用何种执行方式，都保留逐单元review与red/green门禁，并遵守“不自行合并”。
+
+## 实施期追加：project attach 授权来源（A12 / §6.3）
+
+执行 A9 时发现 A1–A11 全部内容之外还有一条独立缺陷，且它是 App 内 `spawn_agent`
+消失的直接原因。详见 spec §6.3，此处只记录落地位置：
+
+| 变更 | 位置 | 作用 |
+|---|---|---|
+| `leased_clients` 字段 | `crates/yi-agent-lifecycle/src/authorization.rs` | 与 root 绑定分开记账，语义不同、生命周期不同 |
+| `AuthorizationUpdate::ClientLeased` | 同上 | 线协议新变体；不授予 root，只让 daemon 认下「这个 client 持有租约」 |
+| `authorized_clients()` 合并两源 | 同上 | attach 闸问的是「guardian 为谁担保」，root 绑定与租约都是担保 |
+| `holds_lease()` | 同上 | 让需要 root 的调用方能区分「有租约」与「有 root」 |
+| `announce_client_lease()` | `crates/yi-agent-supervisors/src/lifecycle/guardian.rs` | 注册成功后先本地记账再推 daemon；`LeaseOnly` 不推 |
+| `Register` 成功分支调用它 | 同上 | 用**实际授予**的 mode，`WaitingNextGeneration` 不授权 |
+| `start_daemon` 重放 live lease | 同上 | 新 generation 的 ledger 为空，不重放会让 App 重启后再丢工具 |
+| `authorize_attach_key` 注释 | `crates/yi-agent-store/src/runtime.rs` | 说明为何 project attach 可以读请求里的 `client_run_id`，以及它不产生任何 root |
+| `the_apps_first_conversation_attaches_its_delegation_runtime` | `crates/yi-agent/tests/managed_production_integration.rs` | 真实进程 + 真实私有通道的端到端判据，含测试扮演壳应答 `_shell/authorizeRoot` |
+
+判别性已实测：把 `authorized_clients()` 里合并租约的那一行临时注释掉，该测试立即
+失败，报 `... holds no root authorization on this daemon ... (project attach for
+app-run-...)`；恢复后通过。其余三个反向边界（租约不能当 capability、释放后 attach
+失效、观察者不推送）各有单测。
+
+未完成：真实 GUI 窗口的 A10 仍需按 §7.2 单独验收；纯 stdio 协议层只能计 A9/A12。

@@ -383,3 +383,22 @@
   → `spawn_agent` 返回 `queued`，`wait_agent` 返回 `status: completed`、
   `report: "hello"`，`inspect_agent` 复核同一 task；同时生成
   `sockets/<hash>/guardian-control.sock` 证明走的是 guardian 拥有 daemon 的受管路径。
+
+- [x] App 的首次会话能接上委派运行时（project attach 授权）— 症状是工具列表里没有
+  `spawn_agent`。根因不在装配而在授权：桌面端首个 `thread/start` 的 `attach_delegation`
+  第一步是 project attach，此时会话还没有 root capability（它要在这一步之后才申请），
+  而 attach 闸只认 root 绑定，于是必然拒绝并降级。修法见 `yi-agent-lifecycle` 的
+  `ClientLeased`（租约作为第二个担保来源，但不授予任何 root）与 `yi-agent-store` 的
+  `authorize_attach_key`。判据是真实进程、真实私有通道的端到端测试
+  `the_apps_first_conversation_attaches_its_delegation_runtime`
+  （`crates/yi-agent/tests/managed_production_integration.rs`）：
+  `cargo test --all-features -p yi-agent --test managed_production_integration`
+  （20 passed）。它按桌面真实顺序驱动——bootstrap 私有通道、`_shell/prepare` 起
+  guardian、用 App 的 run id `FrontendLease::register`、带 `shellAuthorization` 的
+  `initialize`、`thread/start`，并由测试扮演壳应答 `_shell/authorizeRoot`——然后断言
+  trace 无 `no root authorization matches this capability`、无
+  `subagent delegation unavailable`，且 `runtime.sqlite` 的
+  `application_root_attachments` 非空。判别性实测：临时把
+  `authorized_clients()` 里合并租约那一行回退，该测试立即失败并报
+  `... holds no root authorization on this daemon ... (project attach for app-run-...)`；
+  恢复后通过。边界：只覆盖 stdio 协议层，真实 GUI 窗口（spec A10）仍需单独验收
