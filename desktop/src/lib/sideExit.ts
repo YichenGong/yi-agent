@@ -79,6 +79,21 @@ export class SideExitCoordinator {
   }
 
   /**
+   * 把一条失败记录重新放回待发队列（用户点了「重试」）。
+   *
+   * 只重置**这张票**：别的宿主、别的父上的失败不受影响，也不会顺手重试一堆
+   * 已经明确失败的东西——那会让一次点击变成一串后台请求。
+   */
+  retry(target: SideExitParams): void {
+    if (this.disposed) return;
+    const record = this.records.get(sideExitKey(target));
+    if (record === undefined || record.phase !== "failed") return;
+    record.phase = "pending";
+    record.message = null;
+    this.notify();
+  }
+
+  /**
    * 这个 `(宿主, 父)` 上是否还有未确认的退出。
    *
    * 为真期间不能为同一父创建新环境：旧环境还可能占着宿主上的唯一性槽位，

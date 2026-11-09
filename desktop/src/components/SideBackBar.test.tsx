@@ -29,7 +29,9 @@ describe("SideBackBar", () => {
 
     // 可见文字与无障碍名都要指向同一条父会话：只说「返回」会让人不确定回到哪。
     const button = screen.getByRole("button", { name: "返回主会话" });
-    expect(button.getAttribute("title")).toBe("返回主会话：修复登录超时");
+    expect(button.getAttribute("title")).toBe(
+      "退出旁问并回到主会话：修复登录超时",
+    );
     expect(screen.getByText("修复登录超时")).toBeTruthy();
   });
 

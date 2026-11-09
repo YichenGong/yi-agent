@@ -581,7 +581,7 @@ export class SideConversationStore {
     view.summary = { ...view.summary, parent_thread_id: parentId, generation };
   }
 
-  /** 该宿主上的全部旁支，供「继续旁问」入口与 list 对账使用。 */
+  /** 该宿主上的全部旁支，供 list 对账与「这条父上是否已有旁支」判定使用。 */
   list(hostKey: SideHostKey): SideView[] {
     return [...(this.views.get(hostKey)?.values() ?? [])];
   }

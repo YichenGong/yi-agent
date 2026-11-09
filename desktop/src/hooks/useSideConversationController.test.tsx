@@ -10,10 +10,10 @@ import {
 import type { SideStatusWire } from "../lib/protocol";
 import type { SideSummaryWire } from "../lib/generated/SideSummaryWire";
 import type { SideSyncController } from "../lib/sideSync";
+import { SideExitCoordinator } from "../lib/sideExit";
 import {
   parentStatusText,
   useSideConversationController,
-  type CloseConfirmation,
 } from "./useSideConversationController";
 
 afterEach(cleanup);
@@ -26,11 +26,28 @@ type Request = { method: string; params: unknown };
 /** 最小 RPC 客户端：记录请求，按 method 回放应答。 */
 function fakeClient(responses: Record<string, (params: any) => unknown> = {}) {
   const requests: Request[] = [];
+  /** 已签发的票据序号，保证每次 prepare 拿到不同的 entryId。 */
+  let prepared = 0;
   const request = vi.fn(async (method: string, params: unknown) => {
     requests.push({ method, params });
     const handler = responses[method];
     if (handler) return handler(params);
     if (method === "side/list") return { sides: [] };
+    // 每次入场先签票。默认实现按请求的父回一张合法票据，测试只需要关心
+    // 票据**之后**的行为；要测票据本身（错宿主、迟到、缺字段）的用例自己覆盖。
+    if (method === "side/prepare") {
+      // 每次 prepare 签一张新票：生产端就是这么做的，测试替身照抄，否则
+      // 「迟到回包属于哪一次入场」这类断言会失去意义。
+      prepared += 1;
+      return {
+        hostInstanceId: INSTANCE,
+        parentThreadId: (params as { parentThreadId: string }).parentThreadId,
+        entryId: `entry-${prepared}`,
+      };
+    }
+    if (method === "side/exit") {
+      return { ...(params as object), state: "closed" };
+    }
     return {};
   });
   return { requests, request } as unknown as RpcClient & { requests: Request[] };
@@ -49,6 +66,9 @@ function fakeController() {
       ): Promise<SideSubmitReceipt> => ({ kind: "accepted", requestId }),
     ),
     reconcile: vi.fn(async () => {}),
+    // 退出会要求控制器让那一代失效（停缓存、停在途对账）。假的也要有，否则
+    // 「退出时不该再做别的事」这条断言会以 TypeError 的形态失败，而不是断言失败。
+    invalidateGeneration: vi.fn(),
     client: null as unknown,
     dispose: vi.fn(),
   };
@@ -58,6 +78,8 @@ function setup(options: {
   responses?: Record<string, (params: any) => unknown>;
   supported?: boolean;
   scope?: "observe" | "control" | "admin";
+  /** 绑定的连接状态。断网用例把它设成 false 来复现「退出时连不上」。 */
+  connected?: () => boolean;
 } = {}) {
   const store = new SideConversationStore();
   const client = fakeClient(options.responses);
@@ -69,7 +91,7 @@ function setup(options: {
     supported: options.supported ?? true,
     snapshotLifecycle: true,
     scope: options.scope ?? "control",
-    connected: true,
+    connected: options.connected?.() ?? true,
   });
   const controllers: Array<ReturnType<typeof fakeController>> = [];
   const controllerFor = vi.fn(() => {
@@ -79,16 +101,18 @@ function setup(options: {
     return c as unknown as SideSyncController;
   });
   const onChange = vi.fn();
+  const exits = new SideExitCoordinator(() => {});
   let seq = 0;
   const hook = renderHook(() =>
     useSideConversationController({
       store,
       controllerFor,
       onChange,
+      exits,
       newRequestId: () => `00000000-0000-4000-a000-${String(++seq).padStart(12, "0")}`,
     }),
   );
-  return { store, binding, client, controllerFor, controllers, onChange, hook };
+  return { store, binding, client, controllerFor, controllers, onChange, exits, hook };
 }
 
 describe("useSideConversationController.open", () => {
@@ -190,10 +214,22 @@ describe("useSideConversationController.open", () => {
     await act(async () => {
       await s.hook.result.current.open(s.binding, "t1", "");
     });
-    // 同一父上已有未关闭的旁支：第二次直接复用，不再请求服务端。
+    // 同一父上已有未关闭的旁支：第二次仍要签票 + open，让服务端把这张新票
+    // 绑定到**同一代次**（spec §6.2.2）。这是本机获得退出权的唯一途径，
+    // 少走一步就等于放弃了「Control 端可以销毁共享环境」。
+    expect(
+      s.client.requests.filter((r) => r.method === "side/prepare"),
+    ).toHaveLength(2);
     expect(
       s.client.requests.filter((r) => r.method === "side/open"),
-    ).toHaveLength(1);
+    ).toHaveLength(2);
+    // 第二次 open 里的票与第一次不是同一张：每次入场都是一张新票。
+    const tickets = s.client.requests
+      .filter((r) => r.method === "side/open")
+      .map((r) => (r.params as { entryId: string }).entryId);
+    expect(new Set(tickets).size).toBe(2);
+    // 服务端把它绑到同一代：本地视图仍是同一条旁支，没有被换成新的。
+    expect(s.hook.result.current.active).toMatchObject({ kind: "side", sideId: "s1" });
   });
 
   it("refuses to open on a host without the capability", async () => {
@@ -234,6 +270,11 @@ describe("useSideConversationController navigation intent", () => {
     act(() => {
       opening = s.hook.result.current.open(s.binding, "t1", "");
     });
+    // 让 prepare 先回来，这样「在途」的确实是被 `back` 打断的那次 open。
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     // 用户等不及网络，先返回了主会话。
     act(() => s.hook.result.current.back());
     await act(async () => {
@@ -242,26 +283,48 @@ describe("useSideConversationController navigation intent", () => {
     });
     // 迟到的 open 回包不得抢当前视图。
     expect(s.hook.result.current.active?.kind).not.toBe("side");
-    // 但也不能丢掉：这条旁支照样对账进了原身份的 store，之后 `/side` 能重入。
-    expect(s.controllers[0].reconcile).toHaveBeenCalledWith("t1");
+    // 也不能把它留下（spec §6.2.5「open 的迟到回包必须使本代销毁」）：
+    // 不做对账（免得把即将销毁的帧拉回来），而是再补一个精确退出。
+    expect(s.controllers[0].reconcile).not.toHaveBeenCalled();
+    // 两次退出，同一张票，各有分工：`back` 那次是「票可能还没被消费，先撤销」，
+    // open 迟到成功那次才是「这一代真的建起来了，销毁它」。
+    const exits = s.client.requests.filter((r) => r.method === "side/exit");
+    expect(exits).toHaveLength(2);
+    expect(new Set(exits.map((r) => (r.params as { entryId: string }).entryId)).size).toBe(1);
+    expect(s.controllers[0].invalidateGeneration).toHaveBeenCalledWith("s1", 1);
   });
 
-  it("re-enters a side the user explicitly asked for after the open landed", async () => {
+  it("re-enters only after the previous generation is confirmed gone", async () => {
     const s = setup({ responses: { "side/open": () => summary() } });
     await act(async () => {
       await s.hook.result.current.open(s.binding, "t1", "");
     });
     expect(s.hook.result.current.active).toMatchObject({ kind: "side", sideId: "s1" });
-    // 对账会把基线装进真 store；这里用假控制器手动补上等价的一步。
-    s.store.installBaseline(s.binding.key, "s1", { snapshot_seq: 0 } as never, []);
-    s.store.adopt(s.binding.key, "s1", "t1", 1);
+
     act(() => s.hook.result.current.back());
+    // 退出意图刚被记录：宿主还没确认销毁，此时不能建第二套。
+    act(() => {
+      void s.hook.result.current.open(s.binding, "t1", "");
+    });
+    expect(s.hook.result.current.notice).toContain("正在退出");
+
+    // 补发拿到 `closed`（fake 默认回 closed），屏障解除。
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(s.exits.blocked(INSTANCE, "t1")).toBe(false);
+
     await act(async () => {
       await s.hook.result.current.open(s.binding, "t1", "");
     });
-    // 显式再开一次是新的导航意图：视图回来，且不重复请求服务端。
+    // 重新进入是一次**新的**入场：重新签票、重新 open，不复用旧环境。
+    expect(
+      s.client.requests.filter((r) => r.method === "side/prepare"),
+    ).toHaveLength(2);
+    expect(s.client.requests.filter((r) => r.method === "side/open")).toHaveLength(2);
     expect(s.hook.result.current.active).toMatchObject({ kind: "side", sideId: "s1" });
-    expect(s.client.requests.filter((r) => r.method === "side/open")).toHaveLength(1);
   });
 
   it("keeps the automatic first question as a draft when the user left first", async () => {
@@ -542,223 +605,312 @@ describe("useSideConversationController.stop", () => {
   });
 });
 
-describe("useSideConversationController.close", () => {
-  /** 一条 running 的旁问摘要：关闭确认必须拿到服务端**当前**的 turn。 */
-  const runningSummary = (overrides: Partial<SideSummaryWire> = {}): SideSummaryWire => ({
-    side_id: "s1",
-    parent_thread_id: "t1",
-    status: "running",
-    snapshot_revision: 2,
-    last_seq: 9,
-    active_turn_id: "turn-9",
-    expires_at: null,
-    generation: 1,
-    stopping: false,
-    ...overrides,
-  } as SideSummaryWire);
+describe("useSideConversationController.leaveSide", () => {
+  /** 一次成功的入场：prepare 由 fixture 默认给出，open 返回这一代。 */
+  function summary(over: Record<string, unknown> = {}): SideSummaryWire {
+    return {
+      side_id: "s1",
+      parent_thread_id: "t1",
+      status: "idle" as SideStatusWire,
+      snapshot_revision: 1,
+      last_seq: 0,
+      active_turn_id: null,
+      expires_at: null,
+      generation: 1,
+      stopping: false,
+      ...over,
+    } as SideSummaryWire;
+  }
 
-  function setupClose(responses: Record<string, (params: any) => unknown> = {}) {
-    const s = setup({ responses });
+  it("records the entry ticket and asks the host to destroy this generation", async () => {
+    const s = setup({ responses: { "side/open": () => summary() } });
+    await act(async () => {
+      await s.hook.result.current.open(s.binding, "t1", "");
+    });
+    // 条款顺序：先 prepare 拿票，再带票 open。
+    const methods = s.client.requests.map((r) => r.method);
+    expect(methods.indexOf("side/prepare")).toBeGreaterThanOrEqual(0);
+    expect(methods.indexOf("side/open")).toBeGreaterThan(methods.indexOf("side/prepare"));
+    const prepared = s.client.requests.find((r) => r.method === "side/prepare")!;
+    expect(prepared.params).toEqual({ parentThreadId: "t1" });
+    const opened = s.client.requests.find((r) => r.method === "side/open")!;
+    expect(opened.params).toEqual({ parentThreadId: "t1", entryId: "entry-1" });
+
+    await act(async () => {
+      s.hook.result.current.back();
+    });
+    // 返回 = 退出：一张精确票据，三个身份齐全。
+    const exits = s.client.requests.filter((r) => r.method === "side/exit");
+    expect(exits).toHaveLength(1);
+    expect(exits[0].params).toEqual({
+      hostInstanceId: INSTANCE,
+      parentThreadId: "t1",
+      entryId: "entry-1",
+    });
+    expect(s.hook.result.current.active).toMatchObject({ kind: "main" });
+  });
+
+  it("never sends the parent's interrupt or the old side/close", async () => {
+    const s = setup({ responses: { "side/open": () => summary({ status: "running", active_turn_id: "t9" }) } });
+    await act(async () => {
+      await s.hook.result.current.open(s.binding, "t1", "");
+    });
+    await act(async () => {
+      s.hook.result.current.back();
+    });
+    const methods = s.client.requests.map((r) => r.method);
+    // 退出自带取消语义：不需要先 interrupt，也不走旧的 close 二次确认。
+    expect(methods).not.toContain("side/turnInterrupt");
+    expect(methods).not.toContain("turn/interrupt");
+    expect(methods).not.toContain("side/close");
+  });
+
+  it("backs out during open without submitting a late first question", async () => {
+    let resolveOpen!: (value: unknown) => void;
+    const pending = new Promise((resolve) => {
+      resolveOpen = resolve;
+    });
+    const s = setup({
+      responses: {
+        "side/prepare": () => ({
+          hostInstanceId: INSTANCE,
+          parentThreadId: "t1",
+          entryId: "e1",
+        }),
+        "side/open": () => pending,
+        "side/exit": (params: any) => ({ ...params, state: "closing" }),
+      },
+    });
+    let opening!: Promise<boolean>;
+    act(() => {
+      opening = s.hook.result.current.open(s.binding, "t1", "首问");
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    act(() => s.hook.result.current.back());
+    await act(async () => {
+      resolveOpen(summary());
+      await opening;
+    });
+    // 用户已经走了：这次 open 迟到，必须在服务端销毁这一代，且**不提问**。
+    expect(s.client.requests.some((r) => r.method === "side/exit")).toBe(true);
+    expect(s.client.requests.some((r) => r.method === "side/turnStart")).toBe(false);
+    expect(s.controllers.every((c) => c.submit.mock.calls.length === 0)).toBe(true);
+    expect(s.hook.result.current.active?.kind).toBe("main");
+  });
+
+  it("only revokes the ticket when prepare lands after the user left", async () => {
+    let resolvePrepare!: (value: unknown) => void;
+    const pending = new Promise((resolve) => {
+      resolvePrepare = resolve;
+    });
+    const s = setup({ responses: { "side/prepare": () => pending } });
+    let opening!: Promise<boolean>;
+    act(() => {
+      opening = s.hook.result.current.open(s.binding, "t1", "");
+    });
+    act(() => s.hook.result.current.back());
+    await act(async () => {
+      resolvePrepare({
+        hostInstanceId: INSTANCE,
+        parentThreadId: "t1",
+        entryId: "late-ticket",
+      });
+      await opening;
+    });
+    // 票还没被消费：只撤销它，绝不建环境。
+    expect(s.client.requests.some((r) => r.method === "side/open")).toBe(false);
+    // 撤票走的是 side/exit（票据图的同一个入口），回 `closed` 后屏障解除。
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(s.exits.blocked(INSTANCE, "t1")).toBe(false);
+  });
+
+  it("rejects a prepare receipt that describes another host or parent", async () => {
+    const s = setup({
+      responses: {
+        "side/prepare": () => ({
+          hostInstanceId: "another-host",
+          parentThreadId: "t1",
+          entryId: "e1",
+        }),
+      },
+    });
+    await act(async () => {
+      await s.hook.result.current.open(s.binding, "t1", "");
+    });
+    // 不匹配的票既不能 open，也不能留着占屏障——它描述的不是这次停留。
+    expect(s.client.requests.some((r) => r.method === "side/open")).toBe(false);
+    expect(s.exits.blocked("another-host", "t1")).toBe(false);
+    expect(s.hook.result.current.error).toContain("不匹配");
+  });
+
+  it("refuses to open while the previous generation is still exiting", async () => {
+    const s = setup({ responses: { "side/open": () => summary() } });
+    await act(async () => {
+      await s.hook.result.current.open(s.binding, "t1", "");
+    });
+    // 让宿主的 exit 一直停在 closing：屏障必须保持。
+    s.exits.record({
+      hostInstanceId: INSTANCE,
+      parentThreadId: "t1",
+      entryId: "still-exiting",
+    });
+    act(() => s.hook.result.current.back());
+    const before = s.client.requests.filter((r) => r.method === "side/prepare").length;
+    await act(async () => {
+      await s.hook.result.current.open(s.binding, "t1", "第二个问题");
+    });
+    expect(
+      s.client.requests.filter((r) => r.method === "side/prepare").length,
+    ).toBe(before);
+    expect(s.hook.result.current.notice).toContain("正在退出");
+  });
+
+  it("drops the generation and its draft on the way out", async () => {
+    const s = setup({ responses: { "side/open": () => summary() } });
     s.store.installBaseline(s.binding.key, "s1", { snapshot_seq: 0 } as never, []);
     s.store.adopt(s.binding.key, "s1", "t1", 1);
     s.store.setSync(s.binding.key, "s1", "synced");
-    return s;
-  }
-
-  it("reads the server's current turn before confirming", async () => {
-    const s = setupClose({ "side/list": () => ({ sides: [runningSummary()] }) });
-    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
-    let confirmation: CloseConfirmation | null = null;
     await act(async () => {
-      confirmation = await s.hook.result.current.requestClose(s.binding, "t1");
+      await s.hook.result.current.open(s.binding, "t1", "");
     });
-    // 确认带上完整出发身份，而不是只带一个 sideId —— 这正是「切走也能关对」
-    // 与「迟到的确认不抢视图」的前提。
-    expect(confirmation).not.toBeNull();
-    expect(confirmation!.target).toEqual({
-      kind: "side",
-      hostKey: s.binding.key,
-      parentId: "t1",
-      sideId: "s1",
-      generation: 1,
+    expect(s.store.read(s.binding.key, "s1")).toBeDefined();
+    await act(async () => {
+      s.hook.result.current.back();
     });
-    expect(confirmation!.client).toBe(s.client);
-    expect(confirmation!.activeTurnId).toBe("turn-9");
-    expect(confirmation!.running).toBe(true);
+    // 退出即丢弃：不留可续聊的正文、草稿或用量。
+    expect(s.store.read(s.binding.key, "s1")).toBeUndefined();
   });
 
-  it("closes the side it was confirmed for, not the one now on screen", async () => {
-    // 两条宿主，各自一条同代旁问；确认在 A 上生成，用户切到 B 才点确认。
-    const s = setupClose({ "side/list": () => ({ sides: [runningSummary()] }) });
-    const otherClient = fakeClient({
-      "side/list": () => ({ sides: [runningSummary()] }),
-    });
-    const other = s.store.bind({
-      key: sideHostKey("proj-b" as never, "host-2"),
-      slot: "proj-b" as never,
-      instanceId: "host-2",
-      client: otherClient,
-      supported: true,
-      snapshotLifecycle: true,
-      scope: "control",
-      connected: true,
-    });
-    s.store.installBaseline(other.key, "s1", { snapshot_seq: 0 } as never, []);
-    s.store.adopt(other.key, "s1", "t1", 1);
-    s.store.setSync(other.key, "s1", "synced");
-    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
-    let confirmation: CloseConfirmation | null = null;
+  it("stops the departing generation's controller without reconciling it back", async () => {
+    const s = setup({ responses: { "side/open": () => summary() } });
     await act(async () => {
-      confirmation = await s.hook.result.current.requestClose(s.binding, "t1");
+      await s.hook.result.current.open(s.binding, "t1", "");
     });
-    act(() => s.hook.result.current.enter(other, "t1", "s1", 1));
+    const controller = s.controllers[s.controllers.length - 1];
+    const before = controller.reconcile.mock.calls.length;
     await act(async () => {
-      await s.hook.result.current.confirmClose(confirmation!);
+      s.hook.result.current.back();
     });
-    // 请求仍打 A（用确认时捕获的 client），B 一条都没收到。
-    expect(s.client.requests.some((r) => r.method === "side/close")).toBe(true);
-    expect(otherClient.requests.some((r) => r.method === "side/close")).toBe(false);
-    // 用户当下看的是 B 上的 s1：过期的确认不得把它切走。
-    expect(s.hook.result.current.active).toMatchObject({
-      kind: "side",
-      hostKey: other.key,
-      sideId: "s1",
-    });
+    // 退出不是「重新对齐」：再对账一次会把即将销毁的正文拉回来。
+    expect(controller.reconcile.mock.calls.length).toBe(before);
   });
 
-  it("does not yank the user back if they navigated while the close was pending", async () => {
-    let release: (() => void) | null = null;
-    const s = setupClose({
-      "side/list": () => ({ sides: [runningSummary()] }),
-      "side/close": () =>
-        new Promise((resolve) => {
-          release = () => resolve({});
-        }),
-    });
-    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
-    let confirmation: CloseConfirmation | null = null;
+  it("leaves through navigation without fighting the new view", async () => {
+    const s = setup({ responses: { "side/open": () => summary() } });
     await act(async () => {
-      confirmation = await s.hook.result.current.requestClose(s.binding, "t1");
+      await s.hook.result.current.open(s.binding, "t1", "");
     });
-    let closing: Promise<boolean> | null = null;
-    act(() => {
-      closing = s.hook.result.current.confirmClose(confirmation!);
-    });
-    // 关闭还在路上：A → 主 → A 重新进入，导航修订已经变了。
-    act(() => s.hook.result.current.back());
-    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
-    await act(async () => {
-      release?.();
-      await closing;
-    });
-    // 成功关闭了，但用户已经重新入场：不许被一份过期确认强制送回主会话。
-    expect(s.hook.result.current.active).toMatchObject({ kind: "side", sideId: "s1" });
+    act(() => s.hook.result.current.selectMain(s.binding, "t2"));
+    // 切到另一条普通会话也是退出：意图已记录，视图交给导航。
+    expect(s.exits.blocked(INSTANCE, "t1")).toBe(true);
+    expect(s.hook.result.current.active).toMatchObject({ kind: "main", parentId: "t2" });
   });
 
-  it("closes a background side from the main view", async () => {
-    const s = setupClose({ "side/list": () => ({ sides: [runningSummary()] }) });
-    // 完全没有 enter：主视图也要能关掉后台旁问。
-    let confirmation: CloseConfirmation | null = null;
-    await act(async () => {
-      confirmation = await s.hook.result.current.requestClose(s.binding, "t1");
-    });
-    expect(confirmation).not.toBeNull();
-    await act(async () => {
-      await s.hook.result.current.confirmClose(confirmation!);
-    });
-    expect(s.client.requests).toContainEqual({
-      method: "side/close",
-      params: { sideId: "s1", expectedActiveTurnId: "turn-9" },
-    });
-    // 主视图没被切走：它本来就不是旁支视图。
-    expect(s.hook.result.current.active).toBeNull();
-  });
-
-  it("is idempotent when there is nothing to close", async () => {
-    const s = setupClose({ "side/list": () => ({ sides: [] }) });
-    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
-    let confirmation: CloseConfirmation | null = "unset" as never;
-    await act(async () => {
-      confirmation = await s.hook.result.current.requestClose(s.binding, "t1");
-    });
-    // 另一端已经关掉了：没有可确认的对象，也不该再发一次 close。
-    expect(confirmation).toBeNull();
-    expect(s.hook.result.current.notice).toBe("当前没有打开的旁问");
-    expect(s.hook.result.current.active).toMatchObject({ kind: "main" });
-    expect(s.client.requests.some((r) => r.method === "side/close")).toBe(false);
-  });
-
-  it("refuses a confirmation whose connection has been replaced", async () => {
-    const s = setupClose({ "side/list": () => ({ sides: [runningSummary()] }) });
-    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
-    let confirmation: CloseConfirmation | null = null;
-    await act(async () => {
-      confirmation = await s.hook.result.current.requestClose(s.binding, "t1");
-    });
-    // 重连：同一个 hostKey 换了一条客户端。
-    const reconnected = fakeClient();
-    s.store.bind({ ...s.binding, client: reconnected });
-    await act(async () => {
-      await s.hook.result.current.confirmClose(confirmation!);
-    });
-    // 不能往旧 client 上发已经过期的关闭。
-    expect(reconnected.requests.some((r) => r.method === "side/close")).toBe(false);
-    expect(s.hook.result.current.visibleError).toContain("连接已经更换");
-  });
-
-  it("refuses a confirmation from a generation that has been replaced", async () => {
-    const s = setupClose({ "side/list": () => ({ sides: [runningSummary()] }) });
-    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
-    let confirmation: CloseConfirmation | null = null;
-    await act(async () => {
-      confirmation = await s.hook.result.current.requestClose(s.binding, "t1");
-    });
-    // 服务端换了一代：confirmation 描述的旁问已经不在了。
-    s.store.adopt(s.binding.key, "s1", "t1", 7);
-    await act(async () => {
-      await s.hook.result.current.confirmClose(confirmation!);
-    });
-    expect(s.client.requests.some((r) => r.method === "side/close")).toBe(false);
-    expect(s.hook.result.current.visibleError).toContain("取代");
-  });
-
-  it("refuses to close on an observe-only host", async () => {
+  /**
+   * 断网时退出：本地正文立刻丢弃，退出意图留着；重连后**先**补发再谈别的
+   * （spec §6.4）。这条不能靠「反正下次握手会好」——环境还在宿主上占着槽位。
+   */
+  it("keeps the exit intent through a disconnect and sends it on reconnect", async () => {
+    let connected = true;
     const s = setup({
-      scope: "observe",
-      responses: { "side/list": () => ({ sides: [runningSummary()] }) },
+      connected: () => connected,
+      responses: { "side/open": () => summary() },
     });
-    let confirmation: CloseConfirmation | null = "unset" as never;
     await act(async () => {
-      confirmation = await s.hook.result.current.requestClose(s.binding, "t1");
+      await s.hook.result.current.open(s.binding, "t1", "");
     });
-    expect(confirmation).toBeNull();
-    expect(s.client.requests.some((r) => r.method === "side/close")).toBe(false);
+    s.client.requests.length = 0;
+    // 连接状态变了：真实路径走 `setConnected`（原地改，视图保留、禁发）。
+    connected = false;
+    s.store.setConnected(s.binding.key, false);
+
+    act(() => s.hook.result.current.back());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // 意图仍在：屏障挡着重入，断线期间不发（发了也是白费）。
+    expect(s.exits.blocked(INSTANCE, "t1")).toBe(true);
+    expect(s.client.requests.filter((r) => r.method === "side/exit")).toHaveLength(0);
+
+    connected = true;
+    await act(async () => {
+      await s.exits.flush({ ...s.binding, connected: true });
+    });
+    expect(s.client.requests.filter((r) => r.method === "side/exit")).toHaveLength(1);
+    expect(s.exits.blocked(INSTANCE, "t1")).toBe(false);
   });
 
-  it("does not force a close when the turn changed after confirmation", async () => {
-    // 确认时是 turn-9；真正关闭时服务端说它的 turn 已经变了。
-    const s = setupClose({
-      "side/list": () => ({ sides: [runningSummary()] }),
-      "side/close": () => {
-        const e = new Error("active turn conflict") as Error & { code: number };
-        e.code = -32010;
-        throw e;
-      },
+  /**
+   * 宿主换了一代（重连到另一个进程）：旧票在新宿主上永远无法确认。此时不能
+   * 拿新连接去发旧 exit——那会命中一个无关的环境（spec §6.2.3）。
+   */
+  it("drops old tickets instead of sending them to a replaced host", async () => {
+    const s = setup({ responses: { "side/open": () => summary() } });
+    await act(async () => {
+      await s.hook.result.current.open(s.binding, "t1", "");
     });
+    act(() => s.hook.result.current.back());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    s.client.requests.length = 0;
+
+    s.exits.hostReplaced(INSTANCE);
+    await act(async () => {
+      await s.exits.flush(s.binding);
+    });
+    expect(s.client.requests).toHaveLength(0);
+    expect(s.exits.blocked(INSTANCE, "t1")).toBe(false);
+  });
+
+  it("leaves the local view without an exit RPC on a read-only device", async () => {
+    const s = setup({ scope: "observe" });
     act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
-    let confirmation: CloseConfirmation | null = null;
+    act(() => s.hook.result.current.back());
+    expect(s.client.requests).toHaveLength(0);
+    expect(s.hook.result.current.active).toMatchObject({ kind: "main" });
+  });
+
+  it("closeBackground exits the entry when it is the one on this device", async () => {
+    const s = setup({ responses: { "side/open": () => summary() } });
     await act(async () => {
-      confirmation = await s.hook.result.current.requestClose(s.binding, "t1");
+      await s.hook.result.current.open(s.binding, "t1", "");
     });
-    let ok = true;
     await act(async () => {
-      ok = await s.hook.result.current.confirmClose(confirmation!);
+      await s.hook.result.current.closeBackground(s.binding, "t1");
     });
-    // 冲突就是冲突：不重试、不改传别的 turn、不强行关，留在原视图。
-    expect(ok).toBe(false);
-    expect(s.client.requests.filter((r) => r.method === "side/close")).toHaveLength(1);
-    expect(s.hook.result.current.active).toMatchObject({ kind: "side", sideId: "s1" });
-    expect(s.hook.result.current.visibleError).toBeTruthy();
+    expect(s.client.requests.some((r) => r.method === "side/exit")).toBe(true);
+    expect(s.hook.result.current.active).toMatchObject({ kind: "main" });
+  });
+
+  it("does not pretend to close a side another device opened", async () => {
+    const s = setup();
+    // 本地有视图，但本次停留不是它（换句说：不是本机开的，没有票据）。
+    s.store.installBaseline(s.binding.key, "s1", { snapshot_seq: 0 } as never, []);
+    s.store.adopt(s.binding.key, "s1", "t1", 1);
+    await act(async () => {
+      await s.hook.result.current.closeBackground(s.binding, "t1");
+    });
+    // 没有票据就没有精确定位：如实说明，不虚构一次关闭。
+    expect(s.client.requests.some((r) => r.method === "side/exit")).toBe(false);
+    expect(s.hook.result.current.error).toContain("无法从本机退出");
+  });
+
+  it("refuses to close at all on a read-only device", async () => {
+    const s = setup({ scope: "observe" });
+    await act(async () => {
+      await s.hook.result.current.closeBackground(s.binding, "t1");
+    });
+    expect(s.client.requests).toHaveLength(0);
+    expect(s.hook.result.current.error).toContain("只读设备");
   });
 });
 

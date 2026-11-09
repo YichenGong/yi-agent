@@ -10,6 +10,7 @@ import type {
   SideTarget,
 } from "../lib/sideConversation";
 import type { SideSyncController } from "../lib/sideSync";
+import type { SideExitCoordinator } from "../lib/sideExit";
 
 /**
  * 「当前正在看哪个会话」。
@@ -32,6 +33,14 @@ export type ActiveConversation =
 
 export interface SideConversationControllerDeps {
   store: SideConversationStore;
+  /**
+   * 退出意图账本（Task 10）。
+   *
+   * 控制器**只**记录意图，不负责补发：补发要在「连接恢复」时由应用 owner
+   * 触发（`exits.flush(binding)`），因为只有它知道哪条连接刚刚重新握手。把
+   * 重试塞进控制器会让它自带一个重试队列，而那正是 spec §6.4 明确不要的。
+   */
+  exits: SideExitCoordinator;
   /** 取（必要时创建）某宿主上某个父的对账控制器。 */
   controllerFor: (binding: SideHostBinding, parentId: string) => SideSyncController;
   /** store 变化后的重渲染。 */
@@ -41,28 +50,62 @@ export interface SideConversationControllerDeps {
 }
 
 /**
- * 关闭前的确认。
+ * 为什么离开。
  *
- * 这里带的是**完整的出发身份**，不是「当前旁支」：确认弹窗开着的时候用户可能
- * 已经切走、切回，或者连接换了。确认一旦生成，就只对这份身份有效——
- * `target` + `client` 决定请求打给谁，`navigationRevision` 决定成功后**要不要**
- * 把用户送回父会话（中途走开的人不该被一个过期的确认拽回去）。
+ * 三种都要销毁，差别只在给用户的说法与是否需要回父视图：
+ * - `back`：用户按了返回/`/back`。回到主视图。
+ * - `navigation`：切到另一条普通会话、另一个项目/宿主。视图由导航自己接管。
+ * - `close`：`/side-close` 显式关闭（在主视图里关后台那条）。
+ *
+ * 另有两个不出现在用户操作里的：`unmount`（应用 owner 的延迟终结检查）与
+ * `flag`（本机实验开关被关掉）。它们同样走销毁，只是提示文案不同。
  */
-export interface CloseConfirmation {
-  target: SideTarget;
-  client: RpcClient;
-  /** 生成这份确认时的导航修订；成功后必须仍然相同才回父。 */
-  navigationRevision: number;
-  /** `null` = 服务端说它空闲；非 null = 正在跑的那一轮，需要用户确认后传回。 */
-  activeTurnId: string | null;
-  running: boolean;
+export type LeaveReason =
+  | "back"
+  | "navigation"
+  | "close"
+  | "unmount"
+  | "flag";
+
+/**
+ * 本次停留（entry）。
+ *
+ * 「停留」是这次进入的**全部**本地状态的容器：入场票据、捕获的宿主绑定、父、
+ * 首问与可选的摘要。它存在的理由只有一个——退出时所有字段都**从这份记录**取，
+ * 而不是从「此刻选中的会话」推断。推断会在两种情况下出错：
+ *
+ * - 用户已经切到另一条会话：`store.currentId` 是新那条，退出会打到别人身上。
+ * - 用户切了项目/宿主：`activeSlot` 变了，票据属于旧宿主，新连接上没有它。
+ *
+ * 首问只在**退出前**保留：退出立刻清空（spec §4.3「丢弃旧首问，不补发」）。
+ */
+interface SideEntry {
+  binding: SideHostBinding;
+  parentId: string;
+  /** 宿主签发的入场票据；`null` = prepare 还没回。 */
+  target: { hostInstanceId: string; parentThreadId: string; entryId: string } | null;
+  /** 服务端确认后的这一代；`null` = 还没 open 成功。 */
+  summary: { sideId: string; generation: number } | null;
+  /** 入场首问。退出时清空，绝不补发。 */
+  question: string | null;
 }
 
 export interface SideConversationController {
   active: ActiveConversation | null;
   /** 打开（或续用）某个父上的旁支。返回是否成功受理。 */
   open: (binding: SideHostBinding, parentId: string, question: string) => Promise<boolean>;
-  /** 把当前视图切回主会话。**不**停旁支、不关闭；也能撤销一个尚未完成的入场。 */
+  /**
+   * 离开旁支：**退出即销毁**（spec §4.3）。
+   *
+   * 这是唯一的退出口。`back`（顶栏按钮 / `/back`）、`selectMain`（切到另一条
+   * 普通会话）、项目/宿主切换、以及 `/side-close` 的兼容入口全部落在这里——
+   * 分支散成两三条时，总有一条会忘记录退出意图，于是用户返回了、环境还在跑。
+   *
+   * 立刻做的是本地部分：清掉本次停留（含首问）、丢正文与草稿、回到主视图。
+   * 网络部分是异步的、不阻塞导航：`exits.flush` 在内部吸收错误并记录收据。
+   */
+  leaveSide: (reason: LeaveReason) => void;
+  /** `/back` 的兼容别名（等价 `leaveSide("back")`）。 */
   back: () => void;
   /** 用户在主视图里显式切到某个父（真实父/宿主导航）。 */
   selectMain: (binding: SideHostBinding, parentId: string) => void;
@@ -82,18 +125,12 @@ export interface SideConversationController {
   submit: (text: string) => Promise<SideSubmitReceipt>;
   stop: () => Promise<void>;
   /**
-   * 请求关闭：先读这个父在服务端的**当前**摘要，把确认所需信息交回 UI。
+   * `/side-close` 的兼容入口：在主视图里关掉**后台**那条旁支。
    *
-   * 传 `binding`/`parentId` 而不是「当前旁支」：主视图也要能关闭后台旁问。
-   * 返回 `null` 表示没有可关闭的对象（已关闭、或这个父本来就没有旁问），
-   * 此时只留下一条幂等提示，绝不虚构一次关闭。
+   * 它同样是销毁（`leaveSide("close")`），只是出发时不在旁支视图里，所以
+   * 需要显式给出父身份。找不到本次停留、也没有本地视图时只留一条提示。
    */
-  requestClose: (
-    binding: SideHostBinding,
-    parentId: string,
-  ) => Promise<CloseConfirmation | null>;
-  /** 用户确认后真正关闭。`expectedActiveTurnId` 必须来自 `requestClose`。 */
-  confirmClose: (confirmation: CloseConfirmation) => Promise<boolean>;
+  closeBackground: (binding: SideHostBinding, parentId: string) => Promise<void>;
   /** 正在处理一条旁支 RPC（按钮据此禁用）。 */
   busy: boolean;
   /**
@@ -146,7 +183,7 @@ function defaultRequestId(): string {
 export function useSideConversationController(
   deps: SideConversationControllerDeps,
 ): SideConversationController {
-  const { store, controllerFor, onChange } = deps;
+  const { store, controllerFor, onChange, exits } = deps;
   const newRequestId = deps.newRequestId ?? defaultRequestId;
   const [active, setActive] = useState<ActiveConversation | null>(null);
   const [busy, setBusy] = useState(false);
@@ -206,6 +243,14 @@ export function useSideConversationController(
    * `/back` 可撤销完成后进入的意图」）。
    */
   const entryIntent = useRef<{ hostKey: SideHostKey; parentId: string } | null>(null);
+  /**
+   * 本次停留（见 `SideEntry`）。`null` = 不在旁支里（包含「还没进入」）。
+   *
+   * 它是退出的**唯一**依据：票据、父、那一代、首问都从这里取。用 ref 而不是
+   * state，因为退出必须在同一帧里同步失效——放进 state 要等下一次渲染，而
+   * 迟到的回包可能在渲染之前就到了。
+   */
+  const entryRef = useRef<SideEntry | null>(null);
   const bumpNavigation = useCallback((): number => {
     navigationRevision.current += 1;
     return navigationRevision.current;
@@ -330,6 +375,13 @@ export function useSideConversationController(
           return false;
         }
         entryIntent.current = null;
+        entryRef.current = {
+          binding,
+          parentId,
+          target: null,
+          summary: { sideId, generation: fresh.generation },
+          question: null,
+        };
         setActiveBoth({
           kind: "side",
           hostKey: binding.key,
@@ -373,14 +425,25 @@ export function useSideConversationController(
         recordError("当前宿主不支持旁问", null);
         return false;
       }
+      if (!binding.snapshotLifecycle) {
+        // 双能力位都要：只有旧位意味着宿主还是「返回后仍可恢复」的语义，
+        // 而前端这块界面已经没有恢复入口了。
+        recordError("当前宿主版本不支持入即可退出的旁问，请更新宿主", null);
+        return false;
+      }
       if (binding.scope === "observe") {
         // Observe 只能**查看**已有的旁问（spec §4.3）：`side/list` 与
-        // `side/readItems` 是 Observe 级，`side/open` 不是。所以这里绝不发
-        // open，而是把服务端已有的那条找出来、装进本地再导航过去。
+        // `side/readItems` 是 Observe 级，`side/prepare` / `side/open` 不是。
         return observeOnly(binding, parentId, question);
       }
+      // 上一代还没确认销毁：不能再建第二套（spec §6.1/§6.2「Closing 或清理未
+      // 排空时显示上一条旁问正在退出，不并行建立第二条」）。
+      if (exits.blocked(binding.instanceId, parentId)) {
+        recordNotice("上一条旁问正在退出，请稍后重试");
+        return false;
+      }
       const key = lockKey(binding.key, parentId, "open");
-      // 重复点击合并到同一次开场：服务端 `side/open` 幂等，但本地若并发走两遍
+      // 重复点击合并到同一次开场：服务端 `open` 幂等，但本地若并发走两遍
       // list/分页，会把同一条旁的正文对账两次。
       if (inFlight.current.has(key)) return true;
       inFlight.current.add(key);
@@ -403,67 +466,128 @@ export function useSideConversationController(
         return true;
       };
 
-      try {
-        // 已有未关闭的旁支：直接续用，不再请求服务端。
-        const existing = store
-          .list(binding.key)
-          .find((v) => v.parentId === parentId && !v.closed);
-        if (existing) {
-          enterIfCurrent(existing.sideId, existing.generation);
-          if (question.trim() === "") return true;
-          // 重新对账一次：切回来时正文可能是旧的。首问照样发，但只在这个意图
-          // 还有效时——用户已经返回的话，问题留在原草稿里（Task 2 的 rejected
-          // 记录同样落在那条旁支上）。
-          const controller = controllerFor(binding, parentId);
-          await controller.reconcile(parentId);
-          onChange();
-          await submitInternalRef.current(
-            { ...target, sideId: existing.sideId, generation: existing.generation },
-            question,
-            binding,
-            { onlyIfIntentCurrent: intentStillCurrent, revision },
-          );
-          return true;
-        }
+      // 本次停留从这里开始记录。**先建记录再发请求**：prepare/open 的迟到回包
+      // 都要靠它判断「用户还在不在」，而记录一旦建立，退出就能拿到票据。
+      const entry: SideEntry = {
+        binding,
+        parentId,
+        target: null,
+        summary: null,
+        question: question.trim() === "" ? null : question,
+      };
+      entryRef.current = entry;
 
-        const summary = await run(async () =>
-          binding.client.request<SideSummaryWire>("side/open", {
-            parentThreadId: parentId,
-          }),
+      try {
+        // 1. 签票。参数校验（票据形状）与「是否属于这条宿主」在下面一起验。
+        //
+        // 已有未关闭的旁支（另一台设备开的，或本机开过但还没退出）也走这条路：
+        // 服务端会把这张新票**绑定到同一代次**上（spec §6.2.2「多个端的不同
+        // 票据可绑定同一 Creating/Open 代次，不刷新快照」）。所以这里不需要
+        // 单独复用分支——而**必须**签票，否则本机退出时定位不到那一代，等于
+        // 放弃了 spec §7「有 Control/Admin 权限的端可以销毁共享环境」。
+        const prepared = await run(async () =>
+          binding.client.request<{
+            hostInstanceId: string;
+            parentThreadId: string;
+            entryId: string;
+          }>("side/prepare", { parentThreadId: parentId }),
         );
-        if (summary === null) {
+        if (prepared === null) {
+          entryRef.current = null;
           recordError(lastErrorRef.current?.message ?? "打开旁问失败", target);
           return false;
         }
+        // 迟到的 prepare 回包描述的不是这次请求：撤销这张票（不留下环境），
+        // 也不拿它去 open（spec §6.2.1「迟到回包只需撤销票据」）。
+        if (
+          prepared.hostInstanceId !== binding.instanceId ||
+          prepared.parentThreadId !== parentId ||
+          typeof prepared.entryId !== "string" ||
+          prepared.entryId === ""
+        ) {
+          entryRef.current = null;
+          recordError("宿主返回了不匹配的入场票据", target);
+          return false;
+        }
+        entry.target = {
+          hostInstanceId: prepared.hostInstanceId,
+          parentThreadId: prepared.parentThreadId,
+          entryId: prepared.entryId,
+        };
+        // 拿到票之后用户已经离开：只撤票，不 open、不建环境。
+        if (!intentStillCurrent() || entryRef.current !== entry) {
+          const t = entry.target;
+          entry.target = null;
+          entryRef.current = null;
+          // 上面已经排除了 `observe`：走到这里一定有 Control。
+          if (t !== null) {
+            exits.record(t);
+            void exits.flush(binding);
+          }
+          return true;
+        }
 
-        // 这次的 open 已经在服务端生效：无论用户是否还在这里，都要把它对账进
-        // 原身份（否则这条旁支在本地永远缺一份正文）。
+        // 2. 用票 open。
+        const summary = await run(async () =>
+          binding.client.request<SideSummaryWire>("side/open", {
+            parentThreadId: parentId,
+            entryId: prepared.entryId,
+          }),
+        );
+        if (summary === null) {
+          // open 失败：票还留着，它指向一代并未建立的环境。记成退出意图让宿主
+          // 回收（幂等），同时撤掉本地记录。
+          const t = entry.target;
+          entry.target = null;
+          entryRef.current = null;
+          if (t !== null) {
+            exits.record(t);
+            void exits.flush(binding);
+          }
+          recordError(lastErrorRef.current?.message ?? "打开旁问失败", target);
+          return false;
+        }
+        entry.summary = { sideId: summary.side_id, generation: summary.generation };
+
+        // 用户在这次 open 在途时已经离开了（spec §6.2.5「open 的迟到回包必须
+        // 使本代销毁」）。此时**不要**对账——那会把一批即将被销毁的帧拉回本地
+        // 视图；直接把刚建立的这一代连同票据一起送去销毁，并且不提交首问、
+        // 不存草稿。
+        if (!intentStillCurrent() || entryRef.current !== entry) {
+          const t = entry.target;
+          entry.target = null;
+          entry.question = null;
+          entryRef.current = null;
+          const late = controllerFor(binding, parentId);
+          late.invalidateGeneration(summary.side_id, summary.generation);
+          store.dropGeneration(binding.key, summary.side_id, summary.generation);
+          if (t !== null) {
+            exits.record(t);
+            void exits.flush(binding);
+          }
+          onChange();
+          return true;
+        }
+
+        // 这次的 open 已经在服务端生效：把它对账进原身份，否则这条旁支在本地
+        // 永远缺一份正文。
         const controller = controllerFor(binding, parentId);
         await controller.reconcile(parentId);
         onChange();
         enterIfCurrent(summary.side_id, summary.generation);
-        if (question.trim() !== "") {
-          // 首问的「是否还该发」与「入场」是两件事：用户返回之后不能再替他在
-          // 后台发出一个他还没确认的问题（spec §5.2）。
-          const receipt = await submitInternalRef.current(
+        if (entry.question !== null) {
+          // `reconcile` 期间用户可能离开：同样不替他发出这句还没确认的问题。
+          if (!intentStillCurrent() || entryRef.current !== entry) return true;
+          await submitInternalRef.current(
             {
               ...target,
               sideId: summary.side_id,
               generation: summary.generation,
             },
-            question,
+            entry.question,
             binding,
             { onlyIfIntentCurrent: intentStillCurrent, revision },
           );
-          if (!intentStillCurrent() && receipt.kind === "rejected") {
-            // 用户已经返回：不替他发出这句还没确认的问题，但也**不能丢**——
-            // 留成那条旁问的草稿，他之后再 `/side` 进来还能看见并发送
-            // （spec §5.2）。已有草稿时不覆盖（那是他自己正在写的东西）。
-            const view = store.read(target.hostKey, summary.side_id);
-            if (view && view.draft.trim() === "") {
-              store.setDraft(target.hostKey, summary.side_id, question);
-            }
-          }
         }
         return true;
       } finally {
@@ -480,6 +604,8 @@ export function useSideConversationController(
       bumpNavigation,
       observeOnly,
       recordError,
+      recordNotice,
+      exits,
     ],
   );
 
@@ -577,30 +703,108 @@ export function useSideConversationController(
     ) => {
       bumpNavigation();
       entryIntent.current = null;
+      // 进入一条已经存在的旁问不算「本次停留」：本机没有它的票据，退出也就
+      // 无从定位（见 `open` 里复用分支的注释）。记录仍建立，这样退出至少能丢
+      // 掉本地正文并停掉在途的对账。
+      entryRef.current = {
+        binding,
+        parentId,
+        target: null,
+        summary: { sideId, generation },
+        question: null,
+      };
       setActiveBoth({ kind: "side", hostKey: binding.key, parentId, sideId, generation });
     },
     [setActiveBoth, bumpNavigation],
   );
 
-  const back = useCallback(() => {
-    const current = activeRef.current;
-    // 连一个还没完成的 open 也一并撤销：本地返回绝不能等网络，也不能被一个迟到
-    // 的回包推翻。先加修订号，再决定要不要切换视图。
-    bumpNavigation();
-    const pending = entryIntent.current;
-    entryIntent.current = null;
-    // 返回只是换个指针。停旁支要显式点 Stop，关闭要显式确认。
-    const from = current ?? pending;
-    if (from === null) return;
-    if (current !== null && current.kind === "main") return;
-    setActiveBoth({ kind: "main", hostKey: from.hostKey, parentId: from.parentId });
-  }, [setActiveBoth, bumpNavigation]);
+  /**
+   * 结束本次停留的**本地**部分。
+   *
+   * 顺序是刻意的，每一步都对应一条具体的错误：
+   *
+   * 1. 先清「停留」记录。任何在途回包（prepare/open/分页）此后再检查它都会
+   *    看到 null，于是不会把用户送回一个已经离开的视图。**必须同步**——放在
+   *    一个 `await` 之后就已经晚了。
+   * 2. 再记退出意图。票据在退出这一刻从记录里取（不是从「当前选中的会话」推
+   *    断）。记录之后，`blocked()` 立刻对这一父成立，本地不能再建第二套。
+   * 3. 只读端（`observe`）不记：它没有关闭共享环境的权限，退出只清本地视图。
+   *    这一点由 `SideExitCoordinator` 再判一次（那里还有「宿主不支持」等）。
+   * 4. 丢掉这一代正文、草稿、用量与分页水位。**不做 `reconcile`**——退出不是
+   *    「重新对齐」，再去问服务端反而会把一批即将被销毁的帧拉回来。
+   * 5. 最后补发一次退出。不 await：导航不能等网络。
+   */
+  const endEntry = useCallback(
+    (entry: SideEntry | null, reason: LeaveReason): void => {
+      if (entry === null) return;
+      const { binding, parentId, target, summary } = entry;
+      // 首问与摘要都属于这次停留，退出即刻丢弃（spec §4.3/§4.4）。
+      entry.question = null;
+      if (target !== null) {
+        // `flag`：本机实验开关被关掉。宿主自己会在后台 `close_all` 把本机环境
+        // 全部收掉，此时再发 `side/exit` 只会得到 `-32601`，并且会在账本里留下
+        // 一条永远确认不了的记录——那会把这条父永久锁在「正在退出」上。所以这里
+        // 只丢本地视图与正文，退出交给宿主。
+        if (binding.scope !== "observe" && reason !== "flag") exits.record(target);
+        if (summary !== null) {
+          const controller = controllerFor(binding, parentId);
+          controller.invalidateGeneration(summary.sideId, summary.generation);
+          store.dropGeneration(binding.key, summary.sideId, summary.generation);
+        }
+        if (reason !== "flag") void exits.flush(binding);
+      } else if (summary !== null) {
+        // 没有票据（例如旧宿主）时至少把正文丢掉，不留一份可被「恢复」的视图。
+        const controller = controllerFor(binding, parentId);
+        controller.invalidateGeneration(summary.sideId, summary.generation);
+        store.dropGeneration(binding.key, summary.sideId, summary.generation);
+      }
+      onChange();
+    },
+    [exits, store, controllerFor, onChange],
+  );
+
+  /**
+   * 唯一的退出口（spec §4.3）。
+   *
+   * 所有「从旁支离开」的动作都走它：顶栏返回、`/back`、切到另一条普通会话、
+   * `/side-close`、项目/宿主切换、应用卸载、本机开关被关。
+   */
+  const leaveSide = useCallback(
+    (reason: LeaveReason) => {
+      const entry = entryRef.current;
+      // 先加修订号再清记录：迟到的 open 回包必须立刻看不见任何授权。
+      bumpNavigation();
+      entryRef.current = null;
+      entryIntent.current = null;
+      const current = activeRef.current;
+      endEntry(entry, reason);
+      if (reason === "navigation") {
+        // 视图由导航自己接管（它会立刻 `selectMain` 到新的那条），这里不抢。
+        return;
+      }
+      if (current !== null && current.kind === "main") return;
+      const from = current ?? entry;
+      if (from === null) return;
+      const hostKey = "binding" in from ? from.binding.key : from.hostKey;
+      const parentId = from.parentId;
+      setActiveBoth({ kind: "main", hostKey, parentId });
+    },
+    [bumpNavigation, endEntry, setActiveBoth],
+  );
+
+  const back = useCallback(() => leaveSide("back"), [leaveSide]);
 
   const selectMain = useCallback(
     (binding: SideHostBinding, parentId: string) => {
       const current = activeRef.current;
-      bumpNavigation();
-      entryIntent.current = null;
+      // 从旁支切到另一条普通会话也是退出（spec §4.3）。已经在主视图里就不算
+      // 离开，只是换当前会话。
+      if (current !== null && current.kind === "side") {
+        leaveSide("navigation");
+      } else {
+        bumpNavigation();
+        entryIntent.current = null;
+      }
       // 已经在主视图里也必须把 `parentId` 换成刚选中的那条：主视图的这个字段
       // 就是「当前会话」的身份，输入框的会话键由它派生。提前返回会让切会话后
       // 身份停在旧值——两条会话于是共用一个键，一次在途提交/长请求就能锁住
@@ -608,7 +812,7 @@ export function useSideConversationController(
       if (current !== null && current.kind === "main" && current.parentId === parentId) return;
       setActiveBoth({ kind: "main", hostKey: binding.key, parentId });
     },
-    [setActiveBoth, bumpNavigation],
+    [setActiveBoth, bumpNavigation, leaveSide],
   );
 
   const stop = useCallback(async () => {
@@ -647,168 +851,89 @@ export function useSideConversationController(
   }, [store, run, onChange, recordError]);
 
   /**
-   * 关闭的第一步：读**这个父**在服务端的当前摘要，把确认所需信息交回 UI。
+   * 在主视图里关掉**后台**那条旁支（`/side-close`）。
    *
-   * 为什么必须读服务端而不是本地缓存：本地可能还停在 idle，而旁支其实已经跑
-   * 起来了。关掉一个正在回答的旁支与关掉一个空闲旁支是两种确认，不能猜。
-   *
-   * 为什么用 `side/list` 而不是给单条旁支加读接口：`list` 已经是 Observe 级、
-   * 返回全部摘要、且**不产生新状态**。找不到那条旁支意味着它已被另一端关掉，
-   * 此时只留一条幂等提示，绝不虚构一次关闭。
+   * 与 `leaveSide` 的区别只有出发位置：这里不在旁支视图里，所以父身份要由调用
+   * 方给。行为完全相同——记退出意图、丢本地正文、补发一次退出。
    */
-  /**
-   * 若当前正显示这个父的某条旁支，就切回主会话。
-   *
-   * 传 `guard` 时还要求「显示的就是那条」且 `navigationRevision` 仍是生成确认时
-   * 的那一个——关闭是在等网络，期间用户可能已经返回、进了别的旁支，或者重新
-   * 导航过。这种情况下切换视图是替他做决定。
-   */
-  const leaveIfShowing = useCallback(
-    (
-      hostKey: SideHostKey,
-      parentId: string,
-      guard: { sideId: string; revision: number } | null,
-    ): void => {
-      const current = activeRef.current;
-      if (current === null || current.kind !== "side") return;
-      if (current.hostKey !== hostKey || current.parentId !== parentId) return;
-      if (guard !== null) {
-        if (current.sideId !== guard.sideId) return;
-        if (navigationRevision.current !== guard.revision) return;
-      }
-      setActiveBoth({ kind: "main", hostKey, parentId });
-    },
-    [setActiveBoth],
-  );
-
-  const requestClose = useCallback(
-    async (
-      binding: SideHostBinding,
-      parentId: string,
-    ): Promise<CloseConfirmation | null> => {
+  const closeBackground = useCallback(
+    async (binding: SideHostBinding, parentId: string): Promise<void> => {
       if (!binding.supported) {
         recordError("当前宿主不支持旁问", null);
-        return null;
+        return;
       }
       if (binding.scope === "observe") {
         recordError("只读设备不能关闭旁问", null);
-        return null;
+        return;
       }
       setNotice(null);
       const key = lockKey(binding.key, parentId, "close");
-      if (inFlight.current.has(key)) return null;
+      if (inFlight.current.has(key)) return;
       inFlight.current.add(key);
-      // 目标身份在**出发前**定格：确认弹窗开着的时候用户可能已经切走。
-      const revision = bumpNavigation();
-      const target: SideTarget = {
-        kind: "side",
-        hostKey: binding.key,
-        parentId,
-        sideId: "",
-        generation: 0,
-      };
       try {
-        const sides = await run(async () => {
-          const r = await binding.client.request<{ sides: SideSummaryWire[] }>(
-            "side/list",
-            { parentThreadId: parentId },
+        const entry = entryRef.current;
+        if (entry !== null && entry.binding.key === binding.key && entry.parentId === parentId) {
+          // 本次停留就是它：走同一条退出路径，票据已经在手。
+          leaveSide("close");
+          return;
+        }
+        // 后台旁支（本次停留不是它，或根本不是本会话开的）：本地视图里的那一代
+        // 可以作为退出的起点，但**不**凭它猜一个票据——票据只在真正的入场时
+        // 签发过。没有票据时如实说明，不虚构一次关闭。
+        //
+        // 先问一次服务端：本地视图为空**不等于**没有旁支（可能是另一端刚开的，
+        // 也可能本机从未看到过它）。直接说「没有打开的旁问」会让用户以为已经
+        // 清干净，而宿主上还占着唯一性槽位。`side/list` 是只读，代价可忽略。
+        let view = store
+          .list(binding.key)
+          .find((v) => v.parentId === parentId && !v.closed);
+        if (view === undefined) {
+          const listed = await run(async () =>
+            binding.client.request<{ sides?: unknown }>("side/list", {
+              parentThreadId: parentId,
+            }),
           );
-          return r.sides;
-        });
-        if (sides === null) {
-          recordError(lastErrorRef.current?.message ?? "读取旁问失败", target);
-          return null;
+          const sides = Array.isArray(listed?.sides) ? listed.sides : [];
+          const alive = sides.filter(
+            (row): row is { side_id: string } =>
+              typeof row === "object" &&
+              row !== null &&
+              typeof (row as { side_id?: unknown }).side_id === "string" &&
+              (row as { side_id: string }).side_id !== "",
+          );
+          if (alive.length === 0) {
+            recordNotice("当前没有打开的旁问");
+            return;
+          }
+          // 有，但不是本机开的：定位不到那一代，如实说明。
+          recordError(
+            "这条旁问不是本设备打开的，无法从本机退出；请在打开它的设备上返回",
+            {
+              kind: "side",
+              hostKey: binding.key,
+              parentId,
+              sideId: alive[0].side_id,
+              generation: 0,
+            },
+          );
+          return;
         }
-        const summary = sides.find(
-          (x) => x.parent_thread_id === parentId && x.side_id !== "",
-        );
-        if (summary === undefined) {
-          recordNotice("当前没有打开的旁问");
-          leaveIfShowing(binding.key, parentId, null);
-          return null;
-        }
-        return {
-          target: {
-            ...target,
-            sideId: summary.side_id,
-            generation: summary.generation,
+        recordError(
+          "这条旁问不是本设备打开的，无法从本机退出；请在打开它的设备上返回",
+          {
+            kind: "side",
+            hostKey: binding.key,
+            parentId,
+            sideId: view.sideId,
+            generation: view.generation,
           },
-          client: binding.client,
-          navigationRevision: revision,
-          activeTurnId: summary.active_turn_id,
-          running: summary.status === "running",
-        };
-      } finally {
-        inFlight.current.delete(key);
-        onChange();
-      }
-    },
-    [run, onChange, bumpNavigation, recordError, recordNotice],
-  );
-
-  /**
-   * 用户确认后真正关闭。
-   *
-   * 发请求前把 `confirmation` 与**当前**绑定再核对一次：连接换了（client 变了）
-   * 就不能往旧 client 上发；权限降成 Observe 也不能发。请求用的是
-   * `confirmation.client` 与 `confirmation.activeTurnId`——即用户确认时看到的那
-   * 一轮，而不是「此刻 store 里最新的那一轮」。新起的一轮绝不能被这次关闭顺手
-   * 停掉（服务端会按 expectedActiveTurnId 拒绝，这正是它的作用）。
-   */
-  const confirmClose = useCallback(
-    async (confirmation: CloseConfirmation): Promise<boolean> => {
-      const { target } = confirmation;
-      const binding = store.binding(target.hostKey);
-      if (!binding) {
-        recordError("旁问所在的项目没有连接", target);
-        return false;
-      }
-      if (binding.client !== confirmation.client) {
-        recordError("连接已经更换，请重新确认关闭", target);
-        return false;
-      }
-      if (!binding.supported || binding.scope === "observe") {
-        recordError("当前权限不能关闭旁问", target);
-        return false;
-      }
-      // 换代：这份确认描述的那一代已经不在了，关它没有意义（也不安全）。
-      const view = store.read(target.hostKey, target.sideId);
-      if (view !== undefined && view.generation !== target.generation) {
-        recordError("这条旁问已经被新的会话取代", target);
-        return false;
-      }
-      setNotice(null);
-      const key = lockKey(target.hostKey, target.parentId, "close");
-      if (inFlight.current.has(key)) return false;
-      inFlight.current.add(key);
-      try {
-        const ok = await run(async () => {
-          await confirmation.client.request("side/close", {
-            sideId: target.sideId,
-            expectedActiveTurnId: confirmation.activeTurnId,
-          });
-          return true;
-        });
-        if (ok !== true) {
-          recordError(lastErrorRef.current?.message ?? "关闭旁问失败", target);
-          return false;
-        }
-        // 只有「还看着这一条」且「用户没再导航过」才把视图送回父会话。在等待
-        // 期间走开又回来的人，不该被一份过期确认强行送走。
-        leaveIfShowing(
-          target.hostKey,
-          target.parentId,
-          { sideId: target.sideId, revision: confirmation.navigationRevision },
         );
-        await controllerFor(binding, target.parentId).reconcile(target.parentId);
-        onChange();
-        return true;
       } finally {
         inFlight.current.delete(key);
         onChange();
       }
     },
-    [store, controllerFor, run, onChange, recordError],
+    [store, leaveSide, onChange, recordError, recordNotice, run],
   );
 
   const clearError = useCallback(() => {
@@ -832,8 +957,8 @@ export function useSideConversationController(
     enter,
     submit,
     stop,
-    requestClose,
-    confirmClose,
+    leaveSide,
+    closeBackground,
     busy,
     error,
     errorTarget,

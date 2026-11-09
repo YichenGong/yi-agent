@@ -1,6 +1,7 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import type { ReactElement } from "react";
 import { CONNECTION_DISCONNECTED_TEXT, ConnectionError } from "./lib/connectionError";
 import { notifyRuntimeSettingsInvalidated } from "./lib/runtimeSettingsBus";
@@ -98,8 +99,9 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     // 首屏渲染组长条目）测的都是"开关打开时的行为"，缺省成关会让它们全部
     // 变成在测另一条分支。
     leadFlagEnabled: true,
-    // 该宿主是否声明 `side_conversation_v1`。默认**关**：旁支是新增能力，既有
-    // 用例（都是老宿主）不该因为多了一条通知命名空间而改变行为。
+    // 该宿主是否声明两版旁支契约（`side_conversation_v1` +
+    // `side_snapshot_lifecycle_v1`）。默认**关**：旁支是新增能力，既有用例
+    // （都是老宿主）不该因为多了一条通知命名空间而改变行为。
     sideSupported: false,
     // 旁支宿主实例 id（`sideHostInstanceId`）。能力打开时必须有值，缺了会被
     // 前端判成「不支持」。
@@ -112,6 +114,11 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     sideSnapshots: {} as Record<string, Record<string, unknown>>,
     // `side/close` 是否回 `close_conflict`（模拟状态在确认与执行之间变了）。
     sideCloseConflict: false,
+    // 已签发但未消费的票据：`side/exit` 用它判断这张票还在不在。
+    sideOpenTickets: new Set<string>(),
+    // `side/exit` 回的终态。默认 `closed`；`closing`/`failed` 用来测「没确认
+    // 销毁时不得放行重入，也不得装作已经退出」。
+    sideExitState: "closed" as "closed" | "closing" | "failed",
     // `flags/list` 里 `side_conversation` 的值。默认**开**：既有的旁支用例
     // 假定能力可用；「关掉开关」的用例显式把它设成 false。
     sideConversationFlagEnabled: true,
@@ -293,14 +300,50 @@ vi.mock("./lib/rpc", () => ({
         // 默认都不给——老宿主的握手本来就没有这两个字段。
         if (!state.sideSupported) return {};
         return {
-          capabilities: { side_conversation_v1: true },
+          capabilities: {
+            side_conversation_v1: true,
+            side_snapshot_lifecycle_v1: true,
+          },
           sideHostInstanceId: state.sideInstanceId,
         };
       }
-      if (method === "side/open") {
+      if (method === "side/prepare") {
         const p = params as { parentThreadId: string };
+        const entryId = `entry-${state.sideOpenTickets.size + 1}`;
+        state.sideOpenTickets.add(entryId);
+        return {
+          hostInstanceId: state.sideInstanceId,
+          parentThreadId: p.parentThreadId,
+          entryId,
+        };
+      }
+      if (method === "side/exit") {
+        const p = params as {
+          hostInstanceId: string;
+          parentThreadId: string;
+          entryId: string;
+        };
+        state.sideOpenTickets.delete(p.entryId);
+        if (state.sideExitState === "closed") {
+          // 退出即销毁：这个父上的旁支随之从 list 里消失。
+          state.sideSummaries = state.sideSummaries.filter(
+            (x) => x.parent_thread_id !== p.parentThreadId,
+          );
+        }
+        return { ...p, state: state.sideExitState };
+      }
+      if (method === "side/open") {
+        const p = params as { parentThreadId: string; entryId: string };
+        const ticket = state.sideOpenTickets.has(p.entryId);
+        // 与真宿主同形：票只在签票表里才有效（无票 open 一律拒绝），且已存在
+        // 的那一代原样返回——`open` 是「进入」，不是「重置成 idle」。
+        if (!ticket) throw { code: -32602, message: "unknown entry ticket" };
+        const existing = state.sideSummaries.find(
+          (x) => x.parent_thread_id === p.parentThreadId,
+        );
         const summary =
           state.sideOpenSummary ??
+          existing ??
           {
             side_id: "side-1",
             parent_thread_id: p.parentThreadId,
@@ -563,6 +606,11 @@ beforeEach(() => {
   state.sideOpenSummary = null;
   state.sideSnapshots = {};
   state.sideCloseConflict = false;
+  state.sideOpenTickets.clear();
+  state.sideExitState = "closed";
+  // 实验开关也是逐用例的：有两条用例会把它拨关（本机/远端各一条），不复位
+  // 会让后面的用例根本没进旁支——表现为「Send 按钮还在」这种看似 UI 的失败。
+  state.sideConversationFlagEnabled = true;
   dragDrop.fn = null;
   contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
@@ -571,7 +619,15 @@ beforeEach(() => {
   localStorage.clear();
 });
 
-afterEach(cleanup);
+afterEach(async () => {
+  cleanup();
+  // 应用 owner 的卸载终结检查是**0ms 之后**的一次性确认（spec §6.4）：它的用意
+  // 就是「活过这次 cleanup」。用例必须等它跑完，否则它会带着上一条用例的
+  // client/票据冲进下一条用例的 fixture（表现为「另一个用例的旁支莫名消失」）。
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  });
+});
 
 const modeTrigger = () => screen.getByRole("button", { name: /mode/i });
 
@@ -7217,6 +7273,9 @@ describe("App 旁支视图", () => {
     // 用**侧栏**切回父会话（而不是再敲一次 `/back`——那会把命令文本打进同一个
     // 输入框、覆盖掉正在测的那份草稿）。
     //
+    // 切回父会话就是**退出**旁支（spec §4.3）：那份草稿随之丢弃，不再「回来
+    // 还在」。这正是本次改动的产品语义，所以下面断言的是「重进拿到新的空草稿」。
+    //
     // 限定在侧栏内：旁支的返回条也会显示父会话标题，全局 `getByText` 会同时
     // 命中"侧栏里的会话行"和"返回条上的副标题"两处，那是同一件事的两个控件，
     // 不是重复渲染。
@@ -7226,12 +7285,14 @@ describe("App 旁支视图", () => {
     fireEvent.change(box(), { target: { value: "parent draft" } });
     expect(box().value).toBe("parent draft");
 
-    // 再进旁支：旁支自己的草稿原样还在，父的没被带进来。
+    // 再进旁支：旧草稿已随退出丢弃，父的也没被带进来。
     await command("/side");
-    await waitFor(() => expect(box().value).toBe("side draft"));
-    // 同一父已有旁支时不重取上下文：续用，不再 `side/open`。
-    expect(methods().filter((m) => m === "side/open")).toHaveLength(1);
-    // 切来切去都不该碰服务端的旁支状态。
+    await waitFor(() => expect(box().value).toBe(""));
+    // 退出已销毁上一代，重进是**新的一代**：重新签票、重新 open。
+    await waitFor(() =>
+      expect(methods().filter((m) => m === "side/open")).toHaveLength(2),
+    );
+    // 退出自带取消语义：不需要 interrupt，也不再走旧的 close。
     expect(methods()).not.toContain("side/turnInterrupt");
     expect(methods()).not.toContain("side/close");
   });
@@ -7407,6 +7468,78 @@ describe("App 旁支视图", () => {
     // 收尾只落在本地状态上：绝不为「本机关的」去关闭或打断别处的旁支。
     expect(methods()).not.toContain("side/close");
     expect(methods()).not.toContain("side/turnInterrupt");
+    // 也不再发 side/exit：那会真的销毁本机打开的这条旁问，而开关只该清本地视图。
+    expect(methods()).not.toContain("side/exit");
+  });
+
+  /**
+   * `pagehide` 是「尽力通知」：真的离开页面时补一次退出（spec §6.4）。
+   * `visibilitychange` 不在此列——切后台不等于用户退出，另有断言守着。
+   */
+  it("makes a best-effort exit when the page is actually left", async () => {
+    await readyWithSide();
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
+    reset();
+
+    act(() => {
+      window.dispatchEvent(new Event("pagehide"));
+    });
+    await waitFor(() => expect(methods()).toContain("side/exit"));
+  });
+
+  /**
+   * 应用 owner 真正卸载时才终结（spec §6.4）。React StrictMode 的
+   * 「清理 → 立即重新挂载」只是订阅生命周期，不该发出一张销毁票。
+   */
+  it("exits on real unmount but not on a StrictMode remount", async () => {
+    state.sideSupported = true;
+    state.sideInstanceId = "host-test";
+    const { unmount } = render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
+    // StrictMode 挂载期（含双调用）已经过去：到现在为止没有退出。
+    expect(methods()).not.toContain("side/exit");
+
+    reset();
+    unmount();
+    // 终结检查是 0ms 后的一次性确认，等它跑完。
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    });
+    expect(methods()).toContain("side/exit");
+  });
+
+  /**
+   * 临时隐藏/切后台**不是**退出：不破坏环境，回来后还能接着问（spec §6.4）。
+   */
+  it("does not exit when the document is merely hidden", async () => {
+    await readyWithSide();
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
+    reset();
+
+    act(() => {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "hidden",
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(methods()).not.toContain("side/exit");
+    expect(screen.getByText(/^\/side · /)).toBeTruthy();
+    // 复位，别污染后面的用例。
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "visible",
+    });
   });
 
   it("stops only the side's own turn", async () => {
@@ -7427,76 +7560,84 @@ describe("App 旁支视图", () => {
     expect(methods()).not.toContain("turn/interrupt");
   });
 
-  it("asks the server for the live turn before confirming a close", async () => {
+  /**
+   * `/side-close` 就是退出（spec §4.3）：没有二次确认，也没有「返回但保留」。
+   *
+   * 旧实现在这里会先 `side/list` 问当前轮次、再弹一个「要不要打断」的确认框。
+   * 新契约里退出**本来就会**停止那一轮，再问一次等于把同一个问题问两遍。
+   */
+  /**
+   * `/side-close` 就是退出（spec §4.3）：没有二次确认，也没有「返回但保留」。
+   *
+   * 旧实现在这里会先 `side/list` 问当前轮次、再弹一个「要不要打断」的确认框。
+   * 新契约里退出**本来就会**停止那一轮，再问一次等于把同一个问题问两遍。
+   */
+  it("exits on /side-close without a second confirmation", async () => {
     await readyWithSide({ sideSummaries: [runningSummary("side-turn-9")] });
     await command("/side");
     await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
     reset();
 
     await command("/side-close");
-    // 弹出确认前必须问过服务端当前状态（`side/list`），不能拿本地缓存猜。
-    await waitFor(() => expect(methods()).toContain("side/list"));
-    const dialog = await screen.findByRole("dialog", { name: "关闭旁问" });
-    expect(within(dialog).getByText(/还在回答/)).toBeTruthy();
-
-    // 取消：不发 close，也不返回（spec §5.4「取消确认不关闭、不返回」）。
-    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
-    expect(methods()).not.toContain("side/close");
-    expect(screen.getByText(/^\/side · /)).toBeTruthy();
-  });
-
-  it("sends close with the confirmed turn id", async () => {
-    await readyWithSide({ sideSummaries: [runningSummary("side-turn-9")] });
-    await command("/side");
-    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
-    await command("/side-close");
-    const dialog = await screen.findByRole("dialog", { name: "关闭旁问" });
-    fireEvent.click(within(dialog).getByRole("button", { name: "关闭旁问" }));
-
-    await waitFor(() => expect(methods()).toContain("side/close"));
-    expect(clients[0].requests).toContainEqual({
-      method: "side/close",
-      params: { sideId: "side-1", expectedActiveTurnId: "side-turn-9" },
+    // 不再有确认弹窗。
+    expect(screen.queryByRole("dialog", { name: "关闭旁问" })).toBeNull();
+    // 本机在入场时拿到过票，所以这次退出是**精确**的：带三元组，不猜 turnId。
+    await waitFor(() => expect(methods()).toContain("side/exit"));
+    const exit = clients[0].requests.find((r) => r.method === "side/exit");
+    expect(exit?.params).toMatchObject({
+      hostInstanceId: "host-test",
+      parentThreadId: "t1",
     });
-    // 关闭后回主会话，且父会话没被顺带停掉。
+    expect((exit?.params as { entryId: string }).entryId).toMatch(/^entry-\d+$/);
+    // 退出后回主会话，父会话没被顺带停掉。
     await waitFor(() => expect(screen.queryByText(/^\/side · /)).toBeNull());
     expect(methods()).not.toContain("turn/interrupt");
+    expect(methods()).not.toContain("side/close");
   });
 
-  it("closes a background side from the main view", async () => {
-    // `/side-close` 不能在主视图里被简单拒绝（spec §4.2）：旁支只在视图里显示，
-    // 关闭它不该要求先进去。
+  it("does not fake an exit for a background side this device cannot address", async () => {
     await readyWithSide({ sideSummaries: [idleSummary()] });
     reset();
     await command("/side-close");
-    await waitFor(() => expect(methods()).toContain("side/list"));
-    const dialog = await screen.findByRole("dialog", { name: "关闭旁问" });
-    fireEvent.click(within(dialog).getByRole("button", { name: "关闭旁问" }));
-    await waitFor(() => expect(methods()).toContain("side/close"));
-    expect(clients[0].requests).toContainEqual({
-      method: "side/close",
-      params: { sideId: "side-1", expectedActiveTurnId: null },
-    });
+    // 没有本机的入场票据 → 定位不到那一代 → 如实说明。
+    await waitFor(() =>
+      expect(screen.getByText(/无法从本机退出/)).toBeTruthy(),
+    );
+    // 旧路径会先 `side/list` 再 `side/close`；两者都不该出现。
+    expect(methods()).not.toContain("side/exit");
+    expect(methods()).not.toContain("side/close");
   });
 
-  it("keeps the side open and says why when the close conflicts", async () => {
-    // 确认与执行之间状态变了（新起了一轮）：服务端按 `expectedActiveTurnId` 拒绝。
-    // 这里**不能**重试、不能强关、更不能把用户送回主会话——那条旁支还在跑。
-    await readyWithSide({ sideSummaries: [runningSummary("side-turn-9")] });
+  /**
+   * 退出失败（宿主没确认 `closed`）时不能在 UI 上装作已经退出：屏障仍然挡着
+   * 重入，用户可以重试，旁支视图也还在。
+   *
+   * 旧实现这条路是 `side/close` 回 `close_conflict`；退出屏障统一之后，冲突
+   * 归到 `side/exit` 的状态里，但「失败必须可见、不得自动重试」这条不变。
+   */
+  /**
+   * 宿主没确认销毁（`failed`）时不能在 UI 上装作已经退出：屏障仍然挡着重入，
+   * 用户可以看到原因并重试**同一张**票（spec §8）。
+   */
+  it("says when the exit is not confirmed and offers a retry", async () => {
+    await readyWithSide({ sideSummaries: [idleSummary()] });
     await command("/side");
     await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
-    state.sideCloseConflict = true;
+    state.sideExitState = "failed";
     reset();
-    await command("/side-close");
-    const dialog = await screen.findByRole("dialog", { name: "关闭旁问" });
-    fireEvent.click(within(dialog).getByRole("button", { name: "关闭旁问" }));
 
-    await waitFor(() => expect(methods()).toContain("side/close"));
-    // 失败原因必须在旁支视图里当场可见（这条确认属于这条旁支）。
-    expect(await screen.findByText(/side state changed/)).toBeTruthy();
-    expect(screen.getByText(/^\/side · /)).toBeTruthy();
-    // 只尝试了一次：冲突不是可重试的瞬态错误。
-    expect(methods().filter((m) => m === "side/close")).toHaveLength(1);
+    await command("/side-close");
+    expect(await screen.findByText(/旁问退出尚未确认/)).toBeTruthy();
+
+    // 重试只补发**原来那张票**，不重新 open、不建新环境。
+    state.sideExitState = "closed";
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() =>
+      expect(methods().filter((m) => m === "side/exit")).toHaveLength(2),
+    );
+    const exits = clients[0].requests.filter((r) => r.method === "side/exit");
+    expect(new Set(exits.map((r) => (r.params as { entryId: string }).entryId)).size).toBe(1);
+    expect(methods()).not.toContain("side/open");
     expect(methods()).not.toContain("turn/interrupt");
   });
 
@@ -7520,9 +7661,9 @@ describe("App 旁支视图", () => {
     await readyWithSide();
     reset();
     await command("/side-close");
-    await waitFor(() => expect(methods()).toContain("side/list"));
-    // 幂等提示：不虚构一次关闭，但用户必须看到「为什么什么都没发生」。
+    // 幂等提示：不虚构一次退出，但用户必须看到「为什么什么都没发生」。
     expect(await screen.findByText(/没有打开的旁问/)).toBeTruthy();
+    expect(methods()).not.toContain("side/exit");
     expect(methods()).not.toContain("side/close");
   });
 
