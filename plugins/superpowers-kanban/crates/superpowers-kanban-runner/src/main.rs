@@ -1328,6 +1328,26 @@ fn run_daemon(args: Args) {
         eprintln!("superpowers-kanban: {error}");
         std::process::exit(1);
     }
+    // 先解析 daemon 地址，**再碰任何状态**。取不到地址就是配置错了，不是
+    // "daemon 恰好不在"：此时建 state 目录、拿锁、开查询服务全都会留下副作用，
+    // 让下一次排查误以为插件正常启动过。所以这里失败即 exit 1，什么都不创建。
+    //
+    // 这一步同时是探测循环的前提：有了确定的地址，后面的失败诊断才能打印
+    // "到底探的是哪条路径"，而不是把不可达、超时、协议不符压成一句 daemon is gone。
+    let daemon = match superpowers_kanban_ipc::client::socket_path(&args.runtime_dir) {
+        Ok(socket) => {
+            eprintln!("superpowers-kanban: daemon socket at {}", socket.display());
+            Arc::new(BoardDaemon::new(socket))
+        }
+        Err(error) => {
+            eprintln!(
+                "superpowers-kanban: cannot resolve the daemon socket for runtime={}: {error}",
+                args.runtime_dir.display()
+            );
+            std::process::exit(1);
+        }
+    };
+
     let calendar = ConcurrencyCalendar::load_merged(&args.state_dir);
     // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到锁就在有界预算内
     // 重试，超时即让位退出——旧的无限等待会留下永不推进也不退出的空转进程。
@@ -1345,13 +1365,6 @@ fn run_daemon(args: Args) {
                 std::process::exit(0);
             }
         };
-
-    // daemon 存活探测的地址。取不到（runtime 目录不可用）就没有可探的目标，此后
-    // 的探测一律当作「已失联」——孤儿必须能有界退出。
-    let daemon = superpowers_kanban_ipc::client::socket_path(&args.runtime_dir)
-        .ok()
-        .map(BoardDaemon::new)
-        .map(Arc::new);
 
     // 推进循环与查询服务共享同一实例，槽位租约与看板状态因此只有一份真相。
     //
@@ -1387,15 +1400,37 @@ fn run_daemon(args: Args) {
     let _query_server = start_query_server(Arc::clone(&service), &args.state_dir);
 
     let mut liveness = superpowers_kanban_runner::single_instance::Liveness::default();
+    // 只打印一次的启动标记：进程测试从这里开始计失联窗口，因此它必须在
+    // 迁移/查询启动之后、首次 probe 之前。初始化耗时不计入窗口。
+    eprintln!(
+        "superpowers-kanban: daemon probe loop starting runtime={} socket={}",
+        args.runtime_dir.display(),
+        daemon.socket().display()
+    );
     loop {
         // 先探 daemon，且必须在开关判断之前：开关关闭的孤儿走 `continue` 分支，
         // 若把探测放在其后，它永远发现不了 daemon 已死，会一直占着单实例锁。
-        // 阈值 3 × interval ≈ 让位窗口。
-        let alive = daemon.as_ref().is_some_and(|daemon| daemon.is_alive());
-        if liveness.observe(alive, 3) {
+        //
+        // 退出预算是 "P/I/W 各自有界"（spec §7 A12），不是 "3 × interval" 的
+        // 整进程硬上界：单次探测受 2 秒 IO 预算约束，循环间隔由 interval 决定，
+        // 关掉开关时的空转 sleep 同样有界，三者的上界都不依赖工作负载。
+        let result = daemon.probe();
+        let should_exit = liveness.observe(result.is_ok(), 3);
+        if let Err(error) = result {
             eprintln!(
-                "superpowers-kanban: daemon is gone; exiting so a fresh instance can take over"
+                "superpowers-kanban: daemon probe failed runtime={} socket={} misses={}/3: {}{}",
+                args.runtime_dir.display(),
+                daemon.socket().display(),
+                liveness.misses(),
+                error,
+                if should_exit {
+                    "; consecutive probe failures; exiting to release instance lock"
+                } else {
+                    ""
+                }
             );
+        }
+        if should_exit {
             std::process::exit(0);
         }
         if !board_switch(&args.state_dir).is_enabled() {

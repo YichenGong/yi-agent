@@ -73,6 +73,11 @@ pub struct Liveness {
 }
 
 impl Liveness {
+    /// 当前连续失联次数。诊断行用它，避免再维护第二个计数源。
+    pub fn misses(&self) -> u32 {
+        self.misses
+    }
+
     /// 记录一次探测结果，返回是否应退出。
     pub fn observe(&mut self, ok: bool, threshold: u32) -> bool {
         if ok {
@@ -226,6 +231,23 @@ mod tests {
         assert!(
             acquire_within(dir.path(), Duration::ZERO).is_none(),
             "预算为 0 表示不等待、只试一次"
+        );
+    }
+
+    #[test]
+    fn misses_accessor_tracks_only_consecutive_failures() {
+        let mut liveness = Liveness::default();
+        assert!(!liveness.observe(false, 3));
+        assert_eq!(liveness.misses(), 1, "first failure counts");
+        assert!(!liveness.observe(true, 3));
+        assert_eq!(liveness.misses(), 0, "a success clears the streak");
+        assert!(!liveness.observe(false, 3));
+        assert!(!liveness.observe(false, 3));
+        assert!(liveness.observe(false, 3));
+        assert_eq!(
+            liveness.misses(),
+            3,
+            "the streak that trips the exit is visible"
         );
     }
 
