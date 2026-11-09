@@ -1103,9 +1103,16 @@ where
                             // 必须看到同一个 id,否则客户端会把「重连」当成
                             // 「宿主换代」而丢掉本地基线。
                             "capabilities": {
-                                // 能力位跟随本机开关；宿主 id 与它无关（下一行），
-                                // 客户端靠 id 区分「重连」与「宿主换代」。
+                                // 两个能力位都跟随本机开关；宿主 id 与它们无关
+                                //（下一行），客户端靠 id 区分「重连」与「宿主换代」。
+                                //
+                                // `side_conversation_v1` 是旧的分页/通知契约，
+                                // `side_snapshot_lifecycle_v1` 是本次「退出即销毁 +
+                                // 票据准入」的契约。新前端必须两个都为 true 才开放
+                                // 入口：只认旧位会按「返回后仍可恢复」的旧语义使用一块
+                                // 已经不可恢复的界面。
                                 "side_conversation_v1": (side_gate)(),
+                                "side_snapshot_lifecycle_v1": (side_gate)(),
                             },
                             "sideHostInstanceId": side_registry.host_instance_id(),
                             "syncPlan": sync_plan,

@@ -45,7 +45,12 @@ export type { ThreadStatus } from "./generated/ThreadStatus";
 export type { Notification } from "./generated/Notification";
 // 旁支会话(spec §8.1–8.3)。请求是 camelCase + `deny_unknown_fields`,响应是
 // snake_case——这是本协议既有的两套约定,照旧各走各的。
+export type { SidePrepareParams } from "./generated/SidePrepareParams";
+export type { SidePrepareResult } from "./generated/SidePrepareResult";
 export type { SideOpenParams } from "./generated/SideOpenParams";
+export type { SideExitParams } from "./generated/SideExitParams";
+export type { SideExitResult } from "./generated/SideExitResult";
+export type { SideExitStateWire } from "./generated/SideExitStateWire";
 export type { SideListParams } from "./generated/SideListParams";
 export type { SideListResult } from "./generated/SideListResult";
 export type { SideReadItemsParams } from "./generated/SideReadItemsParams";

@@ -20,12 +20,14 @@
 use std::sync::Arc;
 
 use crate::protocol::{
-    RequestEnvelope, RequestId, RpcError, Scope, SideCloseParams, SideListParams, SideListResult,
-    SideOpenParams, SideReadItemsParams, SideReadItemsResult, SideSummaryWire,
+    RequestEnvelope, RequestId, RpcError, Scope, SideCloseParams, SideExitParams, SideExitResult,
+    SideExitStateWire, SideListParams, SideListResult, SideOpenParams, SidePrepareParams,
+    SidePrepareResult, SideReadItemsParams, SideReadItemsResult, SideSummaryWire,
     SideTurnInterruptParams, SideTurnStartParams, SideTurnStartResult,
 };
 use crate::rpc::{AppState, Flow};
 use crate::server::{SideResponseSender, err_response, ok_response, write_response};
+use crate::side_conversation::tickets::{EntryTarget, ExitState};
 use crate::side_conversation::{ReplayBaseline, SideRegistry};
 use yi_agent_runtime::side_conversation::{SideError, SideErrorReason};
 
@@ -33,7 +35,9 @@ use yi_agent_runtime::side_conversation::{SideError, SideErrorReason};
 pub(crate) fn owns(method: &str) -> bool {
     matches!(
         method,
-        "side/open"
+        "side/prepare"
+            | "side/open"
+            | "side/exit"
             | "side/list"
             | "side/readItems"
             | "side/turnStart"
@@ -91,6 +95,34 @@ pub(crate) async fn handle(
     let tasks = &mut state.side_tasks;
 
     match method {
+        "side/prepare" => {
+            let params: SidePrepareParams = match parse(&req.params) {
+                Ok(params) => params,
+                Err(error) => {
+                    write_response(state.hub, state.client, err_response(id, error)).await?;
+                    return Ok(Flow::Continue);
+                }
+            };
+            // 签发票据是**纯内存**决定:不读父、不建目录、不启模型。放在请求路径
+            // 上是安全的,也让「我要进」与「我真的进」在时间上分开。
+            let result = registry
+                .prepare_entry(&params.parent_thread_id)
+                .await
+                .map(|target| SidePrepareResult {
+                    host_instance_id: registry.host_instance_id().to_string(),
+                    parent_thread_id: target.parent().to_string(),
+                    entry_id: target.entry_id().to_string(),
+                });
+            write_response(
+                state.hub,
+                state.client,
+                match result {
+                    Ok(result) => ok_response(id, serde_json::json!(result)),
+                    Err(error) => err_response(id, RpcError::side(&error)),
+                },
+            )
+            .await?;
+        }
         "side/open" => {
             let params: SideOpenParams = match parse(&req.params) {
                 Ok(params) => params,
@@ -100,17 +132,45 @@ pub(crate) async fn handle(
                 }
             };
             let id_for_task = id.clone();
+            let host = registry.host_instance_id().to_string();
             tasks.spawn(async move {
-                // 旧协议没有票据,但**创建路径只有一条**:这里先签发一张票再消费它,
-                // 而不是留一个绕过准入的旁路。Task 9 会把票据升为参数,届时这段
-                // 自签自用删掉即可。
-                let result = match registry.prepare_entry(&params.parent_thread_id).await {
-                    Ok(target) => registry
-                        .open_entry(&target)
-                        .await
-                        .map(|summary| SideSummaryWire::from_registry(&summary)),
-                    Err(error) => Err(error),
-                };
+                // 宿主身份取自 registry 本身,不取自请求:客户端拼出来的宿主要么
+                // 就是这一台,要么票据校验会拒掉它。
+                let target =
+                    EntryTarget::from_identities(host, params.parent_thread_id, params.entry_id);
+                let result = registry
+                    .open_entry(&target)
+                    .await
+                    .map(|summary| SideSummaryWire::from_registry(&summary));
+                responder.send(id_for_task, result).await;
+            });
+        }
+        "side/exit" => {
+            let params: SideExitParams = match parse(&req.params) {
+                Ok(params) => params,
+                Err(error) => {
+                    write_response(state.hub, state.client, err_response(id, error)).await?;
+                    return Ok(Flow::Continue);
+                }
+            };
+            let id_for_task = id.clone();
+            let host = registry.host_instance_id().to_string();
+            tasks.spawn(async move {
+                let target =
+                    EntryTarget::from_identities(host, params.parent_thread_id, params.entry_id);
+                let result = registry
+                    .exit_entry(&target)
+                    .await
+                    .map(|receipt| SideExitResult {
+                        host_instance_id: registry.host_instance_id().to_string(),
+                        parent_thread_id: target.parent().to_string(),
+                        entry_id: target.entry_id().to_string(),
+                        state: match receipt.state {
+                            ExitState::Closing => SideExitStateWire::Closing,
+                            ExitState::Closed | ExitState::Unused => SideExitStateWire::Closed,
+                            ExitState::Failed => SideExitStateWire::Failed,
+                        },
+                    });
                 responder.send(id_for_task, result).await;
             });
         }

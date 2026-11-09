@@ -793,8 +793,11 @@ impl SideRegistry {
                 state: ExitState::Closed,
                 generation: receipt.generation,
             }),
+            // A failed cleanup is not `closed`: the caller must retry so the same
+            // generation is drained again, and must not release its re-entry
+            // barrier on the strength of a teardown that did not happen.
             Phase::Failed => Ok(ExitReceipt {
-                state: ExitState::Closing,
+                state: ExitState::Failed,
                 generation: receipt.generation,
             }),
             _ => {

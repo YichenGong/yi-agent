@@ -29,7 +29,7 @@ fn side_methods_baseline_matches_owns_and_domain() {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect();
-    assert_eq!(all.len(), 6, "基线必须恰好六个方法");
+    assert_eq!(all.len(), 8, "基线必须恰好八个方法");
     for method in &all {
         assert!(owns(method), "{method} 必须由 side 域认领");
         assert_eq!(
@@ -40,7 +40,9 @@ fn side_methods_baseline_matches_owns_and_domain() {
     }
     // 反向:域内认领的每一个方法都必须在基线里,否则清单就少了一行。
     for method in [
+        "side/prepare",
         "side/open",
+        "side/exit",
         "side/list",
         "side/readItems",
         "side/turnStart",
@@ -253,4 +255,70 @@ fn side_turn_text_uses_raw_utf8_bytes() {
 
 fn uuid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// open 必须带票:旧形状(`parentThreadId` only)是 `invalid_params`,而不是一条
+/// 绕过票据准入的创建通道。
+#[test]
+fn side_open_requires_a_host_issued_entry_ticket() {
+    assert!(
+        serde_json::from_value::<SideOpenParams>(json!({"parentThreadId": "p"})).is_err(),
+        "open without a ticket must not deserialize"
+    );
+    let parsed: SideOpenParams = serde_json::from_value(json!({
+        "parentThreadId": "p", "entryId": "ticket"
+    }))
+    .unwrap();
+    assert_eq!(parsed.entry_id, "ticket");
+    // 未知字段仍然被拒:票据是**唯一**的授权形状,多塞字段不能成为第二条路。
+    assert!(
+        serde_json::from_value::<SideOpenParams>(json!({
+            "parentThreadId": "p", "entryId": "t", "force": true
+        }))
+        .is_err()
+    );
+}
+
+/// exit 用三个身份定位一代,并且必须能回出 `failed`。
+#[test]
+fn side_exit_wire_states_are_stable_strings() {
+    for (state, expected) in [
+        (SideExitStateWire::Closing, "closing"),
+        (SideExitStateWire::Closed, "closed"),
+        (SideExitStateWire::Failed, "failed"),
+    ] {
+        assert_eq!(serde_json::to_value(state).unwrap(), json!(expected));
+    }
+    let params: SideExitParams = serde_json::from_value(json!({
+        "hostInstanceId": "h", "parentThreadId": "p", "entryId": "e"
+    }))
+    .unwrap();
+    assert_eq!(params.host_instance_id, "h");
+    assert_eq!(params.parent_thread_id, "p");
+    assert_eq!(params.entry_id, "e");
+    // 缺一个身份就不能定位票据:少任何一个都必须拒。
+    for missing in ["hostInstanceId", "parentThreadId", "entryId"] {
+        let mut value = json!({
+            "hostInstanceId": "h", "parentThreadId": "p", "entryId": "e"
+        });
+        value.as_object_mut().unwrap().remove(missing);
+        assert!(
+            serde_json::from_value::<SideExitParams>(value).is_err(),
+            "{missing} must be required"
+        );
+    }
+}
+
+/// prepare 的响应形状:camelCase 且三个身份齐全。
+#[test]
+fn side_prepare_result_carries_all_three_identities() {
+    let result = SidePrepareResult {
+        host_instance_id: "h".into(),
+        parent_thread_id: "p".into(),
+        entry_id: "e".into(),
+    };
+    let value = serde_json::to_value(&result).unwrap();
+    assert_eq!(value["hostInstanceId"], json!("h"));
+    assert_eq!(value["parentThreadId"], json!("p"));
+    assert_eq!(value["entryId"], json!("e"));
 }

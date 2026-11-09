@@ -126,10 +126,23 @@ async fn side_creating_open_does_not_block_the_loop() {
     let mut h = Harness::with_scope_and_side_registry(Scope::Admin, registry).await;
     initialize(&mut h).await;
 
+    // 先拿一张票(纯内存,立即返回),再用它 open。旧形状的 open 现在就等于
+    // `invalid_params`,不会再走到解析器上,那样这个测试就只是在测参数校验。
+    let prepared = call(
+        &mut h,
+        1,
+        "side/prepare",
+        serde_json::json!({"parentThreadId": "p1"}),
+    )
+    .await;
+    let entry_id = prepared["result"]["entryId"]
+        .as_str()
+        .expect("prepare must issue an entry ticket")
+        .to_string();
     h.send(
         &serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "side/open",
-            "params": {"parentThreadId": "p1"}
+            "params": {"parentThreadId": "p1", "entryId": entry_id}
         })
         .to_string(),
     )
@@ -305,7 +318,9 @@ async fn every_side_method_is_method_not_found_when_the_flag_is_off() {
     initialize(&mut h).await;
 
     for (i, method) in [
+        "side/prepare",
         "side/open",
+        "side/exit",
         "side/list",
         "side/readItems",
         "side/turnStart",
@@ -428,6 +443,137 @@ async fn a_live_parent_publishes_its_progress_and_unpublishes_on_exit() {
     assert!(
         h.live_side_parents.get(&thread_id).is_none(),
         "an exited driver must not leave a live parent behind"
+    );
+
+    h.shutdown().await;
+}
+
+/// 两条连接各签一张票,open 到同一父必须共享一代;一端 exit 后旧票失效,
+/// 再 prepare 得到新的一代。
+#[tokio::test]
+async fn prepare_then_open_shares_one_generation_and_exit_retires_the_ticket() {
+    let home = tempfile::TempDir::new().unwrap();
+    let registry = test_side_registry(home.path(), None);
+    let expected = registry.host_instance_id().to_string();
+    let mut a = Harness::with_scope_and_side_registry(Scope::Admin, Arc::clone(&registry)).await;
+    let mut b = Harness::with_scope_and_side_registry(Scope::Admin, Arc::clone(&registry)).await;
+    initialize(&mut a).await;
+    initialize(&mut b).await;
+
+    let pa = call(
+        &mut a,
+        10,
+        "side/prepare",
+        serde_json::json!({"parentThreadId": "p1"}),
+    )
+    .await;
+    let pb = call(
+        &mut b,
+        11,
+        "side/prepare",
+        serde_json::json!({"parentThreadId": "p1"}),
+    )
+    .await;
+    assert_eq!(pa["result"]["hostInstanceId"], serde_json::json!(expected));
+    assert_eq!(pa["result"]["parentThreadId"], serde_json::json!("p1"));
+    let entry_a = pa["result"]["entryId"].as_str().unwrap().to_string();
+    let entry_b = pb["result"]["entryId"].as_str().unwrap().to_string();
+    assert_ne!(entry_a, entry_b, "两张票是两张不同的能力");
+
+    let sa = call(
+        &mut a,
+        12,
+        "side/open",
+        serde_json::json!({
+            "parentThreadId": "p1", "entryId": entry_a
+        }),
+    )
+    .await;
+    let sb = call(
+        &mut b,
+        13,
+        "side/open",
+        serde_json::json!({
+            "parentThreadId": "p1", "entryId": entry_b
+        }),
+    )
+    .await;
+    assert_eq!(
+        sa["result"]["side_id"], sb["result"]["side_id"],
+        "{sa} {sb}"
+    );
+    assert_eq!(sa["result"]["generation"], sb["result"]["generation"]);
+
+    // 一端退出:立刻 closing,旧票随后失效。
+    let exit = call(
+        &mut a,
+        14,
+        "side/exit",
+        serde_json::json!({
+            "hostInstanceId": expected, "parentThreadId": "p1", "entryId": entry_a
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            exit["result"]["state"].as_str(),
+            Some("closing") | Some("closed")
+        ),
+        "{exit}"
+    );
+
+    // 旧票重放 open 必须被拒:它指向的那一代已经不在。
+    let stale = call(
+        &mut a,
+        15,
+        "side/open",
+        serde_json::json!({
+            "parentThreadId": "p1", "entryId": entry_a
+        }),
+    )
+    .await;
+    assert!(stale.get("error").is_some(), "旧票不得创建新环境: {stale}");
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// 未知票据是一个稳定的 reason,而不是内部错误。
+#[tokio::test]
+async fn unknown_entry_ticket_is_entry_expired() {
+    let home = tempfile::TempDir::new().unwrap();
+    let registry = test_side_registry(home.path(), None);
+    let mut h = Harness::with_scope_and_side_registry(Scope::Admin, registry).await;
+    initialize(&mut h).await;
+
+    let opened = call(
+        &mut h,
+        20,
+        "side/open",
+        serde_json::json!({
+            "parentThreadId": "p1", "entryId": "never-issued"
+        }),
+    )
+    .await;
+    assert_eq!(
+        opened["error"]["data"]["reason"],
+        serde_json::json!("entry_expired"),
+        "{opened}"
+    );
+    // exit 用同样的答案:未知票据既不能创建也不能杀任何东西。
+    let exited = call(
+        &mut h,
+        21,
+        "side/exit",
+        serde_json::json!({
+            "hostInstanceId": "whatever", "parentThreadId": "p1", "entryId": "never-issued"
+        }),
+    )
+    .await;
+    assert_eq!(
+        exited["error"]["data"]["reason"],
+        serde_json::json!("entry_expired"),
+        "{exited}"
     );
 
     h.shutdown().await;

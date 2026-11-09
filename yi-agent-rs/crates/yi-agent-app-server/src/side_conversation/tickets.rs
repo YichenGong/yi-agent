@@ -81,8 +81,32 @@ pub struct EntryTarget {
 }
 
 impl EntryTarget {
+    /// Rebuild the internal target from the three identities a client holds.
+    ///
+    /// Used by `side/exit`, where the client names a ticket by
+    /// `(hostInstanceId, parentThreadId, entryId)` rather than by `sideId`: the
+    /// ticket is the only thing that knows the exact generation. Constructing it
+    /// here grants nothing — `verify` still refuses an unknown, expired, foreign or
+    /// wrong-parent ticket.
+    pub fn from_identities(
+        host: impl Into<String>,
+        parent: impl Into<String>,
+        entry_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            ticket: entry_id.into(),
+            parent: parent.into(),
+        }
+    }
+
     pub fn parent(&self) -> &str {
         &self.parent
+    }
+
+    /// The opaque ticket string, for echoing back to the caller.
+    pub fn entry_id(&self) -> &str {
+        &self.ticket
     }
 }
 
@@ -95,6 +119,12 @@ pub enum ExitState {
     Closing,
     /// The ticket was already closed (or its generation already finished).
     Closed,
+    /// A bound generation was asked to close and could not prove its release.
+    ///
+    /// Distinct from `Closing` on purpose: a client must not release its re-entry
+    /// barrier on a teardown that has not happened, and the retry has to resume the
+    /// *same* generation rather than open a new one.
+    Failed,
 }
 
 /// The result of consuming a ticket on exit.

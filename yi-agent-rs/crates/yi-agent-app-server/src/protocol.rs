@@ -937,12 +937,75 @@ impl<'a> NotificationEnvelope<'a> {
     }
 }
 
+/// `side/prepare` 的参数。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SidePrepareParams {
+    pub parent_thread_id: String,
+}
+
+/// `side/prepare` 的响应:一张票据的三个身份。
+///
+/// 客户端必须先核对这三个值与它当前相信的宿主/父一致,再去 `side/open`。少了
+/// 这一步,一个迟到的 prepare 回包会把「我要进 A」变成「我进了 B」。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase")]
+pub struct SidePrepareResult {
+    pub host_instance_id: String,
+    pub parent_thread_id: String,
+    pub entry_id: String,
+}
+
 /// `side/open` 的参数。
+///
+/// `entry_id` 是**必填**的:没有票据不能创建环境,所以旧客户端那个只有
+/// `parentThreadId` 的形状在新宿主上直接是 `invalid_params`,而不是一条绕过
+/// 准入的旁路。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SideOpenParams {
     pub parent_thread_id: String,
+    pub entry_id: String,
+}
+
+/// `side/exit` 的参数。
+///
+/// 三个身份一起定位一张票据:宿主靠它查出**精确代次**,客户端不需要知道
+/// `sideId`。这既是权限边界(每次 exit 都要 Control 认证),也是幂等键。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SideExitParams {
+    pub host_instance_id: String,
+    pub parent_thread_id: String,
+    pub entry_id: String,
+}
+
+/// 一次退出请求的结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "snake_case")]
+pub enum SideExitStateWire {
+    /// 意图已记录:本代正在销毁,还没证明资源释放。
+    Closing,
+    /// 本代已确认销毁。客户端只有收到这个才解除重入屏障。
+    Closed,
+    /// 清理未能证明释放。保留最小账目,重试排空**同一代**。
+    Failed,
+}
+
+/// `side/exit` 的响应。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase")]
+pub struct SideExitResult {
+    pub host_instance_id: String,
+    pub parent_thread_id: String,
+    pub entry_id: String,
+    pub state: SideExitStateWire,
 }
 
 /// `side/list` 的参数。
