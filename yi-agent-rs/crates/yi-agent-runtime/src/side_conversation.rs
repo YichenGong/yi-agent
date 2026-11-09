@@ -38,8 +38,7 @@ pub use runner::{
     SideTokenTotals, SideUsage,
 };
 pub use source::{
-    EffectiveSideSource, SideAttachment, SideAttachmentCatalog, SideSourcePublisher, SideWebPolicy,
-    SourceUpdate,
+    EffectiveSideSource, SideAttachment, SideAttachmentCatalog, SideSourcePublisher, SourceUpdate,
 };
 pub use transcript::{
     SIDE_TOOL_DISPLAY_BYTES, SIDE_TRANSCRIPT_BYTES, SIDE_TRANSCRIPT_CONTROL_RESERVE,

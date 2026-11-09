@@ -3608,13 +3608,15 @@ fn side_local_command_text(side: &SideSession, name: &str) -> String {
         "cost" => format_side_usage(side),
         "config" => "旁支继承父会话的模型与推理档；只读，不能改配置".to_string(),
         _ => {
-            // 工具白名单直接取自调度侧的同一份策略,不在这里另抄一遍:
-            // 两处各写一份,总有一天帮助里说能用的工具其实被拒。
-            let tools = crate::side_driver::allowed_side_tools().join("、");
-            format!(
-                "/back 返回主会话，/side-close 关闭旁支。\
-旁支可用工具（只读）：{tools}"
-            )
+            // 能力集合取自调度侧的同一份策略,不在 UI 里另写一份:两处各写一份,
+            // 总有一天帮助里说能用的工具其实被拒。
+            let tools = crate::side_driver::allowed_side_tools();
+            let capability = if tools.is_empty() {
+                "旁支不调用任何工具,只基于进入时的对话快照回答".to_string()
+            } else {
+                format!("旁支可用工具：{}", tools.join("、"))
+            };
+            format!("/back 返回主会话，/side-close 关闭旁支。{capability}")
         }
     }
 }

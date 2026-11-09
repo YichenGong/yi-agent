@@ -298,13 +298,8 @@ impl SideDriver {
             .resources
             .prepare(Arc::clone(&lease), &snapshot, cancel)
             .await?;
-        let tools = SideToolSetupFactory::new(
-            snapshot.clone(),
-            Arc::clone(&prepared.access),
-            Arc::clone(&self.pool),
-            side_id.clone(),
-            Arc::clone(&prepared.lease) as Arc<dyn Send + Sync>,
-        );
+        // A side has no tools; the factory only carries its identity.
+        let tools = SideToolSetupFactory::new(side_id.clone());
         let runner = SideConversationRunner::new(side_id.clone(), snapshot, prepared, tools)?;
 
         self.transcript = Some(SideTranscript::side_defaults());
@@ -817,7 +812,10 @@ pub fn side_host_root(workdir: &std::path::Path) -> PathBuf {
     yi_agent_store::paths::instance_home().unwrap_or_else(|| workdir.join(".yi-agent"))
 }
 
-/// 旁支只读工具白名单,供 `/help` 与顶部提示展示同一份来源。
+/// 旁支可用的工具集合,供 `/help` 展示。
+///
+/// 恒为空:旁支只回答进入时的对话快照,不读文件、不联网、不调 MCP。保留这个
+/// 函数是让界面文案从策略取值,而不是在 UI 里另写一份"能干什么"。
 pub fn allowed_side_tools() -> Vec<&'static str> {
     SideToolPolicy::default().allowed_names().to_vec()
 }

@@ -3376,8 +3376,7 @@ fn publish_side_source(
         revision,
         generation: 1,
         provider_gate: None,
-        web_policy: yi_agent_runtime::side_conversation::SideWebPolicy::default(),
-        live: live.live_settings.clone(),
+        effective_config: None,
     };
     source.revision = revision;
     update.commit(source);
@@ -3434,11 +3433,10 @@ fn side_source_snapshot_with_session(
         // generation 与父会话一致:父 clear/delete 会推进它并作废旁支。
         generation: 1,
         provider_gate: None,
-        web_policy: yi_agent_runtime::side_conversation::SideWebPolicy::default(),
         // The start-up snapshot is published before the driver exists, so there is
-        // no parent agent to take a source from yet. The driver's first
-        // `publish_side_source` replaces it, and that one carries the source.
-        live: None,
+        // no parent agent to take a cached configuration from yet. The driver's
+        // first `publish_side_source` replaces it, and that one carries the cache.
+        effective_config: None,
     }
 }
 

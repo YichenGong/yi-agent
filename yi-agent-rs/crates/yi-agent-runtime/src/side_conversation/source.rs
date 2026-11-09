@@ -73,25 +73,6 @@ impl SideAttachmentCatalog {
     }
 }
 
-/// Whether the side may use the network at all.
-///
-/// Kept host-internal on purpose: it can carry a provider credential, so it must
-/// never be serialised or logged.
-#[derive(Clone, Default)]
-pub struct SideWebPolicy {
-    pub fetch_enabled: bool,
-    pub search_config: Option<serde_json::Value>,
-}
-
-impl std::fmt::Debug for SideWebPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SideWebPolicy")
-            .field("fetch_enabled", &self.fetch_enabled)
-            .field("search_configured", &self.search_config.is_some())
-            .finish()
-    }
-}
-
 /// Everything a side conversation runs on, captured from its parent.
 ///
 /// `Clone` shares the provider, the history handle and the authorisation source,
@@ -114,6 +95,13 @@ pub struct EffectiveSideSource {
     /// granting access to future reads.
     pub current_roots: Arc<dyn yi_agent_tools::SideRoots>,
     pub attachments: SideAttachmentCatalog,
+    /// The parent's most recently rendered configuration (prompt included).
+    ///
+    /// `config` is the value assembled for the parent, but a live-settings save
+    /// can change the prompt the provider actually receives. Reading this cache
+    /// gives the side the real value **without** asking the live source to rescan
+    /// project rules or skills. It is `None` once the snapshot is taken.
+    pub effective_config: Option<Arc<Mutex<AgentConfig>>>,
     /// Monotonic revision of this source. A reader uses it to detect that the
     /// parent changed underneath it.
     pub revision: u64,
@@ -122,21 +110,11 @@ pub struct EffectiveSideSource {
     /// The parent's provider admission gate, if the host has one. A side acquires
     /// its own lease from it rather than reusing the parent's.
     pub provider_gate: Option<Arc<dyn yi_agent_core::ProviderTurnGate>>,
-    pub web_policy: SideWebPolicy,
-    /// The parent's live runtime-settings source, when the host has one.
-    ///
-    /// Deliberately **not** part of the lifecycle: a settings save must reach a
-    /// running side's next turn without bumping `revision` or `generation`, which
-    /// would make the side look like it needs to be replaced. The side keeps its
-    /// own hard `ManagedRunLimits` and its spent budget; only the ordinary
-    /// dynamic values follow the save.
-    pub live: Option<Arc<dyn yi_agent_core::live_settings::AgentSettingsSource>>,
 }
 
 impl std::fmt::Debug for EffectiveSideSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Deliberately omits the session contents, the credential-bearing web
-        // policy and the provider identity.
+        // Deliberately omits the session contents and the provider identity.
         f.debug_struct("EffectiveSideSource")
             .field("model", &self.config.model)
             .field("primary", &self.primary)
@@ -145,7 +123,6 @@ impl std::fmt::Debug for EffectiveSideSource {
             .field("revision", &self.revision)
             .field("generation", &self.generation)
             .field("has_provider_gate", &self.provider_gate.is_some())
-            .field("has_live_settings", &self.live.is_some())
             .finish()
     }
 }
@@ -269,13 +246,18 @@ impl SideSourcePublisher {
             }
 
             let mut captured = source;
-            captured
-                .session
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .replace_messages(messages.clone());
+            // Freeze the configuration the parent actually runs with. Reading the
+            // published cache costs one lock and never rescans project prompts.
+            if let Some(cache) = &captured.effective_config {
+                captured.config = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+            }
+            captured.effective_config = None;
             // A fresh handle, so the side's history is independent even though the
-            // content came from the parent's.
+            // content came from the parent's. The parent's own session is never
+            // rewritten: trimming an unsafe tail happens on this copy only.
             captured.session = Arc::new(Mutex::new(Session::from_messages(messages)));
             return Ok(captured);
         }
@@ -485,14 +467,9 @@ mod tests {
 
     #[test]
     fn side_source_debug_never_prints_history_or_credentials() {
-        let mut source = source_with_history("父秘密问题", "父秘密回答");
-        source.web_policy = SideWebPolicy {
-            fetch_enabled: true,
-            search_config: Some(serde_json::json!({"api_key": "sk-very-secret"})),
-        };
+        let source = source_with_history("父秘密问题", "父秘密回答");
         let rendered = format!("{source:?}");
         assert!(!rendered.contains("父秘密"), "{rendered}");
-        assert!(!rendered.contains("sk-very-secret"), "{rendered}");
         assert!(rendered.contains("has_provider_gate"), "{rendered}");
     }
 }

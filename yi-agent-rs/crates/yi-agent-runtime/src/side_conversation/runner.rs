@@ -414,13 +414,11 @@ impl SideConversationRunner {
         if let Some(gate) = &self.source.provider_gate {
             agent = agent.with_provider_turn_gate(Arc::clone(gate));
         }
-        // The parent's live source, not a copy of its values: a settings save
-        // reaches this turn's next safe point. The side's own hard limits
-        // (`ManagedRunLimits::side_defaults`) and its already-spent budget stay
-        // exactly as they are, so a save never resets or reopens a side.
-        if let Some(live) = &self.source.live {
-            agent.set_live_settings(Arc::clone(live));
-        }
+        // No live-settings source is attached. The side runs on the configuration
+        // frozen at entry, which is what makes it a snapshot: a later save in the
+        // parent must not change the side's prompt, model or history mid-way, and
+        // enabling one here would also let a save reach into a conversation whose
+        // premise is "this is what the parent looked like when I asked".
 
         let run = agent
             .run_managed_blocks(

@@ -549,13 +549,8 @@ impl SideRegistry {
             .prepare(Arc::clone(&lease), &source, cancel.clone())
             .await?;
 
-        let tools = SideToolSetupFactory::new(
-            source.clone(),
-            Arc::clone(&prepared.access),
-            Arc::clone(&self.pool),
-            side_id.clone(),
-            prepared.lease.clone() as Arc<dyn Send + Sync>,
-        );
+        // A side has no tools; the factory only carries its identity.
+        let tools = SideToolSetupFactory::new(side_id.clone());
         // Captured before the source is moved into the runner: afterwards the fixed
         // values are only reachable through the runner, and the point of the snapshot
         // is that it never changes again.

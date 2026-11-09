@@ -25,7 +25,7 @@ use yi_agent_runtime::bootstrap::{
 use yi_agent_runtime::config::RuntimeConfig;
 use yi_agent_runtime::side_conversation::{
     EffectiveSideSource, SideAttachment, SideAttachmentCatalog, SideError, SideErrorReason,
-    SideResult, SideWebPolicy,
+    SideResult,
 };
 
 use crate::thread_store::ThreadStore;
@@ -184,10 +184,10 @@ pub fn assemble_cold_source(
         revision: 1,
         generation: 1,
         provider_gate: None,
-        web_policy: SideWebPolicy::default(),
-        // Filled in by the caller that holds the parent agent's live source; a
-        // side created from persisted state alone has none.
-        live: None,
+        // A cold parent has no running agent, so there is no published cache to
+        // freeze. The assembled `for_side` config below is already the exact
+        // prompt a side should inherit; nothing may rescan project rules later.
+        effective_config: None,
     })
 }
 
@@ -361,10 +361,10 @@ pub fn source_from_live_agent(
         revision: 1,
         generation: 1,
         provider_gate: None,
-        web_policy: SideWebPolicy::default(),
-        // Filled in by the caller that holds the parent agent's live source; a
-        // side created from persisted state alone has none.
-        live: None,
+        // A cold parent has no running agent, so there is no published cache to
+        // freeze. The assembled `for_side` config below is already the exact
+        // prompt a side should inherit; nothing may rescan project rules later.
+        effective_config: None,
     })
 }
 

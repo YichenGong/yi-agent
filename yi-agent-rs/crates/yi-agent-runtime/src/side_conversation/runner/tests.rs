@@ -57,13 +57,8 @@ impl Fixture {
             .prepare(Arc::clone(&lease), &source, CancellationToken::new())
             .await
             .unwrap();
-        let tools = SideToolSetupFactory::new(
-            source.clone(),
-            Arc::clone(&prepared.access),
-            Arc::new(SideBlockingPool::new(4, 1, 4, 1)),
-            TEST_SIDE_ID.to_string(),
-            Arc::clone(&lease) as Arc<dyn Send + Sync>,
-        );
+        // A side has no tools; the factory only carries its identity.
+        let tools = SideToolSetupFactory::new(TEST_SIDE_ID.to_string());
         SideConversationRunner::new(TEST_SIDE_ID.to_string(), source, prepared, tools).unwrap()
     }
 }
@@ -571,5 +566,67 @@ async fn side_runner_injects_the_hidden_boundary_once() {
     assert!(
         messages.len() > 1,
         "the parent's safe history must be inherited, not replaced by the marker"
+    );
+}
+
+/// The snapshot is taken once at entry. A parent that keeps working afterwards
+/// must not leak into the side, and the side's own Q&A must never reach the parent.
+#[tokio::test]
+async fn side_stays_on_its_entry_snapshot_across_questions() {
+    use yi_agent_core::Message;
+
+    let fixture = Fixture::new();
+    let mut source =
+        crate::side_conversation::test_support::source_with_history("父问题", "父回答");
+    let provider = Arc::new(CapturingProvider::new("旁支回答"));
+    source.provider = provider.clone();
+    let parent = Arc::clone(&source.session);
+    let mut runner = fixture.runner(source).await;
+
+    // The parent keeps working after the user entered the side.
+    parent
+        .lock()
+        .unwrap()
+        .push(Message::user("父后来新增的问题"));
+
+    for (turn, question) in [("turn-a", "第一问"), ("turn-b", "第二问")] {
+        let stream = runner
+            .start_turn(turn.into(), question.into())
+            .await
+            .unwrap();
+        drain(stream).await;
+        runner.wait_quiescent().await.unwrap();
+    }
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "one request per question");
+    for (index, request) in requests.iter().enumerate() {
+        assert!(
+            request.tools.is_empty(),
+            "request {index} must carry zero tools"
+        );
+        let rendered = serde_json::to_string(&request.messages).unwrap();
+        assert!(
+            rendered.contains("父问题") && rendered.contains("父回答"),
+            "request {index} must keep the entry snapshot"
+        );
+        assert!(
+            !rendered.contains("父后来新增的问题"),
+            "request {index} must not follow the parent past entry: {rendered}"
+        );
+        if index == 1 {
+            assert!(
+                rendered.contains("第一问"),
+                "the side's own accepted Q&A carries over between questions: {rendered}"
+            );
+        }
+    }
+
+    // Nothing the side said reached the parent's session.
+    let parent_now = parent.lock().unwrap().clone();
+    let rendered_parent = serde_json::to_string(&parent_now.messages()).unwrap();
+    assert!(
+        !rendered_parent.contains("旁支回答") && !rendered_parent.contains("第一问"),
+        "the parent transcript must never receive side content: {rendered_parent}"
     );
 }

@@ -12,7 +12,7 @@ use yi_agent_core::{
     StopReason,
 };
 
-use super::source::{EffectiveSideSource, SideWebPolicy};
+use super::source::EffectiveSideSource;
 
 /// Roots that never change, for tests that do not exercise revocation.
 #[derive(Debug)]
@@ -108,8 +108,7 @@ fn source_from_session(session: Session) -> EffectiveSideSource {
         revision: 1,
         generation: 1,
         provider_gate: None,
-        web_policy: SideWebPolicy::default(),
-        live: None,
+        effective_config: None,
     }
 }
 

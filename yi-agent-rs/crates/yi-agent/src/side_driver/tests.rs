@@ -13,7 +13,7 @@ use yi_agent_core::{
     AgentConfig, ContentBlock, Message, Provider, ProviderError, ProviderEvent, ProviderRequest,
     Session, StopReason,
 };
-use yi_agent_runtime::side_conversation::{EffectiveSideSource, SideWebPolicy};
+use yi_agent_runtime::side_conversation::EffectiveSideSource;
 use yi_agent_tools::SideRoots;
 
 #[derive(Debug)]
@@ -89,8 +89,7 @@ fn source(provider: Arc<CountingProvider>, root: &std::path::Path) -> EffectiveS
         revision: 1,
         generation: 1,
         provider_gate: None,
-        web_policy: SideWebPolicy::default(),
-        live: None,
+        effective_config: None,
     }
 }
 
@@ -628,13 +627,9 @@ async fn failed_open_reports_a_main_target_error() {
 }
 
 #[test]
-fn side_tool_policy_is_read_only_and_never_empty() {
+fn side_tools_are_empty_so_no_capability_can_leak() {
+    // Not "read-only tools minus the dangerous ones": a side has none at all, so
+    // editing a list can never re-grant the parent's file, shell or web access.
     let allowed = allowed_side_tools();
-    assert!(!allowed.is_empty());
-    for forbidden in ["bash", "write", "edit", "apply_patch"] {
-        assert!(
-            !allowed.contains(&forbidden),
-            "{forbidden} 不能出现在旁支只读白名单里"
-        );
-    }
+    assert!(allowed.is_empty(), "旁支不能有任何工具，实际为 {allowed:?}");
 }
