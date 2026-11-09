@@ -23,7 +23,7 @@ function handshake(over: Record<string, unknown> = {}): Record<string, unknown> 
   return {
     serverInfo: { name: "yi-agent-app-server", version: "0.0.0" },
     protocolVersion: 1,
-    capabilities: { side_conversation_v1: true },
+    capabilities: { side_conversation_v1: true, side_snapshot_lifecycle_v1: true },
     sideHostInstanceId: "h1",
     syncPlan: [],
     ...over,
@@ -180,6 +180,32 @@ describe("parseSideHandshake", () => {
     );
     expect(b).not.toBeNull();
     expect(b!.supported).toBe(false);
+  });
+
+  it("requires both capability bits for the disposable lifecycle", () => {
+    const both = parseSideHandshake(SLOT, fakeClient("c"), handshake(), "control");
+    expect(both!.snapshotLifecycle).toBe(true);
+
+    // 只声明旧位：分页/通知还能用（supported），但「退出即销毁 + 票据准入」
+    // 不在，入口必须不开放。
+    const legacy = parseSideHandshake(
+      SLOT,
+      fakeClient("c"),
+      handshake({ capabilities: { side_conversation_v1: true } }),
+      "control",
+    );
+    expect(legacy!.supported).toBe(true);
+    expect(legacy!.snapshotLifecycle).toBe(false);
+
+    // 只声明新位：没有旧分页契约，同样不开放。
+    const onlyNew = parseSideHandshake(
+      SLOT,
+      fakeClient("c"),
+      handshake({ capabilities: { side_snapshot_lifecycle_v1: true } }),
+      "control",
+    );
+    expect(onlyNew!.supported).toBe(false);
+    expect(onlyNew!.snapshotLifecycle).toBe(true);
   });
 
   it("treats a missing host id as unsupported", () => {
@@ -451,6 +477,54 @@ describe("SideConversationStore", () => {
     store.apply(a.key, changed("s1", 1));
     store.apply(b.key, changed("s2", 1));
     expect(store.list(a.key).map((v) => v.sideId)).toEqual(["s1"]);
+  });
+});
+
+describe("SideConversationStore.dropGeneration", () => {
+  it("drops exactly one generation and leaves the next one alone", () => {
+    const store = new SideConversationStore();
+    const b = store.bind(binding(fakeClient("c")));
+    store.apply(b.key, changed("s", 1, { generation: 1 }));
+    expect(store.read(b.key, "s")!.generation).toBe(1);
+
+    // 旧代退出：按精确代删除。
+    expect(store.dropGeneration(b.key, "s", 1)).toBe(true);
+    expect(store.read(b.key, "s")).toBeUndefined();
+
+    // 重进得到新的一代：那份新视图不该被一次迟到的旧代删除带走。
+    store.apply(b.key, changed("s", 1, { generation: 2 }));
+    expect(store.dropGeneration(b.key, "s", 1)).toBe(false);
+    expect(store.read(b.key, "s")!.generation).toBe(2);
+  });
+
+  it("does not touch another parent on the same host", () => {
+    const store = new SideConversationStore();
+    const b = store.bind(binding(fakeClient("c")));
+    store.apply(b.key, changed("mine", 1));
+    store.apply(
+      b.key,
+      {
+        method: "side/changed",
+        params: {
+          ...changed("theirs", 1).params,
+          parent_thread_id: "p2",
+          side_id: "theirs",
+        },
+      } as SideNotification,
+    );
+    store.dropGeneration(b.key, "mine", 1);
+    expect(store.read(b.key, "mine")).toBeUndefined();
+    expect(store.read(b.key, "theirs")).toBeDefined();
+  });
+
+  it("keeps a late frame from resurrecting the dropped generation", () => {
+    const store = new SideConversationStore();
+    const b = store.bind(binding(fakeClient("c")));
+    store.apply(b.key, itemUpdated("s", 1, agentItem("before", "m1")));
+    store.dropGeneration(b.key, "s", 1);
+    // 旧代迟到的正文帧不得重建视图。
+    store.apply(b.key, itemUpdated("s", 2, agentItem("late", "m2")));
+    expect(store.read(b.key, "s")).toBeUndefined();
   });
 });
 

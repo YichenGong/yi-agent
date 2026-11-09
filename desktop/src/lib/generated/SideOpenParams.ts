@@ -2,5 +2,9 @@
 
 /**
  * `side/open` 的参数。
+ *
+ * `entry_id` 是**必填**的:没有票据不能创建环境,所以旧客户端那个只有
+ * `parentThreadId` 的形状在新宿主上直接是 `invalid_params`,而不是一条绕过
+ * 准入的旁路。
  */
-export type SideOpenParams = { parentThreadId: string, };
+export type SideOpenParams = { parentThreadId: string, entryId: string, };

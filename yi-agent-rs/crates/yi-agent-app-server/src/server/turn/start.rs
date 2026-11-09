@@ -96,6 +96,9 @@ pub(crate) async fn start_thread_core(
     // 进程级运行期设置绑定。只影响本进程自起的项目 daemon 的 worker 工厂；
     // `None` 与历史行为逐字一致。
     live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+    // 宿主级「本进程正在驱动的父会话」表。`None` = 该宿主没有旁问能力(测试里
+    // 的裸装配、开关关闭的宿主)；那时既不发布也不登记，与旁问不存在时逐字一致。
+    live_side_parents: Option<&Arc<crate::side_conversation::LiveSideParents>>,
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
@@ -246,6 +249,24 @@ pub(crate) async fn start_thread_core(
                 None
             }
         };
+    // 发布本会话作为父会话的旁问来源。放在 `insert` 之前：`threads` 一出现，
+    // `thread/start` 的响应就返回了，用户可能立刻敲 `/side`——此刻表里必须已有
+    // 真实来源，否则会退化成冷读磁盘，读到一个还没落盘的旧会话。
+    //
+    // 失败(父还没有可继承的历史)不是错误：会话本身照建，来源留空，下一次
+    // 刷新(首轮落盘后)再装上。`LiveParentSource::drop` 负责在 driver 退出时
+    // 摘除，所以这里不需要任何清理路径。
+    let side_source = live_side_parents.and_then(|parents| {
+        crate::side_conversation::LiveParentSource::install(
+            Arc::clone(parents),
+            thread_id.clone(),
+            &agent,
+            cwd,
+            crate::side_conversation::live_roots(cwd, &extra_roots),
+            Default::default(),
+        )
+    });
+
     threads.insert(
         thread_id.clone(),
         ThreadSession {
@@ -264,6 +285,7 @@ pub(crate) async fn start_thread_core(
             status: Arc::clone(&store_status),
             subagent_tx,
             writer_lock,
+            side_source: side_source.clone(),
         },
     );
 
@@ -316,6 +338,7 @@ pub(crate) async fn start_thread_core(
         None,
         sandbox,
         Arc::clone(&process_manager),
+        side_source,
     ));
 
     Ok(())

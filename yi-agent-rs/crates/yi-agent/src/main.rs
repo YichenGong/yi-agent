@@ -3381,8 +3381,7 @@ async fn side_parent_barrier(
 /// 不会看到「新 provider + 旧 config」这种半更新状态。
 fn publish_side_source(
     publisher: Option<&Arc<yi_agent_runtime::side_conversation::SideSourcePublisher>>,
-    live: &LiveRebuild,
-    session: &Arc<std::sync::Mutex<yi_agent_core::Session>>,
+    agent: &yi_agent_core::Agent,
     primary: &std::path::Path,
 ) {
     let Some(publisher) = publisher else {
@@ -3393,25 +3392,34 @@ fn publish_side_source(
         // 强行覆盖,那会让读侧读到混搭的来源。
         return;
     };
+    let bindings = agent.snapshot_bindings();
     let revision = publisher.revision().unwrap_or(1).saturating_add(1);
     let roots = vec![primary.to_path_buf()];
-    let mut source = yi_agent_runtime::side_conversation::EffectiveSideSource {
-        session: Arc::clone(session),
-        provider: Arc::clone(&live.provider),
+    let config = bindings
+        .effective_config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let source = yi_agent_runtime::side_conversation::EffectiveSideSource {
+        session: bindings.session,
+        provider: bindings.provider,
         // 与启动路径同一条规则:父 config 是主会话的口吻,旁支必须在末尾追加
         // 只读策略,否则模型会把继承来的父任务当成自己的待办继续执行。
-        config: yi_agent_core::side_agent_config(&live.config),
+        //
+        // 这里用的是**父会话真正发出去的那份**配置(agent 的生效缓存),不是
+        // 装配时的快照:设置页改过的 prompt/预算必须被旁支继承,而重算一遍
+        // 会重新扫描项目规则与 skills——那正是旁支不该做的外部读取。
+        config: yi_agent_core::side_agent_config(&config),
         primary: primary.to_path_buf(),
         roots: roots.clone(),
         current_roots: Arc::new(yi_agent_tools::StaticSideRoots::new(roots)),
         attachments: Default::default(),
         revision,
         generation: 1,
-        provider_gate: None,
-        web_policy: yi_agent_runtime::side_conversation::SideWebPolicy::default(),
-        live: live.live_settings.clone(),
+        provider_gate: bindings.provider_gate,
+        // 快照要读的权威缓存:与 `snapshot()` 里「读缓存盖掉 config」同一份。
+        effective_config: Some(bindings.effective_config),
     };
-    source.revision = revision;
     update.commit(source);
 }
 
@@ -3466,11 +3474,10 @@ fn side_source_snapshot_with_session(
         // generation 与父会话一致:父 clear/delete 会推进它并作废旁支。
         generation: 1,
         provider_gate: None,
-        web_policy: yi_agent_runtime::side_conversation::SideWebPolicy::default(),
         // The start-up snapshot is published before the driver exists, so there is
-        // no parent agent to take a source from yet. The driver's first
-        // `publish_side_source` replaces it, and that one carries the source.
-        live: None,
+        // no parent agent to take a cached configuration from yet. The driver's
+        // first `publish_side_source` replaces it, and that one carries the cache.
+        effective_config: None,
     }
 }
 
@@ -3741,7 +3748,6 @@ fn run_tui_agent(
                 let handles = crate::side_driver::spawn_side_driver(
                     Arc::clone(&publisher),
                     resources,
-                    Arc::clone(&side_pool),
                 );
                 side_commands_tx_for_driver = Some(handles.commands.clone());
                 side_commands_tx_for_tui_exit = Some(handles.commands.clone());
@@ -3843,8 +3849,7 @@ fn run_tui_agent(
             // 所以每个可能改变它的入口都要重新发布（见下面的 publish_side_source 调用）。
             publish_side_source(
                 side_publisher_for_driver.as_ref(),
-                &live,
-                &session_handle,
+                &agent,
                 &driver_workdir,
             );
 
@@ -3894,8 +3899,7 @@ fn run_tui_agent(
                             // 让之后打开的空父旁支立刻得到 parent_not_started 的明确错误。
                             publish_side_source(
                                 side_publisher_for_driver.as_ref(),
-                                &live,
-                                &agent.session_handle(),
+                                &agent,
                                 &driver_workdir,
                             );
                             // 到这里清空已经落地（内存 + 磁盘都成功才走到这）,
@@ -3961,8 +3965,7 @@ fn run_tui_agent(
                                     // 正在问的旁支腰斩。
                                     publish_side_source(
                                         side_publisher_for_driver.as_ref(),
-                                        &live,
-                                        &handle,
+                                        &agent,
                                         &driver_workdir,
                                     );
                                     tracing::info!("agent session compacted via /compact");
@@ -4046,8 +4049,7 @@ fn run_tui_agent(
                                 .await;
                             publish_side_source(
                                 side_publisher_for_driver.as_ref(),
-                                &live,
-                                &agent.session_handle(),
+                                &agent,
                                 &driver_workdir,
                             );
                             tracing::info!("MCP config reloaded from disk");
@@ -4067,8 +4069,7 @@ fn run_tui_agent(
                             );
                             publish_side_source(
                                 side_publisher_for_driver.as_ref(),
-                                &live,
-                                &agent.session_handle(),
+                                &agent,
                                 &driver_workdir,
                             );
                             tracing::info!("MCP tool registry refreshed");
@@ -4102,8 +4103,7 @@ fn run_tui_agent(
                                     );
                                     publish_side_source(
                                         side_publisher_for_driver.as_ref(),
-                                        &live,
-                                        &agent.session_handle(),
+                                        &agent,
                                         &driver_workdir,
                                     );
                                     tracing::info!(
@@ -4192,8 +4192,7 @@ fn run_tui_agent(
                             );
                             publish_side_source(
                                 side_publisher_for_driver.as_ref(),
-                                &live,
-                                &agent.session_handle(),
+                                &agent,
                                 &driver_workdir,
                             );
                             tracing::info!(
@@ -5349,6 +5348,58 @@ mod tests {
                 .iter()
                 .any(|m| format!("{m:?}").contains("resume 里的问题")),
             "启动来源里必须能读到 resume 的历史: {messages:?}"
+        );
+    }
+
+    /// 一次重发布必须带上父会话**真正发出去**的配置。
+    ///
+    /// 装配时的 `live.config` 只是起点：设置页改过的 system prompt、预算都会在
+    /// agent 的生效缓存里。重发布若读旧 `config`，用户「刚在设置里改了 prompt」
+    /// 之后再开旁支会拿到旧口径——而且不会有任何错误提示。
+    #[tokio::test]
+    async fn republishing_a_parent_uses_its_effective_configuration() {
+        let mut config = yi_agent_core::AgentConfig {
+            model: "parent-model".into(),
+            system_prompt: Some("装配时的旧提示".into()),
+            ..Default::default()
+        };
+        let mut agent = yi_agent_core::Agent::new(
+            Arc::new(SideTestProvider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .push(yi_agent_core::Message::user("父问题"));
+
+        let publisher = Arc::new(
+            yi_agent_runtime::side_conversation::SideSourcePublisher::new(
+                side_source_snapshot_with_session(
+                    &config,
+                    Arc::new(SideTestProvider),
+                    std::path::PathBuf::from("/tmp/proj"),
+                    agent.session_handle(),
+                ),
+            ),
+        );
+
+        // 用户改了父会话的生效 prompt（真实请求之后缓存里才有这个值）。
+        config.system_prompt = Some("用户刚改过的新提示".into());
+        agent.set_system_prompt(Some("用户刚改过的新提示".into()));
+
+        publish_side_source(Some(&publisher), &agent, std::path::Path::new("/tmp/proj"));
+
+        let snapshot = publisher.snapshot().await.expect("父会话有可继承历史");
+        let prompt = snapshot.config.system_prompt.unwrap_or_default();
+        assert!(
+            prompt.contains("用户刚改过的新提示"),
+            "a republish must carry the parent's effective prompt: {prompt}"
+        );
+        assert!(
+            prompt.ends_with(yi_agent_core::SIDE_SYSTEM_POLICY),
+            "the side policy still terminates the prompt: {prompt}"
         );
     }
 

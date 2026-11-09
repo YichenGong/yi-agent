@@ -210,6 +210,18 @@ impl ReplayStore {
         }
     }
 
+    /// Whether `token` exists, belongs to `connection`, and names `side_id`.
+    ///
+    /// Exists so a caller can ask "may I keep paging this side?" **without**
+    /// consuming the token, and without reordering the errors a page can produce:
+    /// a foreign token must still answer `snapshot_expired`, not "the side closed".
+    pub fn owns_token(&self, connection: &str, side_id: &str, token: &str) -> bool {
+        self.tokens
+            .get(token)
+            .map(|entry| entry.connection == connection && entry.side_id == side_id)
+            .unwrap_or(false)
+    }
+
     pub fn token_count(&self) -> usize {
         self.tokens.len()
     }

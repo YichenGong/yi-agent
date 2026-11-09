@@ -15,6 +15,7 @@
 //! Nothing here depends on `yi-agent-app-server`: both hosts consume these
 //! primitives directly, so the dependency never has to be inverted later.
 
+pub mod cleanup;
 pub mod ledger;
 pub mod policy;
 pub mod resources;
@@ -27,6 +28,7 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
+pub use cleanup::{SideCleanupReceipt, SideCleanupState};
 pub use ledger::{AcceptedRequest, SideIdleDeadline, SideRequestLedger};
 pub use policy::{SideToolPolicy, SideToolSetupFactory, build_side_tool_setup};
 pub use resources::{
@@ -38,8 +40,7 @@ pub use runner::{
     SideTokenTotals, SideUsage,
 };
 pub use source::{
-    EffectiveSideSource, SideAttachment, SideAttachmentCatalog, SideSourcePublisher, SideWebPolicy,
-    SourceUpdate,
+    EffectiveSideSource, SideAttachment, SideAttachmentCatalog, SideSourcePublisher, SourceUpdate,
 };
 pub use transcript::{
     SIDE_TOOL_DISPLAY_BYTES, SIDE_TRANSCRIPT_BYTES, SIDE_TRANSCRIPT_CONTROL_RESERVE,
@@ -106,6 +107,15 @@ pub enum SideErrorReason {
     CloseConflict,
     SnapshotExpired,
     SideCreating,
+    /// A host entry ticket is unknown, expired, or already closed.
+    ///
+    /// Also the answer for a ticket issued by a *different* host instance: an
+    /// old ticket must never be mistaken for a usable one.
+    EntryExpired,
+    /// The host holds as many entry tickets as it will track.
+    EntryLimit,
+    /// The ticket exists but does not belong to this host or this parent.
+    EntryMismatch,
     RequestLimit,
     ResourceLimit,
     TurnFailed,
@@ -130,6 +140,9 @@ impl SideErrorReason {
             Self::CloseConflict => "close_conflict",
             Self::SnapshotExpired => "snapshot_expired",
             Self::SideCreating => "side_creating",
+            Self::EntryExpired => "entry_expired",
+            Self::EntryLimit => "entry_limit",
+            Self::EntryMismatch => "entry_mismatch",
             Self::RequestLimit => "request_limit",
             Self::ResourceLimit => "resource_limit",
             Self::TurnFailed => "turn_failed",

@@ -257,7 +257,7 @@ where
             thread_id,
             self.theme,
             self.git_diff,
-            extra_roots,
+            extra_roots.clone(),
             self.lead_inbox,
             self.lead_replies,
             self.lead_control,
@@ -320,6 +320,19 @@ where
         let (subagent_tx, subagent_rx) =
             tokio::sync::watch::channel(crate::protocol::SubagentTotals::default());
 
+        // 发布本会话作为父会话的旁问来源:冷装配出来的会话同样是父会话,用户
+        // 打开它之后随时可能敲 `/side`,那时不能退化成再读一遍磁盘。
+        let side_source = self.live_side_parents.and_then(|parents| {
+            crate::side_conversation::LiveParentSource::install(
+                Arc::clone(parents),
+                thread_id.to_string(),
+                &agent,
+                cwd.clone(),
+                crate::side_conversation::live_roots(&cwd, &extra_roots),
+                Default::default(),
+            )
+        });
+
         self.threads.insert(
             thread_id.to_string(),
             ThreadSession {
@@ -340,6 +353,7 @@ where
                 writer_lock,
                 // 准入许可随 turn 生命周期管理；驱动会话起会话时尚未申请。
                 turn_permit: None,
+                side_source: side_source.clone(),
             },
         );
 
@@ -390,6 +404,7 @@ where
             None,
             sandbox,
             Arc::clone(&process_manager),
+            side_source,
         ));
 
         Ok(())

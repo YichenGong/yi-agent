@@ -29,26 +29,6 @@ fn side_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Roots the test can empty while a handle is already alive.
-#[derive(Default)]
-struct RevocableRoots(std::sync::Mutex<Vec<PathBuf>>);
-
-impl RevocableRoots {
-    fn new(paths: Vec<PathBuf>) -> Arc<Self> {
-        Arc::new(Self(std::sync::Mutex::new(paths)))
-    }
-
-    fn revoke(&self) {
-        self.0.lock().unwrap().clear();
-    }
-}
-
-impl yi_agent_tools::SideRoots for RevocableRoots {
-    fn current_roots(&self) -> Vec<PathBuf> {
-        self.0.lock().unwrap().clone()
-    }
-}
-
 /// A feasible fixture: a private source root and a file the catalog names.
 struct Fixture {
     /// Kept alive so the instance home outlives the host that uses it.
@@ -221,65 +201,11 @@ fn side_startup_reclaims_only_unlocked_hosts() {
     drop(host);
 }
 
-#[test]
-fn side_resource_limits_are_enforced_before_unbounded_work() {
-    let fixture = Fixture::new();
-    let source = fixture.source_with_attachment("huge.bin", &vec![0u8; 1024]);
-    // Shrink the allowance by pretending the history already holds most of it.
-    let dir = tempfile::tempdir().unwrap();
-    let plan = plan_copies(&source).unwrap();
-    assert_eq!(
-        plan.len(),
-        1,
-        "the manifest marker is present, so it copies"
-    );
-
-    let copy_source = CopySource {
-        provider_primary: source.primary.clone(),
-        created_roots: source.roots.clone(),
-        current_roots: Arc::clone(&source.current_roots),
-        inline_bytes: SIDE_BINARY_BUDGET_BYTES,
-    };
-    let error = copy_attachments(&copy_source, &plan, dir.path()).unwrap_err();
-    assert_eq!(
-        error.kind(),
-        std::io::ErrorKind::InvalidData,
-        "a spent budget must be refused up front: {error}"
-    );
-    assert!(
-        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
-        "nothing may be written once the budget is exhausted"
-    );
-
-    // An empty attachment must be refused too: a zero-byte copy would otherwise
-    // look like a successful copy under a spent budget.
-    let empty = fixture.source_with_attachment("empty.txt", b"");
-    let empty_plan = plan_copies(&empty).unwrap();
-    assert_eq!(empty_plan.len(), 1);
-    let spent = CopySource {
-        provider_primary: empty.primary.clone(),
-        created_roots: empty.roots.clone(),
-        current_roots: Arc::clone(&empty.current_roots),
-        inline_bytes: SIDE_BINARY_BUDGET_BYTES,
-    };
-    let error = copy_attachments(&spent, &empty_plan, dir.path()).unwrap_err();
-    assert_eq!(
-        error.kind(),
-        std::io::ErrorKind::InvalidData,
-        "a spent budget must refuse even an empty attachment: {error}"
-    );
-    assert_eq!(
-        std::fs::read_dir(dir.path()).unwrap().count(),
-        0,
-        "no copy may exist for a refused attachment"
-    );
-}
-
 #[tokio::test]
-async fn side_inherits_inline_images_and_copies_catalog_files() {
+async fn side_prepare_creates_no_directory_and_copies_no_attachment() {
     let fixture = Fixture::new();
     let source = fixture.source_with_attachment("报告.txt", b"report body");
-    // An inline image whose original path is gone still counts as binary.
+    // An inline image is the only binary the side inherits.
     source
         .session
         .lock()
@@ -296,149 +222,131 @@ async fn side_inherits_inline_images_and_copies_catalog_files() {
         ]));
 
     let lease = fixture.host.reserve_slot(&side_id()).unwrap();
+    let dir = lease.dir().to_path_buf();
     let prepared = fixture
         .host
         .prepare(Arc::clone(&lease), &source, CancellationToken::new())
         .await
         .unwrap();
 
-    assert_eq!(
-        prepared.binary_bytes,
-        "report body".len(),
-        "only the copied file counts as copied bytes"
-    );
-    // The copy exists in the side's private directory.
-    let copied: Vec<_> = std::fs::read_dir(prepared.lease.dir())
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(copied.len(), 1, "{copied:?}");
-    assert!(copied[0].ends_with("报告.txt"), "{copied:?}");
-
-    // The alias resolves to the copy, and reads work through the side handle.
-    let file = prepared
-        .access
-        .open_regular(&source.attachments.0[0].original)
-        .unwrap();
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    let mut file = file;
-    file.read_to_end(&mut bytes).unwrap();
-    assert_eq!(bytes, b"report body");
-
-    // The private directory must never become a general root.
     assert!(
-        !source.roots.iter().any(|root| root == prepared.lease.dir()),
-        "the side's private directory must not be added to the parent's roots"
+        prepared.binary_bytes > 0 && prepared.binary_bytes < SIDE_BINARY_BUDGET_BYTES,
+        "only the inherited inline media counts: {}",
+        prepared.binary_bytes
+    );
+    assert!(
+        !dir.exists(),
+        "preparing a side must not create a private directory"
+    );
+    assert!(
+        !source.roots.iter().any(|root| root == &dir),
+        "no private directory may become a root"
     );
 }
 
 #[tokio::test]
-async fn side_attachment_copy_is_revoked_with_its_original() {
+async fn side_prepare_refuses_a_snapshot_whose_inline_media_exceeds_the_budget() {
     let fixture = Fixture::new();
-    let roots = RevocableRoots::new(vec![fixture.workspace.path().to_path_buf()]);
-    let mut source = fixture.source_with_attachment("doc.txt", b"secret body");
-    source.current_roots = roots.clone();
-
-    let lease = fixture.host.reserve_slot(&side_id()).unwrap();
-    let prepared = fixture
-        .host
-        .prepare(Arc::clone(&lease), &source, CancellationToken::new())
-        .await
-        .unwrap();
-    let original = source.attachments.0[0].original.clone();
-
-    // While the original is authorised, the alias serves its copy.
-    assert!(prepared.access.open_regular(&original).is_ok());
-    assert!(prepared.access.open_regular(prepared.lease.dir()).is_err());
-
-    // Prove the read really went through the copy, not the parent's file: after
-    // the original is replaced, the alias must still return the copied bytes.
-    let copied_file = std::fs::read_dir(prepared.lease.dir())
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.path())
-        .next()
-        .expect("a private copy exists");
-    assert_eq!(std::fs::read(&copied_file).unwrap(), b"secret body");
-
-    // Revoke the parent's root. The *same* handle must stop serving the alias:
-    // otherwise the copy would be a way around revocation.
-    roots.revoke();
-    let error = prepared.access.open_regular(&original).unwrap_err();
-    assert_eq!(
-        error.kind(),
-        std::io::ErrorKind::PermissionDenied,
-        "{error}"
-    );
-
-    // Restoring the root restores the alias, proving the decision is live rather
-    // than a one-way latch.
-    *roots.0.lock().unwrap() = vec![fixture.workspace.path().to_path_buf()];
-    assert!(prepared.access.open_regular(&original).is_ok());
-}
-
-#[tokio::test]
-async fn side_attachment_is_skipped_when_its_marker_left_the_safe_history() {
-    let fixture = Fixture::new();
-    let source = fixture.source_with_attachment("gone.txt", b"x");
-    // Drop the manifest line: the model can no longer see the reference.
+    let source = source_with_history("q", "a");
+    // Pretend the history already carries more than the allowance: no IO runs, so
+    // the refusal is about the accounting, not about reading a huge file.
+    let block = yi_agent_core::ContentBlock::Image {
+        source: yi_agent_core::ImageSource::Base64 {
+            media_type: "image/png".into(),
+            // Base64 decodes to ~3/4 of its length, so 90 MB of padding is
+            // ~67.5 MiB decoded, just past the 64 MiB allowance.
+            data: "A".repeat(90_000_000),
+        },
+        detail: yi_agent_core::ImageDetail::High,
+        path: None,
+    };
     source
         .session
         .lock()
         .unwrap()
-        .replace_messages(vec![yi_agent_core::Message::user("no attachments here")]);
-    let plan = plan_copies(&source).unwrap();
-    assert!(
-        plan.is_empty(),
-        "an attachment whose manifest line was trimmed must not be copied"
-    );
-
+        .push(yi_agent_core::Message::assistant(vec![block]));
     let lease = fixture.host.reserve_slot(&side_id()).unwrap();
-    let prepared = fixture
+    let error = fixture
         .host
         .prepare(lease, &source, CancellationToken::new())
         .await
-        .unwrap();
-    assert_eq!(prepared.binary_bytes, 0);
+        .unwrap_err();
+    assert_eq!(error.reason, SideErrorReason::ResourceLimit);
 }
 
 #[tokio::test]
-async fn side_attachment_cannot_escape_the_parent_root() {
+async fn side_prepare_refuses_after_cancel_before_touching_anything() {
     let fixture = Fixture::new();
-    // The catalog names a file outside every authorised root.
-    let outside = tempfile::tempdir().unwrap();
-    let secret = outside.path().join("secret.txt");
-    std::fs::write(&secret, b"outside").unwrap();
-    let marker = format!("{}0-secret.txt", MANIFEST_PATH_PREFIX);
-    let mut source = source_with_history(&format!("- {marker}\n"), "a");
-    source.primary = fixture.workspace.path().to_path_buf();
-    source.roots = vec![fixture.workspace.path().to_path_buf()];
-    source.current_roots = Arc::new(StaticRoots(vec![fixture.workspace.path().to_path_buf()]));
-    source.attachments = SideAttachmentCatalog(vec![SideAttachment {
-        original: secret.clone(),
-        manifest_marker: marker,
-    }]);
+    let source = fixture.source_with_attachment("report.txt", b"body");
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let lease = fixture.host.reserve_slot(&side_id()).unwrap();
+    let dir = lease.dir().to_path_buf();
+    let error = fixture
+        .host
+        .prepare(lease, &source, cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(error.reason, SideErrorReason::ResourceLimit);
+    assert!(!dir.exists());
+}
 
-    let dir = tempfile::tempdir().unwrap();
-    let plan = plan_copies(&source).unwrap();
-    assert_eq!(plan.len(), 1);
-    let copy_source = CopySource {
-        provider_primary: source.primary.clone(),
-        created_roots: source.roots.clone(),
-        current_roots: Arc::clone(&source.current_roots),
-        inline_bytes: 0,
+/// The failure this guards: a delete that fails must not free the slot, or the
+/// quota reports capacity over a directory that still exists.
+#[tokio::test]
+async fn side_cleanup_failure_keeps_the_slot_and_a_retry_can_finish_it() {
+    let instance = tempfile::tempdir().unwrap();
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let remove = {
+        let fail = Arc::clone(&fail);
+        Arc::new(move |_: &std::path::Path| {
+            if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(std::io::Error::other("injected"))
+            } else {
+                Ok(())
+            }
+        })
     };
-    let error = copy_attachments(&copy_source, &plan, dir.path()).unwrap_err();
-    assert!(
-        matches!(
-            error.kind(),
-            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-        ),
-        "an out-of-root attachment must be refused by the access handle: {error}"
-    );
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    let host = SideHostResources::new_with_cleanup(
+        instance.path().to_path_buf(),
+        Arc::new(SideBlockingPool::new(8, 2, 8, 2)),
+        remove,
+    )
+    .unwrap();
+
+    let id = side_id();
+    let lease = host.reserve_slot(&id).unwrap();
+    let mut receipt = host.cleanup_receipt(&id).unwrap();
+    assert_eq!(receipt.state(), SideCleanupState::Pending);
+
+    drop(lease);
+    let error = receipt.wait(Duration::from_secs(5)).await.unwrap_err();
+    assert_eq!(error.message, "cleanup_failed");
+    assert_eq!(host.slots_in_use(), 1, "a failed delete must keep its slot");
+    assert_eq!(host.failed_cleanups(), 1);
+
+    // The retry only becomes legal once no owner is left, which it now is.
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut retried = host.retry_cleanup(&id).unwrap();
+    retried.wait(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(host.slots_in_use(), 0);
+    assert_eq!(host.completed_cleanups(), 1);
+}
+
+#[tokio::test]
+async fn side_cleanup_receipt_stays_pending_while_another_owner_holds_the_lease() {
+    let fixture = Fixture::new();
+    let id = side_id();
+    let lease = fixture.host.reserve_slot(&id).unwrap();
+    let worker = Arc::clone(&lease);
+    let mut receipt = fixture.host.cleanup_receipt(&id).unwrap();
+    drop(lease);
+    assert_eq!(receipt.state(), SideCleanupState::Pending);
+    let error = receipt.wait(Duration::from_millis(10)).await.unwrap_err();
+    assert_eq!(error.message, "cleanup_timeout");
+    drop(worker);
+    receipt.wait(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(fixture.host.slots_in_use(), 0);
 }
 
 #[test]

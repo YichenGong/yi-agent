@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 
 import { createHandshakeRecovery } from "./useHandshakeRecovery";
+import { SideExitCoordinator } from "../lib/sideExit";
 import { ClientRegistry } from "../lib/clientRegistry";
 import { LOCAL_SLOT } from "../lib/slots";
 import type { RpcClient } from "../lib/rpc";
@@ -44,6 +45,7 @@ function harness(options: { failInitialize?: boolean; initializeDeferred?: boole
   } as unknown as RpcClient;
 
   const handshake = createHandshakeRecovery({
+    sideExits: new SideExitCoordinator(() => {}),
     activeSlotRef: { current: LOCAL_SLOT },
     clientRef: { current: client },
     registryRef: { current: new ClientRegistry<RpcClient>() },

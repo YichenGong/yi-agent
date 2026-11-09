@@ -1169,6 +1169,7 @@ async fn trace_unwatch_rpc_preserves_children_watch() {
                 is_remote: false,
                 shell_authorization: None,
                 client_scope: Scope::Admin,
+                live_side_parents: None,
                 cfg: &cfg,
                 theme_handle: &theme,
                 models_path: &models_path,

@@ -195,6 +195,7 @@ fn background_parent_events_do_not_change_side_history_or_running() {
     let before = (side.items.len(), side.running);
 
     let main_event = ConversationEvent {
+        entry_id: None,
         target: ConversationTarget::Main,
         turn_id: None,
         event: ConversationPayload::Main,

@@ -608,6 +608,12 @@ pub(crate) struct Harness {
     /// no test reads it today, hence the allow.
     #[allow(dead_code)]
     pub(crate) bringup: Arc<yi_agent_subagent::binding::BringUpChoice>,
+    /// 本进程正在驱动的父会话表，与宿主共享同一实例。
+    ///
+    /// 同一手法（`view_frames` / `managed`）：服务端发布，测试观察。自造一份
+    /// 会让「`thread/start` 之后旁问能立刻读到活跃父」这条断言在空表上永远
+    /// 失败得莫名其妙。
+    pub(crate) live_side_parents: Arc<crate::side_conversation::LiveSideParents>,
 }
 
 pub(crate) type WatchmanCalls = Arc<StdMutex<Vec<(bool, PathBuf)>>>;
@@ -728,6 +734,7 @@ impl Harness {
             // 静态装配：只有 `with_live_settings` 注入共享实例。
             None,
             Arc::new(|| true),
+            None,
         )
     }
 
@@ -768,6 +775,7 @@ impl Harness {
             // 静态装配：只有 `with_live_settings` 注入共享实例。
             None,
             Arc::new(|| true),
+            None,
         )
     }
 
@@ -820,6 +828,7 @@ impl Harness {
             // 静态装配：只有 `with_live_settings` 注入共享实例。
             None,
             Arc::new(move || enabled),
+            None,
         )
     }
 
@@ -862,6 +871,66 @@ impl Harness {
             // 静态装配：只有 `with_live_settings` 注入共享实例。
             None,
             Arc::new(move || side_enabled),
+            None,
+        )
+    }
+
+    /// 垂直集成专用:注入共享活父表、旁支注册表与自定义 agent 工厂。
+    ///
+    /// 与 [`Harness::with_scope_side_flag_and_registry`] 的差别只有两点,都是
+    /// 「真实链路」要求的:
+    ///
+    /// 1. `live_side_parents` 由调用方持有并注入宿主,于是旁支 resolver 查到的
+    ///    就是**宿主自己**在每轮收尾后重发布的那份快照。自造第二份只能证明替身
+    ///    会返回答案,证明不了「父未落盘的进度能被旁支看到」。
+    /// 2. `build` 可换成记录 provider 的工厂,用来断言父与旁支各自收到的
+    ///    `ProviderRequest`(工具集为空、历史逐字节不变)。
+    pub(crate) async fn with_live_side_registry<F>(
+        scope: Scope,
+        registry: Arc<crate::side_conversation::SideRegistry>,
+        live_side_parents: Arc<crate::side_conversation::LiveSideParents>,
+        build: F,
+    ) -> Self
+    where
+        F: Fn(
+                Option<yi_agent_core::Session>,
+                &std::path::Path,
+                crate::thread_store::ThreadMode,
+            ) -> anyhow::Result<BuiltAgent>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman_in(
+            test_config(),
+            build,
+            PERMISSION_TIMEOUT,
+            scope,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            Some(registry),
+            None,
+            None,
+            None,
+            Arc::new(|| true),
+            Some(live_side_parents),
         )
     }
 
@@ -979,6 +1048,7 @@ impl Harness {
             Some(binding),
             // 旁支默认开：这条构造器只关心运行期设置，不该顺带改变旁支行为。
             Arc::new(|| true),
+            None,
         )
     }
 
@@ -1095,6 +1165,8 @@ impl Harness {
             // 默认静态装配；只有 `with_live_settings` 才注入共享实例。
             None,
             side_gate,
+            // 默认自建活父表；只有垂直集成才注入宿主那一份。
+            None,
         )
     }
 
@@ -1143,6 +1215,7 @@ impl Harness {
             }),
             None,
             Arc::new(|| true),
+            None,
         )
     }
 
@@ -1167,6 +1240,9 @@ impl Harness {
         management: Option<Arc<crate::server::local_management::ManagementHandle>>,
         live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
         side_gate: crate::side_gate::SideGate,
+        // 活跃父来源表:注入优先。垂直集成必须让 side 的 resolver 查**宿主自己**
+        // 发布的那一份;自造第二份,测到的只是替身。
+        live_side_parents: Option<Arc<crate::side_conversation::LiveSideParents>>,
     ) -> Self
     where
         F: Fn(
@@ -1193,6 +1269,7 @@ impl Harness {
             Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
             live_settings,
             side_gate,
+            live_side_parents,
         )
     }
 
@@ -1213,6 +1290,9 @@ impl Harness {
         bringup: Arc<yi_agent_subagent::binding::BringUpChoice>,
         live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
         side_gate: crate::side_gate::SideGate,
+        // 活跃父来源表:注入优先。垂直集成必须让 side 的 resolver 查**宿主自己**
+        // 发布的那一份;自造第二份,测到的只是替身。
+        live_side_parents: Option<Arc<crate::side_conversation::LiveSideParents>>,
     ) -> Self
     where
         F: Fn(
@@ -1312,6 +1392,9 @@ impl Harness {
         // 与 `view_frames` 同一手法:服务端写入、测试观察。自造一份会让
         // 「握手装上了本会话的身份」这条断言在空槽位上永远成立。
         let managed: crate::server::ManagedSlot = Arc::new(StdMutex::new(None));
+        // 与 `view_frames` / `managed` 同一手法：宿主写入、测试观察。
+        let live_side_parents = live_side_parents
+            .unwrap_or_else(|| Arc::new(crate::side_conversation::LiveSideParents::new()));
         let handle = tokio::spawn(serve_scoped(
             server_r,
             server_w,
@@ -1345,6 +1428,7 @@ impl Harness {
                     .clone()
                     .unwrap_or_else(|| skills_home.path().to_path_buf()),
                 remote_dir: index_dir.path().to_path_buf(),
+                live_side_parents: Some(Arc::clone(&live_side_parents)),
                 side_registry,
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -1397,6 +1481,7 @@ impl Harness {
             plugins_dir,
             daemon_calls,
             bringup,
+            live_side_parents,
         }
     }
 
@@ -2277,6 +2362,7 @@ fn tick_test_session(project: &Path, thread_id: &str, status: ThreadStatus) -> T
         model: "test".to_string(),
         active_turn_id: None,
         turn_permit: None,
+        side_source: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         prompt_tx,
@@ -3052,6 +3138,7 @@ impl MergedHarness {
                 remote_dir: PathBuf::new(),
                 // 与手工装配的 serve_stdio 用例同一个约束:空 remote_dir +
                 // `None` 会让 serve() 把旁支宿主目录建到当前工作目录。
+                live_side_parents: None,
                 side_registry: Some(test_side_registry(index_dir.path(), None)),
                 // 第二套 harness（`serve_scoped_with_loopback`）也要能跑 side
                 // 测试：默认开，关掉的用例自行构造。
@@ -3376,6 +3463,66 @@ impl crate::side_conversation::SideParentResolver for StubSideResolver {
     }
 }
 
+/// 只认本进程活父表的解析器:垂直集成用。
+///
+/// 生产路径是 [`crate::side_conversation::WorkspaceResolver`]:先查活父表,查不到
+/// 再冷读磁盘。这里去掉冷读,理由是测试里那些父会话只存在于内存(host 的
+/// `thread/start` 建的是临时目录里的 thread,断言的是「未落盘的进度也能进快照」),
+/// 冷读会把用例变成「磁盘上恰好有什么」而不是「旁支拿到了什么」。
+///
+/// 活父表**必须**是宿主注入的那一份:自造一份就只是又一个替身,
+/// 「父每轮收尾后重发布」这条链路根本没被覆盖。
+pub(crate) struct LiveParentResolver {
+    pub(crate) live: Arc<crate::side_conversation::LiveSideParents>,
+}
+
+impl crate::side_conversation::SideParentResolver for LiveParentResolver {
+    fn resolve<'a>(
+        &'a self,
+        parent: &'a str,
+    ) -> futures::future::BoxFuture<
+        'a,
+        yi_agent_runtime::side_conversation::SideResult<
+            yi_agent_runtime::side_conversation::EffectiveSideSource,
+        >,
+    > {
+        Box::pin(async move {
+            let publisher = self.live.get(parent).ok_or_else(|| {
+                yi_agent_runtime::side_conversation::SideError::new(
+                    yi_agent_runtime::side_conversation::SideErrorReason::ParentNotStarted,
+                    format!("父会话 {parent} 不在本进程驱动中"),
+                )
+            })?;
+            publisher.snapshot().await
+        })
+    }
+}
+
+/// 与 [`test_side_registry`] 相同,但解析走本进程的活父表。
+///
+/// 同时把 `SideHostResources` 交出去:验收要断言「退出之后资源槽归零」,
+/// 而槽表在 registry 里是私有字段,从别的模块看不到。测试自己持有同一个
+/// `Arc` 就能直接读 `slots_in_use()`,不必为断言在生产类型上加口子。
+pub(crate) fn live_parent_side_registry(
+    home: &Path,
+    live: Arc<crate::side_conversation::LiveSideParents>,
+) -> (
+    Arc<crate::side_conversation::SideRegistry>,
+    Arc<yi_agent_runtime::side_conversation::SideHostResources>,
+) {
+    let pool = Arc::new(yi_agent_tools::SideBlockingPool::new(2, 1, 8, 4));
+    let resources = yi_agent_runtime::side_conversation::SideHostResources::new(
+        home.to_path_buf(),
+        Arc::clone(&pool),
+    )
+    .expect("test side host resources");
+    let registry = Arc::new(crate::side_conversation::SideRegistry::new(
+        Arc::new(LiveParentResolver { live }),
+        Arc::clone(&resources),
+    ));
+    (registry, resources)
+}
+
 /// 测试用旁支注册表:宿主资源落在 `home` 下,调用方负责保活那个临时目录。
 ///
 /// 手工装配 `RuntimeAttachments` 的用例必须用它,而**不能**留
@@ -3394,7 +3541,6 @@ pub(crate) fn test_side_registry(
     Arc::new(crate::side_conversation::SideRegistry::new(
         Arc::new(StubSideResolver { gate }),
         resources,
-        pool,
     ))
 }
 

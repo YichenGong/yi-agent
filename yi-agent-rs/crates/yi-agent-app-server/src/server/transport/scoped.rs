@@ -109,6 +109,7 @@ where
             // 实例状态根：插件生命周期/授权表/安装登记都在它下面。
             instance_home: instance_home_dir(),
             remote_dir: instance_home_dir(),
+            live_side_parents: None,
             side_registry: None,
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -231,6 +232,7 @@ where
             // 实例状态根：插件生命周期/授权表/安装登记都在它下面。
             instance_home: instance_home_dir(),
             remote_dir: instance_home_dir(),
+            live_side_parents: None,
             side_registry: None,
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),

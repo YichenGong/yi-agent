@@ -284,6 +284,7 @@ impl Host {
             theme: &self.theme,
             git_diff: &self.git_diff,
             workspaces: &self.workspaces,
+            live_side_parents: None,
             build_agent,
             #[cfg(test)]
             before_prompt_send: None,
@@ -381,6 +382,7 @@ impl Host {
             &self.lead_control_replies,
             self.lead_agent_enabled,
             &self.instance_home,
+            None,
         )
         .await;
     }

@@ -19,13 +19,11 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use yi_agent_core::{Agent, Session};
-use yi_agent_runtime::bootstrap::{
-    build_agent_config, build_provider, resolve_side_config, resolve_side_prompt,
-};
+use yi_agent_runtime::bootstrap::{build_agent_config, build_provider, resolve_side_config};
 use yi_agent_runtime::config::RuntimeConfig;
 use yi_agent_runtime::side_conversation::{
     EffectiveSideSource, SideAttachment, SideAttachmentCatalog, SideError, SideErrorReason,
-    SideResult, SideWebPolicy,
+    SideResult,
 };
 
 use crate::thread_store::ThreadStore;
@@ -68,20 +66,36 @@ impl SideResolverFactory {
 pub struct WorkspaceResolver {
     workspaces: Arc<crate::workspace_index::WorkspaceIndex>,
     base: RuntimeConfig,
+    /// Parents this process drives. Consulted first, so a side inherits the
+    /// **running** history and provider rather than the last file flush.
+    live: Arc<super::live_parents::LiveSideParents>,
 }
 
 impl WorkspaceResolver {
     pub fn new(
         workspaces: Arc<crate::workspace_index::WorkspaceIndex>,
         base: RuntimeConfig,
+        live: Arc<super::live_parents::LiveSideParents>,
     ) -> Self {
-        Self { workspaces, base }
+        Self {
+            workspaces,
+            base,
+            live,
+        }
     }
 }
 
 impl SideParentResolver for WorkspaceResolver {
     fn resolve<'a>(&'a self, parent: &'a str) -> BoxFuture<'a, SideResult<EffectiveSideSource>> {
         Box::pin(async move {
+            // A live parent is authoritative. Falling back to the cold path here
+            // would hand the side a stale transcript (and a rebuilt provider) while
+            // the real parent keeps running, which is the failure this branch
+            // exists to prevent. If the live source is unusable, its error is the
+            // honest answer: do not silently read the disk instead.
+            if let Some(publisher) = self.live.get(parent) {
+                return publisher.snapshot().await;
+            }
             let store = crate::server::store_for(&self.workspaces, &self.base, parent);
             ThreadStoreResolver::new(
                 store,
@@ -147,16 +161,15 @@ pub fn assemble_cold_source(
         )
     })?;
 
-    let system_prompt = resolve_side_prompt(&config).map_err(|error| {
-        SideError::new(
-            SideErrorReason::ParentNotStarted,
-            format!("无法解析父会话系统提示：{error}"),
-        )
-    })?;
-
-    // Same mapping the ordinary assembly uses, so a side inherits the parent's
-    // compaction/turn budgets instead of core defaults.
-    let side_config = build_agent_config(&config, system_prompt);
+    // A cold parent has no rendered prompt to reuse, and re-rendering one here
+    // would rescan project rules and skills — an external read the side must not
+    // perform, and a source of drift between "what a side sees" and "what the
+    // parent saw". Use only the user-configured prompt, then append the fixed side
+    // policy: that is the whole of what a cold side may inherit.
+    let side_config = yi_agent_core::side_agent_config(&build_agent_config(
+        &config,
+        config.system_prompt.clone(),
+    ));
 
     let primary = config.workdir.clone();
     let mut roots = vec![primary.clone()];
@@ -184,10 +197,10 @@ pub fn assemble_cold_source(
         revision: 1,
         generation: 1,
         provider_gate: None,
-        web_policy: SideWebPolicy::default(),
-        // Filled in by the caller that holds the parent agent's live source; a
-        // side created from persisted state alone has none.
-        live: None,
+        // A cold parent has no running agent, so there is no published cache to
+        // freeze. The assembled `for_side` config below is already the exact
+        // prompt a side should inherit; nothing may rescan project rules later.
+        effective_config: None,
     })
 }
 
@@ -302,20 +315,24 @@ pub fn read_cold_parent(
 
 /// 从运行中的 agent 抽一份来源（活跃父路径）。
 ///
-/// 关键点：`session` 用的是 agent 的**同一份 `Arc`**，`provider` 也是同一个对象。
-/// 这样旁支继承的正是父此刻使用的历史，而不是「上次落盘的版本」；凭据也只读一次。
+/// Everything comes from [`Agent::snapshot_bindings`]: the **same** session `Arc`
+/// the parent is writing to, the **same** provider object, the parent's
+/// admission gate, and the cache of the configuration the provider actually
+/// received. Nothing is rebuilt from `RuntimeConfig` here — rebuilding would
+/// produce a second provider with its own credentials and would silently rescan
+/// project rules, which is exactly what a frozen snapshot must not do.
 pub fn source_from_live_agent(
     agent: &Agent,
-    config: RuntimeConfig,
     primary: impl Into<PathBuf>,
     roots: Vec<PathBuf>,
     attachments: SideAttachmentCatalog,
 ) -> SideResult<EffectiveSideSource> {
-    let session = agent.session_handle();
-    // 在锁外测量：`measure_side_history` 会逐个消息序列化，持锁期间算它会让父的
-    // 下一轮迟迟拿不到锁。
+    let bindings = agent.snapshot_bindings();
+    // Measure outside the lock: `measure_side_history` serialises every message, and
+    // holding the parent's session lock for that would stall its next turn.
     {
-        let guard = session
+        let guard = bindings
+            .session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         yi_agent_core::measure_side_history(
@@ -328,43 +345,34 @@ pub fn source_from_live_agent(
                 format!("父会话历史超出旁支预算：{error}"),
             )
         })?;
-        if yi_agent_core::forkable_messages(&guard).is_empty() {
-            return Err(SideError::new(
-                SideErrorReason::ParentNotStarted,
-                "父会话还没有可继承的安全历史",
-            ));
-        }
     }
+    // Note: an *empty* history is published, not rejected. A live parent is
+    // authoritative even when it has nothing yet: falling through to the cold
+    // path would read the file copy instead, which can be older than what the
+    // running conversation already holds. `SideSourcePublisher::snapshot` is
+    // what reports `parent_not_started`, so the error a side sees is the same
+    // either way — it just cannot be a stale success.
 
-    let system_prompt = resolve_side_prompt(&config).map_err(|error| {
-        SideError::new(
-            SideErrorReason::ParentNotStarted,
-            format!("无法解析父会话系统提示：{error}"),
-        )
-    })?;
-
-    let side_config = build_agent_config(&config, system_prompt);
+    // `config` here is a starting value only: `snapshot()` replaces it with the
+    // cached effective config before handing the source to a runner.
+    let config = bindings
+        .effective_config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
 
     Ok(EffectiveSideSource {
-        session,
-        provider: yi_agent_runtime::bootstrap::build_provider(&config).map_err(|error| {
-            SideError::new(
-                SideErrorReason::ParentNotStarted,
-                format!("无法按父会话配置构建 provider：{error}"),
-            )
-        })?,
-        config: side_config,
+        session: bindings.session,
+        provider: bindings.provider,
+        config,
         primary: primary.into(),
         roots: roots.clone(),
         current_roots: Arc::new(yi_agent_tools::StaticSideRoots::new(roots)),
         attachments,
         revision: 1,
         generation: 1,
-        provider_gate: None,
-        web_policy: SideWebPolicy::default(),
-        // Filled in by the caller that holds the parent agent's live source; a
-        // side created from persisted state alone has none.
-        live: None,
+        provider_gate: bindings.provider_gate,
+        effective_config: Some(bindings.effective_config),
     })
 }
 

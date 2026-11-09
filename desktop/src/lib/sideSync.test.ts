@@ -846,6 +846,108 @@ describe("sideHostKey stability", () => {
   });
 });
 
+describe("invalidateGeneration", () => {
+  it("stops a late page from writing into a discarded generation", async () => {
+    // 让 readItems 挂着：分页在途中，用户按了返回。
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const store = new SideConversationStore();
+    const request = vi.fn(async (method: string) => {
+      if (method === "side/list") {
+        return listResult([{ side_id: SIDE, generation: 1, last_seq: 0 }]);
+      }
+      if (method === "side/readItems") {
+        await gate;
+        return page({ items: [agentItem("late", "m1")], snapshot_seq: 0 });
+      }
+      return {};
+    });
+    const client = { request } as unknown as RpcClient;
+    const binding = parseSideHandshake(
+      SLOT,
+      client,
+      {
+        capabilities: { side_conversation_v1: true, side_snapshot_lifecycle_v1: true },
+        sideHostInstanceId: "h1",
+      },
+      "control",
+    )!;
+    store.bind(binding);
+    const controller = new SideSyncController({
+      binding,
+      store,
+      subscribeParent: async () => {},
+      clock: () => Date.now(),
+    });
+
+    const reconciling = controller.reconcile(PARENT);
+    await flush();
+    // 退出：让这一代立刻失效，再删视图。
+    controller.invalidateGeneration(SIDE, 1);
+    store.dropGeneration(binding.key, SIDE, 1);
+    release();
+    await reconciling;
+    // 迟到的基线不得把正文写回一个已经丢弃的代次。
+    expect(store.read(binding.key, SIDE)).toBeUndefined();
+  });
+
+  it("leaves a newer generation untouched", async () => {
+    const store = new SideConversationStore();
+    const binding = parseSideHandshake(
+      SLOT,
+      { request: vi.fn(async () => ({})) } as unknown as RpcClient,
+      {
+        capabilities: { side_conversation_v1: true, side_snapshot_lifecycle_v1: true },
+        sideHostInstanceId: "h1",
+      },
+      "control",
+    )!;
+    store.bind(binding);
+    store.apply(binding.key, changed(1));
+    store.adopt(binding.key, SIDE, PARENT, 1);
+    store.dropGeneration(binding.key, SIDE, 1);
+    // 重开成新的一代。
+    store.apply(binding.key, { ...changed(1), params: { ...changed(1).params, generation: 2 } } as SideNotification);
+    const controller = new SideSyncController({
+      binding,
+      store,
+      subscribeParent: async () => {},
+      clock: () => Date.now(),
+    });
+    // 旧代的失效请求不该带走新代。
+    controller.invalidateGeneration(SIDE, 1);
+    expect(store.read(binding.key, SIDE)).toBeDefined();
+    expect(store.read(binding.key, SIDE)!.generation).toBe(2);
+  });
+
+  it("does not dispose the caller's client", () => {
+    // 连接是共享的：invalidate 只停自己那一代的工作。
+    const dispose = vi.fn();
+    const client = { request: vi.fn(async () => ({})), dispose } as unknown as RpcClient;
+    const store = new SideConversationStore();
+    const binding = parseSideHandshake(
+      SLOT,
+      client,
+      {
+        capabilities: { side_conversation_v1: true, side_snapshot_lifecycle_v1: true },
+        sideHostInstanceId: "h1",
+      },
+      "control",
+    )!;
+    store.bind(binding);
+    const controller = new SideSyncController({
+      binding,
+      store,
+      subscribeParent: async () => {},
+      clock: () => Date.now(),
+    });
+    controller.invalidateGeneration(SIDE, 1);
+    expect(dispose).not.toHaveBeenCalled();
+  });
+});
+
 describe("wire ids", () => {
   it("keeps side ids as UUIDs in fixtures", () => {
     // 服务端只接受合法 UUID；测试里用合法形状，wire 断言才有意义。

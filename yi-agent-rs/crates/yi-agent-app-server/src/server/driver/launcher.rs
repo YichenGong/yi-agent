@@ -121,6 +121,8 @@ pub(crate) struct ServeLauncher<'a, F> {
     pub(crate) theme: &'a crate::theme_tool::ThemeHandle,
     pub(crate) git_diff: &'a crate::git_diff_tool::GitDiffHandle,
     pub(crate) workspaces: &'a WorkspaceIndex,
+    /// 本进程正在驱动的父会话表（旁问来源）。`None` = 宿主无旁问能力。
+    pub(crate) live_side_parents: Option<&'a Arc<crate::side_conversation::LiveSideParents>>,
     pub(crate) build_agent: &'a F,
     /// 组长信箱:普通会话经 `ask_lead` 投递的消息从这里被消费。与主循环共享
     /// 同一个实例(见 `serve` 的注入),自造一份会投进没人听的通道。
@@ -375,6 +377,7 @@ where
             plugin_plan.map(|plan| plan.binding).into_iter().collect(),
             // 进程级运行期设置绑定:被驱动会话所在项目的内嵌 daemon 也跟随保存。
             self.live_settings,
+            self.live_side_parents,
         )
         .await?;
 
@@ -775,6 +778,7 @@ where
             // 组长会话不绑插件。
             Vec::new(),
             self.live_settings,
+            self.live_side_parents,
         )
         .await?;
 

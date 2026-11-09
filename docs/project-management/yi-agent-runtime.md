@@ -1,5 +1,9 @@
 # yi-agent-runtime（共享运行时）
 
+## 一次性对话快照旁问（自动检查通过，真实设备验收未执行）
+
+- [ ] 无工具快照问答与退出资源释放 — [plan](../superpowers/plans/2026-11-09-side-snapshot-lifecycle-impl.md) · [复核](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md) · [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §5、§6、§9。自动部分已完成：`crates/yi-agent-runtime/src/side_conversation/policy.rs::build_side_tool_setup` 返回空注册表；`source.rs::SideSourcePublisher::snapshot_with` 复制 `forkable_messages` 并换新 `Arc<Mutex<Session>>`；`runner.rs::SideConversationRunner::new` 只 fork 一次并追加一次边界。判据：`cargo test -p yi-agent-app-server --all-features --lib server::tests::side::` 16 passed（含真实 stdio 垂直链：旁支请求 `tools == []`、父未落盘进度可见、同代不跟随新进展、父历史逐字节不变、退出后资源槽与 `live_cleanups` 归零）；变异证明见 [验收记录](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-acceptance.md) §3（给旁支重新注册工具 → 用例变红；同时移除 source/runner 两层复制 → 「同代看到进度B」变红）。`just ci` exit 0（6325 passed + 50 passed）。仍阻塞：TUI / 桌面 / 手机真机路径未验收，故本项保持未完成。旧只读工具白名单记录为历史基线，已不再适用。
+
 ## 模块说明
 
 `yi-agent-runtime` 是配置加载与 Agent 装配的共享 crate，供 CLI（`yi-agent`）与

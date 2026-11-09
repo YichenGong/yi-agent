@@ -1,5 +1,9 @@
 # yi-agent-tui
 
+## 一次性旁问退出（自动检查通过，真实终端验收未执行）
+
+- [ ] `/back` 与 `/side-close` 退出即销毁 — [plan](../superpowers/plans/2026-11-09-side-snapshot-lifecycle-impl.md) · [复核](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md) · [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §4、§8、§9。自动部分已完成：`crates/yi-agent/src/side_driver.rs` 的 `SideDriverCommand::Leave { entry_id }` 校验当前 entry 后取消构造/runner 并在 10 秒窗口内排空销毁，`entry_matches` 让旧 entry 的迟到提交不落到新代；`tui/app.rs::leave_side_session` 清空 history/input/usage/pending 并投递 `Leave`。判据：`cargo test -p yi-agent --all-features --bins side_driver::tests::` 12 passed（含 `a_late_frame_from_an_older_entry_does_not_rebuild_a_view`、`leave_during_creation_cancels_and_creates_nothing`）；`cargo nextest run --all-features --profile ci -p yi-agent -E 'test(side_repair_pasted_back_needs_enter_and_sends_leave)'` 通过，`tui::app::notification_tests::side_repair_pasted_back_needs_enter_and_sends_leave` 断言 `/back` 必须发 `Leave` 且不触发父 interrupt/审批。变异证明见 [验收记录](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-acceptance.md) §3（`/back` 只导航 → 该用例变红；去掉旧 entry 检查 → 迟到帧用例变红）。工作树内 `just ci` exit 0（6325 passed + 50 passed）覆盖该 12 例。仍阻塞：真实终端路径未验收，本项保持未完成。
+
 ## 模块说明
 
 yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。提供结构化对话历史展示、输入编辑、slash 命令弹窗、状态栏、bash 弹窗等功能。从早期 InlineRenderer（reedline 流式打印）迁移而来，现已设为默认 TUI 模式。

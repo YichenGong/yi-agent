@@ -190,6 +190,20 @@ impl AgentConfig {
     }
 }
 
+/// The live parent facts a host needs to assemble a derived conversation.
+///
+/// Deliberately narrow: it carries no tools, no permission checker, no inbox
+/// and no transcript bytes. A consumer cannot reach the parent's capabilities
+/// through it, and reading it triggers no configuration scan.
+#[derive(Clone)]
+pub struct AgentSnapshotBindings {
+    pub session: Arc<Mutex<Session>>,
+    pub provider: Arc<dyn Provider>,
+    /// The effective configuration of the most recent real request.
+    pub effective_config: Arc<Mutex<AgentConfig>>,
+    pub provider_gate: Option<Arc<dyn ProviderTurnGate>>,
+}
+
 /// Agent runtime.
 pub struct Agent {
     provider: Arc<dyn Provider>,
@@ -211,6 +225,14 @@ pub struct Agent {
     /// id. Lets a caller stop one long-running tool (the TUI's bash panel) without
     /// cancelling the whole turn. Rebuilt on every run.
     tool_call_tokens: ToolCallTokens,
+    /// The effective configuration the provider actually received most recently.
+    ///
+    /// A host that needs to assemble a side conversation must freeze the prompt
+    /// the parent is *using*, but it must not call the live-settings source
+    /// itself: that source may rescan project rules and skills, which a side is
+    /// forbidden to do. The run publishes the merged value here after every real
+    /// request, so reading it costs one lock and no I/O.
+    effective_config: Arc<Mutex<AgentConfig>>,
 }
 
 /// Shared map of the active run's per-tool-call cancellation tokens.
@@ -521,11 +543,13 @@ pub enum AgentError {
 
 impl Agent {
     pub fn new(provider: Arc<dyn Provider>, tools: Arc<ToolRegistry>, config: AgentConfig) -> Self {
+        let effective_config = Arc::new(Mutex::new(config.clone()));
         Self {
             provider,
             tools,
             session: Arc::new(Mutex::new(Session::new())),
             config,
+            effective_config,
             cancel_token: CancellationToken::new(),
             permission_checker: None,
             decision_rx: None,
@@ -615,6 +639,28 @@ impl Agent {
     /// (e.g. the skills catalog) to refresh the prompt between messages.
     pub fn set_system_prompt(&mut self, prompt: Option<String>) {
         self.config.system_prompt = prompt;
+        // The published value follows a real configuration change immediately.
+        // It is still only a cache: the next request overwrites it with the
+        // merged live value the provider actually receives.
+        *self
+            .effective_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.config.clone();
+    }
+
+    /// The provider, session, effective configuration and admission gate of this
+    /// agent, for a host that assembles a derived conversation.
+    ///
+    /// Every field is a clone of an existing handle except the configuration,
+    /// which is a cached value. Notably this does **not** call the live-settings
+    /// source: assembling a side conversation must never rescan project prompts.
+    pub fn snapshot_bindings(&self) -> AgentSnapshotBindings {
+        AgentSnapshotBindings {
+            session: Arc::clone(&self.session),
+            provider: Arc::clone(&self.provider),
+            effective_config: Arc::clone(&self.effective_config),
+            provider_gate: self.provider_turn_gate.clone(),
+        }
     }
 
     /// The configuration this agent was built with.
@@ -832,6 +878,7 @@ impl Agent {
         // `interject()` works even after the stream has been moved away.
         let inbox = self.inbox.clone();
         let tool_call_tokens = self.tool_call_tokens.clone();
+        let effective_config = Arc::clone(&self.effective_config);
 
         let children = crate::managed_run::ChildTasks::new();
         let loop_children = children.clone();
@@ -865,6 +912,7 @@ impl Agent {
                 live_settings,
                 inbox,
                 tool_call_tokens,
+                effective_config,
                 loop_children,
             )
             .await;
@@ -1212,6 +1260,7 @@ async fn think_phase(
     messages: &mut Vec<Message>,
     turn: u32,
     payload_leases: &mut Vec<crate::run_budget::BudgetLease>,
+    effective_config: &Arc<Mutex<AgentConfig>>,
 ) -> ThinkOutcome {
     // 1. THINK
     //
@@ -1291,6 +1340,12 @@ async fn think_phase(
                 pre_iteration.cloned()
             };
             let effective = merge_static_and_live(config, live_snapshot.as_ref());
+            // Publish what a real request will run with *before* the request is
+            // sent. Writing here, not in a getter, is what keeps a consumer from
+            // triggering a project-prompt rescan of its own.
+            *effective_config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = effective.clone();
             // Waiting for admission is not "the iteration has started": a cap
             // lowered during that wait must stop this iteration here, before a
             // request exists. The turn index was already counted by the caller,
@@ -1976,6 +2031,7 @@ async fn run_loop(
     live_settings: Option<Arc<dyn AgentSettingsSource>>,
     inbox: Option<InboxHandle>,
     tool_call_tokens: ToolCallTokens,
+    effective_config: Arc<Mutex<AgentConfig>>,
     children: crate::managed_run::ChildTasks,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
@@ -2184,6 +2240,7 @@ async fn run_loop(
             &mut messages,
             turn,
             &mut payload_leases,
+            &effective_config,
         )
         .await
         {
@@ -5993,6 +6050,83 @@ mod tests {
         assert!(
             prompt.contains("Do not explore one file per turn"),
             "prompt must forbid the one-file-per-turn pattern it is replacing"
+        );
+    }
+
+    /// The side host needs the provider, session and *effective* configuration
+    /// of the parent without rebuilding anything. Reading the bindings must
+    /// never consult the live-settings source: that source can rescan project
+    /// prompts, which a side must not trigger.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_bindings_publish_effective_config_without_rescanning() {
+        use crate::live_settings::{AgentSettingsSource, LiveAgentSnapshot, LiveSettingsError};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FixedSource(Arc<AtomicUsize>);
+
+        impl AgentSettingsSource for FixedSource {
+            fn snapshot(&self) -> Result<LiveAgentSnapshot, LiveSettingsError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(LiveAgentSnapshot {
+                    revision: "rev".into(),
+                    max_turns: Some(200),
+                    compact_threshold: Some(100_000),
+                    compact_user_budget_tokens: 40_000,
+                    compact_tool_budget_tokens: 80_000,
+                    system_prompt: Some("live-prompt".into()),
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn Provider> =
+            Arc::new(ScriptedProvider::new(vec![vec![ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            }]]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig {
+                system_prompt: Some("assembled".into()),
+                ..Default::default()
+            },
+        );
+        let bindings = agent.snapshot_bindings();
+        assert!(Arc::ptr_eq(&bindings.session, &agent.session_handle()));
+        assert!(Arc::ptr_eq(&bindings.provider, &provider));
+
+        agent.set_system_prompt(Some("refreshed".into()));
+        assert_eq!(
+            bindings
+                .effective_config
+                .lock()
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("refreshed"),
+            "the published value must follow real configuration changes"
+        );
+
+        agent.set_live_settings(Arc::new(FixedSource(calls.clone())));
+        let stream = agent.run("hi".into()).await.unwrap();
+        let _ = collect_events(stream);
+        assert_eq!(
+            bindings
+                .effective_config
+                .lock()
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("live-prompt"),
+            "the cache must hold the prompt the provider actually received"
+        );
+        let after_run = calls.load(Ordering::SeqCst);
+        assert!(after_run >= 1);
+        let _ = agent.snapshot_bindings();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_run,
+            "reading the bindings must not rescan the live source"
         );
     }
 

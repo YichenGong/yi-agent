@@ -20,6 +20,7 @@ import {
   parseSideHandshake,
   type SideConversationStore,
 } from "../lib/sideConversation";
+import type { SideExitCoordinator } from "../lib/sideExit";
 import { storedRemoteConfig } from "../lib/remoteConfig";
 
 type SettingsState = ReturnType<typeof useSettingsState>;
@@ -61,6 +62,14 @@ export interface HandshakeRecoveryDeps {
   /** 旁支绑定登记处。每条连接各自解析能力与宿主 id，不借 globalReader。 */
   sideStore: SideConversationStore;
   /**
+   * 退出意图账本。
+   *
+   * 握手成功是**唯一**的补发时机：一条连接刚刚重新就绪，此时把上一轮没发出去
+   * 的退出补上（spec §6.4「重连先补退出，不能恢复旧旁问」）。放在别处（例如
+   * 定时器）会变成一条无上限的重试队列。
+   */
+  sideExits: SideExitCoordinator;
+  /**
    * 一次握手的开始：返回这一轮的 epoch。
    *
    * 同一条 client 上可能先后跑两次握手（重连很快，前一轮的回包还没到）。只有
@@ -74,6 +83,7 @@ export interface HandshakeRecoveryDeps {
 
 export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
   const {
+    sideExits,
     activeSlotRef,
     clientRef,
     registryRef,
@@ -125,7 +135,13 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
           ? (storedRemoteConfig(localStorage)?.scope ?? "control")
           : "admin";
         const sideBinding = parseSideHandshake(slot, client, initialized, scope);
-        if (sideBinding) sideStore.bind(sideBinding);
+        if (sideBinding) {
+          sideStore.bind(sideBinding);
+          // 先补退出，再让界面用这条连接做任何对账：反过来的话，一次「已退出但
+          // 没发出去」的意图会先被 `side/list` 看到那条还没销毁的旁支，用户于是
+          // 又看到它「回来了」。
+          void sideExits.flush(sideBinding);
+        }
         // 构建类型只在 dev 上开放「实验功能」；读失败按 release 处理（fail-closed，
         // 与 Rust 侧的硬闸同一口径），不让面板因为一次网络抖动冒出来。
         // 全局只读一律问**本地**槽位（spec §5.2）：远端跑的是它自己的二进制，

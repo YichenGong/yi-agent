@@ -1,6 +1,8 @@
 side/close
+side/exit
 side/list
 side/open
+side/prepare
 side/readItems
 side/turnInterrupt
 side/turnStart

@@ -1,5 +1,9 @@
 # yi-agent-app-server（GUI app-server）
 
+## 一次性旁问生命周期（自动检查通过，真实设备验收未执行）
+
+- [ ] 入场身份与精确退出协议 — [plan](../superpowers/plans/2026-11-09-side-snapshot-lifecycle-impl.md) · [复核](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md) · [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §6、§7、§9。自动部分已完成：`rpc/side.rs::required_scope` 只把 `side/list`/`side/readItems` 归 Observe，其余 Control；`side_conversation/tickets.rs::verify` 拒绝未知/过期/异主/异父票据；`registry.rs::open_entry` 先 `tickets.resolve` 再按 `parents` 占位加入或创建，`drain` 依序 cancel → close runner → join 转发器 → 撤销分页 → 确认 cleanup 收据 → 摘代次 → 写墓碑。判据：`cargo test -p yi-agent-app-server --all-features --lib` 1612 passed / 0 failed / 7 ignored；`--lib server::tests::side::` 16 passed，其中 `a_side_sees_the_live_progress_and_dies_on_exit_without_touching_the_parent` 走真实 stdio 全链（进入、退出、重入），`a_second_client_reads_the_same_generation_but_cannot_control_it` 覆盖同宿主两端：Observe 可 list/readItems 但对 prepare/open/turnStart/exit 一律 `-32014`，Control 退出后两端本代同时失效。变异证明见 [验收记录](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-acceptance.md) §3（未知票据放行、`prepare` 放宽到 Observe、清理失败仍释放槽，各自让对应用例变红）。`just ci` exit 0（6325 passed + 50 passed）。仍阻塞：真实设备（桌面/手机同 relay）联合验收未执行，本项保持未完成。
+
 ## 普通会话只读同步与可靠投递（Spec 已复核、Plan 已编写，未实施）
 
 [修复 spec rev2](../superpowers/specs/2026-11-08-session-completeness-repair-design.md) · [复核记录](../superpowers/reports/2026-11-08-session-completeness-spec-review.md) · [数据 Plan B1–B12](../superpowers/plans/2026-11-08-session-completeness-repair-impl.md)；前端窗口及对账接线计入 [desktop](./desktop.md)，不在本模块重复计数。

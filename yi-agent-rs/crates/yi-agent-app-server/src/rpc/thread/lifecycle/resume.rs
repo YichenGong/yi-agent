@@ -219,7 +219,7 @@ pub(crate) async fn handle(
                 state.git_diff_handle,
                 // 与工厂槽位**同一个值**：resume 侧的委派路径必须与
                 // 重建 agent 时下发到工厂的根集一致。
-                extra_roots,
+                extra_roots.clone(),
                 state.lead_inbox,
                 state.lead_replies,
                 state.lead_control,
@@ -291,6 +291,20 @@ pub(crate) async fn handle(
                     }
                 };
 
+            // 发布本会话作为父会话的旁问来源，理由与 `thread/start` 相同：插入
+            // `threads` 之后响应立即返回，用户可能马上敲 `/side`。resume 的历史
+            // 已在 agent 里，这条来源一开始就可用。
+            let side_source = state.live_side_parents.and_then(|parents| {
+                crate::side_conversation::LiveParentSource::install(
+                    Arc::clone(parents),
+                    thread_id.clone(),
+                    &agent,
+                    cwd.clone(),
+                    crate::side_conversation::live_roots(&cwd, &extra_roots),
+                    Default::default(),
+                )
+            });
+
             state.threads.insert(
                 thread_id.clone(),
                 ThreadSession {
@@ -310,6 +324,7 @@ pub(crate) async fn handle(
                     writer_lock,
                     // 准入许可随 turn 生命周期管理；新建/恢复会话时尚未申请。
                     turn_permit: None,
+                    side_source: side_source.clone(),
                 },
             );
 
@@ -360,6 +375,7 @@ pub(crate) async fn handle(
                 None,
                 sandbox,
                 Arc::clone(&process_manager),
+                side_source,
             ));
 
             // 回放:thread/started → 若干批量 items/completed → 最近用量 → 响应。

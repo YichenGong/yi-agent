@@ -442,6 +442,14 @@ pub(crate) struct RuntimeAttachments {
     /// (会真的在 `side-conversations/` 下建目录并取 flock),让每个装配点自己
     /// 构造就等于每个测试都在真实实例根里留垃圾。生产只有一个构造点。
     pub(crate) side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
+    /// 本进程正在驱动的父会话表（旁问来源）。`None` = 生产路径，由 `serve()`
+    /// 自建一份；测试注入时能直接观察「发布 / 刷新 / 退出摘除」的可见效果，
+    /// 而不是靠间接推断。
+    ///
+    /// 与 `side_registry` 同为 `Option` 的理由相同：它是宿主级共享状态，不该
+    /// 由每个装配点自己 new 一份（那样 resolver 看到的与 driver 写进去的会是
+    /// 两张不同的表，旁问永远读不到活跃父）。
+    pub(crate) live_side_parents: Option<Arc<crate::side_conversation::LiveSideParents>>,
     /// 桌面主题句柄：`ui/settings/read|write` 维护它，每个 thread 的
     /// `set_theme` 工具也持同一实例，故任一路径改主题都会落盘 + 广播。
     pub(crate) theme: crate::theme_tool::ThemeHandle,

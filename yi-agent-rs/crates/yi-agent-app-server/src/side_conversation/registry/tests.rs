@@ -8,10 +8,21 @@ use std::sync::Arc;
 
 use yi_agent_runtime::side_conversation::{CloseReason, SideErrorReason, SideStatus};
 
+use crate::side_conversation::tickets::{ExitState, SideGeneration};
+
 use super::*;
 use crate::side_conversation::source::ThreadStoreResolver;
 use crate::thread_store::{ThreadMode, ThreadStore, TurnLine};
 use tempfile::TempDir;
+
+/// Enter one side through the only production path: a ticket, then an open.
+///
+/// Tests used to call `registry.open` directly; keeping a test-only shortcut would
+/// leave the "production cannot create without a ticket" property unexercised.
+async fn open_side(registry: &Arc<SideRegistry>, parent: &str) -> Result<SideSummary, SideError> {
+    let target = registry.prepare_entry(parent).await?;
+    registry.open_entry(&target).await
+}
 
 fn uuid() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -70,7 +81,7 @@ fn seed_parent(store: &ThreadStore, id: &str) {
 ///
 /// Returns the temp dirs so the caller keeps them alive: the store and the
 /// resource root both live under them.
-async fn registry_fixture() -> (TempDir, TempDir, SideRegistry) {
+async fn registry_fixture() -> (TempDir, TempDir, Arc<SideRegistry>) {
     registry_fixture_with_provider(None).await
 }
 
@@ -99,7 +110,7 @@ impl super::SideParentResolver for ProviderResolver {
 
 async fn registry_fixture_with_provider(
     provider: Option<Arc<dyn yi_agent_core::Provider>>,
-) -> (TempDir, TempDir, SideRegistry) {
+) -> (TempDir, TempDir, Arc<SideRegistry>) {
     let project = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let store = Arc::new(ThreadStore::new(project.path()));
@@ -120,8 +131,100 @@ async fn registry_fixture_with_provider(
         Arc::clone(&pool),
     )
     .expect("host resources");
-    let registry = SideRegistry::new(resolver, resources, pool);
+    let registry = Arc::new(SideRegistry::new(resolver, resources));
     (project, home, registry)
+}
+
+/// A resolver that blocks inside `resolve` until a test releases it.
+///
+/// Needed to observe `Creating` at all: production resolves a parent quickly, so
+/// without a gate a `Creating` generation exists for less time than a test can
+/// schedule a second caller against it.
+struct GatedResolver {
+    inner: ThreadStoreResolver,
+    gate: Arc<ResolverGate>,
+}
+
+#[derive(Default)]
+struct ResolverGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    seen: std::sync::atomic::AtomicBool,
+    open: std::sync::atomic::AtomicBool,
+}
+
+impl ResolverGate {
+    async fn wait_entered(&self) {
+        while !self.seen.load(std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notified().await;
+        }
+    }
+
+    fn release(&self) {
+        self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+impl super::SideParentResolver for GatedResolver {
+    fn resolve<'a>(
+        &'a self,
+        parent: &'a str,
+    ) -> futures::future::BoxFuture<
+        'a,
+        yi_agent_runtime::side_conversation::SideResult<
+            yi_agent_runtime::side_conversation::EffectiveSideSource,
+        >,
+    > {
+        Box::pin(async move {
+            self.gate
+                .seen
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.gate.entered.notify_waiters();
+            while !self.gate.open.load(std::sync::atomic::Ordering::SeqCst) {
+                self.gate.release.notified().await;
+            }
+            self.inner.resolve(parent).await
+        })
+    }
+}
+
+/// One parent `p1` whose resolution is held behind `gate`.
+/// One parent `p1` whose resolution is held behind `gate`.
+struct GatedRegistry {
+    registry: Arc<SideRegistry>,
+    gate: Arc<ResolverGate>,
+    // 保持临时目录活着:store 与资源根都在里面。
+    _project: TempDir,
+    _home: TempDir,
+}
+
+async fn gated_registry() -> GatedRegistry {
+    let project = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let store = Arc::new(ThreadStore::new(project.path()));
+    seed_parent(&store, "p1");
+    let mut cfg = crate::test_support::test_config();
+    cfg.model = "parent-model".into();
+    cfg.workdir = project.path().to_path_buf();
+    let inner = ThreadStoreResolver::new(store, cfg, Default::default());
+    let gate = Arc::new(ResolverGate::default());
+    let resolver: Arc<dyn super::SideParentResolver> = Arc::new(GatedResolver {
+        inner,
+        gate: Arc::clone(&gate),
+    });
+    let pool = Arc::new(yi_agent_tools::SideBlockingPool::new(2, 1, 8, 4));
+    let resources = yi_agent_runtime::side_conversation::SideHostResources::new(
+        home.path().to_path_buf(),
+        Arc::clone(&pool),
+    )
+    .expect("host resources");
+    GatedRegistry {
+        registry: Arc::new(SideRegistry::new(resolver, resources)),
+        gate,
+        _project: project,
+        _home: home,
+    }
 }
 
 struct ReplyProvider {
@@ -159,7 +262,7 @@ async fn published_turn(fail: bool) -> (serde_json::Value, Vec<serde_json::Value
     let client = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
     let mut rx = hub.register(client.clone());
     hub.subscribe(&client, vec!["p1".into()]);
-    let side = registry.open("p1").await.unwrap();
+    let side = open_side(&registry, "p1").await.unwrap();
     let turn = registry
         .turn_start(&side.side_id, "旁问问题".into(), uuid())
         .await
@@ -217,7 +320,7 @@ async fn side_provider_failure_publishes_feedback_instead_of_idle() {
 async fn side_transcript_refusal_does_not_start_or_accept_a_turn() {
     let (_project, _home, registry) =
         registry_fixture_with_provider(Some(Arc::new(ReplyProvider { fail: false }))).await;
-    let side = registry.open("p1").await.unwrap();
+    let side = open_side(&registry, "p1").await.unwrap();
     let entry = registry.entry(&side.side_id).await.unwrap();
     entry.lock().await.transcript = SideTranscript::new(1, 1);
     let request = uuid();
@@ -251,7 +354,7 @@ async fn side_accepted_question_is_in_snapshot_and_published_once() {
     let client = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
     let mut rx = hub.register(client.clone());
     hub.subscribe(&client, vec!["p1".to_string()]);
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     let request = uuid();
     let turn = registry
         .turn_start(&summary.side_id, "旁支问题".into(), request.clone())
@@ -306,7 +409,7 @@ async fn side_accepted_question_is_in_snapshot_and_published_once() {
 #[tokio::test]
 async fn side_concurrent_open_returns_one_runner() {
     let (_project, _home, registry) = registry_fixture().await;
-    let (a, b) = tokio::join!(registry.open("p1"), registry.open("p1"));
+    let (a, b) = tokio::join!(open_side(&registry, "p1"), open_side(&registry, "p1"));
     let a = a.expect("first open");
     let b = b.expect("second open");
     assert_eq!(a.side_id, b.side_id, "two opens must collapse to one side");
@@ -373,9 +476,11 @@ async fn side_open_during_a_parent_turn_does_not_touch_parent_files() {
         Arc::clone(&pool),
     )
     .expect("host resources");
-    let registry = SideRegistry::new(resolver, resources, pool);
+    let registry = Arc::new(SideRegistry::new(resolver, resources));
 
-    let summary = registry.open("p1").await.expect("父运行中必须能开旁支");
+    let summary = open_side(&registry, "p1")
+        .await
+        .expect("父运行中必须能开旁支");
     assert_eq!(summary.parent_thread_id, "p1");
     assert_eq!(registry.list("p1").await.len(), 1, "只该有一个旁支");
 
@@ -394,8 +499,8 @@ async fn side_open_during_a_parent_turn_does_not_touch_parent_files() {
 #[tokio::test]
 async fn side_open_is_create_or_get() {
     let (_project, _home, registry) = registry_fixture().await;
-    let first = registry.open("p1").await.unwrap();
-    let second = registry.open("p1").await.unwrap();
+    let first = open_side(&registry, "p1").await.unwrap();
+    let second = open_side(&registry, "p1").await.unwrap();
     assert_eq!(first.side_id, second.side_id);
     assert_eq!(
         first.generation, second.generation,
@@ -406,14 +511,14 @@ async fn side_open_is_create_or_get() {
 #[tokio::test]
 async fn side_open_unknown_parent_leaves_no_slot() {
     let (_project, _home, registry) = registry_fixture().await;
-    let error = registry.open("nobody").await.unwrap_err();
+    let error = open_side(&registry, "nobody").await.unwrap_err();
     assert_eq!(error.reason, SideErrorReason::UnknownThread);
     // A failed create must release the parent slot, or the parent would be
     // permanently stuck in `Creating`.
     assert!(registry.list("nobody").await.is_empty());
     // And a later attempt must be able to try again (not blocked forever).
     assert_eq!(
-        registry.open("nobody").await.unwrap_err().reason,
+        open_side(&registry, "nobody").await.unwrap_err().reason,
         SideErrorReason::UnknownThread
     );
 }
@@ -421,7 +526,7 @@ async fn side_open_unknown_parent_leaves_no_slot() {
 #[tokio::test]
 async fn side_request_id_deduplicates_turn_start() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     let request = uuid();
 
     let first = registry
@@ -441,7 +546,7 @@ async fn side_request_id_deduplicates_turn_start() {
 #[tokio::test]
 async fn side_rejects_a_reused_request_id_with_different_text() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     let request = uuid();
     registry
         .turn_start(&summary.side_id, "原来的问题".into(), request.clone())
@@ -458,7 +563,7 @@ async fn side_rejects_a_reused_request_id_with_different_text() {
 #[tokio::test]
 async fn side_rejects_second_inflight_turn() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     registry
         .turn_start(&summary.side_id, "第一问".into(), uuid())
         .await
@@ -474,7 +579,7 @@ async fn side_rejects_second_inflight_turn() {
 #[tokio::test]
 async fn side_close_rejects_stale_turn_confirmation() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     let turn = registry
         .turn_start(&summary.side_id, "问题".into(), uuid())
         .await
@@ -497,7 +602,7 @@ async fn side_close_rejects_stale_turn_confirmation() {
 #[tokio::test]
 async fn side_close_is_idempotent_through_the_tombstone() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     registry.close(&summary.side_id, None).await.unwrap();
     // A repeated close is a success, not a 404: the client may retry after a
     // dropped response.
@@ -511,7 +616,7 @@ async fn side_close_is_idempotent_through_the_tombstone() {
 #[tokio::test]
 async fn side_after_close_answer_is_side_not_found() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     registry.close(&summary.side_id, None).await.unwrap();
 
     let error = registry
@@ -528,7 +633,7 @@ async fn side_after_close_answer_is_side_not_found() {
 #[tokio::test]
 async fn side_tombstone_keeps_only_identifiers() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     let request = uuid();
     let turn = registry
         .turn_start(&summary.side_id, "很长的秘密问题".into(), request.clone())
@@ -557,7 +662,7 @@ async fn side_lists_a_creating_side() {
     // `list` must be able to report the id assigned by an in-flight `open`, so a
     // second client can show "creating" instead of "nothing here".
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     let listed = registry.list("p1").await;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].side_id, summary.side_id);
@@ -567,7 +672,7 @@ async fn side_lists_a_creating_side() {
 #[tokio::test]
 async fn side_parent_change_invalidates_the_side() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
 
     let guard = registry.begin_parent_change("p1").await;
     guard.commit(CloseReason::ParentCleared).await;
@@ -584,7 +689,7 @@ async fn side_parent_change_invalidates_the_side() {
 #[tokio::test]
 async fn side_parent_change_barrier_blocks_new_opens_until_committed() {
     let (_project, _home, registry) = registry_fixture().await;
-    let first = registry.open("p1").await.unwrap();
+    let first = open_side(&registry, "p1").await.unwrap();
 
     let guard = registry.begin_parent_change("p1").await;
     // While the barrier is up the parent has no side, so a concurrent open would
@@ -594,14 +699,14 @@ async fn side_parent_change_barrier_blocks_new_opens_until_committed() {
 
     // After the change a fresh open gets a *different* side: the old generation is
     // gone for good.
-    let second = registry.open("p1").await.unwrap();
+    let second = open_side(&registry, "p1").await.unwrap();
     assert_ne!(first.side_id, second.side_id);
 }
 
 #[tokio::test]
 async fn side_parent_change_rollback_restores_the_parent_slot() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
 
     {
         let guard = registry.begin_parent_change("p1").await;
@@ -617,19 +722,19 @@ async fn side_parent_change_rollback_restores_the_parent_slot() {
 #[tokio::test]
 async fn side_shutdown_closes_everything() {
     let (_project, _home, registry) = registry_fixture().await;
-    registry.open("p1").await.unwrap();
+    open_side(&registry, "p1").await.unwrap();
     registry.shutdown().await;
     assert_eq!(registry.side_count().await, 0);
     // After shutdown no new side can be created: the host is going away and a
     // half-created side would leak its directory.
-    let error = registry.open("p1").await.unwrap_err();
+    let error = open_side(&registry, "p1").await.unwrap_err();
     assert_eq!(error.reason, SideErrorReason::SideClosing);
 }
 
 #[tokio::test]
 async fn side_second_turn_is_accepted_after_the_first_completes() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     let first = registry
         .turn_start(&summary.side_id, "第一问".into(), uuid())
         .await
@@ -676,7 +781,7 @@ async fn side_second_turn_is_accepted_after_the_first_completes() {
 #[tokio::test]
 async fn side_stale_interrupt_does_not_kill_a_newer_turn() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     let first = registry
         .turn_start(&summary.side_id, "第一问".into(), uuid())
         .await
@@ -726,7 +831,7 @@ async fn side_events_follow_parent_subscription_without_polluting_parent() {
     let mut stranger_rx = hub.register(stranger.clone());
     hub.subscribe(&stranger, vec!["someone-elses-thread".to_string()]);
 
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     let request = uuid();
     let turn = registry
         .turn_start(&summary.side_id, "旁支问题".into(), request)
@@ -783,7 +888,7 @@ async fn side_close_publishes_a_terminal_frame_for_its_generation() {
     let mut rx = hub.register(client.clone());
     hub.subscribe(&client, vec!["p1".to_string()]);
 
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     registry.close(&summary.side_id, None).await.unwrap();
 
     let mut closed = None;
@@ -811,7 +916,7 @@ async fn side_close_publishes_a_terminal_frame_for_its_generation() {
 #[tokio::test]
 async fn side_publish_after_close_is_a_no_op() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     registry.close(&summary.side_id, None).await.unwrap();
 
     let published = registry
@@ -835,7 +940,7 @@ async fn side_close_revokes_outstanding_snapshots() {
     let replay = crate::side_conversation::shared_replay_store();
     registry.attach_replay(Arc::clone(&replay)).await;
 
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
     {
         let mut store = replay.lock().await;
         let snapshot = registry.snapshot(&summary.side_id).await.unwrap();
@@ -862,7 +967,7 @@ async fn side_close_revokes_outstanding_snapshots() {
 #[tokio::test]
 async fn side_publish_advances_seq_by_one() {
     let (_project, _home, registry) = registry_fixture().await;
-    let summary = registry.open("p1").await.unwrap();
+    let summary = open_side(&registry, "p1").await.unwrap();
 
     let first = registry
         .publish(&summary.side_id, |entry| {
@@ -893,7 +998,7 @@ async fn side_publish_advances_seq_by_one() {
 #[tokio::test]
 async fn close_all_stops_every_side_and_leaves_the_registry_usable() {
     let (_project, _home, registry) = registry_fixture().await;
-    let first = registry.open("p1").await.unwrap();
+    let first = open_side(&registry, "p1").await.unwrap();
 
     registry.close_all().await;
 
@@ -902,8 +1007,7 @@ async fn close_all_stops_every_side_and_leaves_the_registry_usable() {
 
     // 可逆性：关掉再打开必须还能用。这条断言是 `close_all` 与 `shutdown()` 的
     // 分界线——复用 `shutdown()` 会让它失败。
-    let again = registry
-        .open("p1")
+    let again = open_side(&registry, "p1")
         .await
         .expect("close_all must not be terminal");
     assert_ne!(again.side_id, first.side_id, "a new generation");
@@ -925,11 +1029,11 @@ async fn close_all_wins_against_a_concurrent_open() {
         let registry = Arc::new(registry);
         let a = tokio::spawn({
             let registry = Arc::clone(&registry);
-            async move { registry.open("p1").await }
+            async move { open_side(&registry, "p1").await }
         });
         let b = tokio::spawn({
             let registry = Arc::clone(&registry);
-            async move { registry.open("p1").await }
+            async move { open_side(&registry, "p1").await }
         });
         tokio::task::yield_now().await;
         registry.close_all().await;
@@ -941,4 +1045,173 @@ async fn close_all_wins_against_a_concurrent_open() {
             "a create or a woken waiter that outlived the sweep must not leave a live side"
         );
     }
+}
+
+/// 旧票的退出不能关掉下一代。
+///
+/// spec §12:票据绑定的是**精确代次**。一个迟到的 exit(用户在上一条已经退出后
+/// 才点返回)如果按父 id 关闭,就会杀掉用户刚刚进入的新环境。
+#[tokio::test]
+async fn old_exit_ticket_does_not_close_the_next_side() {
+    let (_project, _home, registry) = registry_fixture().await;
+    let old = registry.prepare_entry("p1").await.unwrap();
+    let first = registry.open_entry(&old).await.unwrap();
+    assert_eq!(
+        registry.exit_entry(&old).await.unwrap().state,
+        ExitState::Closing
+    );
+    // 用收据轮询到 closed,固定 2 秒总预算,不靠任意 sleep 猜成功。
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if registry.exit_entry(&old).await.unwrap().state == ExitState::Closed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the drain must confirm its own release");
+
+    let next = registry.prepare_entry("p1").await.unwrap();
+    let second = registry.open_entry(&next).await.unwrap();
+    assert_ne!(first.side_id, second.side_id, "重新进入必须是新代次");
+
+    // 旧票重放:仍然是 closed,且不能影响新代。
+    assert_eq!(
+        registry.exit_entry(&old).await.unwrap().state,
+        ExitState::Closed
+    );
+    assert_eq!(
+        registry.exit_entry(&old).await.unwrap().generation,
+        Some(SideGeneration::new(first.side_id.clone(), first.generation)),
+        "旧票回答的是它自己那一代"
+    );
+    assert_eq!(
+        registry.open_entry(&next).await.unwrap().side_id,
+        second.side_id,
+        "新一代必须仍然活着"
+    );
+}
+
+/// Creating 期间的退出:立刻进入 closing,首问不得提交,资源最终释放。
+#[tokio::test]
+async fn exit_during_creation_cancels_before_the_first_question() {
+    let fixture = gated_registry().await;
+    let registry = Arc::clone(&fixture.registry);
+    let target = registry.prepare_entry("p1").await.unwrap();
+    let opening = {
+        let registry = Arc::clone(&registry);
+        let target = target.clone();
+        tokio::spawn(async move { registry.open_entry(&target).await })
+    };
+    // 构造卡在父解析上:文档尚未就绪,`Creating` 已经可见。
+    fixture.gate.wait_entered().await;
+    assert_eq!(registry.list("p1").await.len(), 1, "Creating 必须可见");
+    assert_eq!(registry.list("p1").await[0].status, SideStatus::Creating);
+
+    let receipt = registry.exit_entry(&target).await.unwrap();
+    assert_eq!(receipt.state, ExitState::Closing);
+    // 关闭中:同父的新票 open 必须被拒绝,不能并行建立第二条环境。
+    let probe = registry.prepare_entry("p1").await.unwrap();
+    assert_eq!(
+        registry.open_entry(&probe).await.unwrap_err().reason,
+        SideErrorReason::SideClosing
+    );
+    // 首问从未提交:没有任何 entry 能接受它。
+    let open_result = opening.await.unwrap();
+    assert!(
+        open_result.is_err(),
+        "创建被取消后 open 必须失败而不是交付一条环境"
+    );
+
+    fixture.gate.release();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if registry.exit_entry(&target).await.unwrap().state == ExitState::Closed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("取消构造后资源必须确认释放");
+    assert_eq!(registry.side_count().await, 0);
+    assert_eq!(registry.resources.slots_in_use(), 0);
+}
+
+/// 关闭中的 side 拒绝正文读取与新提交。
+#[tokio::test]
+async fn closing_side_refuses_reads_and_submits() {
+    let (_project, _home, registry) = registry_fixture().await;
+    let target = registry.prepare_entry("p1").await.unwrap();
+    let summary = registry.open_entry(&target).await.unwrap();
+    registry.exit_entry(&target).await.unwrap();
+
+    assert_eq!(
+        registry
+            .snapshot(&summary.side_id)
+            .await
+            .err()
+            .expect("退出之后不得再读到正文")
+            .reason,
+        SideErrorReason::SideClosing
+    );
+    assert!(matches!(
+        registry
+            .turn_start(&summary.side_id, "太晚了".into(), uuid())
+            .await
+            .unwrap_err()
+            .reason,
+        SideErrorReason::SideClosing | SideErrorReason::SideNotFound
+    ));
+}
+
+/// 一个票据只能绑定一条环境:两个不同票据进同一父,共享同一代次。
+#[tokio::test]
+async fn two_tickets_on_one_parent_share_one_generation() {
+    let (_project, _home, registry) = registry_fixture().await;
+    let a = registry.prepare_entry("p1").await.unwrap();
+    let b = registry.prepare_entry("p1").await.unwrap();
+    let first = registry.open_entry(&a).await.unwrap();
+    let second = registry.open_entry(&b).await.unwrap();
+    assert_eq!(first.side_id, second.side_id);
+    assert_eq!(first.generation, second.generation);
+    assert_eq!(registry.side_count().await, 1);
+
+    // 任一票据的退出关闭的是这一**共享**代次,另一张票据随即失效。
+    assert_eq!(
+        registry.exit_entry(&a).await.unwrap().state,
+        ExitState::Closing
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if registry.exit_entry(&a).await.unwrap().state == ExitState::Closed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shared generation must be released");
+    assert_eq!(registry.side_count().await, 0);
+    assert!(matches!(
+        registry.open_entry(&b).await.unwrap_err().reason,
+        SideErrorReason::SideClosing | SideErrorReason::EntryExpired
+    ));
+}
+
+/// 构造失败也必须确认资源释放后才移除父占位。
+#[tokio::test]
+async fn failed_creation_releases_its_slot_and_parent() {
+    let (_project, _home, registry) = registry_fixture().await;
+    assert_eq!(
+        open_side(&registry, "nobody").await.unwrap_err().reason,
+        SideErrorReason::UnknownThread
+    );
+    assert_eq!(
+        registry.resources.slots_in_use(),
+        0,
+        "失败的构造不能留下资源槽"
+    );
+    assert!(registry.list("nobody").await.is_empty());
 }

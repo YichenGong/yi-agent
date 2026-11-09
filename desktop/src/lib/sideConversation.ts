@@ -52,6 +52,15 @@ export interface SideHostBinding {
   client: RpcClient;
   /** 该连接上的宿主是否声明了 `side_conversation_v1`。 */
   supported: boolean;
+  /**
+   * 该连接上的宿主是否声明了 `side_snapshot_lifecycle_v1`。
+   *
+   * 与 `supported` 分开是刻意的：前者是旧的分页/通知契约（「返回后还能再看到
+   * 这条旁支」），后者是本次「退出即销毁 + 票据准入」的契约。新前端必须**两个
+   * 都为 true** 才开放入口——只认旧位会把一块已经不可恢复的界面按「可恢复」
+   * 的旧语义驱动。
+   */
+  snapshotLifecycle: boolean;
   scope: SideScope;
   /**
    * 连接当前是否活着。断线时**保留**视图（用户切回来还能看到最后状态），但
@@ -66,6 +75,8 @@ export function sideHostKey(slot: Slot, instanceId: string): SideHostKey {
 
 /**
  * 从 `initialize` 的回包里解析旁支能力与宿主身份。
+ *
+ * 两个能力位分别对应两版契约（见 `SideHostBinding.snapshotLifecycle`）。
  *
  * 旧宿主既没有 `capabilities.side_conversation_v1` 也没有 `sideHostInstanceId`。
  * 那种情况**不返回 null**：返回一条 `supported: false` 的绑定，前端据此隐藏
@@ -87,17 +98,25 @@ export function parseSideHandshake(
   };
   const caps =
     typeof raw.capabilities === "object" && raw.capabilities !== null
-      ? (raw.capabilities as { side_conversation_v1?: unknown })
+      ? (raw.capabilities as {
+          side_conversation_v1?: unknown;
+          side_snapshot_lifecycle_v1?: unknown;
+        })
       : null;
   const instanceId =
     typeof raw.sideHostInstanceId === "string" ? raw.sideHostInstanceId : "";
   const supported = caps?.side_conversation_v1 === true && instanceId !== "";
+  // 没有宿主 id 时两个位都不成立：票据是按 `(hostInstanceId, parent, entryId)`
+  // 定位的，缺了宿主身份就无从校验回包。
+  const snapshotLifecycle =
+    caps?.side_snapshot_lifecycle_v1 === true && instanceId !== "";
   return {
     key: sideHostKey(slot, instanceId),
     slot,
     instanceId,
     client,
     supported,
+    snapshotLifecycle,
     scope,
     connected: true,
   };
@@ -258,6 +277,20 @@ const EMPTY_USAGE: SideUsageWire = {
 export class SideConversationStore {
   private readonly bindings = new Map<SideHostKey, SideHostBinding>();
   private readonly views = new Map<SideHostKey, Map<string, SideView>>();
+  /**
+   * 已经被明确退出（销毁）的最高代次，按 `(hostKey, sideId)`。
+   *
+   * `dropGeneration` 删掉视图之后，旧代**迟到的**帧仍然可能到达（退出时把在途
+   * 请求中断了，但已经发出去的帧还在链路上）。没有这份记录，`viewFor` 会按
+   * 「第一次听说这个 side」的逻辑重建一个视图——用户刚丢弃的正文就以「一条新的
+   * 旁支」的样子回来了，而它其实属于一个已经不存在于宿主上的环境。
+   *
+   * 只记**代次上界**：同一个 `sideId` 之后可能被重开成更高的一代，那一代必须
+   * 被允许建视图，所以判据是 `generation <= retired`，不是「见过这个 sideId」。
+   */
+  private readonly retired = new Map<SideHostKey, Map<string, number>>();
+  /** 退休记录上限：一次会话里退出过多少条旁支就有多少条，按最旧的淘汰。 */
+  private static readonly RETIRED_CAP = 512;
 
   /** 已登记的绑定（只读快照，供 UI 决定是否显示入口）。 */
   binding(hostKey: SideHostKey): SideHostBinding | undefined {
@@ -322,6 +355,7 @@ export class SideConversationStore {
   dropHost(hostKey: SideHostKey): void {
     this.bindings.delete(hostKey);
     this.views.delete(hostKey);
+    this.retired.delete(hostKey);
   }
 
   read(hostKey: SideHostKey, sideId: string): SideView | undefined {
@@ -431,6 +465,41 @@ export class SideConversationStore {
     }
   }
 
+  /**
+   * 只丢弃**精确一代**。
+   *
+   * 退出旁问时用：这一代已经销毁，它的正文、草稿、用量、分页水位、滚动位置都
+   * 不该留在内存里（spec §4.4「不恢复旧问答、旧草稿、旧用量、分页 token、滚动
+   * 位置」）。按 `(hostKey, sideId, generation)` 三重匹配删除，于是：
+   *
+   * - 同一个 `sideId` 在用户返回期间被另一端重开成新一代时，新代**不受影响**；
+   * - 旧代一个迟到的帧回来找不到视图，`apply` 本来就是 no-op，不会复活；
+   * - 别的父上的旁支一概不动（这是 `clearParent` 做不到的粒度）。
+   *
+   * 返回是否真的删掉了东西，供调用方决定要不要重渲染。
+   */
+  dropGeneration(hostKey: SideHostKey, sideId: string, generation: number): boolean {
+    const bySide = this.views.get(hostKey);
+    if (!bySide) return false;
+    const view = bySide.get(sideId);
+    if (!view || view.generation !== generation) return false;
+    bySide.delete(sideId);
+    // 记住这一代已经销毁：它的迟到帧不得重建视图（见 `retired` 的注释）。
+    let bySideRetired = this.retired.get(hostKey);
+    if (!bySideRetired) {
+      bySideRetired = new Map();
+      this.retired.set(hostKey, bySideRetired);
+    }
+    bySideRetired.set(sideId, Math.max(bySideRetired.get(sideId) ?? 0, generation));
+    if (bySideRetired.size > SideConversationStore.RETIRED_CAP) {
+      // Map 保持插入序：淘汰最早记下的那条。被淘汰只意味着一个非常古老的
+      // 迟到帧可能重建视图，而那时它早已不可能再收到新的正文。
+      const oldest = bySideRetired.keys().next().value;
+      if (oldest !== undefined) bySideRetired.delete(oldest);
+    }
+    return true;
+  }
+
   /** 设置（或清除）一次未确定提交。 */
   setPending(
     hostKey: SideHostKey,
@@ -499,12 +568,20 @@ export class SideConversationStore {
   adopt(hostKey: SideHostKey, sideId: string, parentId: string, generation: number): void {
     const view = this.views.get(hostKey)?.get(sideId);
     if (!view) return;
+    // 基线安装是**另一条**写入路径（分页 → `installBaseline` → `adopt`），它不
+    // 经过 `viewFor` 的退休检查。分页在途时用户退出，迟到的基线会在这里把一代
+    // 已经销毁的视图认领下来——所以同一个判据也要在这里执行一次。
+    const retiredGeneration = this.retired.get(hostKey)?.get(sideId);
+    if (retiredGeneration !== undefined && generation <= retiredGeneration) {
+      this.views.get(hostKey)?.delete(sideId);
+      return;
+    }
     view.parentId = parentId;
     view.generation = generation;
     view.summary = { ...view.summary, parent_thread_id: parentId, generation };
   }
 
-  /** 该宿主上的全部旁支，供「继续旁问」入口与 list 对账使用。 */
+  /** 该宿主上的全部旁支，供 list 对账与「这条父上是否已有旁支」判定使用。 */
   list(hostKey: SideHostKey): SideView[] {
     return [...(this.views.get(hostKey)?.values() ?? [])];
   }
@@ -596,6 +673,15 @@ export class SideConversationStore {
     }
     const existing = bySide.get(n.params.side_id);
     if (existing) return existing;
+    const retiredGeneration = this.retired.get(hostKey)?.get(n.params.side_id);
+    if (retiredGeneration !== undefined && n.params.generation <= retiredGeneration) {
+      // 这一代已经被明确销毁：旧帧不重建视图（同上，`retired` 的注释）。
+      return undefined;
+    }
+    if (retiredGeneration !== undefined) {
+      // 更高的一代：同一个 `sideId` 被重开了，退休记录不再拦它。
+      this.retired.get(hostKey)?.delete(n.params.side_id);
+    }
     const view: SideView = {
       sideId: n.params.side_id,
       parentId: n.params.parent_thread_id,

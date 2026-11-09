@@ -610,6 +610,7 @@ async fn driver_ignores_interrupt_tagged_with_other_turn() {
         None,
         built.sandbox.clone(),
         Arc::clone(&built.process_manager),
+        None,
     ));
 
     // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -1273,6 +1274,7 @@ async fn driver_uses_unique_item_ids_across_turns() {
         None,
         built.sandbox.clone(),
         Arc::clone(&built.process_manager),
+        None,
     ));
 
     let mut client_r = BufReader::new(client_r);
@@ -1532,6 +1534,7 @@ async fn stale_interrupt_does_not_cancel_turn_during_approval() {
         None,
         built.sandbox.clone(),
         Arc::clone(&built.process_manager),
+        None,
     ));
 
     prompt_tx
@@ -2292,6 +2295,7 @@ async fn driver_clears_the_checkpoint_when_the_initiator_disconnects_during_appr
         None,
         built.sandbox.clone(),
         Arc::clone(&built.process_manager),
+        None,
     ));
 
     prompt_tx
@@ -4169,6 +4173,7 @@ async fn a_server_reloaded_during_a_turn_reaches_the_registry_on_the_next_turn()
             true,
         ),
         yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        None,
     ));
 
     // ---- 本轮:模型调用 mcp_reload → 写盘 + 探测(这里直接做等价动作) ----

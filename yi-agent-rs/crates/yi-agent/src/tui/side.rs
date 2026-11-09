@@ -111,6 +111,13 @@ impl SideOperation {
 /// 标签不是装饰:消费者靠它分流,重连时客户端靠 `turn_id` 匹配 interrupt。
 #[derive(Debug, Clone)]
 pub struct ConversationEvent {
+    /// 这一帧属于**哪一次进入**。
+    ///
+    /// `None` 是主会话事件与操作失败帧——后者必须永远能被看见，所以它不被
+    /// 入场授权拦。`Some(entry)` 的帧只有在该 entry 仍是当前入场时才可建立/
+    /// 更新视图：这是「旧旁支的迟到帧不能复活已关闭视图」的唯一判据，不能靠
+    /// 任意 `SideStatus` 帧自动重建环境。
+    pub entry_id: Option<String>,
     pub target: ConversationTarget,
     pub turn_id: Option<String>,
     pub event: ConversationPayload,
@@ -156,10 +163,10 @@ pub const SIDE_CLOSE_COMMAND: &str = "side-close";
 pub const SIDE_HELP_ENTRIES: [(&str, &str); 3] = [
     (
         "side [问题]",
-        "打开临时旁问（基于创建时上下文，只读）；/btw 是别名",
+        "打开临时旁问（基于进入时的对话快照；不跟随主任务更新；退出后丢弃）；/btw 是别名",
     ),
-    ("back", "从旁问返回主会话，保留旁问及其在途轮次"),
-    ("side-close", "关闭当前旁问（取消在途轮次）"),
+    ("back", "退出旁问并丢弃本次环境（会停止当前回答）"),
+    ("side-close", "退出旁问并丢弃本次环境（/back 的同义命令）"),
 ];
 
 /// 旁支视图中允许的本地命令。

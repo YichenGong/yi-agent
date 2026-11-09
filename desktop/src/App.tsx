@@ -26,11 +26,12 @@ import { ThreadStore } from "./lib/threadStore";
 import { canRunSlashDuringTurn, SLASH_COMMANDS } from "./lib/slash";
 import { ClientRegistry } from "./lib/clientRegistry";
 import { SideConversationStore, type SideView } from "./lib/sideConversation";
+import { SideExitCoordinator } from "./lib/sideExit";
+import type { SideExitParams } from "./lib/protocol";
 import { useSideConversation } from "./hooks/useSideConversation";
 import {
   canControlSide,
   useSideConversationController,
-  type CloseConfirmation,
 } from "./hooks/useSideConversationController";
 import type { SideCommand } from "./lib/sideCommands";
 import { LOCAL_SLOT, type Slot } from "./lib/slots";
@@ -230,16 +231,28 @@ export default function App() {
     bumpSide((v) => v + 1);
   }, []);
 
+  /**
+   * 退出意图账本。**应用级单例**：它必须在控制器与连接的整个生命周期内保留，
+   * 因为「用户已明确退出、但网络不可用」这条意图要跨越多轮重连（spec §6.4）。
+   * 放进控制器会让它在一次渲染里重建，退出意图随之丢失。
+   *
+   * 回调必须触发重渲染：`pending`/`failed` 与提示都要能被用户看见（spec §8
+   * 「退出失败：主视图显示旁问退出尚未确认，允许重试」）。
+   */
+  const sideExitsRef = useRef<SideExitCoordinator | null>(null);
+  if (sideExitsRef.current === null) {
+    sideExitsRef.current = new SideExitCoordinator(() => forceSide());
+  }
+  const sideExits = sideExitsRef.current;
 
   /**
-   * 关闭旁支的二次确认。
+   * 卸载终结检查排下的定时器（spec §6.4）。
    *
-   * 非 null 表示「已经向服务端问过当前状态，等用户点头」。关一条正在回答的
-   * 旁支与关一条空闲的是两句话，所以确认文案由 `running` 决定，而不是一律
-   * 弹同一个框。
+   * 用 ref 而不是局部变量：StrictMode 的 cleanup 与紧接着的重新挂载是两次
+   * 不同的 effect 调用，只有共享的 ref 才能让后一次撤销前一次。
    */
-  const [sideCloseConfirm, setSideCloseConfirm] =
-    useState<CloseConfirmation | null>(null);
+  const pendingSideTermination = useRef<ReturnType<typeof setTimeout> | null>(null);
+
 
   /**
    * 旁支作用域里的一行提示（`/help`、`/config`、`/usage` 的输出）。
@@ -264,6 +277,7 @@ export default function App() {
     store: sideStoreRef.current,
     controllerFor: (binding, parentId) => sideApiRef.current!.controllerFor(binding, parentId),
     onChange: forceSide,
+    exits: sideExits,
   });
   const sideConversationRef = useRef(sideConversation);
   sideConversationRef.current = sideConversation;
@@ -962,11 +976,18 @@ export default function App() {
         // 只处理本地：远端项目跑的是另一台机器的二进制，它们的开关由那台机器的
         // `initialize` 决定，本机拨开关不该替它清视图。
         if (written.name === "side_conversation" && written.enabled === false) {
-          // 先返回主会话再销毁：顺序反了会让用户盯着一个已消失的视图。
-          // `back()` 无参、且能撤销一个尚未完成的入场，正是这里要的语义
-          // （`selectMain` 需要 binding + parentId，而此刻视图可能已经没 binding）。
-          sideConversationRef.current.back();
           const store = sideStoreRef.current;
+          // 本机开关只作用于**本机**槽位（spec §7「本机拨关不替远端清视图」）。
+          // 当前显示的若是远端旁问，这里既不清它、也不把用户从它上面导航走。
+          const shown = sideConversationRef.current.active;
+          if (shown !== null && shown.kind === "side") {
+            const binding = store.binding(shown.hostKey);
+            if (binding !== undefined && binding.slot === LOCAL_SLOT) {
+              // 先返回主会话再销毁：顺序反了会让用户盯着一个已消失的视图。
+              // `leaveSide` 能撤销一个尚未完成的入场，正是这里要的语义。
+              sideConversationRef.current.leaveSide("flag");
+            }
+          }
           for (const binding of store.bindingsForSlot(LOCAL_SLOT)) {
             store.dropHost(binding.key);
           }
@@ -1166,10 +1187,51 @@ export default function App() {
       if (document.visibilityState === "hidden") flushAll();
     };
     document.addEventListener("visibilitychange", onHide);
-    window.addEventListener("pagehide", flushAll);
     return () => {
       document.removeEventListener("visibilitychange", onHide);
-      window.removeEventListener("pagehide", flushAll);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * 页面离开：**尽力**通知一次旁问退出（spec §6.4）。
+   *
+   * 与上面那条分开：那条只在远端客户端（有本地缓存）时才生效，而旁问的退出
+   * 通知跟内容落盘无关。这里不承诺送达（浏览器收页面时 WebSocket 可能立刻断），
+   * 也**不**因 `visibilitychange` 而退出——手机切后台、窗口隐藏都不算用户离开。
+   */
+  useEffect(() => {
+    const onLeave = () => {
+      sideConversationRef.current.leaveSide("unmount");
+    };
+    window.addEventListener("pagehide", onLeave);
+    return () => {
+      window.removeEventListener("pagehide", onLeave);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * 应用 owner 卸载时的终结检查（spec §6.4）。
+   *
+   * React StrictMode 在开发期会「清理 → 立即重新挂载」：如果 cleanup 里直接
+   * 退出旁问，一次挂载能发出一次莫名其妙的销毁。所以 cleanup 只**安排**一次
+   * 0ms 后的终结，重新挂载时撤销它——同一 owner 内立即回来就零退出。
+   *
+   * 订阅本身由各自的 effect 负责 dispose；这里只管「用户真的走了」这一件事。
+   */
+  useEffect(() => {
+    // 挂载即撤销上一次清理排下的终结：同一 owner 立刻回来就不该有任何退出。
+    const pending = pendingSideTermination.current;
+    if (pending !== null) {
+      clearTimeout(pending);
+      pendingSideTermination.current = null;
+    }
+    return () => {
+      pendingSideTermination.current = setTimeout(() => {
+        pendingSideTermination.current = null;
+        sideConversationRef.current.leaveSide("unmount");
+      }, 0);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2077,6 +2139,7 @@ export default function App() {
       },
       buildResumeHints,
       sideStore: sideStoreRef.current,
+      sideExits,
       // 按 client 的握手 epoch：同一条连接上后一轮握手会让前一轮的「就绪」失效。
       onTraceHandshakeStart: (client) => handshakeEpochFor(client),
       onTraceHandshakeReady: (client, epoch) => {
@@ -2981,8 +3044,33 @@ export default function App() {
    * 来源边界：旁支的内容只在旁支视图里出现。父视图只显示**属于父**的错误
    * （`currentError` 已由 `setCurrentError` 按来源写），不把旁支的失败说成父的。
    */
-  const composerFeedback: { tone: "error" | "warn" | "info"; text: string } | null =
-    (() => {
+  const composerFeedback: {
+    tone: "error" | "warn" | "info";
+    text: string;
+    /** 为真时这一条旁边给一个「重试」：只对可重试的退出失败。 */
+    retryExit?: SideExitParams;
+  } | null = (() => {
+      /**
+       * 退出尚未被宿主确认（spec §8「退出失败：主视图显示旁问退出尚未确认/
+       * 清理失败，允许重试精确旧退出；不恢复正文，不静默重新 open」）。
+       *
+       * 优先级最高：它是**已经发生**的破坏性操作没收尾，比「这次发送失败了」
+       * 更需要用户看到——否则用户会以为已经走干净，而宿主上还占着槽位。
+       */
+      const exits = sideExits
+        .pending()
+        .filter((r) => r.target.parentThreadId === sess.currentId);
+      if (exits.length > 0) {
+        const failed = exits.find((r) => r.phase === "failed") ?? null;
+        if (failed !== null) {
+          return {
+            tone: "warn",
+            text: `旁问退出尚未确认：${failed.message ?? "清理未完成"}`,
+            retryExit: failed.target,
+          };
+        }
+        return { tone: "warn", text: "旁问正在退出，宿主确认前不能重新进入" };
+      }
       if (activeSide !== null) {
         if (sideConversation.visibleError !== null) {
           return { tone: "error", text: sideConversation.visibleError };
@@ -3101,9 +3189,12 @@ export default function App() {
     const view = sideStoreRef.current.read(a.hostKey, a.sideId);
     if (!view) return;
     if (name === "help") {
+      // 文案必须把**后果**写在前面：`/back` 与 `/side-close` 都会停止回答并
+      // 丢弃本次旁问（spec §4.3），没有「返回但保留」这条路。
       setSideNotice(
-        `旁问基于创建时的上下文，只读。可执行 /back 返回、/side-close 关闭、` +
-          `/config 查看固定配置、/usage 查看本旁问用量。` +
+        `旁问基于创建时的上下文，只读。可连续提问；/back 或 /side-close ` +
+          `都会退出并丢弃本次旁问（回答随之停止），再次进入是全新环境。` +
+          `/config 查看固定配置，/usage 查看本旁问用量。` +
           (args ? `${args} 的帮助请在主会话查看。` : ""),
       );
       return;
@@ -3136,6 +3227,27 @@ export default function App() {
    * 应打给他当时要关的那条。主视图也能关后台旁问——旁支只在视图里显示，不该
    * 成为「必须先进入才能关」的东西。
    */
+  /**
+   * 重试一条**精确**的旧退出（spec §8）。
+   *
+   * 不重新 open、不恢复正文：只是把那张旧票再送给宿主一次。票据带着
+   * `(hostInstanceId, parentThreadId, entryId)` 三元组，所以重试永远不会误关
+   * 之后新建的环境。
+   */
+  const retrySideExit = (target: SideExitParams): void => {
+    const binding = sideStoreRef.current
+      .bindingsForSlot(activeSlotRef.current)
+      .find((b) => b.instanceId === target.hostInstanceId);
+    if (binding === undefined) {
+      // 这个宿主已经不在了（换项目/断开）。`hostReplaced` 会在重连时清掉它。
+      forceSide();
+      return;
+    }
+    sideExits.retry(target);
+    void sideExits.flush(binding);
+    forceSide();
+  };
+
   const beginSideClose = async (): Promise<void> => {
     const binding =
       sideStoreRef.current.bindingsForSlot(activeSlotRef.current)[0];
@@ -3144,11 +3256,11 @@ export default function App() {
       setSideNotice("当前没有打开的旁问");
       return;
     }
-    const confirmation = await sideConversationRef.current.requestClose(
-      binding,
-      parentId,
-    );
-    if (confirmation !== null) setSideCloseConfirm(confirmation);
+    // 关闭就是退出（spec §4.3）：不再有「返回但保留」这条路，也就不再需要
+    // 二次确认（确认弹窗原本只是在问「要不要停止正在跑的那一轮」，而退出本来
+    // 就会停止它）。帮助与按钮文案已经把这一后果写在前面。
+    await sideConversationRef.current.closeBackground(binding, parentId);
+    forceSide();
   };
 
   /**
@@ -3492,7 +3604,7 @@ export default function App() {
                 {composerFeedback !== null && (
                   <p
                     role="status"
-                    className={`px-4 pt-2 text-xs ${
+                    className={`flex items-center gap-2 px-4 pt-2 text-xs ${
                       composerFeedback.tone === "error"
                         ? "text-red-500"
                         : composerFeedback.tone === "warn"
@@ -3500,7 +3612,20 @@ export default function App() {
                           : "text-fg-muted"
                     }`}
                   >
-                    {composerFeedback.text}
+                    <span>{composerFeedback.text}</span>
+                    {composerFeedback.retryExit !== undefined && (
+                      <button
+                        type="button"
+                        className="underline decoration-dotted"
+                        onClick={() =>
+                          retrySideExit(
+                            composerFeedback.retryExit as SideExitParams,
+                          )
+                        }
+                      >
+                        重试
+                      </button>
+                    )}
                   </p>
                 )}
                 <MessageInput
@@ -3606,50 +3731,6 @@ export default function App() {
                   }
                 />
             </>
-            {/*
-              关闭旁支的确认。文案分两种：正在回答时明确告诉用户会打断那一轮，
-              空闲时就只是关掉。`expectedActiveTurnId` 来自服务端当前摘要
-              （`beginSideClose` 刚问过），所以这不是"拿本地缓存去猜"。
-            */}
-            {sideCloseConfirm !== null && (
-              <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-                <div
-                  role="dialog"
-                  aria-label="关闭旁问"
-                  className="w-full max-w-sm rounded-lg border border-line-strong bg-panel p-4 text-sm shadow-xl"
-                >
-                  <p className="mb-3 text-fg">
-                    {sideCloseConfirm.running
-                      ? "这条旁问还在回答，关闭会中止它。确定关闭？"
-                      : "关闭后这条旁问不再保留。确定关闭？"}
-                  </p>
-                  <div className="flex justify-end gap-2">
-                    <button
-                      type="button"
-                      className="rounded-md border border-line-strong px-3 py-1 text-fg-muted hover:bg-raised"
-                      onClick={() => setSideCloseConfirm(null)}
-                    >
-                      取消
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded-md bg-red-600 px-3 py-1 font-medium text-white hover:bg-red-500"
-                      onClick={() => {
-                        // 只操作**捕获的**那份确认：弹窗开着时用户可能已经切走，
-                        // 关闭请求仍应打给他当时要关的那条（spec §5.4）。
-                        const confirmation = sideCloseConfirm;
-                        setSideCloseConfirm(null);
-                        void sideConversationRef.current
-                          .confirmClose(confirmation)
-                          .then(() => forceSide());
-                      }}
-                    >
-                      关闭旁问
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
             {/* 运行时版本横幅：与本功能无关，来自 main 的 daemon 生命周期计划。 */}
             {runtimeScopeKey !== null && runtimeControl !== null && (
               <RuntimeVersionBanner

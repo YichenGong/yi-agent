@@ -8,10 +8,14 @@
 //! Kept separate from the runtime so the shared crate never has to know about
 //! `ThreadStore`, `Item`, or the app-server's persisted wire types.
 
+pub mod lifecycle;
+pub mod live_parents;
 pub mod registry;
 pub mod replay;
 pub mod source;
+pub mod tickets;
 
+pub use live_parents::{LiveParentSource, LiveSideParents, live_roots};
 pub use registry::{
     ClosedSide, ParentChangeGuard, SIDE_TOMBSTONE_TTL, SIDE_TOMBSTONES, SideEffectiveConfig,
     SideRegistry, SideSnapshot, SideSummary,
@@ -26,4 +30,8 @@ pub use replay::{
 pub use source::{
     ColdParent, SIDE_COLD_ATTEMPTS, SideParentResolver, SideResolverFactory, ThreadStoreResolver,
     WorkspaceResolver, assemble_cold_source, read_cold_parent, source_from_live_agent,
+};
+pub use tickets::{
+    CLOSED_TICKET_TTL, ENTRY_TICKET_TTL, ENTRY_TICKETS_PER_HOST, ENTRY_TICKETS_PER_PARENT,
+    EntryTarget, EntryTickets, ExitReceipt, ExitState, SideGeneration,
 };
