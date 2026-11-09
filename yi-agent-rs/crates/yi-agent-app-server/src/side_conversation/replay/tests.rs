@@ -464,3 +464,46 @@ fn oversized_single_item_is_refused_not_truncated() {
         SideErrorReason::SnapshotTooLarge
     );
 }
+
+/// 关闭之后的续页必须失败,且旧 token 不复活。
+///
+/// 快照里只有标识与 item,没有「已关闭」这个事实;只靠 token 的有效期撑住,
+/// 就等于让客户端从 token 读回一条已经销毁的旁支的正文。
+#[tokio::test]
+async fn a_released_side_cannot_be_paged_again() {
+    let mut store = ReplayStore::new();
+    let baseline = ReplayBaseline {
+        side_id: "side-1".into(),
+        parent_thread_id: "p1".into(),
+        generation: 1,
+        snapshot_seq: 0,
+        status: SideStatus::Idle,
+        usage: SideUsage::default(),
+        active_turn_id: None,
+        accepted_requests: Default::default(),
+        effective_config: crate::side_conversation::SideEffectiveConfig {
+            model: "m".into(),
+            reasoning_effort: None,
+            preserve_thinking: false,
+            tool_names: Vec::new(),
+        },
+        items: Vec::new(),
+    };
+    let first = store
+        .read_page("conn", "side-1", None, None, Some(baseline.clone()))
+        .expect("first read");
+    // 断言这条基线确实签发了 token:否则下面「续页失败」就没有意义。
+    if !first.finished {
+        store.release_side("side-1");
+        let error = store
+            .read_page("conn", "side-1", Some("any-token"), None, None)
+            .expect_err("released side must not be pageable");
+        assert_eq!(error.reason, SideErrorReason::SnapshotExpired);
+        return;
+    }
+    // 空转录:首读即末页,token 已经释放。
+    let error = store
+        .read_page("conn", "side-1", Some("any-token"), None, None)
+        .expect_err("no token survives a finished page");
+    assert_eq!(error.reason, SideErrorReason::SnapshotExpired);
+}

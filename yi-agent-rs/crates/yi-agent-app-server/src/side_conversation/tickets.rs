@@ -107,9 +107,19 @@ pub struct ExitReceipt {
 
 #[derive(Clone, Debug)]
 enum TicketState {
-    Prepared { expires: Instant },
+    Prepared {
+        expires: Instant,
+    },
     Bound(SideGeneration),
-    Closed { at: Instant },
+    /// A closed record remembers which generation it named, if any.
+    ///
+    /// The generation is not content and is not a capability: it lets a retried
+    /// `exit` answer "that exact generation is still closing" instead of claiming
+    /// a destroy that has not happened yet.
+    Closed {
+        at: Instant,
+        side: Option<SideGeneration>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -251,6 +261,22 @@ impl EntryTickets {
         }
     }
 
+    /// The generation a closed record named, if any.
+    ///
+    /// Used by the host to answer a retried `exit` precisely. Returns `None` for an
+    /// unknown, expired or never-bound ticket.
+    pub fn closed_generation(
+        &mut self,
+        target: &EntryTarget,
+        now: Instant,
+    ) -> Option<SideGeneration> {
+        self.verify(target, now).ok()?;
+        match &self.records.get(&target.ticket)?.state {
+            TicketState::Closed { side, .. } => side.clone(),
+            _ => None,
+        }
+    }
+
     /// Consume `target` on exit.
     ///
     /// Answers with the *exact* generation to close. An unused ticket becomes
@@ -271,12 +297,18 @@ impl EntryTickets {
                 state: ExitState::Closing,
                 generation: Some(side.clone()),
             },
-            TicketState::Closed { .. } => ExitReceipt {
+            // A retried exit reports the same generation it reported the first
+            // time, so the caller can ask the owner whether that generation is
+            // really gone instead of inferring it from this table alone.
+            TicketState::Closed { side, .. } => ExitReceipt {
                 state: ExitState::Closed,
-                generation: None,
+                generation: side.clone(),
             },
         };
-        record.state = TicketState::Closed { at: now };
+        record.state = TicketState::Closed {
+            at: now,
+            side: receipt.generation.clone(),
+        };
         Ok(receipt)
     }
 
@@ -292,7 +324,10 @@ impl EntryTickets {
                 TicketState::Bound(bound) if bound == side
             );
             if matches {
-                record.state = TicketState::Closed { at: now };
+                record.state = TicketState::Closed {
+                    at: now,
+                    side: Some(side.clone()),
+                };
             }
         }
     }
@@ -341,7 +376,7 @@ impl EntryTickets {
         self.records.retain(|_, record| match &record.state {
             TicketState::Prepared { expires } => *expires > now,
             TicketState::Bound(_) => true,
-            TicketState::Closed { at } => now.duration_since(*at) < CLOSED_TICKET_TTL,
+            TicketState::Closed { at, .. } => now.duration_since(*at) < CLOSED_TICKET_TTL,
         });
     }
 
@@ -355,7 +390,7 @@ impl EntryTickets {
                 .records
                 .iter()
                 .filter_map(|(ticket, record)| match &record.state {
-                    TicketState::Closed { at } => Some((ticket.clone(), *at)),
+                    TicketState::Closed { at, .. } => Some((ticket.clone(), *at)),
                     _ => None,
                 })
                 .min_by_key(|(_, at)| *at);
@@ -642,12 +677,14 @@ mod tests {
 
         let receipt = tickets.revoke(&target, now).unwrap();
         assert_eq!(receipt.state, ExitState::Closing);
-        assert_eq!(receipt.generation, Some(side));
+        assert_eq!(receipt.generation, Some(side.clone()));
 
-        // A replay must not close a second side; it sees "already closed".
+        // A replay must not close a second side; it sees "already closed" and
+        // still names the generation it referred to, so the host can ask that
+        // generation whether its cleanup really finished.
         let replay = tickets.revoke(&target, now).unwrap();
         assert_eq!(replay.state, ExitState::Closed);
-        assert_eq!(replay.generation, None);
+        assert_eq!(replay.generation, Some(side));
     }
 
     #[test]

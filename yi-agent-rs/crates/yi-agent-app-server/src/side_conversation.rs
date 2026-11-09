@@ -8,6 +8,7 @@
 //! Kept separate from the runtime so the shared crate never has to know about
 //! `ThreadStore`, `Item`, or the app-server's persisted wire types.
 
+pub mod lifecycle;
 pub mod live_parents;
 pub mod registry;
 pub mod replay;

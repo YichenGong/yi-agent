@@ -101,10 +101,16 @@ pub(crate) async fn handle(
             };
             let id_for_task = id.clone();
             tasks.spawn(async move {
-                let result = registry
-                    .open(&params.parent_thread_id)
-                    .await
-                    .map(|summary| SideSummaryWire::from_registry(&summary));
+                // 旧协议没有票据,但**创建路径只有一条**:这里先签发一张票再消费它,
+                // 而不是留一个绕过准入的旁路。Task 9 会把票据升为参数,届时这段
+                // 自签自用删掉即可。
+                let result = match registry.prepare_entry(&params.parent_thread_id).await {
+                    Ok(target) => registry
+                        .open_entry(&target)
+                        .await
+                        .map(|summary| SideSummaryWire::from_registry(&summary)),
+                    Err(error) => Err(error),
+                };
                 responder.send(id_for_task, result).await;
             });
         }
@@ -252,6 +258,22 @@ async fn read_items(
         let snapshot = registry.snapshot(&params.side_id).await?;
         Some(ReplayBaseline::from_snapshot(&snapshot))
     } else {
+        // 续页也必须过同一道关闭屏障:快照 token 里钉着正文,只因为「页码对得上」
+        // 就继续吐,等于让已退出的一代从 token 复活。
+        //
+        // 顺序:先认这条连接的 token(别的连接/别的 side 仍是 `snapshot_expired`,
+        // 不能因为对应 side 恰好关了就换一个错误原因),再验这一代是否还活着。
+        let token = params.snapshot_token.as_deref().unwrap_or_default();
+        if replay.owns_token(connection, &params.side_id, token)
+            && registry.snapshot(&params.side_id).await.is_err()
+        {
+            // 关掉这条连接的 token:留着它只是给下一次重试留一条通往旧代的路。
+            replay.release_connection(connection);
+            return Err(SideError::new(
+                SideErrorReason::SideClosing,
+                "旁支已退出，不能继续分页",
+            ));
+        }
         None
     };
     let page = replay.read_page(

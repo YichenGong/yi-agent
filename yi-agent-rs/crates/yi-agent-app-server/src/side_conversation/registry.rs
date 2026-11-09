@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::StreamExt;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use yi_agent_runtime::side_conversation::{
     CloseReason, SideConversationRunner, SideHostResources, SideIdleDeadline, SideRequestLedger,
@@ -32,8 +32,10 @@ use yi_agent_runtime::side_conversation::{
 
 use yi_agent_runtime::side_conversation::{SideError, SideErrorReason, SideUsage};
 
+use super::lifecycle::{GenerationOwner, Phase};
 use super::replay::SIDE_ITEM_FLUSH_INTERVAL;
 use super::source::SideParentResolver;
+use super::tickets::{EntryTarget, EntryTickets, ExitReceipt, ExitState};
 
 /// How many closed sides a host remembers for idempotent retries.
 pub const SIDE_TOMBSTONES: usize = 1024;
@@ -280,24 +282,37 @@ struct StagedRevision {
 }
 
 /// How a parent is currently occupied.
+///
+/// One parent has at most one generation in any non-terminal phase. A second
+/// entry for the same parent binds to that generation instead of creating a
+/// second environment, which is what keeps two transports from starting two
+/// provider streams over one history.
 enum ParentSlot {
-    /// A creation is in flight; everyone else waits on the notify.
-    Creating(Arc<Notify>),
-    Ready(String),
+    /// One generation exists (creating, open, closing, or failed-cleanup).
+    Bound(Arc<GenerationOwner>),
+    /// A destructive parent operation holds the parent: new entries are refused
+    /// until it commits or rolls back.
+    Changing,
+}
+
+/// Everything the registry mutates, under one lock.
+///
+/// Parents, sides and tickets share a lock on purpose. Splitting them is what
+/// would allow a "bind this ticket" step to interleave with a "remove that
+/// parent" step, so a revoked ticket could still create an environment, or a
+/// closed generation could still be reached through a stale binding.
+struct RegistryState {
+    parents: HashMap<String, ParentSlot>,
+    sides: HashMap<String, Arc<GenerationOwner>>,
+    tickets: EntryTickets,
+    tombstones: HashMap<String, Tombstone>,
 }
 
 /// The host's side registry.
 pub struct SideRegistry {
     resolver: Arc<dyn SideParentResolver>,
     resources: Arc<SideHostResources>,
-    parents: Mutex<HashMap<String, ParentSlot>>,
-    sides: Mutex<HashMap<String, Arc<Mutex<SideEntry>>>>,
-    tombstones: Mutex<HashMap<String, Tombstone>>,
-    /// The notify of each in-flight create, kept until the creator wakes waiters.
-    ///
-    /// Separate from `parents` because the placeholder is *replaced* by `Ready` on
-    /// success while the notify still has waiters; mixing the two would lose them.
-    creating_notify: Mutex<HashMap<String, Arc<Notify>>>,
+    state: Mutex<RegistryState>,
     /// Bumped on every successful create so a side id is never reused.
     next_generation: AtomicU64,
     /// 分页快照登记表。`None` 表示宿主没装(纯 registry 单测),此时关闭不必
@@ -310,13 +325,9 @@ pub struct SideRegistry {
     closed: std::sync::atomic::AtomicBool,
     /// 清扫代次。每次 `close_all()` 自增。
     ///
-    /// `create_inner` 与 `open()` 的等待者在把一条 side 对外可见之前都要复核它，
-    /// 不一致就放弃。没有它，「关掉开关」与「正在创建」并发时会漏：`create_inner`
-    /// 要读完父会话、复制附件之后才 `sides.insert`，那时清扫可能已经跑完了。
-    ///
-    /// **两处都要复核**（只护 `create_inner` 不够）：等待者在 `Creating` 占位上
-    /// 醒来后会回到 `open()` 的 loop，若不复核就会以清扫之后的新代次重试，成功
-    /// 建出一条活旁支。
+    /// 构造在把一条 side 对外可见之前要复核它，不一致就放弃。没有它，
+    /// 「关掉开关」与「正在创建」并发时会漏：构造要读完父会话、准备资源之后
+    /// 才安装 entry，那时清扫可能已经跑完了。
     sweep_epoch: AtomicU64,
 }
 
@@ -325,13 +336,16 @@ impl SideRegistry {
     /// so nothing here needs one. Cleanup uses the pool owned by
     /// [`SideHostResources`], which already outlives every side.
     pub fn new(resolver: Arc<dyn SideParentResolver>, resources: Arc<SideHostResources>) -> Self {
+        let host = resources.host_instance_id().to_string();
         Self {
             resolver,
             resources,
-            parents: Mutex::new(HashMap::new()),
-            sides: Mutex::new(HashMap::new()),
-            tombstones: Mutex::new(HashMap::new()),
-            creating_notify: Mutex::new(HashMap::new()),
+            state: Mutex::new(RegistryState {
+                parents: HashMap::new(),
+                sides: HashMap::new(),
+                tickets: EntryTickets::new(host),
+                tombstones: HashMap::new(),
+            }),
             next_generation: AtomicU64::new(1),
             replay: tokio::sync::Mutex::new(None),
             hub: std::sync::Mutex::new(None),
@@ -432,114 +446,171 @@ impl SideRegistry {
         self.resources.host_instance_id()
     }
 
-    /// Create or return the parent's side.
+    /// Issue one entry ticket for `parent`.
     ///
-    /// Concurrent calls for one parent collapse: the first becomes the creator and
-    /// the rest wait on its notify, then re-read the table. That is what keeps two
-    /// transports from starting two provider streams on one history.
-    pub async fn open(&self, parent: &str) -> Result<SideSummary, SideError> {
+    /// Touches no parent state: no resolver call, no directory, no provider. The
+    /// whole point of splitting "may I open" from "open" is that the first question
+    /// is cheap, bounded and revocable, and the second is only asked with a
+    /// capability in hand.
+    pub async fn prepare_entry(&self, parent: &str) -> Result<EntryTarget, SideError> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(SideError::new(SideErrorReason::SideClosing, "宿主正在关闭"));
         }
-        // 记下进来时的代次：等待者在 `Creating` 上醒来后会走到 loop 顶部，
-        // 若期间发生过清扫，这次 open 属于「清扫之前的意图」，不能再建。
+        let mut state = self.state.lock().await;
+        state.tickets.prepare(parent, tokio::time::Instant::now())
+    }
+
+    /// Create or return the side a ticket authorises.
+    ///
+    /// The ticket is the only way in: a caller without one cannot create an
+    /// environment, so "who may open" and "which parent" are one decision rather
+    /// than two that can disagree.
+    pub async fn open_entry(
+        self: &Arc<Self>,
+        target: &EntryTarget,
+    ) -> Result<SideSummary, SideError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(SideError::new(SideErrorReason::SideClosing, "宿主正在关闭"));
+        }
         let epoch = self.sweep_epoch.load(Ordering::SeqCst);
-        loop {
-            if self.sweep_epoch.load(Ordering::SeqCst) != epoch {
-                return Err(SideError::new(
-                    SideErrorReason::SideClosing,
-                    "清扫期间放弃创建旁支",
-                ));
-            }
-            // The wait future is created and *enabled* while the map lock is held.
-            // Creating it after dropping the lock leaves a window in which the
-            // creator publishes `Ready` and notifies nobody; the waiter then sleeps
-            // on a notification that already happened. `enable` registers now, so
-            // that race cannot exist.
-            let wait = {
-                let mut parents = self.parents.lock().await;
-                match parents.get(parent) {
-                    Some(ParentSlot::Ready(side_id)) => Some(Err(side_id.clone())),
-                    Some(ParentSlot::Creating(notify)) => {
-                        let mut future = Box::pin(Arc::clone(notify).notified_owned());
-                        future.as_mut().enable();
-                        Some(Ok(future))
+        let parent = target.parent().to_string();
+        let bound = {
+            let mut state = self.state.lock().await;
+            // A ticket that is prepared right now may still be bound; one that is
+            // closed (or unknown/expired) is refused here, before any work.
+            let existing = state.tickets.resolve(target, tokio::time::Instant::now())?;
+            match existing {
+                Some(side) => state.sides.get(&side.side_id).cloned().ok_or_else(|| {
+                    SideError::new(SideErrorReason::SideClosing, "该票据对应的旁支已经退出")
+                })?,
+                None => match state.parents.get(&parent).map(|slot| match slot {
+                    ParentSlot::Bound(owner) => Some(Arc::clone(owner)),
+                    ParentSlot::Changing => None,
+                }) {
+                    Some(Some(owner)) => {
+                        // Bind to the generation that already exists. This is the
+                        // "one parent, one environment" rule stated as an
+                        // operation: a second caller joins, never creates.
+                        state.tickets.bind(
+                            target,
+                            owner.side().clone(),
+                            tokio::time::Instant::now(),
+                        )?;
+                        owner
+                    }
+                    Some(None) => {
+                        return Err(SideError::new(
+                            SideErrorReason::SideClosing,
+                            "父会话正在变更，暂不能进入旁问",
+                        ));
                     }
                     None => {
-                        let notify = Arc::new(Notify::new());
-                        self.creating_notify
-                            .lock()
-                            .await
-                            .insert(parent.to_string(), Arc::clone(&notify));
-                        parents.insert(
-                            parent.to_string(),
-                            ParentSlot::Creating(Arc::clone(&notify)),
-                        );
-                        None
+                        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+                        let side_id = uuid::Uuid::new_v4().to_string();
+                        let owner =
+                            GenerationOwner::new(side_id.clone(), generation, parent.clone());
+                        // Bind **before** spawning any construction: a ticket that
+                        // was revoked after this point must never create.
+                        state.tickets.bind(
+                            target,
+                            owner.side().clone(),
+                            tokio::time::Instant::now(),
+                        )?;
+                        state
+                            .parents
+                            .insert(parent.clone(), ParentSlot::Bound(Arc::clone(&owner)));
+                        state.sides.insert(side_id, Arc::clone(&owner));
+                        Arc::clone(&owner)
                     }
+                },
+            }
+        };
+
+        self.ensure_constructing(Arc::clone(&bound), parent, epoch)
+            .await;
+        self.wait_open(&bound).await
+    }
+
+    /// Spawn the construction task once per generation.
+    async fn ensure_constructing(
+        self: &Arc<Self>,
+        owner: Arc<GenerationOwner>,
+        parent: String,
+        epoch: u64,
+    ) {
+        if owner.phase() != Phase::Creating {
+            return;
+        }
+        if !owner.claim_construction() {
+            return;
+        }
+        let registry = Arc::clone(self);
+        let task_owner = Arc::clone(&owner);
+        // The construction handle is registered *inside* the task start, so two
+        // concurrent callers cannot both spawn: `construction_pending` flips
+        // before the first await.
+        let handle = tokio::spawn(async move {
+            registry.construct(task_owner, parent, epoch).await;
+        });
+        owner.set_construction(handle).await;
+    }
+
+    /// The body of one generation's creation.
+    async fn construct(self: Arc<Self>, owner: Arc<GenerationOwner>, parent: String, epoch: u64) {
+        let cancel = owner.cancel();
+        let outcome = self.build_entry(&owner, &parent, epoch, cancel).await;
+        match outcome {
+            Ok(summary) => {
+                // The generation is usable only if nobody asked to close while it
+                // was being built. `try_open` is the compare-and-set for that.
+                if !owner.try_open() {
+                    // Exit arrived during construction: drop what was built and let
+                    // the drain that is already running reclaim it.
+                    let _ = summary;
+                    self.finish_failed_construction(&owner, None).await;
                 }
-            };
-            match wait {
-                Some(Err(side_id)) => return self.summary_of(&side_id).await,
-                // Someone else is creating: wait for them rather than racing.
-                Some(Ok(future)) => future.await,
-                None => return self.create(parent).await,
+            }
+            Err(error) => {
+                tracing::debug!(reason = error.reason_str(), "side construction failed");
+                owner.set_error(error);
+                let error = owner.error();
+                self.finish_failed_construction(&owner, error).await;
             }
         }
     }
 
-    /// The body of `open` for the caller that won the creation race.
-    async fn create(&self, parent: &str) -> Result<SideSummary, SideError> {
-        let outcome = self.create_inner(parent).await;
-        {
-            let mut parents = self.parents.lock().await;
-            match &outcome {
-                Ok(summary) => {
-                    parents.insert(
-                        parent.to_string(),
-                        ParentSlot::Ready(summary.side_id.clone()),
-                    );
+    /// Build the environment of one generation.
+    async fn build_entry(
+        self: &Arc<Self>,
+        owner: &Arc<GenerationOwner>,
+        parent: &str,
+        epoch: u64,
+        cancel: CancellationToken,
+    ) -> Result<SideSummary, SideError> {
+        let source = {
+            // Cancellation must be observable while the parent is being read: a
+            // user who leaves during `Creating` should not wait for a cold read of
+            // a large history.
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err(SideError::new(SideErrorReason::Cancelled, "旁支在准备期间被取消"));
                 }
-                // A failed create must not leave a placeholder behind: that would
-                // make the parent permanently un-openable.
-                Err(_) => {
-                    parents.remove(parent);
-                }
+                resolved = self.resolver.resolve(parent) => resolved?,
             }
+        };
+        if cancel.is_cancelled() {
+            return Err(SideError::new(
+                SideErrorReason::Cancelled,
+                "旁支在准备期间被取消",
+            ));
         }
-        // Always wake the waiters, success or failure. On success they re-read the
-        // map and find `Ready`; on failure they find no slot and become the next
-        // creator.
-        self.wake_creating(parent).await;
-        outcome
-    }
-
-    /// Wake waiters registered on a parent's placeholder.
-    ///
-    /// The placeholder is replaced by `Ready` on success, so the only handle to its
-    /// notify is the clone every waiter took. Keeping the notify in the entry would
-    /// mean holding it for the side's whole life for one wake-up; instead the
-    /// creator notifies through the same `Arc` it created. That is why the
-    /// placeholder stores the `Arc` and the creator keeps its own clone.
-    async fn wake_creating(&self, parent: &str) {
-        let notify = self.creating_notify.lock().await.remove(parent);
-        if let Some(notify) = notify {
-            notify.notify_waiters();
-        }
-    }
-
-    async fn create_inner(&self, parent: &str) -> Result<SideSummary, SideError> {
-        // 记下进来时的清扫代次：整个创建要读父会话、复制附件，期间用户可能
-        // 把开关关掉并触发一次 `close_all`。
-        let epoch = self.sweep_epoch.load(Ordering::SeqCst);
-        let source = self.resolver.resolve(parent).await?;
-        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
-        let side_id = uuid::Uuid::new_v4().to_string();
+        let side_id = owner.side().side_id.clone();
+        let generation = owner.side().generation;
 
         // The slot is reserved before any file work so a burst of opens cannot
         // exceed the host's allowance while the copies are still in flight.
         let lease = self.resources.reserve_slot(&side_id)?;
-        let cancel = CancellationToken::new();
         let prepared = self
             .resources
             .prepare(Arc::clone(&lease), &source, cancel.clone())
@@ -575,50 +646,401 @@ impl SideRegistry {
             closing: false,
             config,
         }));
+
         {
-            let mut sides = self.sides.lock().await;
+            // Install only while the generation is still `Creating`: an exit that
+            // arrived during construction must not leave a built environment behind
+            // (its lease would never be released).
             if self.sweep_epoch.load(Ordering::SeqCst) != epoch {
-                // 清扫发生在创建期间：这条 side 从未对外可见，直接丢弃。
-                // 返回 `SideClosing` 让 `create()` 的 Err 分支移除父占位，
-                // 而不是把 `Ready` 写回去。
                 return Err(SideError::new(
                     SideErrorReason::SideClosing,
                     "清扫期间创建的旁支已丢弃",
                 ));
             }
-            sides.insert(side_id.clone(), Arc::clone(&entry));
+            if !owner.install_entry_if_creating(Arc::clone(&entry)).await {
+                return Err(SideError::new(
+                    SideErrorReason::SideClosing,
+                    "退出期间创建的旁支已丢弃",
+                ));
+            }
         }
         let guard = entry.lock().await;
         Ok(guard.summary())
+    }
+
+    /// Remove a generation whose creation failed, and prove its slot is released.
+    ///
+    /// A failed creation still holds a resource slot: the directory may exist and
+    /// its receipt must be confirmed before the slot is considered free. The
+    /// generation is dropped from the maps so the parent is openable again, and the
+    /// ticket is finished so the caller gets an honest "that entry is gone".
+    async fn finish_failed_construction(
+        self: &Arc<Self>,
+        owner: &Arc<GenerationOwner>,
+        error: Option<SideError>,
+    ) {
+        let side = owner.side().clone();
+        let parent = owner.parent().to_string();
+        let side_id = side.side_id.clone();
+        let entry = owner.take_entry().await;
+        if let Some(entry) = entry {
+            let mut guard = entry.lock().await;
+            guard.closing = true;
+            let _ = guard.runner.close().await;
+        }
+        // Dropping the entry drops the last lease; confirm the receipt before the
+        // slot is treated as free.
+        if let Ok(mut receipt) = self.resources.cleanup_receipt(&side_id) {
+            let _ = receipt.wait(super::lifecycle::SIDE_DRAIN_GRACE).await;
+        }
+        self.release_side_snapshots(&side_id).await;
+        {
+            let mut state = self.state.lock().await;
+            state.sides.remove(&side_id);
+            if matches!(
+                state.parents.get(&parent),
+                Some(ParentSlot::Bound(owner)) if owner.side() == &side
+            ) {
+                state.parents.remove(&parent);
+            }
+            state.tickets.finish(&side, tokio::time::Instant::now());
+        }
+        if let Some(error) = error {
+            owner.set_error(error);
+        }
+        owner.set_phase(Phase::Closed);
+    }
+
+    /// Wait until `owner` is usable, or explain why it is not.
+    async fn wait_open(&self, owner: &Arc<GenerationOwner>) -> Result<SideSummary, SideError> {
+        let mut rx = owner.watch();
+        loop {
+            // Read the phase into a value before awaiting: `watch::Ref` holds a
+            // `std` RwLock guard, which is not `Send` and would make the whole
+            // `open` future non-`Send` (so it could not be spawned off the loop).
+            let phase = owner.phase();
+            match phase {
+                Phase::Open => {
+                    let Some(entry) = owner.entry().await else {
+                        return Err(SideError::new(
+                            SideErrorReason::SideClosing,
+                            "旁支环境尚未安装",
+                        ));
+                    };
+                    let guard = entry.lock().await;
+                    return Ok(guard.summary());
+                }
+                Phase::Creating => {}
+                Phase::Closing | Phase::Closed => {
+                    // A generation that never became usable reports *why*: an
+                    // unknown parent is a different answer from "somebody else is
+                    // exiting", and collapsing them would tell the user to retry
+                    // something that can never work.
+                    if let Some(error) = owner.error() {
+                        return Err(error);
+                    }
+                    return Err(SideError::new(
+                        SideErrorReason::SideClosing,
+                        "上一条旁问正在退出，请稍后重试",
+                    ));
+                }
+                Phase::Failed => {
+                    return Err(owner.error().unwrap_or_else(|| {
+                        SideError::new(SideErrorReason::SideClosing, "旁支上次退出未完成")
+                    }));
+                }
+            }
+            if rx.changed().await.is_err() {
+                return Err(SideError::new(
+                    SideErrorReason::SideClosing,
+                    "旁支在等待期间消失",
+                ));
+            }
+        }
+    }
+
+    /// Exit the generation `target` names.
+    ///
+    /// The first call marks the exact generation `Closing` and starts one drain
+    /// task; it returns before the drain finishes, because the caller must not wait
+    /// on a provider stop. A later call polls the *same* generation: `Closing` while
+    /// the drain runs, `Closed` once its resources are confirmed released, `Failed`
+    /// when cleanup could not prove it (a retry resumes the same generation).
+    pub async fn exit_entry(
+        self: &Arc<Self>,
+        target: &EntryTarget,
+    ) -> Result<ExitReceipt, SideError> {
+        let (receipt, owner) = {
+            let mut state = self.state.lock().await;
+            let receipt = state.tickets.revoke(target, tokio::time::Instant::now())?;
+            let owner = receipt
+                .generation
+                .as_ref()
+                .and_then(|side| state.sides.get(&side.side_id).cloned());
+            (receipt, owner)
+        };
+        let Some(owner) = owner else {
+            // Unused ticket, or a generation that is already gone: both are a
+            // no-op, and neither may create or kill anything else.
+            return Ok(ExitReceipt {
+                state: ExitState::Closed,
+                generation: receipt.generation,
+            });
+        };
+        owner.begin_closing();
+        match owner.phase() {
+            Phase::Closed => Ok(ExitReceipt {
+                state: ExitState::Closed,
+                generation: receipt.generation,
+            }),
+            Phase::Failed => Ok(ExitReceipt {
+                state: ExitState::Closing,
+                generation: receipt.generation,
+            }),
+            _ => {
+                if owner.begin_drain() {
+                    let registry = Arc::clone(self);
+                    let draining = Arc::clone(&owner);
+                    tokio::spawn(async move {
+                        let _ = registry.drain(draining, CloseReason::UserClosed).await;
+                    });
+                }
+                Ok(ExitReceipt {
+                    state: ExitState::Closing,
+                    generation: receipt.generation,
+                })
+            }
+        }
+    }
+
+    /// The one cleanup path for a generation.
+    ///
+    /// Everything expensive happens here, outside the state lock and outside the
+    /// request path: cancel construction, close the runner (which joins the real
+    /// core task), join forwarders, revoke snapshots, confirm the resource receipt,
+    /// and only then remove the generation and answer `Closed`.
+    async fn drain(
+        self: &Arc<Self>,
+        owner: Arc<GenerationOwner>,
+        reason: CloseReason,
+    ) -> Result<(), SideError> {
+        let side = owner.side().clone();
+        let side_id = side.side_id.clone();
+        let parent = owner.parent().to_string();
+        owner.set_phase(Phase::Closing);
+        // Stop new work first: any turn accepted after this point must see Closing.
+        owner.cancel().cancel();
+
+        let grace = super::lifecycle::SIDE_DRAIN_GRACE;
+        let failure = async {
+            // 1. A construction still running must observe the cancellation rather
+            //    than be aborted: aborting drops the read mid-flight and races the
+            //    resource cleanup it already queued.
+            if let Some(handle) = owner.take_construction().await {
+                match tokio::time::timeout(super::lifecycle::SIDE_CONSTRUCTION_GRACE, handle).await
+                {
+                    Ok(Ok(())) | Ok(Err(_)) => {}
+                    Err(_) => {
+                        return Err(SideError::new(
+                            SideErrorReason::SideClosing,
+                            "creation_did_not_observe_cancellation",
+                        ));
+                    }
+                }
+            }
+            // 2. Close the runner. `close` waits for the pump's join evidence, so a
+            //    `Closed` here really means the core task ended.
+            if let Some(entry) = owner.entry().await {
+                let mut guard = entry.lock().await;
+                guard.closing = true;
+                match tokio::time::timeout(grace, guard.runner.close()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(SideError::new(
+                            SideErrorReason::SideClosing,
+                            "runner_close_timeout",
+                        ));
+                    }
+                }
+            }
+            Ok::<(), SideError>(())
+        }
+        .await;
+
+        if let Err(error) = failure {
+            // Keep the generation: its owner is the only thing that can retry the
+            // *same* drain, and dropping it would abandon a live core task.
+            tracing::warn!(reason = error.reason_str(), "side drain failed");
+            owner.set_error(error.clone());
+            owner.set_phase(Phase::Failed);
+            owner.end_drain();
+            return Err(error);
+        }
+
+        // 3. Forwarders hold the entry (and the transcript) alive; join them before
+        //    dropping it so no late item can be published for a closed generation.
+        for handle in owner.take_publishers().await {
+            let _ = tokio::time::timeout(grace, handle).await;
+        }
+
+        // 4. Terminal frame while the entry still exists. The budget is deliberately
+        //    short: resources are already being reclaimed, and a client that misses
+        //    this reconciles through `side/exit` or `side/list`.
+        if let Some(entry) = owner.entry().await {
+            let closed = {
+                let mut guard = entry.lock().await;
+                Self::stage(&mut guard, |entry| super::SidePublishedUpdate::Closed {
+                    side_id: entry.side_id.clone(),
+                    reason,
+                })
+            };
+            if let Some(staged) = closed {
+                let _ = tokio::time::timeout(
+                    super::lifecycle::SIDE_CLOSED_NOTIFY_BUDGET,
+                    self.deliver(staged),
+                )
+                .await;
+            }
+        }
+
+        // 5. Capture the dedup table (request id -> turn id, no text) while the
+        //    entry still exists: a retried request must be answered against the
+        //    generation that accepted it, not against a fresh one.
+        let accepted: Vec<(String, String)> = match owner.entry().await {
+            Some(entry) => {
+                let guard = entry.lock().await;
+                guard.ledger.accepted_requests().into_iter().collect()
+            }
+            None => Vec::new(),
+        };
+
+        // Revoke paging snapshots: they hold the body, and the tombstone must
+        // never become a way back into deleted content.
+        self.release_side_snapshots(&side_id).await;
+
+        // 6. Take the entry out (and drop it) so the last lease is released, then
+        //    confirm the delete before claiming the slot back.
+        let entry = owner.take_entry().await;
+        drop(entry);
+        if let Ok(mut receipt) = self.resources.cleanup_receipt(&side_id) {
+            match receipt.wait(grace).await {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::warn!(reason = error.reason_str(), "side cleanup unconfirmed");
+                    owner.set_error(error.clone());
+                    owner.set_phase(Phase::Failed);
+                    owner.end_drain();
+                    return Err(error);
+                }
+            }
+        }
+
+        // 7. Only now: forget the generation, release the parent, finish its exact
+        //    tickets, and remember a tombstone that answers retries honestly.
+        {
+            let mut state = self.state.lock().await;
+            state.sides.remove(&side_id);
+            if matches!(
+                state.parents.get(&parent),
+                Some(ParentSlot::Bound(owner)) if owner.side() == &side
+            ) {
+                state.parents.remove(&parent);
+            }
+            state.tickets.finish(&side, tokio::time::Instant::now());
+            state.tombstones.insert(
+                side_id.clone(),
+                Tombstone {
+                    side_id: side_id.clone(),
+                    parent: parent.clone(),
+                    generation: side.generation,
+                    accepted,
+                    created_at: tokio::time::Instant::now(),
+                },
+            );
+            Self::prune_tombstones(&mut state.tombstones, tokio::time::Instant::now());
+        }
+        owner.set_phase(Phase::Closed);
+        owner.end_drain();
+        Ok(())
     }
 
     /// Every live side for one parent (zero or one, but the wire shape is a list).
     pub async fn list(&self, parent: &str) -> Vec<SideSummary> {
-        let side_ids: Vec<String> = {
-            let parents = self.parents.lock().await;
-            match parents.get(parent) {
-                Some(ParentSlot::Ready(side_id)) => vec![side_id.clone()],
-                _ => Vec::new(),
+        let owner = {
+            let state = self.state.lock().await;
+            match state.parents.get(parent) {
+                Some(ParentSlot::Bound(owner)) => Some(Arc::clone(owner)),
+                _ => None,
             }
         };
-        let mut out = Vec::new();
-        for side_id in side_ids {
-            if let Ok(summary) = self.summary_of(&side_id).await {
-                out.push(summary);
+        let Some(owner) = owner else {
+            return Vec::new();
+        };
+        match owner.entry().await {
+            Some(entry) => {
+                let guard = entry.lock().await;
+                vec![guard.summary()]
             }
+            // A generation that is still being built is reported as `Creating`:
+            // hiding it would make a second client create a second environment.
+            None => vec![SideRegistry::creating_summary(&owner)],
         }
-        out
     }
 
-    async fn summary_of(&self, side_id: &str) -> Result<SideSummary, SideError> {
-        let entry = self.entry(side_id).await?;
-        let guard = entry.lock().await;
-        Ok(guard.summary())
+    fn creating_summary(owner: &GenerationOwner) -> SideSummary {
+        SideSummary {
+            side_id: owner.side().side_id.clone(),
+            parent_thread_id: owner.parent().to_string(),
+            status: SideStatus::Creating,
+            snapshot_revision: owner.side().generation,
+            last_seq: 0,
+            active_turn_id: None,
+            expires_at: None,
+            generation: owner.side().generation,
+            stopping: false,
+        }
+    }
+
+    async fn owner(&self, side_id: &str) -> Option<Arc<GenerationOwner>> {
+        let state = self.state.lock().await;
+        state.sides.get(side_id).cloned()
     }
 
     async fn entry(&self, side_id: &str) -> Result<Arc<Mutex<SideEntry>>, SideError> {
-        let sides = self.sides.lock().await;
-        sides.get(side_id).cloned().ok_or_else(|| {
+        let Some(owner) = self.owner(side_id).await else {
+            return Err(SideError::new(
+                SideErrorReason::SideNotFound,
+                format!("找不到旁支 {side_id}"),
+            ));
+        };
+        owner.entry().await.ok_or_else(|| {
+            SideError::new(
+                SideErrorReason::SideNotFound,
+                format!("找不到旁支 {side_id}"),
+            )
+        })
+    }
+
+    /// Refuse a generation that is on its way out.
+    ///
+    /// Reads and submits share this check: after `Closing` there is no body to read
+    /// and no turn to accept, and an accepted one would publish into a transcript
+    /// that is about to be dropped.
+    async fn live_entry(&self, side_id: &str) -> Result<Arc<Mutex<SideEntry>>, SideError> {
+        let Some(owner) = self.owner(side_id).await else {
+            return Err(SideError::new(
+                SideErrorReason::SideNotFound,
+                format!("找不到旁支 {side_id}"),
+            ));
+        };
+        if owner.is_closing() {
+            return Err(SideError::new(
+                SideErrorReason::SideClosing,
+                format!("旁支 {side_id} 已关闭"),
+            ));
+        }
+        owner.entry().await.ok_or_else(|| {
             SideError::new(
                 SideErrorReason::SideNotFound,
                 format!("找不到旁支 {side_id}"),
@@ -633,7 +1055,7 @@ impl SideRegistry {
         text: String,
         request_id: String,
     ) -> Result<String, SideError> {
-        let entry = self.entry(side_id).await?;
+        let entry = self.live_entry(side_id).await?;
         let mut guard = entry.lock().await;
         if guard.closing || guard.runner.status() == SideStatus::Closing {
             return Err(SideError::new(
@@ -711,7 +1133,13 @@ impl SideRegistry {
             turn_id: turn_id.clone(),
             dirty: std::collections::BTreeSet::new(),
         };
-        tokio::spawn(task.run(stream));
+        let handle = tokio::spawn(task.run(stream));
+        // The forwarder holds the entry (and its transcript) alive. A drain must be
+        // able to join it, otherwise a closed generation could still publish an item
+        // after its terminal frame.
+        if let Some(owner) = self.owner(side_id).await {
+            owner.push_publisher(handle).await;
+        }
         Ok(turn_id)
     }
 
@@ -740,24 +1168,40 @@ impl SideRegistry {
     }
 
     /// Close the side, conditionally on the turn the caller believed was active.
-    pub async fn close(&self, side_id: &str, expected: Option<&str>) -> Result<(), SideError> {
-        let entry = match self.entry(side_id).await {
-            Ok(entry) => entry,
-            Err(_) => {
-                // A repeated close against a tombstone is idempotent (spec §8.1).
-                let tombstones = self.tombstones.lock().await;
-                return if tombstones.contains_key(side_id) {
-                    Ok(())
-                } else {
-                    Err(SideError::new(
-                        SideErrorReason::SideNotFound,
-                        format!("找不到旁支 {side_id}"),
-                    ))
-                };
-            }
+    ///
+    /// Retained for the legacy `side/close` method, which a pre-lifecycle client
+    /// still calls. It runs the **same** drain as `exit_entry`: keeping a second,
+    /// simpler teardown path is how one of them quietly stops releasing resources.
+    pub async fn close(
+        self: &Arc<Self>,
+        side_id: &str,
+        expected: Option<&str>,
+    ) -> Result<(), SideError> {
+        let Some(owner) = self.owner(side_id).await else {
+            // A repeated close against a tombstone is idempotent (spec §8.1).
+            let state = self.state.lock().await;
+            return if state.tombstones.contains_key(side_id) {
+                Ok(())
+            } else {
+                Err(SideError::new(
+                    SideErrorReason::SideNotFound,
+                    format!("找不到旁支 {side_id}"),
+                ))
+            };
         };
-        let (parent, generation, accepted) = {
-            let mut guard = entry.lock().await;
+        let Some(entry) = owner.entry().await else {
+            // A generation still being built has no runner to confirm a turn
+            // against; a close here is an exit, and the drain cancels construction.
+            owner.begin_closing();
+            if owner.begin_drain() {
+                let registry = Arc::clone(self);
+                let draining = Arc::clone(&owner);
+                let _ = registry.drain(draining, CloseReason::UserClosed).await;
+            }
+            return Ok(());
+        };
+        {
+            let guard = entry.lock().await;
             let actual = guard.runner.active_turn_id().map(str::to_string);
             // CAS and the transition into Closing happen in one critical section, so
             // a turn accepted concurrently cannot slip in between them.
@@ -771,51 +1215,29 @@ impl SideRegistry {
                     ),
                 ));
             }
-            guard.closing = true;
-            let accepted: Vec<(String, String)> =
-                guard.ledger.accepted_requests().into_iter().collect();
-            (guard.parent.clone(), guard.generation, accepted)
-        };
-
-        {
-            let mut guard = entry.lock().await;
-            guard.runner.close().await?;
         }
-        // `side/closed` 是**终态**,必须在本条 side 从表里消失之前发布:客户端收到
-        // 它就丢弃该 generation 的本地内容与在途分页,不等一个已经不存在的快照。
-        // 它走带背压的投递,拥塞时宁可阻塞也不丢——丢了另一端会停在旧视图。
-        let closed = {
-            let mut guard = entry.lock().await;
-            Self::stage(&mut guard, |entry| super::SidePublishedUpdate::Closed {
-                side_id: entry.side_id.clone(),
-                reason: CloseReason::UserClosed,
-            })
-        };
-        if let Some(staged) = closed {
-            self.deliver(staged).await;
-        }
-        self.release_side_snapshots(side_id).await;
-        self.sides.lock().await.remove(side_id);
-        {
-            let mut parents = self.parents.lock().await;
-            if let Some(ParentSlot::Ready(current)) = parents.get(&parent)
-                && current == side_id
-            {
-                parents.remove(&parent);
+        // The local handle must not outlive this check: drain drops the *last*
+        // reference to release the resource lease, and holding one here would keep
+        // the slot alive forever (cleanup would time out).
+        drop(entry);
+        owner.begin_closing();
+        if owner.begin_drain() {
+            self.drain(Arc::clone(&owner), CloseReason::UserClosed)
+                .await?;
+        } else {
+            // Another drain owns this generation: wait for its verdict instead of
+            // starting a second close over the same runner.
+            let mut rx = owner.watch();
+            loop {
+                let phase = *rx.borrow_and_update();
+                if !matches!(phase, Phase::Closing) {
+                    break;
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
             }
         }
-        let mut tombstones = self.tombstones.lock().await;
-        tombstones.insert(
-            side_id.to_string(),
-            Tombstone {
-                side_id: side_id.to_string(),
-                parent,
-                generation,
-                accepted,
-                created_at: tokio::time::Instant::now(),
-            },
-        );
-        Self::prune_tombstones(&mut tombstones, tokio::time::Instant::now());
         Ok(())
     }
 
@@ -852,8 +1274,8 @@ impl SideRegistry {
     /// gone, which is what a reconnect needs to decide between "closed" and
     /// "never existed".
     pub async fn tombstone(&self, side_id: &str) -> Option<ClosedSide> {
-        let tombstones = self.tombstones.lock().await;
-        tombstones.get(side_id).map(|stone| ClosedSide {
+        let state = self.state.lock().await;
+        state.tombstones.get(side_id).map(|stone| ClosedSide {
             side_id: stone.side_id.clone(),
             parent_thread_id: stone.parent.clone(),
             generation: stone.generation,
@@ -867,14 +1289,20 @@ impl SideRegistry {
             let guard = entry.lock().await;
             return Some(guard.ledger.accepted_requests().into_iter().collect());
         }
-        let tombstones = self.tombstones.lock().await;
-        tombstones.get(side_id).map(|stone| stone.accepted.clone())
+        let state = self.state.lock().await;
+        state
+            .tombstones
+            .get(side_id)
+            .map(|stone| stone.accepted.clone())
     }
 
     /// A consistent snapshot of one side: items plus the metadata a client needs to
     /// reconcile.
     pub async fn snapshot(&self, side_id: &str) -> Result<SideSnapshot, SideError> {
-        let entry = self.entry(side_id).await?;
+        // Reads go through the same barrier as submits: after `Closing` there is
+        // nothing to page through, and serving the body would outlive the decision
+        // to destroy it.
+        let entry = self.live_entry(side_id).await?;
         let guard = entry.lock().await;
         Ok(SideSnapshot {
             summary: guard.summary(),
@@ -886,59 +1314,48 @@ impl SideRegistry {
     }
 
     /// Start a barrier around a destructive parent operation.
-    pub async fn begin_parent_change(&self, parent: &str) -> ParentChangeGuard<'_> {
+    pub async fn begin_parent_change(self: &Arc<Self>, parent: &str) -> ParentChangeGuard<'_> {
         let removed = {
-            let mut parents = self.parents.lock().await;
-            parents.remove(parent)
+            let mut state = self.state.lock().await;
+            state
+                .parents
+                .insert(parent.to_string(), ParentSlot::Changing)
         };
-        let side_id = match &removed {
-            Some(ParentSlot::Ready(side_id)) => Some(side_id.clone()),
+        let owner = match removed {
+            Some(ParentSlot::Bound(owner)) => Some(owner),
             _ => None,
         };
         ParentChangeGuard {
             registry: self,
             parent: parent.to_string(),
-            slot: removed,
-            side_id,
+            slot: replaced_slot(&owner),
+            owner,
             committed: false,
         }
     }
 
-    async fn apply_parent_change(&self, parent: &str, side_id: Option<&str>, reason: CloseReason) {
-        let Some(side_id) = side_id else {
+    async fn apply_parent_change(
+        self: &Arc<Self>,
+        parent: &str,
+        owner: Option<Arc<GenerationOwner>>,
+        reason: CloseReason,
+    ) {
+        let Some(owner) = owner else {
             return;
         };
-        let Ok(entry) = self.entry(side_id).await else {
-            return;
-        };
-        let (generation, accepted, side_parent) = {
-            let mut guard = entry.lock().await;
-            guard.closing = true;
-            let accepted = guard.ledger.accepted_requests().into_iter().collect();
-            (guard.generation, accepted, guard.parent.clone())
-        };
-        // The close is best effort here: the parent is already going away, and a
-        // side that fails to converge must not keep the destructive operation
-        // waiting. It still leaves a tombstone so a retry is answered honestly.
-        {
-            let mut guard = entry.lock().await;
-            let _ = guard.runner.close().await;
+        // The parent is already going away, so a failure to converge must not keep
+        // the destructive operation waiting. The generation stays tracked on a
+        // failure, so a retry drains the same one instead of abandoning it.
+        owner.begin_closing();
+        if owner.begin_drain() {
+            let _ = self.drain(Arc::clone(&owner), reason).await;
         }
-        let _ = reason;
-        self.sides.lock().await.remove(side_id);
-        let mut tombstones = self.tombstones.lock().await;
-        tombstones.insert(
-            side_id.to_string(),
-            Tombstone {
-                side_id: side_id.to_string(),
-                parent: side_parent,
-                generation,
-                accepted,
-                created_at: tokio::time::Instant::now(),
-            },
-        );
-        Self::prune_tombstones(&mut tombstones, tokio::time::Instant::now());
-        let _ = parent;
+        // Release the barrier this change installed: the old generation is gone, and
+        // the parent must be openable again. `Changing` is only ever ours here.
+        let mut state = self.state.lock().await;
+        if matches!(state.parents.get(parent), Some(ParentSlot::Changing)) {
+            state.parents.remove(parent);
+        }
     }
 
     /// Stop every side and wait (bounded) for their resources.
@@ -954,74 +1371,34 @@ impl SideRegistry {
     ///   `side_not_found` 而不是「从未存在」（重连时需要这个区别）。
     /// - **发布 `side/closed`**：客户端靠这个终态帧丢弃本地内容与在途分页。
     ///
-    /// 并发处理的三个要点：
+    /// 并发的两个要点：
     ///
-    /// - 只移除 `ParentSlot::Ready`，保留 `Creating`：清掉占位会让在途创建的
-    ///   `create()` 把 `Ready` 写回去。
-    /// - 自增 `sweep_epoch`：`create_inner` 在 `sides.insert` 之前复核、`open()`
-    ///   的等待者醒来后复核，不一致就放弃。
-    /// - 有界多轮：第一轮期间可能有 `Creating` 落定成 `Ready`。
-    ///
-    /// 不能内联在请求路径上：等 runner 收敛可能要几百毫秒，主循环是单 task。
-    pub async fn close_all(&self) {
+    /// - 自增 `sweep_epoch`：构造在安装 entry 之前复核，不一致就放弃。
+    /// - 有界多轮：第一轮期间可能有构造落定成 `Open`。
+    pub async fn close_all(self: &Arc<Self>) {
         self.sweep_epoch.fetch_add(1, Ordering::SeqCst);
         // 三轮足够覆盖「第一轮期间创建落定」这一种形状。超过上限记警告而不是
         // 静默返回——留下一条活旁支是本功能最不该有的失败模式。
         const MAX_ROUNDS: usize = 3;
         for round in 0..MAX_ROUNDS {
-            let entries: Vec<(String, Arc<Mutex<SideEntry>>)> = {
-                let sides = self.sides.lock().await;
-                sides
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                    .collect()
+            let owners: Vec<Arc<GenerationOwner>> = {
+                let state = self.state.lock().await;
+                state.sides.values().map(Arc::clone).collect()
             };
-            if entries.is_empty() {
+            if owners.is_empty() {
                 self.drop_ready_parents().await;
                 return;
             }
-            for (side_id, entry) in &entries {
-                // 与 `close()` 同一顺序：先关 runner（它会 join 核心任务），
-                // 再 stage 终态，最后在锁外投递。
-                let (parent, generation, accepted, closed) = {
-                    let mut guard = entry.lock().await;
-                    guard.closing = true;
-                    let accepted: Vec<(String, String)> =
-                        guard.ledger.accepted_requests().into_iter().collect();
-                    let parent = guard.parent.clone();
-                    let generation = guard.generation;
-                    let _ = guard.runner.close().await;
-                    let staged = Self::stage(&mut guard, |e| super::SidePublishedUpdate::Closed {
-                        side_id: e.side_id.clone(),
-                        reason: CloseReason::UserClosed,
-                    });
-                    (parent, generation, accepted, staged)
-                };
-                if let Some(staged) = closed {
-                    self.deliver(staged).await;
+            for owner in owners {
+                owner.begin_closing();
+                if owner.begin_drain() {
+                    let registry = Arc::clone(self);
+                    let draining = Arc::clone(&owner);
+                    let _ = tokio::spawn(async move {
+                        let _ = registry.drain(draining, CloseReason::UserClosed).await;
+                    })
+                    .await;
                 }
-                self.release_side_snapshots(side_id).await;
-                self.sides.lock().await.remove(side_id);
-                {
-                    let mut parents = self.parents.lock().await;
-                    if let Some(ParentSlot::Ready(current)) = parents.get(&parent)
-                        && current == side_id
-                    {
-                        parents.remove(&parent);
-                    }
-                }
-                let mut tombstones = self.tombstones.lock().await;
-                tombstones.insert(
-                    side_id.clone(),
-                    Tombstone {
-                        side_id: side_id.clone(),
-                        parent,
-                        generation,
-                        accepted,
-                        created_at: tokio::time::Instant::now(),
-                    },
-                );
-                Self::prune_tombstones(&mut tombstones, tokio::time::Instant::now());
             }
             self.drop_ready_parents().await;
             if self.side_count().await == 0 {
@@ -1040,37 +1417,41 @@ impl SideRegistry {
         }
     }
 
-    /// 移除所有 `Ready` 的父占位，保留 `Creating`。
+    /// 移除所有空的 / 已完成的父占位，保留仍在排空的代次。
     async fn drop_ready_parents(&self) {
-        let mut parents = self.parents.lock().await;
-        parents.retain(|_, slot| matches!(slot, ParentSlot::Creating(_)));
+        let mut state = self.state.lock().await;
+        let live: Vec<String> = state.sides.keys().cloned().collect();
+        state.parents.retain(|_, slot| match slot {
+            ParentSlot::Changing => true,
+            ParentSlot::Bound(owner) => live.contains(&owner.side().side_id),
+        });
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(self: &Arc<Self>) {
         self.closed.store(true, Ordering::SeqCst);
-        let entries: Vec<(String, Arc<Mutex<SideEntry>>)> = {
-            let sides = self.sides.lock().await;
-            sides
-                .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                .collect()
+        let owners: Vec<Arc<GenerationOwner>> = {
+            let state = self.state.lock().await;
+            state.sides.values().map(Arc::clone).collect()
         };
-        for (side_id, entry) in &entries {
-            let mut guard = entry.lock().await;
-            guard.closing = true;
-            let _ = guard.runner.close().await;
-            let _ = side_id;
+        for owner in owners {
+            owner.begin_closing();
+            if owner.begin_drain() {
+                let _ = self
+                    .drain(Arc::clone(&owner), CloseReason::HostShutdown)
+                    .await;
+            }
         }
-        self.sides.lock().await.clear();
-        self.parents.lock().await.clear();
+        let mut state = self.state.lock().await;
+        state.sides.clear();
+        state.parents.clear();
     }
 
     pub async fn side_count(&self) -> usize {
-        self.sides.lock().await.len()
+        self.state.lock().await.sides.len()
     }
 
     pub async fn tombstone_count(&self) -> usize {
-        self.tombstones.lock().await.len()
+        self.state.lock().await.tombstones.len()
     }
 }
 
@@ -1099,6 +1480,13 @@ pub struct SideSnapshot {
 /// would answer a different question than "what is this side running with".
 ///
 /// Holds no secret: no API key, no headers, no system prompt.
+/// The slot a parent held before a change barrier replaced it.
+fn replaced_slot(owner: &Option<Arc<GenerationOwner>>) -> Option<ParentSlot> {
+    owner
+        .as_ref()
+        .map(|owner| ParentSlot::Bound(Arc::clone(owner)))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SideEffectiveConfig {
     pub model: String,
@@ -1113,10 +1501,10 @@ pub struct SideEffectiveConfig {
 /// uncommitted restores the parent's slot, so a failed clear does not leave the
 /// parent permanently unable to open a side.
 pub struct ParentChangeGuard<'a> {
-    registry: &'a SideRegistry,
+    registry: &'a Arc<SideRegistry>,
     parent: String,
     slot: Option<ParentSlot>,
-    side_id: Option<String>,
+    owner: Option<Arc<GenerationOwner>>,
     committed: bool,
 }
 
@@ -1124,9 +1512,9 @@ impl ParentChangeGuard<'_> {
     /// Finish the change: the old generation is invalidated and its side is gone.
     pub async fn commit(mut self, reason: CloseReason) {
         self.committed = true;
-        let side_id = self.side_id.take();
+        let owner = self.owner.take();
         self.registry
-            .apply_parent_change(&self.parent, side_id.as_deref(), reason)
+            .apply_parent_change(&self.parent, owner, reason)
             .await;
     }
 }
@@ -1141,9 +1529,9 @@ impl Drop for ParentChangeGuard<'_> {
         // eager path already restored nothing, so simply not restoring is safe —
         // the next open would create a fresh side over the untouched parent files.
         if let Some(slot) = self.slot.take()
-            && let Ok(mut parents) = self.registry.parents.try_lock()
+            && let Ok(mut state) = self.registry.state.try_lock()
         {
-            parents.insert(self.parent.clone(), slot);
+            state.parents.insert(self.parent.clone(), slot);
         }
     }
 }
