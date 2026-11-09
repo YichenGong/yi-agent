@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { Item } from "./generated/Item";
-import { sideHasStrippedMedia, sideItemsForChat } from "./sideItems";
+import {
+  neutralizeRemoteImages,
+  sideHasStrippedMedia,
+  sideItemsForChat,
+} from "./sideItems";
 
 const image = {
   handle: "img-1",
@@ -97,5 +101,46 @@ describe("sideHasStrippedMedia", () => {
     expect(sideHasStrippedMedia([userMessage({ images: [], attachments: [] })])).toBe(
       false,
     );
+  });
+});
+
+describe("neutralizeRemoteImages", () => {
+  it("turns a remote markdown image into a statement of what is missing", () => {
+    const out = neutralizeRemoteImages("before ![shot](https://example.com/a.png) after");
+    expect(out).toBe("before [shot内容未包含在快照中] after");
+    // 不能留下任何可以自动加载的图片语法。
+    expect(out).not.toContain("![");
+    expect(out).not.toContain("http");
+  });
+
+  it("keeps an inline data: image", () => {
+    // 内嵌字节没有下载副作用，provider 也能直接处理。
+    const text = "![chart](data:image/png;base64,AAAA)";
+    expect(neutralizeRemoteImages(text)).toBe(text);
+  });
+
+  it("uses a generic label when the alt text is empty", () => {
+    expect(neutralizeRemoteImages("![](https://x/y.png)")).toBe(
+      "[图片内容未包含在快照中]",
+    );
+  });
+
+  it("leaves plain text and links alone", () => {
+    const text = "see [the docs](https://example.com/doc) and some text";
+    expect(neutralizeRemoteImages(text)).toBe(text);
+    expect(neutralizeRemoteImages("no images here")).toBe("no images here");
+  });
+
+  it("does not mutate the item it was given", () => {
+    const item: Item = {
+      type: "agentMessage",
+      id: "a1",
+      text: "![x](https://example.com/x.png)",
+    };
+    const [out] = sideItemsForChat([item]);
+    expect(out.type === "agentMessage" && out.text).toBe(
+      "[x内容未包含在快照中]",
+    );
+    expect(item.text).toContain("https://example.com/x.png");
   });
 });

@@ -96,6 +96,7 @@ function bindHost(
     instanceId,
     client: rpc,
     supported: true,
+    snapshotLifecycle: true,
     scope: "control",
     connected: true,
   });

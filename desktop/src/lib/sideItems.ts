@@ -18,7 +18,47 @@ import type { Item } from "../lib/generated/Item";
  * 删除——新增一种带图片的 item 时，这里会编译不过。
  */
 export function sideItemsForChat(items: readonly Item[]): Item[] {
-  return items.map(stripMedia);
+  return items.map(stripItem);
+}
+
+/** 一条 item：既剥掉媒体引用，也把正文里的远程图片地址降级成文本。 */
+function stripItem(item: Item): Item {
+  const stripped = stripMedia(item);
+  switch (stripped.type) {
+    case "agentMessage":
+    case "userMessage":
+    case "userInterjection":
+    case "thinking": {
+      const text = neutralizeRemoteImages(stripped.text);
+      // 没改动时返回**原引用**：下游 memo 靠它跳过整段历史的重渲染。
+      if (text === stripped.text) return stripped;
+      return { ...stripped, text };
+    }
+    default:
+      return stripped;
+  }
+}
+
+/**
+ * 把 markdown 里的**远程**图片降级成文本（spec §5.1）。
+ *
+ * 快照里出现的 `![x](https://…)` 只是一个历史来源标记：旁问进程里那张图并不
+ * 存在，渲染成 `<img>` 会让 webview（或供应商的隐式下载）去拉一个用户没有点过
+ * 的 URL。内嵌的 `data:` 图片没有这个副作用，且 provider 本来就能直接处理，
+ * 所以保留。
+ *
+ * 替换成一句人能读的说明而不是删掉：用户看到「这里原本有张图」比看到一个空洞
+ * 更接近事实。**不改入参**——同一份快照可能正被另一个视图读着。
+ */
+const MARKDOWN_IMAGE = /!\[([^\]]*)\]\(([^()\s]*)(\s+"[^"]*")?\)/g;
+
+export function neutralizeRemoteImages(text: string): string {
+  if (!text.includes("![")) return text;
+  return text.replace(MARKDOWN_IMAGE, (whole, alt: string, url: string) => {
+    if (url.startsWith("data:")) return whole;
+    const label = alt.trim() === "" ? "图片" : alt.trim();
+    return `[${label}内容未包含在快照中]`;
+  });
 }
 
 function stripMedia(item: Item): Item {

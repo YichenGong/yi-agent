@@ -270,6 +270,36 @@ export class SideSyncController {
     this.applyOne(n);
   }
 
+  /**
+   * 让**精确一代**立刻失效（spec §4.4、§8）。
+   *
+   * 退出旁问时调用：这一代已经不在了，任何在途的分页、缓存的帧、尾帧探测都
+   * 属于一段翻篇的历史。这里做三件事，且都只针对那一代：
+   *
+   * 1. 丢掉它的缓存与「需要重读」标记——那些帧再也不会被 replay。
+   * 2. 中断这一轮对账（如果它正在装这条 side 的基线）：装到一半的基线会把
+   *    旧正文写回一个刚被销毁的视图。
+   * 3. 停掉尾帧探测。**不**撤销调用方的 `RpcClient`：连接是共享的，关掉它
+   *    会连父会话一起断。
+   *
+   * 视图本身由调用方 `store.dropGeneration` 删除（两个模块各管一件事：
+   * 控制器管在途工作，store 管可见状态）。
+   */
+  invalidateGeneration(sideId: string, generation: number): void {
+    if (this.disposed) return;
+    const view = this.store.read(this.binding.key, sideId);
+    // 不清别的代：同一条 `sideId` 可能已经被重开成新代，那一代还活着。
+    if (view !== undefined && view.generation !== generation) return;
+    this.cache.delete(sideId);
+    this.overflowed.delete(sideId);
+    const parentId = view?.parentId ?? this.reconciling;
+    if (parentId !== null) this.needsReconcile.delete(parentId);
+    this.abort?.abort();
+    this.abort = null;
+    this.reconciling = null;
+    this.stopTailPoll();
+  }
+
   /** 视图可见性变化：可见时保持尾帧探测，后台停掉。 */
   setVisible(parentId: string | null): void {
     this.visibleParent = parentId;

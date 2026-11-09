@@ -67,6 +67,7 @@ function setup(options: {
     instanceId: INSTANCE,
     client,
     supported: options.supported ?? true,
+    snapshotLifecycle: true,
     scope: options.scope ?? "control",
     connected: true,
   });
@@ -294,6 +295,7 @@ describe("useSideConversationController navigation intent", () => {
       instanceId: "host-2",
       client: s.client,
       supported: true,
+      snapshotLifecycle: true,
       scope: "control",
       connected: true,
     });
@@ -431,6 +433,7 @@ describe("useSideConversationController error attribution", () => {
       instanceId: "host-2",
       client: s.client,
       supported: true,
+      snapshotLifecycle: true,
       scope: "control",
       connected: true,
     });
@@ -596,6 +599,7 @@ describe("useSideConversationController.close", () => {
       instanceId: "host-2",
       client: otherClient,
       supported: true,
+      snapshotLifecycle: true,
       scope: "control",
       connected: true,
     });
