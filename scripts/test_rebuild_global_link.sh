@@ -160,6 +160,99 @@ if bash "$SCRIPT" --help 2>/dev/null | grep -q '^set -euo pipefail'; then
   bad "--help leaks script body"
 else ok "--help stops at the first non-comment line"; fi
 
+# --- 用例 8：僵尸进程必须算作「已退出」 ---------------------------
+#
+# 回归缺陷（2026-11-09 实测）：guardian 被杀后停在 `<defunct>`（父进程
+# app-server 活着却不 wait），`kill -0` 对僵尸仍返回成功，于是 `wait_gone`
+# 永不到期、`stop_dependents` 报「仍有进程停不下来」并 die——而进程其实早就
+# 死了。`is_alive` 必须按 `ps -o stat=Z` 判否。
+sh_pid=""
+# 后台起一个长命进程，取它真实的 pid（不走管道：管道会让 `head` 退出后
+# `sleep` 收到 SIGPIPE 立刻死掉，pid 立刻变僵尸，用例就失去了意义）。
+sleep 30 &
+sh_pid=$!
+if [ -n "$sh_pid" ]; then
+  # 先确认它此刻是活进程（非 Z），否则本用例没有意义。
+  if is_alive "$sh_pid"; then ok "is_alive: a running process counts as alive"
+  else bad "is_alive: a running process was reported dead (pid $sh_pid, stat=$(ps -o stat= -p "$sh_pid" 2>/dev/null | xargs))"; fi
+  kill -KILL "$sh_pid" 2>/dev/null || true
+  wait "$sh_pid" 2>/dev/null || true
+else
+  bad "zombie fixture: could not spawn a probe process"
+fi
+
+# 造一个真僵尸：子进程 kill 掉但不 wait，父进程继续活着。
+zombie_parent="$(sh -c '
+  sh -c "sleep 30" &
+  child=$!
+  kill -KILL "$child" 2>/dev/null
+  # 不 wait：子进程停在 Z，父进程挂着保持它不被回收。
+  sleep 5
+' >/dev/null 2>&1 &
+echo $!)"
+sleep 0.5
+# 从父进程的僵尸子进程里挑一个。
+zombie_pid="$(ps -axo pid=,ppid=,stat= 2>/dev/null | awk -v p="$zombie_parent" '$2==p && $3 ~ /^Z/ {print $1}' | head -1)"
+if [ -n "$zombie_pid" ]; then
+  if is_alive "$zombie_pid"; then
+    bad "is_alive: a zombie (Z) was reported alive (pid $zombie_pid)"
+  else
+    ok "is_alive: a zombie (Z) counts as gone"
+  fi
+  # kill -0 对僵尸成功，这条断言把「为什么不能用 kill -0」钉住。
+  if kill -0 "$zombie_pid" 2>/dev/null; then
+    ok "zombie fixture: kill -0 still succeeds (the reason is_alive exists)"
+  else
+    ok "zombie fixture: kill -0 already fails on this platform"
+  fi
+  if wait_gone 1 "$zombie_pid"; then
+    ok "wait_gone: returns 0 for an already-dead zombie"
+  else
+    bad "wait_gone: timed out on a zombie (pid $zombie_pid)"
+  fi
+  kill -KILL "$zombie_parent" 2>/dev/null || true
+else
+  bad "zombie fixture: could not produce a zombie child"
+  kill -KILL "$zombie_parent" 2>/dev/null || true
+fi
+
+# --- 用例 9：guardian.pid 必须先于 daemon 被停 -------------------
+#
+# guardian 活着就会重启它托管的 daemon，所以先杀 daemon 等于白杀
+# （`lifecycle/guardian.rs` 的 `GUARDIAN_PID_FILE` 注释记的就是这个坑）。
+# 这里只验解析与「只认 internal-runtime guardian」两道判据，不真杀进程。
+use_case "$root/guardian" dev
+ROOT="$root/guardian/repo"
+mkdir -p "$ROOT/.yi-agent/runtime"
+gp="$root/guardian/guardian-pid.json"
+printf '{"pid": 99999, "start_micros": 1794240682569446}\n' > "$ROOT/.yi-agent/runtime/guardian.pid"
+if [ "$(guardian_pid_records)" = "99999" ]; then ok "guardian.pid: pid is read back"
+else bad "guardian.pid: read '$(guardian_pid_records)'"; fi
+
+# 一个不存在的 pid 必须被 is_alive 判否，绝不能凭记录就发信号。
+if is_alive 99999; then bad "guardian.pid: a dead recorded pid was reported alive"
+else ok "guardian.pid: a dead recorded pid is not signalled"; fi
+
+# 缺文件时安静返回空，不报错（首次构建没有该文件）。
+rm -f "$ROOT/.yi-agent/runtime/guardian.pid"
+if [ -z "$(guardian_pid_records)" ]; then ok "guardian.pid: absent file yields nothing"
+else bad "guardian.pid: absent file yielded '$(guardian_pid_records)'"; fi
+
+# 坏 JSON 同样安静跳过。
+printf 'not json\n' > "$ROOT/.yi-agent/runtime/guardian.pid"
+if [ -z "$(guardian_pid_records)" ]; then ok "guardian.pid: malformed file is skipped"
+else bad "guardian.pid: malformed file yielded '$(guardian_pid_records)'"; fi
+
+# 只认 internal-runtime guardian：拿一个普通进程冒充记录里的 pid，必须不杀。
+sleep 30 &
+impostor=$!
+printf '{"pid": %s, "start_micros": 1}\n' "$impostor" > "$ROOT/.yi-agent/runtime/guardian.pid"
+( stop_recorded_guardians ) >/dev/null 2>&1
+if is_alive "$impostor"; then ok "guardian.pid: a pid reused by another program is not killed"
+else bad "guardian.pid: killed an unrelated process that reused the pid"; fi
+kill -KILL "$impostor" 2>/dev/null || true
+wait "$impostor" 2>/dev/null || true
+
 echo
 if [ "$failn" -ne 0 ]; then echo "$failn failed, $pass passed"; exit 1; fi
 echo "$pass passed"

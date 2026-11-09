@@ -174,6 +174,26 @@ ancestor_pids() {
   printf '%s ' "$pid"
 }
 
+# 进程是否「真的还在跑」——僵尸不算。
+#
+# `kill -0` 对僵尸（`Z`）返回成功，因为 pid 还没被回收。守护进程的子进程由
+# app-server 起、app-server 活着却不 `wait()` 时，被杀掉的 guardian 会一直停在
+# `<defunct>`：`kill -0` 永远成功，于是 `wait_gone` 永远等不到「消失」，`stop`
+# 报「仍有进程停不下来」并中止——而进程其实早就死了。实测 2026-11-09：
+# `ps -o stat=` 是 `Z`，`kill -0` 仍成功，`./scripts/rebuild.sh stop` 直接 die。
+#
+# 判据取 `ps -o stat=` 的首字符：`Z` 表示已退出待回收。`ps` 查不到该 pid 时
+# 同样算已退出。不单独处理 `T`（SIGSTOP 挂起）——那仍是活进程，必须先 CONT。
+is_alive() {
+  local stat
+  stat="$(ps -o stat= -p "$1" 2>/dev/null)"
+  [ -n "$stat" ] || return 1
+  case "$stat" in
+    Z*) return 1 ;;
+  esac
+  return 0
+}
+
 # 等一批 pid 消失。$1 秒上限，$2... 要等的 pid。
 wait_gone() {
   local seconds="$1"; shift
@@ -181,7 +201,7 @@ wait_gone() {
   while [ "$(date +%s)" -le "$deadline" ]; do
     local alive=0 pid
     for pid in "$@"; do
-      if kill -0 "$pid" 2>/dev/null; then alive=1; fi
+      if is_alive "$pid"; then alive=1; fi
     done
     if [ "$alive" = 0 ]; then return 0; fi
     sleep 0.2
@@ -312,6 +332,67 @@ stop_test_helpers() {
   fi
 }
 
+# 各 runtime 目录里记录的 guardian pid。
+#
+# `guardian.pid` 存在的唯一目的就是这个：想停 guardian 的调用方不能只读
+# `processes.json`（那里第一个条目是 daemon），否则会「杀了 daemon、guardian
+# 还在，guardian 立刻把 daemon 拉回来」，看起来像 stop 什么都没做
+# （见 `lifecycle/guardian.rs` 的 `GUARDIAN_PID_FILE` 注释）。
+#
+# 文件带 `start_micros`，用来识破 pid 复用：pid 号被系统重新分配后，记录里的
+# 出生时间与新进程对不上，此时不能杀。
+guardian_pid_records() {
+  local file pid birth
+  for file in "$ROOT/.yi-agent/runtime/guardian.pid" \
+              "$HOME"/.yi-agent/supervisors/*/guardian.pid; do
+    [ -f "$file" ] || continue
+    pid="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["pid"])' "$file" 2>/dev/null)"
+    [ -n "$pid" ] || continue
+    printf '%s\n' "$pid"
+  done
+}
+
+# 停掉记录在案的 guardian。必须排在停 daemon 之前。
+#
+# 顺序理由同上：guardian 活着就会重启它托管的 daemon，先杀 daemon 等于白杀。
+# 记录在案的 pid 是不是真的 guardian。
+#
+# 两道判据缺一不可：进程还得活着（`is_alive`），且命令行确实是
+# `internal-runtime guardian`。pid 会被系统复用，只凭记录就发信号会杀掉别人的
+# 进程——而 guardian.pid 里那个 pid 字段恰恰是最不可靠的部分。
+is_recorded_guardian() {
+  is_alive "$1" || return 1
+  case "$(ps -o command= -p "$1" 2>/dev/null)" in
+    *"internal-runtime guardian"*) return 0 ;;
+  esac
+  return 1
+}
+
+stop_recorded_guardians() {
+  local pids count=0 pid
+  pids="$(guardian_pid_records | tr '\n' ' ')"
+  [ -n "${pids// /}" ] || return 0
+  for pid in $pids; do
+    is_recorded_guardian "$pid" || continue
+    kill -CONT "$pid" 2>/dev/null || true
+    if kill -TERM "$pid" 2>/dev/null; then
+      echo "  停止 -> $pid（guardian.pid 记录）"
+      count=$((count + 1))
+    fi
+  done
+  # 给 guardian 一点时间自己退出并收拾它托管的 daemon。
+  # shellcheck disable=SC2086
+  [ "$count" -gt 0 ] && wait_gone 3 $pids || true
+  for pid in $pids; do
+    # 兜底同样要过判据：pid 可能在这几秒里退出并被别人复用。
+    is_recorded_guardian "$pid" || continue
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  if [ "$count" -gt 0 ]; then
+    echo "guardian -> 已停止 $count 个（按 guardian.pid 记录）"
+  fi
+}
+
 # stop_dependents <子命令名>：把依附旧二进制的进程停干净。
 #
 # <子命令名> 用于事件日志与汇总文案；`stop` 只停不编。
@@ -321,6 +402,10 @@ stop_dependents() {
 
   stop_test_helpers
   stop_orphaned_test_binaries
+
+  # ⓪ 先按 guardian.pid 停 guardian，再停 daemon。
+  #    guardian 活着就会把它托管的 daemon 重新拉起来，反过来的顺序等于白杀。
+  stop_recorded_guardians
 
   # ① 先 bootout 值守。KeepAlive=true：先 kill 会在 10s 内复活一个新的
   #    resident watch，而它的第一个动作就是把刚杀掉的 daemon 拉回来。
@@ -377,7 +462,8 @@ stop_dependents() {
     if ! wait_gone 5 $pids; then
       warn "5s 内仍有进程存活，SIGKILL 兜底"
       for pid in $pids; do
-        if kill -0 "$pid" 2>/dev/null; then
+        # 僵尸不需要（也无法）再 SIGKILL：它已经退出，只等父进程 wait。
+        if is_alive "$pid"; then
           kill -KILL "$pid" 2>/dev/null || true
         fi
       done
