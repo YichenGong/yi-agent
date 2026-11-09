@@ -14,6 +14,10 @@
 不受本模块影响：`cargo test -p yi-agent-app-server`（397 个测试）与
 `cargo test -p yi-agent-runtime`（全绿）仍全绿。
 
+## `/compact` 跨会话 Send 隔离修复（Spec 草案，未实施）
+
+- [ ] A 手动 `/compact` 期间，旁问实验开关始终开启的已有会话 B 与新建会话 C 均可独立发送 — [修复 spec](../superpowers/specs/2026-11-09-compact-send-isolation-design.md)。此前两次修复已合入，但用户重新 build 后仍复现，不能标记已解决。本轮确认新建与关闭开关后的两个前端行为红测试；开关始终开启的生产已有会话失败尚未完整复现。完成判据：spec §4 捕获完整主场景因果链，§6 适用回归及门禁通过，§7 M01–M04 真实 macOS App 验收，尤其 B/C 的 `turn/start` 在 A 压缩未完成时受理；真实 App 未执行保持未完成。调查测试位于 `fix/compact-composer-identity`，执行 `cd desktop && npx vitest run src/App.test.tsx -t 'isolates a clicked /compact' --reporter=dot` 当前为 1 passed / 2 failed。
+
 ## Session 内容完整性修复（Spec 已复核、Plan 已编写，未实施）
 
 设计及证据：[修复 spec rev2](../superpowers/specs/2026-11-08-session-completeness-repair-design.md) · [复核记录](../superpowers/reports/2026-11-08-session-completeness-spec-review.md) · [显示 Plan A1–A5](../superpowers/plans/2026-11-08-session-display-convergence-impl.md) · [数据 Plan B1–B12](../superpowers/plans/2026-11-08-session-completeness-repair-impl.md) · [诊断记录](../superpowers/reports/2026-11-08-session-completeness-diagnosis.md)。旧 spacer/窗口 owner 修复保持已完成，本组单独登记。
