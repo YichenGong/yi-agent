@@ -63,7 +63,8 @@ pub(crate) use trace::*;
 
 pub use client::{
     MAX_SOCKET_PATH_BYTES, reply_budget, send_request, send_request_with_version,
-    send_request_with_version_timeout, socket_path_for, subscribe, subscribe_with_filters,
+    send_request_with_version_timeout, send_status_until, socket_path_for, subscribe,
+    subscribe_with_filters,
 };
 pub use daemon::Daemon;
 pub use error::IpcError;

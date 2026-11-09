@@ -1,4 +1,5 @@
 use super::*;
+use std::os::fd::AsRawFd;
 
 pub(crate) const COMMAND_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -190,6 +191,245 @@ pub fn subscribe_with_filters(
         reader: BufReader::new(stream),
         request_id,
     })
+}
+
+/// Ask the business socket for its `Status`, bounded end to end by `deadline`.
+///
+/// Distinct from [`send_request_with_version_timeout`] on purpose. That one sets a
+/// *read* timeout and lets `UnixStream::connect` block for as long as the kernel
+/// wants; a caller deciding "is a daemon already on this socket?" needs the whole
+/// exchange -- connect, write, read -- inside one budget, or it cannot report
+/// "unknown" honestly.
+///
+/// Every wait is therefore non-blocking plus `poll` on the *remaining* budget:
+/// connect completes through `poll(POLLOUT)` + `SO_ERROR`, and the request/response
+/// go through `write`/`read` retried on `EAGAIN` against the same deadline.
+///
+/// Read-only by construction: the only request this can send is `Status`, which is
+/// how a probe may touch the business channel without changing anything about the
+/// daemon it is looking at.
+pub fn send_status_until(
+    socket_path: impl AsRef<Path>,
+    deadline: &yi_agent_lifecycle::deadline::Deadline,
+) -> Result<IpcResponse, IpcError> {
+    let socket_path = socket_path.as_ref();
+    let mut stream = connect_until(socket_path, deadline)?;
+    let request_id = next_request_id();
+    let frame = serde_json::to_vec(&RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: request_id.clone(),
+        command: IpcRequest::Status,
+    })?;
+    if frame.len() > MAX_FRAME_BYTES {
+        return Err(IpcError::FrameTooLarge);
+    }
+    write_all_until(&mut stream, &frame, deadline)?;
+    write_all_until(&mut stream, b"\n", deadline)?;
+    let line = read_line_until(&mut stream, deadline)?;
+    let envelope: ResponseEnvelope = serde_json::from_slice(&line)?;
+    // Same identity check as the blocking client: an answer addressed to a
+    // different request, or spoken in a different protocol, is not an answer to
+    // this probe. Reporting a mismatch as a reply would let a stale or foreign
+    // frame read as "a daemon is here".
+    if envelope.protocol_version != PROTOCOL_VERSION || envelope.request_id != request_id {
+        return Err(IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "response envelope identity mismatch",
+        )));
+    }
+    Ok(envelope.result)
+}
+
+/// A non-blocking connect that gives up when the budget does.
+///
+/// `UnixStream::connect` has no timeout and blocks once the listener's backlog is
+/// full, so a wedged daemon would pin the caller inside `connect` -- outside any
+/// budget the caller thinks it set. Doing the connect by hand keeps it on the same
+/// deadline as the rest of the exchange: non-blocking `connect`, wait for
+/// writability, then read `SO_ERROR` for the result.
+fn connect_until(
+    socket_path: &Path,
+    deadline: &yi_agent_lifecycle::deadline::Deadline,
+) -> Result<UnixStream, IpcError> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path_bytes = socket_path.as_os_str().as_bytes();
+    if path_bytes.len() > MAX_SOCKET_PATH_BYTES {
+        return Err(IpcError::SocketPathTooLong {
+            path: socket_path.display().to_string(),
+            limit: MAX_SOCKET_PATH_BYTES,
+        });
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(IpcError::Io(std::io::Error::last_os_error()));
+    }
+    // From here the descriptor must be closed on every path, so it is owned by a
+    // `UnixStream` as soon as it exists and only handed out once connected.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    stream.set_nonblocking(true)?;
+
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(path_bytes.iter()) {
+        *slot = *byte as libc::c_char;
+    }
+    // The length is the offset of `sun_path` plus the path, **not** the size of the
+    // family type plus the path: the BSDs put a `sun_len` byte ahead of the family,
+    // so the naive sum points `connect` at a shorter string than intended. On macOS
+    // that lands the path in the wrong place and `connect` reports ENOENT for a
+    // socket that is right there -- which a probe would read as "nothing running".
+    let path_offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    let length = (path_offset + path_bytes.len()) as libc::socklen_t;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    {
+        address.sun_len = length as u8;
+    }
+    let connected = unsafe {
+        libc::connect(
+            fd,
+            &address as *const libc::sockaddr_un as *const libc::sockaddr,
+            length,
+        )
+    };
+    if connected == 0 {
+        return Ok(stream);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EINPROGRESS) {
+        // Refused, missing, permission denied: the caller maps this to absence or
+        // to "unknown", never to a launch decision on its own.
+        return Err(IpcError::Io(error));
+    }
+    wait_for(fd, libc::POLLOUT, deadline)?;
+    let mut so_error: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let read = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut so_error as *mut libc::c_int as *mut libc::c_void,
+            &mut size,
+        )
+    };
+    if read != 0 {
+        return Err(IpcError::Io(std::io::Error::last_os_error()));
+    }
+    if so_error != 0 {
+        return Err(IpcError::Io(std::io::Error::from_raw_os_error(so_error)));
+    }
+    Ok(stream)
+}
+
+/// Write the whole buffer, polling on the remaining budget.
+fn write_all_until(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    deadline: &yi_agent_lifecycle::deadline::Deadline,
+) -> Result<(), IpcError> {
+    use std::io::Write;
+    stream.set_nonblocking(true)?;
+    let mut written = 0;
+    while written < bytes.len() {
+        match stream.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(IpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "the peer closed the business socket while the request was being written",
+                )));
+            }
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(IpcError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+/// Read one newline-terminated frame, polling on the remaining budget.
+fn read_line_until(
+    stream: &mut UnixStream,
+    deadline: &yi_agent_lifecycle::deadline::Deadline,
+) -> Result<Vec<u8>, IpcError> {
+    use std::io::Read;
+    stream.set_nonblocking(true)?;
+    let mut out = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                if out.is_empty() {
+                    return Err(IpcError::TruncatedFrame { received: 0 });
+                }
+                return Err(IpcError::TruncatedFrame {
+                    received: out.len(),
+                });
+            }
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    return Ok(out);
+                }
+                out.push(byte[0]);
+                // Bounded like every other frame read: an unbounded peer must not be
+                // able to grow this buffer without limit.
+                if out.len() > MAX_FRAME_BYTES {
+                    return Err(IpcError::FrameTooLarge);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for(stream.as_raw_fd(), libc::POLLIN, deadline)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(IpcError::Io(error)),
+        }
+    }
+}
+
+/// Block until `events` on `fd`, or fail when the budget is spent.
+///
+/// `poll` rather than a socket timeout: a timeout set on the stream is per-syscall,
+/// so a stream trickling one byte at a time would never trip it. Asking for the
+/// *remaining* budget each time makes the whole exchange bounded.
+fn wait_for(
+    fd: std::os::unix::io::RawFd,
+    events: libc::c_short,
+    deadline: &yi_agent_lifecycle::deadline::Deadline,
+) -> Result<(), IpcError> {
+    let remaining = deadline.remaining();
+    if remaining.is_zero() {
+        return Err(IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the business socket did not answer within the budget",
+        )));
+    }
+    let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+    let mut pollfd = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut pollfd, 1, millis) };
+    if ready > 0 {
+        return Ok(());
+    }
+    if ready == 0 {
+        return Err(IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the business socket did not answer within the budget",
+        )));
+    }
+    Err(IpcError::Io(std::io::Error::last_os_error()))
 }
 
 pub(crate) fn write_request(

@@ -904,11 +904,16 @@ impl MigrationBackend for SystemMigrationBackend<'_> {
         expected: &ArtifactIdentity,
         intent: BringUpIntent,
     ) -> std::io::Result<BringUpResult> {
-        super::bringup::ensure_managed_under_guard(
+        // The explicit business-aware entry rather than the forwarding wrapper: this
+        // is the path a migration takes, and a migration that starts a second daemon
+        // over a live business channel is the worst case of the A6 failure -- it can
+        // lose the user's in-flight work while also breaking its own journal.
+        super::bringup::ensure_managed_under_guard_with_business(
             held,
             expected,
             intent,
             self.probes.probe,
+            &super::bringup::BusinessChannelProbe,
             self.probes.launcher,
             self.required_capabilities,
         )

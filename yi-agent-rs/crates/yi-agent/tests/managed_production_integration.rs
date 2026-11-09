@@ -2100,6 +2100,193 @@ fn a_replacement_sidecar_adopts_the_runtime_without_a_second_bringup() -> anyhow
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// A6: a daemon that is alive without a guardian blocks a managed start.
+// ---------------------------------------------------------------------------
+
+/// A real `daemon serve` with no guardian must stop the managed start, and survive it.
+///
+/// This is the case control cannot see. An unsupervised daemon answers the business
+/// socket and nothing on the control socket, so a bring-up that only probes control
+/// reads it as "nothing is running" and starts a guardian whose daemon then refuses
+/// to bind -- or, worse on an older build, binds beside it. Either way the user's
+/// running work is the thing at risk.
+///
+/// The witness is a real process: its start identity is recorded, it answers `Status`
+/// before the attempt, and it is still the same live process with the same database
+/// afterwards. A test that only wrote a socket file would prove nothing about the
+/// refusal, because the refusal is caused by an answer.
+#[test]
+fn existing_embedded_daemon_blocks_managed_start_without_being_stopped() -> anyhow::Result<()> {
+    let mut fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+
+    // The daemon a user gets from `yi-agent daemon serve`: no guardian, no
+    // supervision, one process owning the business socket and the database.
+    let mut command = Command::new(common::yi_agent_bin());
+    fixture.apply_env(&mut command);
+    let daemon = command
+        .args(["daemon", "serve"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    fixture.own(&daemon, "embedded-daemon")?;
+    let mut daemon = daemon;
+
+    let socket = yi_agent_lifecycle::scope::daemon_socket(
+        &fixture.runtime_dir,
+        &fixture.instance_home.join(".yi-agent"),
+    );
+    let answer_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if matches!(
+            yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Status),
+            Ok(yi_agent_store::ipc::IpcResponse::Status { .. })
+        ) {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < answer_deadline,
+            "the embedded daemon never answered Status at {}",
+            socket.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let daemon_identity = start_identity(daemon.id() as i32)
+        .ok_or_else(|| anyhow::anyhow!("the embedded daemon exited after answering"))?;
+    let database = fixture.runtime_dir.join("runtime.sqlite");
+    anyhow::ensure!(
+        database.exists(),
+        "the premise is a live daemon with its database already open"
+    );
+
+    // No guardian was ever started, so the control channel is silent. This is what
+    // makes the test about the business probe: control alone says "absent".
+    let control = yi_agent_lifecycle::scope::guardian_socket(
+        &fixture.runtime_dir,
+        &fixture.instance_home.join(".yi-agent"),
+    );
+    assert!(
+        !control.exists(),
+        "the premise is an *unsupervised* daemon, but a control socket exists at {}",
+        control.display()
+    );
+
+    let mut sidecar = Sidecar::spawn(&mut fixture)?;
+    let params = serde_json::to_value(yi_agent_lifecycle::production::PrepareRequest {
+        scope: fixture.scope(),
+        expected: fixture.artifact().clone(),
+        attempt_id: format!("attempt-{}", uuid_like()),
+    })?;
+    let answer = sidecar.call("_shell/prepare", params, START_BUDGET)?;
+    let rendered = answer.to_string();
+    // `Blocked` is how a manual action reaches the shell: the runtime is reachable in
+    // principle but starting anything here is the user's decision.
+    assert!(
+        rendered.contains("\"Blocked\""),
+        "a live unsupervised daemon must produce a blocked answer, got {answer}"
+    );
+    assert!(
+        rendered.contains("without a supervisor"),
+        "the refusal must name the unsupervised daemon, got {answer}"
+    );
+    assert!(
+        !rendered.contains("\"Connected\"") && !rendered.contains("VersionChoiceRequired"),
+        "prepare must not claim a runtime beside an unsupervised daemon: {answer}"
+    );
+
+    // Nothing supervised was started: no guardian journal, no second business socket,
+    // and no second daemon process.
+    assert!(
+        journal_records(&fixture.runtime_dir).is_empty(),
+        "a guardian recorded a process despite the refusal: {:?}",
+        journal_records(&fixture.runtime_dir)
+    );
+    assert!(
+        !control.exists(),
+        "a guardian control socket appeared at {}",
+        control.display()
+    );
+    assert!(
+        !fixture
+            .instance_home
+            .join(".yi-agent")
+            .join("retired")
+            .exists(),
+        "a refusal must not retire the instance"
+    );
+
+    // The daemon the user was already using is untouched: same process, still
+    // answering, same database. A refusal that killed it would be a different bug
+    // wearing the same answer.
+    assert_eq!(
+        start_identity(daemon.id() as i32),
+        Some(daemon_identity.clone()),
+        "the refusal replaced the running daemon"
+    );
+    assert!(
+        matches!(
+            yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Status),
+            Ok(yi_agent_store::ipc::IpcResponse::Status { .. })
+        ),
+        "the running daemon stopped answering after the refusal"
+    );
+    assert!(database.exists(), "the refusal removed the user's database");
+    assert!(
+        daemon.try_wait()?.is_none(),
+        "the running daemon exited because of the refusal"
+    );
+
+    // The manual branch, driven by the fixture rather than by production code: the
+    // user stops the old daemon, and a fresh attempt then finds both channels empty
+    // and starts one managed runtime. This is the "after the user deals with it"
+    // half of A6 -- production never sends Stop.
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let stopped = Instant::now() + Duration::from_secs(20);
+    loop {
+        if daemon.try_wait()?.is_some() {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < stopped,
+            "the embedded daemon ignored SIGTERM for 20s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut recovered = Sidecar::spawn(&mut fixture)?;
+    let params = serde_json::to_value(yi_agent_lifecycle::production::PrepareRequest {
+        scope: fixture.scope(),
+        expected: fixture.artifact().clone(),
+        attempt_id: format!("attempt-{}", uuid_like()),
+    })?;
+    let answer = recovered.call("_shell/prepare", params, START_BUDGET)?;
+    anyhow::ensure!(
+        answer.get("error").is_none(),
+        "prepare refused after the user stopped the old daemon: {answer}"
+    );
+    let result = answer
+        .get("result")
+        .ok_or_else(|| anyhow::anyhow!("prepare answered without a result: {answer}"))?;
+    let identity = result
+        .get("Connected")
+        .or_else(|| result.get("VersionChoiceRequired"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("prepare did not reach a runtime after the old one stopped: {result}")
+        })?;
+    assert_eq!(
+        identity.get("mode").and_then(|v| v.as_str()),
+        Some("managed"),
+        "the recovered runtime must be managed: {identity}"
+    );
+    assert_eq!(
+        count_daemon_records(&fixture.runtime_dir),
+        1,
+        "the recovery must leave exactly one supervised daemon"
+    );
+    Ok(())
+}
+
 /// How many daemon-process records the guardian journal holds.
 fn count_daemon_records(runtime_dir: &Path) -> usize {
     journal_records(runtime_dir)

@@ -223,7 +223,7 @@ if matches!(step, Step::Freeze) {
   - 关键修正三：plugin 的 query 等待若直接吃满 30s 单元预算，会让既有 `plugin_install_succeeds_but_reports_not_queryable_when_the_socket_never_appears`（等 30s 事件）超时。改为 `budget.clamp(PLUGIN_READY_TIMEOUT)`，保留原 5s 上限。
   - 覆盖范围：`take_locks` 现在把 gate 放进 `HeldScope.retirement_gate`，`confirm` 在 **Freeze 阶段 journal 落盘之后**才 `take()`；失败/提前返回由 RAII 释放。plugin 的 ensure→query-wait→watchman-install 合并为一个持闸 blocking worker（`rpc/startup.rs::start_plugin`），调用方丢 future 不提前放闸。
   - 验证：`-p yi-agent-supervisors` 522 passed / 0 failed；`-p yi-agent-app-server` 1508 passed，2 failed 均为既有并发 flake（`compact_does_not_erase_last_item_id`、`a_failed_append_still_records_the_completion`，单跑与定向复跑全绿，失败集合逐轮漂移，见 `docs/bug-list.md`）；`-p yi-agent-subagent` 244 passed；`cargo clippy --all-targets --all-features -p yi-agent-app-server -p yi-agent-supervisors -- -D warnings` 干净。
-- [ ] **Step 6：按规则提交。** `fix: serialize embedded startup with durable migration freeze`。A1–A5 有证据后才可勾入口统一项，计数相应更新。
+- [x] **Step 6：按规则提交。** `fix: serialize embedded startup with durable migration freeze`，提交 `82e80fb3`。证据：`supervisors` 522 通过、`app-server` 1508 通过（2 个既有并发 flake，单跑即过）、`subagent` 244 通过、clippy 干净；判别性变异四项均成立（取到 scope 即 drop gate → `migration_gateway` 屏障测试红；失败路径泄漏 gate → `a_failed_freeze_returns_the_instance_gate` 红；query 等待跳过预算 → 插件预算测试红；`run_bounded` 改回 `Command::status()` → launchctl 测试 30s 超时红）。
 
 ### Task 3：业务 socket 只读预检（A6、A8 的准入）
 
@@ -256,7 +256,7 @@ pub fn ensure_managed_under_guard_with_business(
 
 测试准确位置为 supervisors `tests/managed_bringup.rs`，复用 `test_scope`、`artifact`、`ScriptedProbe` 和计数launcher，增加 `ScriptedBusinessProbe`（RefCell回答队列与最后结果），fake全显式注入；`tests/migration_gateway.rs`、`tests/runtime_migration.rs` 原fake调用者也同步，不能旧wrapper突然探环境socket。Inspect仍在CoordinationGuard取得前返回，禁止mkdir；可做只读业务probe，但不进入launch或selection路径。补store `ipc/client.rs` 的 `send_status_until(socket: &Path, deadline: &Deadline) -> Result<IpcResponse, IpcError>` 并从ipc/mod.rs导出，复用既有request/response codec；connect使用nonblocking Unix socket+poll+SO_ERROR，write/read逐次poll剩余预算及限制响应长度，非阻塞EAGAIN重探同deadline。不得把 `send_request_with_version_timeout` 的仅readtimeout当总deadline。测试独立UnixStream/listener fixture覆盖connect异常、silent、partial response和有效Status，错误映射Absent仅限ENOENT/ECONNREFUSED，其他fail closed。
 
-- [ ] **Step 1：写 `business_live_without_guardian_never_launches` 和 `business_unresponsive_is_not_absent` red 测试。** 使用现有 ControlProbe/GuardianLauncher stub，加 BusinessProbe stub。预期 controlAbsent+businessAnswered 返回 ManualActionRequired，launch 0；Unresponsive 到预算耗尽仍 launch 0；两端Absent+claim/产物正常的对照 launch 1。
+- [x] **Step 1：写 `business_live_without_guardian_never_launches` 和 `business_unresponsive_is_not_absent` red 测试。** 实际新增 4 条：上述 2 条 + 正面对照 `both_channels_absent_still_launches` + `inspection_reports_an_unsupervised_business_daemon`；`ScriptedBusinessProbe`（`RefCell<usize>` 计数 + 最后结果）与 `RecordingLauncher` 复用。 使用现有 ControlProbe/GuardianLauncher stub，加 BusinessProbe stub。预期 controlAbsent+businessAnswered 返回 ManualActionRequired，launch 0；Unresponsive 到预算耗尽仍 launch 0；两端Absent+claim/产物正常的对照 launch 1。
 
 ```rust
 // 在当前 bringup 测试 harness 新增 business 回答队列与 launched 计数。
@@ -266,10 +266,12 @@ assert_eq!(launched.load(std::sync::atomic::Ordering::SeqCst), 0);
 assert!(!selection_path.exists());
 ```
 
-- [ ] **Step 2：运行 red。** `cargo test --all-features -p yi-agent-supervisors --test managed_bringup business_`；两个拟新增测试分别命名为 `business_live_without_guardian_never_launches`、`business_unresponsive_is_not_absent`，确认至少 2 个实际执行，现有不探业务分支应失败。
-- [ ] **Step 3：实现 bounded probe。** 从 scope.instance_home/runtime_dir 用现有 socket 解析函数取得业务路径；connect ENOENT/ECONNREFUSED→Absent，permission/timeout/invalidresponse→Unresponsive；Status 完整有效→Answered。socket 文件存在不等于活。接入 coordination lock 内、所有 launch 前（含 HeldScope）；Inspect 不落盘。控制端可回答仍保持兼容分类，同时不得用控制 Connected 声称 rootReady。
-- [ ] **Step 4：进程 green 与正面 witness。** 新测试 `existing_embedded_daemon_blocks_managed_start_without_being_stopped`：隔离 fixture 启动真实旧 embedded，记录 birth identity、Status 正面回答、在途 fixture 工作；managed prepare 返回 manual且无第二daemon，旧PID/工作仍活。用户明确处理分支由测试 fixture 自己停止其所有者，再双端Absent重探；自动代码没有 Stop。`cargo test --all-features -p yi-agent --test managed_production_integration existing_embedded_daemon_blocks_managed_start_without_being_stopped`，再跑 supervisors crate。
-- [ ] **Step 5：按规则提交。** `fix: refuse managed startup over an existing business daemon`。存量/认证项仍 `[ ]`，等待 Task4 与安全迁移验收。
+- [x] **Step 2：运行 red。** 编译期 red：`business_*` 测试因 `BusinessProbe`/`BusinessProbeOutcome`/`ensure_managed_with_business` 未定义而 `E0432`，确认接口先于实现存在。
+- [x] **Step 3：实现 bounded probe。** 落地：`store/ipc/client.rs::send_status_until`（非阻塞 `socket`+`connect`+`poll(POLLOUT)`+`getsockopt(SO_ERROR)`，写/读逐次按剩余预算 `poll`，`EAGAIN` 重探同一 `Deadline`，响应长度受 `MAX_FRAME_BYTES` 限制，并校验 `protocol_version`/`request_id`）；`ipc/mod.rs` 导出。`supervisors/lifecycle/bringup.rs` 新增 `BusinessProbe`/`BusinessProbeOutcome`/`BusinessChannelProbe`，仅 `ENOENT`/`ECONNREFUSED` 映射 `Absent`，其余 fail closed 为 `Unresponsive`。`ensure_managed_with_business` 与 `ensure_managed_under_guard_with_business` 为唯一决策点，旧 wrapper 与 `migration_operation.rs::SystemMigrationBackend` 均转发/引用之。业务预检位于 coordination lock 内、`claim_is_ours`/`record_selection`/launch 之前；Inspect 先探 control，仅当其 `Absent` 时再只读探业务，仍在取锁前返回。
+ 从 scope.instance_home/runtime_dir 用现有 socket 解析函数取得业务路径；connect ENOENT/ECONNREFUSED→Absent，permission/timeout/invalidresponse→Unresponsive；Status 完整有效→Answered。socket 文件存在不等于活。接入 coordination lock 内、所有 launch 前（含 HeldScope）；Inspect 不落盘。控制端可回答仍保持兼容分类，同时不得用控制 Connected 声称 rootReady。
+- [x] **Step 4：进程 green 与正面 witness。** `existing_embedded_daemon_blocks_managed_start_without_being_stopped` 通过：真实 `daemon serve`（无 guardian）先正面回答 `Status` 并持有 `runtime.sqlite`；`_shell/prepare` 返回 `Blocked`（reason 含 `without a supervisor`）；control socket 未出现、guardian journal 为空、旧 PID/数据库/应答全部存活；随后的手动分支由 fixture 自己 `SIGTERM` 旧进程，再重探得 `Connected`/`mode=managed` 且 daemon 记录数为 1。证据：`yi-agent` 1093 通过、`supervisors`+`store` 1098 通过。
+ 新测试 `existing_embedded_daemon_blocks_managed_start_without_being_stopped`：隔离 fixture 启动真实旧 embedded，记录 birth identity、Status 正面回答、在途 fixture 工作；managed prepare 返回 manual且无第二daemon，旧PID/工作仍活。用户明确处理分支由测试 fixture 自己停止其所有者，再双端Absent重探；自动代码没有 Stop。`cargo test --all-features -p yi-agent --test managed_production_integration existing_embedded_daemon_blocks_managed_start_without_being_stopped`，再跑 supervisors crate。
+- [x] **Step 5：按规则提交。** `fix: refuse managed startup over an existing business daemon`（未合并，等用户处理）。判别性变异：删除业务预检 → `business_live_without_guardian_never_launches`/`business_unresponsive_is_not_absent` 红，且进程级 A6 测试得到 `Connected/mode=managed`（真的在活 daemon 之上起了第二个）红；`classify_business_error` 全返回 `Absent` → `a_silent_listener_is_unresponsive_not_absent` 红；`wait_for` 忽略 deadline → `a_dripping_peer_cannot_extend_the_budget` 红（2.26s vs 预算 300ms）。三者恢复后全绿。存量/认证项仍 `[ ]`，等待 Task4 与安全迁移验收。
 
 ### Task 4：私有、有界 daemon Ready（A7）
 

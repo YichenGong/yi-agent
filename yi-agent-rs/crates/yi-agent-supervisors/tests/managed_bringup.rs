@@ -10,13 +10,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod support;
+
 use tempfile::TempDir;
 use yi_agent_lifecycle::deadline::Deadline;
 use yi_agent_lifecycle::types::{ArtifactIdentity, RuntimeIdentity, RuntimeMode, RuntimeScope};
 use yi_agent_supervisors::lifecycle::CoordinationGuard;
 use yi_agent_supervisors::lifecycle::bringup::{
-    BringUpIntent, BringUpResult, Compatibility, ControlProbe, GuardianLauncher, ProbeOutcome,
-    classify_compatibility, ensure_managed_with, pin_artifact, verify_pinned,
+    BringUpIntent, BringUpResult, BusinessProbe, BusinessProbeOutcome, Compatibility, ControlProbe,
+    GuardianLauncher, ProbeOutcome, classify_compatibility, ensure_managed_with,
+    ensure_managed_with_business, pin_artifact, verify_pinned,
 };
 
 fn test_scope(directory: &TempDir) -> RuntimeScope {
@@ -24,7 +27,11 @@ fn test_scope(directory: &TempDir) -> RuntimeScope {
         key: directory.path().to_string_lossy().into_owned(),
         runtime_dir: directory.path().to_path_buf(),
         project_key: "/project".to_string(),
-        instance_home: directory.path().to_path_buf(),
+        // A `TempDir` under `/var/folders` is longer than `sun_path` allows once the
+        // socket directory and hash are appended, and the derived socket path is then
+        // *refused* rather than probed -- a real behaviour, but not what these tests
+        // are about. The short home keeps the derived path usable.
+        instance_home: support::short_instance_home(directory.path()),
     }
 }
 
@@ -98,6 +105,28 @@ impl ControlProbe for ScriptedProbe {
     }
 }
 
+/// Reports a scripted business-channel outcome and counts probes.
+struct ScriptedBusinessProbe {
+    last: BusinessProbeOutcome,
+    probes: RefCell<usize>,
+}
+
+impl ScriptedBusinessProbe {
+    fn always(outcome: BusinessProbeOutcome) -> Self {
+        Self {
+            last: outcome,
+            probes: RefCell::new(0),
+        }
+    }
+}
+
+impl BusinessProbe for ScriptedBusinessProbe {
+    fn probe(&self, _scope: &RuntimeScope, _deadline: &Deadline) -> BusinessProbeOutcome {
+        *self.probes.borrow_mut() += 1;
+        self.last.clone()
+    }
+}
+
 /// Records launches instead of starting processes.
 #[derive(Default)]
 struct RecordingLauncher {
@@ -113,6 +142,161 @@ impl GuardianLauncher for RecordingLauncher {
         }
         Ok(())
     }
+}
+
+/// Inspection reports an unsupervised daemon instead of "nothing is running".
+///
+/// The two answers lead a user in opposite directions: "nothing" invites a start,
+/// and a start here is what puts a second daemon on the database. Inspection is
+/// still read-only -- it takes no lock and creates no runtime.
+#[test]
+fn inspection_reports_an_unsupervised_business_daemon() {
+    let directory = TempDir::new().unwrap();
+    let scope = test_scope(&directory);
+    let expected = artifact("build-a");
+    let probe = ScriptedProbe::always(ProbeOutcome::Absent);
+    let business = ScriptedBusinessProbe::always(BusinessProbeOutcome::Answered);
+    let launcher = RecordingLauncher::default();
+
+    let result = ensure_managed_with_business(
+        &scope,
+        &expected,
+        BringUpIntent::Inspect,
+        Deadline::after(Duration::from_secs(2)),
+        &probe,
+        &business,
+        &launcher,
+        &[],
+    )
+    .unwrap();
+
+    let BringUpResult::ManualActionRequired { reason } = result else {
+        panic!("inspection must report the daemon it cannot supervise, got {result:?}");
+    };
+    assert!(
+        reason.contains("without a supervisor"),
+        "the reason must name what was found: {reason}"
+    );
+    assert_eq!(*business.probes.borrow(), 1);
+    assert_eq!(*launcher.launches.borrow(), 0);
+    assert!(
+        !scope.runtime_dir.join("runtime.sqlite").exists(),
+        "inspection created a database"
+    );
+    assert!(
+        !scope.runtime_dir.join("coordination.lock").exists(),
+        "inspection took the coordination lock"
+    );
+}
+
+/// A business daemon that is alive but has no guardian must stop the start.
+///
+/// This is the A6 case: the user's own `daemon serve` is running and answering on
+/// the business socket, but nothing supervises it. Starting a managed runtime here
+/// would put a second daemon on the same database, and the loser would be whichever
+/// one the user was already using. The answer is a manual step, never a launch.
+#[test]
+fn business_live_without_guardian_never_launches() {
+    let directory = TempDir::new().unwrap();
+    let scope = test_scope(&directory);
+    let expected = artifact("build-a");
+    // No control channel: nothing supervised is running.
+    let probe = ScriptedProbe::always(ProbeOutcome::Absent);
+    // But the business socket answers: an unsupervised daemon is alive.
+    let business = ScriptedBusinessProbe::always(BusinessProbeOutcome::Answered);
+    let launcher = RecordingLauncher::default();
+
+    let result = ensure_managed_with_business(
+        &scope,
+        &expected,
+        BringUpIntent::Business,
+        Deadline::after(Duration::from_secs(2)),
+        &probe,
+        &business,
+        &launcher,
+        &[],
+    )
+    .unwrap();
+
+    assert!(
+        matches!(result, BringUpResult::ManualActionRequired { .. }),
+        "a live business daemon must be reported, not replaced: {result:?}"
+    );
+    assert_eq!(
+        *launcher.launches.borrow(),
+        0,
+        "no second daemon may be started beside a live business daemon"
+    );
+    assert!(
+        !scope.runtime_dir.join("runtime.sqlite").exists(),
+        "refusing must not create the database it refused to touch"
+    );
+}
+
+/// A business probe that cannot answer is not "nothing is there".
+///
+/// The distinction decides between "start one" and "stop and ask": reading a
+/// timeout or a permission error as absence is how a live daemon gets replaced.
+#[test]
+fn business_unresponsive_is_not_absent() {
+    let directory = TempDir::new().unwrap();
+    let scope = test_scope(&directory);
+    let expected = artifact("build-a");
+    let probe = ScriptedProbe::always(ProbeOutcome::Absent);
+    let business = ScriptedBusinessProbe::always(BusinessProbeOutcome::Unresponsive(
+        "timed out waiting for Status".to_string(),
+    ));
+    let launcher = RecordingLauncher::default();
+
+    let result = ensure_managed_with_business(
+        &scope,
+        &expected,
+        BringUpIntent::Business,
+        Deadline::after(Duration::from_secs(2)),
+        &probe,
+        &business,
+        &launcher,
+        &[],
+    )
+    .unwrap();
+
+    assert!(
+        matches!(result, BringUpResult::ManualActionRequired { .. }),
+        "an unresponsive business channel must be refused, not read as absent: {result:?}"
+    );
+    assert_eq!(*launcher.launches.borrow(), 0);
+}
+
+/// The positive witness: with both channels absent, a normal start still happens.
+///
+/// Without this, the two tests above would be satisfied by a function that never
+/// launches anything at all.
+#[test]
+fn both_channels_absent_still_launches() {
+    let directory = TempDir::new().unwrap();
+    let scope = test_scope(&directory);
+    let expected = artifact("build-a");
+    let probe = ScriptedProbe::always(ProbeOutcome::Absent);
+    let business = ScriptedBusinessProbe::always(BusinessProbeOutcome::Absent);
+    let launcher = RecordingLauncher::default();
+
+    let result = ensure_managed_with_business(
+        &scope,
+        &expected,
+        BringUpIntent::Business,
+        Deadline::after(Duration::from_secs(2)),
+        &probe,
+        &business,
+        &launcher,
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(
+        *launcher.launches.borrow(),
+        1,
+        "with nothing running a start is the right answer: {result:?}"
+    );
 }
 
 /// Inspection must not create the runtime it is inspecting.
@@ -616,8 +800,11 @@ fn a_runtime_owned_by_another_instance_is_refused() {
     assert_eq!(first.key, second.key, "one directory is one scope key");
 
     let launcher = RecordingLauncher::default();
+    // Injected for the same reason as the project case: the temporary path is too
+    // long for a derived socket, and absence is what this test needs anyway.
+    let business = ScriptedBusinessProbe::always(BusinessProbeOutcome::Absent);
     // The first client claims the directory and starts the runtime.
-    let started = ensure_managed_with(
+    let started = ensure_managed_with_business(
         &first,
         &artifact("build-a"),
         BringUpIntent::Business,
@@ -627,6 +814,7 @@ fn a_runtime_owned_by_another_instance_is_refused() {
             ProbeOutcome::Absent,
             ProbeOutcome::Answered(identity("build-a", RuntimeMode::Managed)),
         ]),
+        &business,
         &launcher,
         &["control.v1".to_string()],
     )
@@ -638,12 +826,13 @@ fn a_runtime_owned_by_another_instance_is_refused() {
     assert_eq!(*launcher.launches.borrow(), 1);
 
     // The second client must be told, not given a second daemon.
-    let refused = ensure_managed_with(
+    let refused = ensure_managed_with_business(
         &second,
         &artifact("build-a"),
         BringUpIntent::Business,
         Deadline::after(Duration::from_secs(5)),
         &ScriptedProbe::always(ProbeOutcome::Absent),
+        &business,
         &launcher,
         &["control.v1".to_string()],
     )
@@ -677,22 +866,28 @@ fn a_runtime_owned_by_another_project_is_refused() {
             .unwrap();
 
     let launcher = RecordingLauncher::default();
-    ensure_managed_with(
+    // The business channel is injected rather than derived: these scopes sit under
+    // a deep temporary path, where the derived socket path is refused by length --
+    // a real behaviour, but not the one this test is about.
+    let business = ScriptedBusinessProbe::always(BusinessProbeOutcome::Absent);
+    ensure_managed_with_business(
         &first,
         &artifact("build-a"),
         BringUpIntent::Business,
         Deadline::after(Duration::from_secs(5)),
         &ScriptedProbe::always(ProbeOutcome::Absent),
+        &business,
         &launcher,
         &[],
     )
     .unwrap();
-    let refused = ensure_managed_with(
+    let refused = ensure_managed_with_business(
         &second,
         &artifact("build-a"),
         BringUpIntent::Business,
         Deadline::after(Duration::from_secs(5)),
         &ScriptedProbe::always(ProbeOutcome::Absent),
+        &business,
         &launcher,
         &[],
     )
@@ -776,4 +971,127 @@ fn a_changed_bundle_requires_an_explicit_choice() {
         panic!("a different build must not be used silently, got {result:?}");
     };
     assert_eq!(identity.daemon_build_id.as_deref(), Some("build-a"));
+}
+
+/// The real probe, against real sockets: only "nothing listening" may be absence.
+///
+/// The injected-probe tests above pin the *decision*; this one pins the
+/// *classification* that feeds it. Without it, a probe that calls every error
+/// "absent" would satisfy them and silently reintroduce the second-daemon start.
+mod business_channel_probe {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+    use yi_agent_lifecycle::deadline::Deadline;
+    use yi_agent_lifecycle::types::RuntimeScope;
+    use yi_agent_supervisors::lifecycle::bringup::{
+        BusinessChannelProbe, BusinessProbe, BusinessProbeOutcome,
+    };
+
+    /// A scope whose derived business socket lives under `home`.
+    fn scope_for(home: &std::path::Path, runtime: &std::path::Path) -> RuntimeScope {
+        RuntimeScope {
+            key: runtime.to_string_lossy().into_owned(),
+            runtime_dir: runtime.to_path_buf(),
+            project_key: "/project".to_string(),
+            instance_home: home.to_path_buf(),
+        }
+    }
+
+    fn short_home_path(seed: &TempDir) -> std::path::PathBuf {
+        let home = crate::support::short_instance_home(seed.path());
+        std::fs::create_dir_all(home.join("sockets")).unwrap();
+        home
+    }
+
+    /// No socket file at all is the one honest "absent".
+    #[test]
+    fn a_missing_socket_is_absent() {
+        let seed = TempDir::new().unwrap();
+        let home = short_home_path(&seed);
+        let runtime = seed.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+
+        let outcome = BusinessChannelProbe.probe(
+            &scope_for(&home, &runtime),
+            &Deadline::after(Duration::from_secs(2)),
+        );
+        assert_eq!(outcome, BusinessProbeOutcome::Absent);
+    }
+
+    /// A listener that accepts and never answers is *not* absent.
+    ///
+    /// This is the classification the whole check rests on: a wedged daemon that
+    /// reads as absent gets replaced by a second one.
+    #[test]
+    fn a_silent_listener_is_unresponsive_not_absent() {
+        let seed = TempDir::new().unwrap();
+        let home = short_home_path(&seed);
+        let runtime = seed.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let scope = scope_for(&home, &runtime);
+
+        let socket = yi_agent_lifecycle::scope::daemon_socket(&runtime, &home);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let held = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+            drop(stream);
+        });
+
+        let outcome =
+            BusinessChannelProbe.probe(&scope, &Deadline::after(Duration::from_millis(300)));
+        assert!(
+            matches!(outcome, BusinessProbeOutcome::Unresponsive(_)),
+            "a silent listener must be unresponsive, got {outcome:?}"
+        );
+        drop(held);
+    }
+
+    /// A listening socket that answers a real Status is `Answered`.
+    #[test]
+    fn a_status_answer_is_answered() {
+        let seed = TempDir::new().unwrap();
+        let home = short_home_path(&seed);
+        let runtime = seed.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let scope = scope_for(&home, &runtime);
+
+        let socket = yi_agent_lifecycle::scope::daemon_socket(&runtime, &home);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&buffer[..read]).unwrap();
+            let request_id = request["request_id"].as_str().unwrap().to_string();
+            let result = serde_json::to_value(yi_agent_store::ipc::IpcResponse::Status {
+                high_water_event_id: 7,
+            })
+            .unwrap();
+            let reply = serde_json::json!({
+                "protocol_version": yi_agent_store::ipc::PROTOCOL_VERSION,
+                "request_id": request_id,
+                "result": result,
+            })
+            .to_string();
+            stream.write_all(reply.as_bytes()).unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+        });
+
+        let outcome = BusinessChannelProbe.probe(&scope, &Deadline::after(Duration::from_secs(3)));
+        assert_eq!(outcome, BusinessProbeOutcome::Answered);
+        worker.join().unwrap();
+    }
 }
