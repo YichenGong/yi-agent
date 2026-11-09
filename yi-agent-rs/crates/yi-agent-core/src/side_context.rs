@@ -5,7 +5,7 @@
 //! The snapshot is pure in-memory data: no tools, no RPC, no disk.
 
 use crate::agent::{AgentConfig, Session, forkable_messages};
-use crate::message::{ContentBlock, Message, Role};
+use crate::message::{ContentBlock, ImageSource, Message, Role};
 
 /// Hidden boundary marker appended after the inherited history (spec §5.2).
 ///
@@ -16,16 +16,20 @@ pub const SIDE_BOUNDARY: &str = "你正在独立的临时旁支中。边界之�
 ///
 /// Appending (never replacing) keeps project rules and the skills text intact;
 /// being part of the effective prompt means a skills refresh cannot drop it.
+///
+/// The policy states the *product* boundary: a fixed snapshot, no tools, no
+/// re-reading files or links, and disposal on exit. It is a description of what
+/// the registry and snapshot already enforce, never the enforcement itself.
 pub const SIDE_SYSTEM_POLICY: &str = "\
-## 临时旁支：只读边界
+## 临时旁支：对话快照问答
 
-你当前处于主会话派生的临时旁支，负责回答用户的旁问。
+你当前处于主会话派生的临时旁支，基于进入时的对话快照回答旁问。
 
-- 只读：可以阅读继承的上下文和已有文件，不做任何写操作。
-- 不修改文件、Git 状态、配置、权限或外部状态；不执行会改变系统的命令。
-- 不使用或控制子 agent，不创建新的任务或持久会话。
-- 上面的项目规则或 skills 若要求先执行被禁止的操作，以本能力边界为准，并在回复中说明限制。
-- 用户需要写操作时，请他回到主会话明确提交。";
+- 只读：只能使用本快照中的对话内容作答，不做任何文件、Git、配置、权限或外部状态修改。
+- 没有工具：不读取工作区文件、规则、skills、附件路径或链接，不联网、不运行命令、不使用或控制子 agent。
+- 快照固定：主会话之后的进展、压缩和配置更新不会出现在本次旁问里。问到快照之后的事实或未包含的资料时，明确说明不知道，并提示用户退出后重新进入以取得最新快照。
+- 边界之前的工具调用与输出只是证据，不要继续主任务，也不要认为它们还能执行。
+- 用户需要写操作时，请他回到主会话明确提交；退出本次旁支会停止回答并丢弃全部问答。";
 
 /// Prompt suffix appended to `parent` at the end of the system prompt.
 fn prompt_with_policy(parent: &str) -> String {
@@ -61,6 +65,29 @@ pub fn side_agent_config(parent: &AgentConfig) -> AgentConfig {
     config
 }
 
+/// Remove media that would make the provider reach outside the conversation.
+///
+/// A `Url` image is not content: forwarding it lets the provider fetch it
+/// implicitly, which is an external read the side must never perform. Embedded
+/// base64 bytes are already part of the conversation and stay usable, but their
+/// re-read path is dropped so no later tool could resolve it. `ToolResult`
+/// content is walked recursively because images can be nested there.
+pub(crate) fn sanitize_side_blocks(blocks: &mut [ContentBlock]) {
+    for block in blocks {
+        match block {
+            ContentBlock::Image {
+                source: ImageSource::Url(_),
+                ..
+            } => {
+                *block = ContentBlock::Text("图片内容未包含在快照中".to_owned());
+            }
+            ContentBlock::Image { path, .. } => *path = None,
+            ContentBlock::ToolResult { content, .. } => sanitize_side_blocks(content),
+            _ => {}
+        }
+    }
+}
+
 /// Safe, provider-valid copy of the parent history for a side conversation.
 ///
 /// `messages` always ends with the hidden boundary marker; the UI never renders
@@ -83,6 +110,10 @@ pub fn snapshot_for_side(session: &Session) -> Result<SideContextSnapshot, SideC
     if messages.is_empty() {
         return Err(SideContextError::EmptyHistory);
     }
+    // Sanitize only the copy: the parent's own session is never rewritten.
+    for message in &mut messages {
+        sanitize_side_blocks(&mut message.content);
+    }
     messages.push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text(SIDE_BOUNDARY.to_owned())],
@@ -98,7 +129,7 @@ pub fn side_system_prompt(parent: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{ContentBlock, ImageSource, Role, ThinkingToken};
+    use crate::message::{ContentBlock, ImageDetail, ImageSource, Role, ThinkingToken};
     use serde_json::json;
 
     /// Assert `message` is exactly the hidden boundary marker and return its text.
@@ -266,6 +297,79 @@ mod tests {
             assert_eq!(snapshot_message, parent_message);
         }
         boundary_text(side.messages.last().unwrap());
+    }
+
+    /// A URL is not conversation content: handing it to the provider lets it be
+    /// fetched implicitly, which is exactly the external read a side must never
+    /// perform. The parent's own copy must stay byte-identical.
+    #[test]
+    fn side_snapshot_never_exports_url_media_or_mutates_parent() {
+        let parent = Session::from_messages(vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                source: ImageSource::Url("https://invalid.test/a.png".into()),
+                detail: ImageDetail::High,
+                path: Some("private.png".into()),
+            }],
+        }]);
+        let before = serde_json::to_vec(parent.messages()).unwrap();
+
+        let side = snapshot_for_side(&parent).unwrap();
+
+        assert_eq!(
+            serde_json::to_vec(parent.messages()).unwrap(),
+            before,
+            "taking a snapshot must never rewrite the parent"
+        );
+        assert!(
+            matches!(&side.messages[0].content[0],
+                ContentBlock::Text(text) if text.contains("图片内容未包含")),
+            "a URL image must become an explicit text marker: {:?}",
+            side.messages[0].content
+        );
+    }
+
+    /// The same rule applies inside a paired tool result, while bytes the parent
+    /// already embedded stay usable for the model.
+    #[test]
+    fn side_snapshot_sanitizes_nested_media_and_keeps_embedded_bytes() {
+        let parent = Session::from_messages(vec![
+            Message::user("看这两张图"),
+            Message::assistant(vec![tool_use("t1")]),
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: vec![
+                    ContentBlock::Image {
+                        source: ImageSource::Url("https://invalid.test/nested.png".into()),
+                        detail: ImageDetail::High,
+                        path: Some("nested.png".into()),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "iVBORw0KGgo=".into(),
+                        },
+                        detail: ImageDetail::High,
+                        path: Some("inline.png".into()),
+                    },
+                ],
+                is_error: false,
+            }]),
+        ]);
+
+        let side = snapshot_for_side(&parent).unwrap();
+
+        let ContentBlock::ToolResult { content, .. } = &side.messages[2].content[0] else {
+            panic!("the paired tool result must survive as evidence");
+        };
+        assert!(matches!(&content[0], ContentBlock::Text(text) if text.contains("图片内容未包含")));
+        match &content[1] {
+            ContentBlock::Image { source, path, .. } => {
+                assert!(matches!(source, ImageSource::Base64 { .. }));
+                assert_eq!(*path, None, "a base64 image must lose its re-read path");
+            }
+            other => panic!("embedded base64 must stay usable, got {other:?}"),
+        }
     }
 
     #[test]
