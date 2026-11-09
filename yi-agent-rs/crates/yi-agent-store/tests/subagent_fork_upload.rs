@@ -133,6 +133,7 @@ async fn attached_root(fork_max_bytes: Option<u64>) -> ForkFixture {
             "fork-upload-fixture",
             &directory.path().join("project"),
             &[],
+            None,
         )
         .await
         .unwrap();

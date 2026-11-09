@@ -45,6 +45,9 @@ fn bring_up_with(
     runtime_dir: &Path,
     models_path: &Path,
     live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+    // The App run this bring-up speaks for, when this session has one. Only the
+    // managed branch reads it: the daemon needs an owner for a project attach.
+    client_run_id: Option<&str>,
 ) -> Result<Arc<RuntimeBinding>, yi_agent_subagent::attach::AttachFailure> {
     use yi_agent_subagent::attach::{
         AttachFailure, BringUpPolicy, ensure_owned_runtime_with_binding,
@@ -92,15 +95,17 @@ fn bring_up_with(
                 bringup.policy,
                 bringup.expected.as_ref(),
                 live_settings.cloned(),
+                client_run_id,
             )
             .map(|attached| {
-                RuntimeBinding::managed_with_live_settings(
+                RuntimeBinding::managed_with_live_settings_and_client(
                     cfg,
                     runtime_dir.to_path_buf(),
                     models_path.to_path_buf(),
                     Arc::new(attached),
                     bringup.clone(),
                     live_settings.cloned(),
+                    client_run_id.map(str::to_string),
                 )
             })
         }
@@ -115,7 +120,7 @@ pub(crate) fn bring_up_with_for_test(
     runtime_dir: &Path,
     models_path: &Path,
 ) -> Result<Arc<RuntimeBinding>, yi_agent_subagent::attach::AttachFailure> {
-    bring_up_with(bringup, cfg, runtime_dir, models_path, None)
+    bring_up_with(bringup, cfg, runtime_dir, models_path, None, None)
 }
 
 /// Test seam: an identity that is *not* the running build.
@@ -157,6 +162,9 @@ pub(crate) fn attach_cwd_runtime(
     live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> Result<Arc<RuntimeBinding>, String> {
     let bringup = yi_agent_subagent::attach::process_bringup_choice();
+    // The default entry point has no client identity of its own: a caller that
+    // has one (the thread index, from the shell-brokered authority) uses the
+    // explicit form below.
     attach_cwd_runtime_with(
         runtimes,
         runtime_dir,
@@ -164,6 +172,7 @@ pub(crate) fn attach_cwd_runtime(
         models_path,
         &bringup,
         live_settings,
+        None,
     )
 }
 
@@ -175,6 +184,10 @@ pub(crate) fn attach_cwd_runtime_with(
     models_path: &Path,
     bringup: &yi_agent_subagent::binding::BringUpChoice,
     live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+    // The App run this conversation belongs to, when the shell authorized one. A
+    // managed bring-up passes it to the daemon so a *project* attach can be
+    // attributed; an embedded one ignores it.
+    client_run_id: Option<&str>,
 ) -> Result<Arc<RuntimeBinding>, String> {
     let key = project_key(&cfg.workdir);
     // A project directory that no longer exists has nothing to bring up, and the
@@ -217,7 +230,14 @@ pub(crate) fn attach_cwd_runtime_with(
     // binding travels with it, because the choice and the settings are decided at
     // the same entry point and a bring-up that saw only one of them could serve a
     // daemon with the other's configuration.
-    let outcome = bring_up_with(bringup, cfg, runtime_dir, models_path, live_settings);
+    let outcome = bring_up_with(
+        bringup,
+        cfg,
+        runtime_dir,
+        models_path,
+        live_settings,
+        client_run_id,
+    );
     let mut cache = runtimes.lock().unwrap_or_else(|p| p.into_inner());
     match &outcome {
         // Only durable conclusions are worth remembering. A transient failure is

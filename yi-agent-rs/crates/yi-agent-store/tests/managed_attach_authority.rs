@@ -149,7 +149,7 @@ async fn an_unmanaged_daemon_attaches_with_the_callers_own_key() {
 
     let workspace = workspace(&directory);
     let attached = coordinator
-        .attach_application_root("project:1234:/p:uuid", &workspace, &[])
+        .attach_application_root("project:1234:/p:uuid", &workspace, &[], None)
         .await
         .expect("an unmanaged attach must keep working");
     assert!(!attached.root_task_id.to_string().is_empty());
@@ -173,11 +173,88 @@ async fn a_managed_daemon_refuses_an_attach_the_guardian_never_authorized() {
     assert!(coordinator.is_managed());
 
     let error = coordinator
-        .attach_application_root("project:1234:/p:uuid", &workspace, &[])
+        .attach_application_root("project:1234:/p:uuid", &workspace, &[], None)
         .await
         .expect_err("a managed daemon must not admit an unauthorized attach");
     let rendered = format!("{error}");
     assert!(rendered.contains("authorization"), "{rendered}");
+}
+
+/// The case that broke the desktop: a *project* attach on a managed daemon.
+///
+/// Its key is its own idempotency string, not a capability, so it resolves to
+/// nothing -- and refusing it aborted delegation setup before any conversation
+/// root could attach, which is why `spawn_agent` never reached the tool list.
+/// Naming the App run it speaks for is what the guardian can actually vouch for,
+/// so that is what admits it.
+#[tokio::test]
+async fn a_managed_daemon_admits_a_project_attach_that_names_an_authorized_client() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let secret = guardian.generation_secret();
+    // The guardian authorizes the App run. The root id it mints is irrelevant to
+    // this attach: a project attach opens a connection, not a particular root, so
+    // the daemon must still choose its own root id.
+    let authorization = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .expect("a business client must be authorizable");
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(authorization)))
+        .expect("the verifier must accept its guardian\'s binding");
+    coordinator
+        .adopt_managed_authority(daemon)
+        .expect("the ledger names this coordinator\'s generation");
+
+    let attached = coordinator
+        .attach_application_root("project:1234:/p:uuid", &workspace, &[], Some("app-run-1"))
+        .await
+        .expect("a project attach naming an authorized client must be admitted");
+    assert_ne!(
+        attached.root_task_id.to_string(),
+        ROOT_ID,
+        "a project attach opens a connection: it must not adopt the root the guardian \
+         authorized for a later conversation"
+    );
+    // Owned by the client it named, so the follow-up conversation attach finds an
+    // owner the guardian already vouched for instead of an invented key.
+    assert!(
+        coordinator
+            .authorize_work("app-run-1", &attached.root_task_id.to_string())
+            .is_ok(),
+        "the project root must be owned by the client it named"
+    );
+}
+
+/// Naming a client is not a bypass: the name still has to be one the guardian
+/// authorized. Otherwise "send my own id" would be an attach for a stranger.
+#[tokio::test]
+async fn a_managed_daemon_refuses_a_project_attach_naming_an_unknown_client() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+
+    // A managed daemon that has authorized nobody yet: an empty set is a refusal,
+    // not a pass.
+    let ledger = verifier_for(&directory, &coordinator, [3u8; 32]);
+    coordinator
+        .adopt_managed_authority(ledger)
+        .expect("the ledger names this coordinator\'s generation");
+
+    let error = coordinator
+        .attach_application_root(
+            "project:1234:/p:uuid",
+            &workspace,
+            &[],
+            Some("app-run-impostor"),
+        )
+        .await
+        .expect_err("a client the guardian never authorized must not attach");
+    let rendered = format!("{error}");
+    assert!(rendered.contains("app-run-impostor"), "{rendered}");
 }
 
 /// The authorized case, end to end: a capability the guardian minted *is* the
@@ -207,7 +284,7 @@ async fn a_managed_daemon_admits_the_capability_its_guardian_minted() {
         .expect("the ledger names this coordinator\'s generation");
 
     let attached = coordinator
-        .attach_application_root(&authorization.capability, &workspace, &[])
+        .attach_application_root(&authorization.capability, &workspace, &[], None)
         .await
         .expect("an authorized attach must be admitted");
     // The owner is the guardian's client, not the capability: the capability is a
@@ -259,7 +336,7 @@ async fn a_released_client_cannot_attach_with_its_old_capability() {
         .expect("the release must reach the daemon");
 
     let error = coordinator
-        .attach_application_root(&authorization.capability, &workspace, &[])
+        .attach_application_root(&authorization.capability, &workspace, &[], None)
         .await
         .expect_err("a released client must not attach");
     assert!(format!("{error}").contains("authorization"), "{error}");
@@ -294,7 +371,7 @@ async fn a_capability_for_another_project_is_refused() {
         .expect("the ledger names this coordinator\'s generation");
 
     let error = coordinator
-        .attach_application_root(&authorization.capability, &workspace, &[])
+        .attach_application_root(&authorization.capability, &workspace, &[], None)
         .await
         .expect_err("a capability for another root must not attach this one");
     assert!(format!("{error}").contains("names"), "{error}");
@@ -324,7 +401,7 @@ async fn a_revocation_applied_while_serving_takes_effect() {
 
     // Authorized now...
     coordinator
-        .attach_application_root(&authorization.capability, &workspace, &[])
+        .attach_application_root(&authorization.capability, &workspace, &[], None)
         .await
         .expect("the first attach must be admitted");
 
@@ -335,7 +412,7 @@ async fn a_revocation_applied_while_serving_takes_effect() {
         })
         .expect("a live revocation must apply");
     let error = coordinator
-        .attach_application_root(&authorization.capability, &workspace, &[])
+        .attach_application_root(&authorization.capability, &workspace, &[], None)
         .await
         .expect_err("the withdrawn capability must stop working");
     assert!(format!("{error}").contains("authorization"), "{error}");
@@ -357,7 +434,7 @@ async fn session_delegation_lifecycle_legacy_identity_is_not_public_key() {
     let coordinator = coordinator(&directory);
     let workspace = workspace(&directory);
     let attached = coordinator
-        .attach_application_root("project:legacy:/p:1", &workspace, &[])
+        .attach_application_root("project:legacy:/p:1", &workspace, &[], None)
         .await
         .expect("an unmanaged attach must keep working");
     let root = SessionRef {
@@ -454,7 +531,7 @@ async fn session_delegation_lifecycle_managed_identity_needs_a_guardian() {
     assert!(!coordinator.is_managed());
     let workspace = workspace(&directory);
     let attached = coordinator
-        .attach_application_root("project:managed:/p:1", &workspace, &[])
+        .attach_application_root("project:managed:/p:1", &workspace, &[], None)
         .await
         .unwrap();
 
@@ -511,7 +588,7 @@ async fn session_delegation_lifecycle_managed_denial_never_falls_back_to_embedde
     assert!(!coordinator.is_managed(), "this fixture has no guardian");
     let workspace = workspace(&directory);
     let attached = coordinator
-        .attach_application_root("project:fallback:/p:1", &workspace, &[])
+        .attach_application_root("project:fallback:/p:1", &workspace, &[], None)
         .await
         .expect("an unmanaged attach is admitted");
     let root = SessionRef {
@@ -593,7 +670,7 @@ async fn session_delegation_lifecycle_replacement_requires_a_stop_proof() {
     let coordinator = coordinator(&directory);
     let workspace = workspace(&directory);
     let attached = coordinator
-        .attach_application_root("project:stop:/p:1", &workspace, &[])
+        .attach_application_root("project:stop:/p:1", &workspace, &[], None)
         .await
         .unwrap();
     let root = SessionRef {
@@ -698,7 +775,7 @@ async fn session_delegation_lifecycle_host_reported_stop_unblocks_the_next_drive
     let coordinator = coordinator(&directory);
     let workspace = workspace(&directory);
     let attached = coordinator
-        .attach_application_root("project:stop-host:/p:1", &workspace, &[])
+        .attach_application_root("project:stop-host:/p:1", &workspace, &[], None)
         .await
         .unwrap();
     let root = SessionRef {
@@ -792,7 +869,7 @@ async fn session_delegation_lifecycle_an_unjoined_stop_is_not_a_stop_proof() {
     let coordinator = coordinator(&directory);
     let workspace = workspace(&directory);
     let attached = coordinator
-        .attach_application_root("project:unjoined:/p:1", &workspace, &[])
+        .attach_application_root("project:unjoined:/p:1", &workspace, &[], None)
         .await
         .unwrap();
     let root = SessionRef {

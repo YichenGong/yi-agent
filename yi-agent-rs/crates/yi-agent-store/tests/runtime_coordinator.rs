@@ -3240,7 +3240,7 @@ async fn non_git_read_only_child_starts_and_completes() {
     // A non-git root has no worktree to provision, so it attaches in place as a
     // read-only root; `create_session` would ask the factory for a worktree.
     let attached = coordinator
-        .attach_application_root("non-git-read-only", &plain, &[])
+        .attach_application_root("non-git-read-only", &plain, &[], None)
         .await
         .unwrap();
     let session = attached.session_id.clone();
@@ -3291,7 +3291,7 @@ async fn non_git_read_only_child_accepts_an_explicit_workdir() {
     });
     let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
     let attached = coordinator
-        .attach_application_root("non-git-read-only-workdir", &plain, &[])
+        .attach_application_root("non-git-read-only-workdir", &plain, &[], None)
         .await
         .unwrap();
     let session = attached.session_id;
@@ -3330,13 +3330,13 @@ async fn non_git_application_root_can_be_reattached() {
     let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
 
     let first = coordinator
-        .attach_application_root("non-git-project", &application_root, &[])
+        .attach_application_root("non-git-project", &application_root, &[], None)
         .await
         .unwrap();
     // Reattaching the same non-git root must stay idempotent even though it
     // keeps no `task_workspaces` row.
     let second = coordinator
-        .attach_application_root("non-git-project", &application_root, &[])
+        .attach_application_root("non-git-project", &application_root, &[], None)
         .await
         .unwrap();
 
@@ -3838,7 +3838,7 @@ async fn a_no_roots_spawn_issues_no_extra_roots_update() {
     let application_root = directory.path().join("not-a-repo");
 
     let attached = coordinator
-        .attach_application_root("audit-project", &application_root, &[])
+        .attach_application_root("audit-project", &application_root, &[], None)
         .await
         .unwrap();
     let session = attached.session_id.clone();
@@ -3955,7 +3955,7 @@ async fn attaching_an_application_root_records_its_linked_roots() {
     let linked = vec!["/w/linked-b".to_string(), "/w/linked-c".to_string()];
 
     let attached = coordinator
-        .attach_application_root("linked-roots-project", &application_root, &linked)
+        .attach_application_root("linked-roots-project", &application_root, &linked, None)
         .await
         .unwrap();
 
@@ -3977,7 +3977,7 @@ async fn reattaching_an_application_root_keeps_the_originally_recorded_roots() {
     let original = vec!["/w/linked-b".to_string()];
 
     let first = coordinator
-        .attach_application_root("linked-roots-project", &application_root, &original)
+        .attach_application_root("linked-roots-project", &application_root, &original, None)
         .await
         .unwrap();
     let second = coordinator
@@ -3985,6 +3985,7 @@ async fn reattaching_an_application_root_keeps_the_originally_recorded_roots() {
             "linked-roots-project",
             &application_root,
             &["/w/other".to_string()],
+            None,
         )
         .await
         .unwrap();
@@ -4007,7 +4008,7 @@ async fn attaching_an_application_root_without_linked_roots_records_nothing() {
     let (coordinator, database, application_root) = non_git_coordinator(&directory);
 
     let attached = coordinator
-        .attach_application_root("single-root-project", &application_root, &[])
+        .attach_application_root("single-root-project", &application_root, &[], None)
         .await
         .unwrap();
 
@@ -4056,7 +4057,7 @@ async fn a_child_inherits_its_parents_linked_roots_transitively() {
     let linked = vec!["/w/linked-b".to_string(), "/w/linked-c".to_string()];
 
     let attached = coordinator
-        .attach_application_root("linked-roots-tree", &application_root, &linked)
+        .attach_application_root("linked-roots-tree", &application_root, &linked, None)
         .await
         .unwrap();
     let session = attached.session_id.clone();
@@ -4134,7 +4135,7 @@ async fn a_session_without_linked_roots_threads_nothing_to_its_workers() {
     let application_root = directory.path().join("not-a-repo");
 
     let attached = coordinator
-        .attach_application_root("single-root-tree", &application_root, &[])
+        .attach_application_root("single-root-tree", &application_root, &[], None)
         .await
         .unwrap();
     let session = attached.session_id.clone();
@@ -4253,14 +4254,14 @@ async fn reattaching_a_root_session_restores_its_linked_roots_on_the_supervisor(
     let linked = vec!["/w/linked-b".to_string()];
 
     let attached = coordinator
-        .attach_application_root("reconnect-project", &application_root, &linked)
+        .attach_application_root("reconnect-project", &application_root, &linked, None)
         .await
         .unwrap();
     drop(coordinator);
 
     let reopened = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
     let reattached = reopened
-        .attach_application_root("reconnect-project", &application_root, &[])
+        .attach_application_root("reconnect-project", &application_root, &[], None)
         .await
         .unwrap();
     assert_eq!(reattached.session_id, attached.session_id);
@@ -4325,7 +4326,7 @@ async fn a_reattach_restores_a_hydrated_childs_linked_roots() {
     let linked = vec!["/w/linked-b".to_string()];
 
     let attached = coordinator
-        .attach_application_root("hydrated-child-project", &application_root, &linked)
+        .attach_application_root("hydrated-child-project", &application_root, &linked, None)
         .await
         .unwrap();
     let session = attached.session_id.clone();
@@ -4355,7 +4356,7 @@ async fn a_reattach_restores_a_hydrated_childs_linked_roots() {
 
     let reopened = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
     let reattached = reopened
-        .attach_application_root("hydrated-child-project", &application_root, &[])
+        .attach_application_root("hydrated-child-project", &application_root, &[], None)
         .await
         .unwrap();
     assert_eq!(reattached.session_id, attached.session_id);
@@ -4425,7 +4426,7 @@ async fn an_unlinked_attach_issues_no_extra_roots_update() {
     // Phase A: an attach with no linked roots. The guarded write must not run.
     assert_eq!(writes(&audit), 0, "the trigger starts from a clean slate");
     let bare = coordinator
-        .attach_application_root("unlinked-attach-project", &application_root, &[])
+        .attach_application_root("unlinked-attach-project", &application_root, &[], None)
         .await
         .unwrap();
     assert_eq!(
@@ -4449,6 +4450,7 @@ async fn an_unlinked_attach_issues_no_extra_roots_update() {
             "linked-attach-project",
             &application_root,
             &["/w/linked-b".to_string()],
+            None,
         )
         .await
         .unwrap();

@@ -170,7 +170,12 @@ async fn fixture(limits: AdmissionLimits) -> Fixture {
     )
     .unwrap();
     let attached = coordinator
-        .attach_application_root("live-admission", &directory.path().join("project"), &[])
+        .attach_application_root(
+            "live-admission",
+            &directory.path().join("project"),
+            &[],
+            None,
+        )
         .await
         .unwrap();
     Fixture {
@@ -541,7 +546,12 @@ async fn a_failing_source_refuses_admission_with_a_stable_code() {
     )
     .unwrap();
     let attached = coordinator
-        .attach_application_root("broken-source", &directory.path().join("project"), &[])
+        .attach_application_root(
+            "broken-source",
+            &directory.path().join("project"),
+            &[],
+            None,
+        )
         .await
         .unwrap();
 

@@ -820,6 +820,7 @@ mod attach_application_root_wire_tests {
             idempotency_key: "k".into(),
             workspace: PathBuf::from("/tmp/w"),
             extra_roots: vec!["/w/linked-b".into(), "/w/linked-c".into()],
+            client_run_id: Some("app-run-1".into()),
         };
         let encoded = serde_json::to_string(&request).unwrap();
         assert_eq!(

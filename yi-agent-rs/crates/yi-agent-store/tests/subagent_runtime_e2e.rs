@@ -296,6 +296,7 @@ fn active_runtime() -> (
             idempotency_key: "runtime-e2e-active".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -383,6 +384,7 @@ fn delivery_survives_restart_without_restarting_worker() {
             idempotency_key: "runtime-e2e-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -506,6 +508,7 @@ fn a_stalled_session_container_still_spawns_after_a_daemon_restart() {
             idempotency_key: "runtime-e2e-stalled-container".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -549,6 +552,7 @@ fn a_stalled_session_container_still_spawns_after_a_daemon_restart() {
             idempotency_key: "runtime-e2e-stalled-container".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -639,6 +643,7 @@ fn delivered_child_commit_survives_restart_and_is_reported_to_parent() {
             idempotency_key: "runtime-e2e-delivery-report-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -708,6 +713,7 @@ fn delivered_child_commit_survives_restart_and_is_reported_to_parent() {
             idempotency_key: "runtime-e2e-delivery-report-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()

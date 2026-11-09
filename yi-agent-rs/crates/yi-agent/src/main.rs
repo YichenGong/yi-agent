@@ -1385,6 +1385,8 @@ fn attach_application_root_request(
         workspace,
         // The headless runtime runs single-root: it links no extra folders.
         extra_roots: Vec::new(),
+        // Headless has no App run: its attach authenticates by the key alone.
+        client_run_id: None,
     }
 }
 
@@ -7675,6 +7677,7 @@ mod tests {
             idempotency_key,
             workspace,
             extra_roots,
+            client_run_id,
         } = attach_application_root_request(
             None,
             "test-key".into(),
@@ -7686,6 +7689,9 @@ mod tests {
         assert_eq!(idempotency_key, "test-key");
         assert_eq!(workspace, std::path::PathBuf::from("/projects/b"));
         assert!(extra_roots.is_empty());
+        // Headless has no App run to speak for, and a client id it invented would
+        // be an owner claim it cannot back.
+        assert_eq!(client_run_id, None);
     }
 
     #[test]

@@ -283,8 +283,11 @@ impl RuntimeCoordinator {
                 "an attach needs a stable operation id",
             ));
         }
+        // A session container's key is the guardian's capability for *this*
+        // conversation, so the attach authenticates from the key itself and names no
+        // client: a client id here would be a claim the capability already carries.
         let attached = self
-            .attach_application_root(idempotency_key, workspace, extra_roots)
+            .attach_application_root(idempotency_key, workspace, extra_roots, None)
             .await?;
         if let Some(digest) = creation_resume_digest {
             if digest.trim().is_empty() {
