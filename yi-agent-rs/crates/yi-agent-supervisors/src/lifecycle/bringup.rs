@@ -768,7 +768,15 @@ impl GuardianLauncher for ProcessGuardian {
         // process exits. Keeping it in a local would close it on return and hand the
         // guardian an immediate EOF -- a guardian that exits the moment it finished
         // starting, the exact opposite of outliving its client.
-        hold_lifeline(parent_end, child.id());
+        //
+        // The `Child` goes with it so that thread can also *reap* it. Dropping the
+        // handle here is what produced `<defunct>` guardians: `std::process::Child`
+        // does not wait on drop, and the desktop's app-server lives for hours, so
+        // every guardian it started and later had killed stayed a zombie for as long
+        // as the app ran. `kill -0` succeeds on a zombie, which made
+        // `scripts/rebuild.sh stop` report "still running" and abort even though the
+        // process was long dead (measured 2026-11-09).
+        hold_lifeline(parent_end, child);
         Ok(())
     }
 }
@@ -860,7 +868,18 @@ const BOOTSTRAP_CHILD_FD: i32 = super::guardian::BOOTSTRAP_FD;
 /// closes. That makes "the launcher is gone" observable without inventing an extra
 /// protocol. Detached on purpose: there is nothing to join, and joining it would
 /// block the caller until the guardian exits.
-fn hold_lifeline(parent_end: std::os::unix::net::UnixStream, guardian_pid: u32) {
+fn hold_lifeline(parent_end: std::os::unix::net::UnixStream, guardian: std::process::Child) {
+    let guardian_pid = guardian.id();
+    // Reap the guardian, or it stays `<defunct>` for as long as this process lives.
+    // A separate thread because `wait` blocks as long as the guardian runs, while the
+    // lifeline below blocks on a descriptor that only closes when *we* exit.
+    std::thread::Builder::new()
+        .name(format!("guardian-reaper-{guardian_pid}"))
+        .spawn(move || {
+            let mut guardian = guardian;
+            let _ = guardian.wait();
+        })
+        .ok();
     std::thread::Builder::new()
         .name(format!("guardian-lifeline-{guardian_pid}"))
         .spawn(move || {
@@ -1015,4 +1034,67 @@ pub fn scope_for_existing(
     instance_home: &Path,
 ) -> io::Result<RuntimeScope> {
     scope_ops::resolve(runtime_dir, project, instance_home)
+}
+
+#[cfg(test)]
+mod reaper_tests {
+    //! `hold_lifeline` 必须同时收尸。
+    //!
+    //! 回归缺陷（2026-11-09 实测）：`launch` 里 spawn 出的 `Child` 直接被丢弃。
+    //! `std::process::Child` 在 `Drop` 里**不** `wait`，而桌面 app-server 会连续
+    //! 运行数小时，于是每一个被它启动、随后被杀掉的 guardian 都停在 `<defunct>`。
+    //! `kill -0` 对僵尸返回成功，`scripts/rebuild.sh stop` 因此报「仍有进程停不下来」
+    //! 并中止——尽管进程早已退出。
+    use super::hold_lifeline;
+
+    /// 一个进程被 kill 之后，它的 pid 不再以 `Z` 留在进程表里。
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_child_does_not_linger_as_a_zombie() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        // 用一个立刻退出的小程序充当 guardian：它不需要理解 lifeline，
+        // 只要能被 spawn 并能被 reap。
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the fixture process starts");
+        let pid = child.id();
+
+        let (parent_end, _child_end) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        hold_lifeline(parent_end, child);
+
+        // 等 reaper 线程把它收掉。它退出后 `ps -o stat=` 要么查不到该 pid，
+        // 要么显示 `Z`——后者正是本测试要排除的形态。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            match std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+            {
+                Ok(output) => {
+                    last = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if last.is_empty() {
+                        return;
+                    }
+                    if !last.starts_with('Z') && !last.is_empty() {
+                        // 还没退出，再等。
+                    }
+                }
+                Err(_) => return,
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !last.starts_with('Z'),
+            "pid {pid} is still a zombie after 5s (stat {last:?}); \
+             the reaper thread did not call wait()"
+        );
+    }
 }

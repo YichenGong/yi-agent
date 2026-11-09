@@ -91,6 +91,39 @@ launchd 会在 10 秒内拉起新的一个，而新实例的第一个动作就�
 `stopped … (supervisor shutting down)` 日志再回收（`supervisor.rs:393-399`）。
 直接 SIGKILL 会让看板的子进程失去回收者，可能留下孤儿。SIGKILL 保留为超时兜底。
 
+#### 2.1.1 补充：guardian 要先于 daemon 停（2026-11-09）
+
+```
+⓪ 按 guardian.pid 记录停 guardian（先于 ①，因为 ① 之后的 daemon 由它托管）
+```
+
+`processes.json` 里第一个条目是 **daemon**，guardian 的 pid 只记在
+`guardian.pid`（字段 `pid` + `start_micros`）。只读 `processes.json` 会犯
+「杀了 daemon、guardian 还在」的错：guardian 发现被托管的 daemon 没了，立刻
+把它重新拉起来，从外部看就是 `stop` 什么都没做成。`lifecycle/guardian.rs` 的
+`GUARDIAN_PID_FILE` 注释已点名这个陷阱。
+
+停之前必须确认 pid 确实是 guardian（命令行含 `internal-runtime guardian`）：
+pid 会被系统复用，`start_micros` 又被写进文件却没人比较，只凭记录发信号可能
+杀掉无关进程。**SIGKILL 兜底那一轮也要重过同一道判据**——pid 可能在等待几秒
+内退出并被别人占用。
+
+#### 2.1.2 补充：僵尸不算活进程（2026-11-09）
+
+`kill -0` 对僵尸（`stat=Z`）返回**成功**，因为 pid 尚未被回收。原先的
+`wait_gone` 用 `kill -0` 判定，于是：app-server 活着却从不 `wait()` 它启动的
+guardian 时，被杀掉的 guardian 永远停在 `<defunct>`，`stop` 报「仍有进程停不
+下来」并 `die`——尽管进程早就退出。
+
+判据改为 `ps -o stat=` 首字符：空或 `Z*` 算已退出。不特殊处理 `T`
+（SIGSTOP 挂起），那仍是活进程，必须先 `CONT` 再 `TERM`。
+
+根因侧同时修掉：`lifecycle/bringup.rs` 的 `hold_lifeline` 现在把 `Child` 交给
+一个常驻 reaper 线程 `wait()`，从源头不再产生僵尸（回归测试
+`reaper_tests::a_reaped_child_does_not_linger_as_a_zombie`，旧实现下实测
+`stat "Z"` 停顿 5s，修复后 0.03s 通过）。
+
+
 ### 2.2 launchd 条目：只 bootout，保留 plist
 
 `watchman.rs:150-167` 的 `uninstall` 会同时 `bootout` **并删除 plist**。本设计
@@ -200,6 +233,11 @@ WARN: pid 69432 (app-server) 是本次重建的祖先进程，跳过。
    被真正替换（用 `stat -f '%Sm'` 比对时间戳）
 6. 重新构造 `resident watch` 场景（或等待下一次登录）后确认值守能自行恢复，
    验证 §2.2「保留 plist 即可自动回来」成立
+7. 存在僵尸（`ps stat=Z`）时 `./scripts/rebuild.sh stop` 仍退出 0，且不把僵尸
+   报成「停不下来的进程」（§2.1.2）
+8. `guardian.pid` 里记录的 pid 被无关进程复用时，该进程不被杀（§2.1.1）
+9. guardian 在跑的场合，guardian 先于 daemon 被停，之后 daemon 不被复活
+   （§2.1.1）
 
 ## 5. 影响面
 
@@ -215,8 +253,8 @@ WARN: pid 69432 (app-server) 是本次重建的祖先进程，跳过。
 `ancestor_pids`、`wait_gone`、`stop_dependents`，新增 `stop` 子命令，
 四个构建子命令在 `preflight` 之后调用 `stop_dependents`。
 
-`scripts/` 整个目录在 `.git/info/exclude`，故脚本改动本身不入库（与该文件头部
-声明一致）；本文档照常入库。
+`scripts/rebuild.sh` 与 `scripts/test_rebuild_global_link.sh` 均由 Git 跟踪
+（`git ls-files scripts/rebuild.sh` 有输出），改动照常入库。
 
 ### 验证
 
@@ -245,6 +283,28 @@ WARN: pid 69432 (app-server) 是本次重建的祖先进程，跳过。
 `target_pids "$(ancestor_pids)"`，结果为「停 3 个（`daemon serve`、
 `resident watch`、`superpowers-kanban`）、跳过 2 个祖先（`desktop`、
 `app-server`）」，与预期一致。
+
+### 2026-11-09 补强：僵尸与 guardian 顺序
+
+现象：`./scripts/rebuild.sh stop` 在 4 个僵尸（其中两个 ppid 是 `app-server`）
+存在的机器上 `die` 于「仍有进程停不下来」，而这些进程其实早已退出。
+
+三处修复与各自的回归测试：
+
+| 修复 | 位置 | 回归测试 |
+|---|---|---|
+| `is_alive` 把 `stat=Z` 判为已退出 | `scripts/rebuild.sh` | `is_alive: a zombie (Z) counts as gone`、`wait_gone: returns 0 for an already-dead zombie` |
+| 先按 `guardian.pid` 停 guardian，且 pid 复用时拒绝 | `scripts/rebuild.sh` | `guardian.pid: a pid reused by another program is not killed` 等 2 条 |
+| `hold_lifeline` 用常驻 reaper 线程 `wait()` 回收 guardian | `lifecycle/bringup.rs` | `reaper_tests::a_reaped_child_does_not_linger_as_a_zombie` |
+
+TDD 证据：先退化到旧实现（丢弃 `Child`、不 `wait`），上述 Rust 测试如实报
+`pid … is still a zombie after 5s (stat "Z")`，耗时 5.02s；恢复修复后 0.03s
+通过。脚本测试从 28 条增至 34 条，全绿。
+
+真实进程表验证：当前机器上 4 个僵尸（`4071`、`25210` 的 ppid 是 `app-server`）
+均被 `is_alive` 判为已退出；`./scripts/rebuild.sh stop` 退出码 0，正确跳过
+祖先进程 `desktop`(4042) / `app-server`(4056)。
+
 
 **未执行**：真实调用 `./scripts/rebuild.sh stop` 会杀掉承载当次会话的
 `app-server`，使验证报告无法交付，故留在用户实际重建时执行。用
