@@ -63,7 +63,10 @@ where
     // 会话期自愈:app 打开期间后台每 ~30s 重新确保每个登记项目都有活着的 daemon,
     // 与 launchd watchman 互补。只在生产入口启动;`serve_stdio`/`serve_scoped` 不装,
     // 故单元测试永远不会拉起真实进程。传入已算好的 `resident_dir`,循环内不重读 HOME。
-    spawn_resident_watch_loop(resident_dir.clone());
+    // Resolved once at this entry point and handed to every consumer that has to
+    // agree with it (watch loop, launcher, driver tick).
+    let bringup = std::sync::Arc::new(yi_agent_subagent::attach::process_bringup_choice());
+    spawn_resident_watch_loop(resident_dir.clone(), std::sync::Arc::clone(&bringup));
     // 主题句柄:`ui/settings/read|write` 与每个 thread 的 `set_theme` 工具共用。
     // 工厂闭包 `'static`,拿不到主循环里的 `theme`;先克隆一份专供工厂。
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
@@ -87,6 +90,9 @@ where
             runtimes,
             thread_roots,
             managed: Arc::new(StdMutex::new(None)),
+            // The same snapshot the watch loop above was started with: one
+            // resolution per entry point, shared with every attach/install.
+            bringup: std::sync::Arc::clone(&bringup),
             models_path: yi_agent_runtime::models::models_path(),
             websearch_path: yi_agent_tools::websearch_path(),
             settings_path: yi_agent_runtime::settings::settings_path(),
@@ -180,7 +186,10 @@ where
     let resident_dir = yi_agent_store::resident::default_dir().unwrap_or_default();
     // 与 `run` 一致:本函数是合一模式的生产入口,故同样在会话期自愈地确保
     // 各登记项目有一枚活着的 daemon(桌面经 `--relay` 启动时不应丢掉该保障)。
-    spawn_resident_watch_loop(resident_dir.clone());
+    // Resolved once at this entry point and handed to every consumer that has to
+    // agree with it (watch loop, launcher, driver tick).
+    let bringup = std::sync::Arc::new(yi_agent_subagent::attach::process_bringup_choice());
+    spawn_resident_watch_loop(resident_dir.clone(), std::sync::Arc::clone(&bringup));
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
     let theme_for_factory = theme.clone();
     // 与 `run` 一致:清单按指纹跟随 `models.json`,工厂逐会话取当前值。
@@ -203,6 +212,9 @@ where
             runtimes,
             thread_roots,
             managed: Arc::new(StdMutex::new(None)),
+            // The same snapshot the watch loop above was started with: one
+            // resolution per entry point, shared with every attach/install.
+            bringup: std::sync::Arc::clone(&bringup),
             models_path: yi_agent_runtime::models::models_path(),
             websearch_path: yi_agent_tools::websearch_path(),
             settings_path: yi_agent_runtime::settings::settings_path(),

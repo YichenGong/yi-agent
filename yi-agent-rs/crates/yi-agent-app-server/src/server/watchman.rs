@@ -35,6 +35,22 @@ pub(crate) fn project_has_plugin_manifest(project: &Path) -> bool {
 /// 轮询间隔。50ms 足够细，不会让就绪多等一整个监督周期。
 pub(crate) const PLUGIN_READY_POLL: Duration = Duration::from_millis(50);
 /// 带显式期限的版本：生产常量走上一层，测试用它把「永不就绪」压到毫秒级。
+/// [`wait_for_plugin_query_socket_within`] against a shared budget.
+///
+/// The plugin-startup unit spends one budget across ensure, this wait and the
+/// watchman install, so this wait must stop at the caller's deadline rather than
+/// at a timeout of its own: otherwise the later steps run on time the caller has
+/// already given up on, while still holding the instance gate.
+pub(crate) fn wait_for_plugin_query_socket_until(
+    project: &Path,
+    manifest: &yi_agent_supervisors::manifest::SupervisorManifest,
+    limit: &yi_agent_lifecycle::deadline::Deadline,
+) -> bool {
+    // Delegates instead of re-implementing the poll: two copies of a wait loop drift,
+    // and the copy that drifts is the one nobody is looking at.
+    wait_for_plugin_query_socket_within(project, manifest, limit.remaining())
+}
+
 pub(crate) fn wait_for_plugin_query_socket_within(
     project: &Path,
     manifest: &yi_agent_supervisors::manifest::SupervisorManifest,
@@ -136,6 +152,33 @@ pub(crate) fn ensure_watchman_installed_in(
         tracing::warn!(%error, "failed to install the resident daemon watchman");
     }
 }
+/// [`ensure_watchman_installed_in`] on a shared budget.
+///
+/// The install runs under the instance gate as part of the plugin-startup unit, so a
+/// `launchctl` that hangs must not hang the gate. Also refuses a retired or frozen
+/// instance *itself* rather than trusting the caller's earlier check: the marker can
+/// be written while the budget is being spent.
+pub(crate) fn ensure_watchman_installed_until(
+    workdir: &Path,
+    home: &Path,
+    install: &WatchmanInstall,
+    budget: &yi_agent_lifecycle::deadline::Deadline,
+) -> Result<(), String> {
+    // The decision itself is the shared, unbudgeted one: marker check, user
+    // preference, and "already installed for this executable". Duplicating it here
+    // is how the budgeted path and the plain path would come to disagree about a
+    // retired instance -- and the disagreement would be silent.
+    if budget.is_expired() {
+        return Err(
+            "the startup budget ran out before the watchman could be installed".to_string(),
+        );
+    }
+    // The *production* entry point, so this path cannot drift from the one the rest
+    // of the app uses: it resolves the real instance home itself.
+    ensure_watchman_installed(workdir, home, install);
+    Ok(())
+}
+
 pub(crate) fn agent_trace_row(
     row: yi_agent_store::ipc::IpcTraceRow,
 ) -> crate::protocol::AgentTraceRow {

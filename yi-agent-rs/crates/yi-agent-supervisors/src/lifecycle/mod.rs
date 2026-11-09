@@ -20,6 +20,7 @@
 pub mod admission;
 pub mod bringup;
 pub mod claim;
+pub mod daemon_ready;
 pub mod demands;
 pub mod foreground_executions;
 pub mod guardian;

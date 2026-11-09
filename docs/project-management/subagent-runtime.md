@@ -340,3 +340,46 @@
   未知 operation 返回 `Operation(None)` 而不是伪造失败；未接控制器的 build 返回
   `Unsupported`，让客户端能区分「这个 build 不能切换」与「我没发起过」。
 - [ ] 切换的桌面壳入口与 App 侧按钮 — 见 Task 16、17
+
+## 2026-11-09 修复：daemon 就绪证明与撤销（subagent 不工作的根因）
+
+现象与根因分两层，缺任何一层都复现「app 里起不了 subagent」：
+
+- **根因一（判定条件过弱）**：guardian 起 daemon 后，只等业务 socket 上的
+  `Status` **能应答**就发布 ready。可 `Status` 只证明「有个东西在监听并懂协议」，
+  不证明是**这一次 launch** 起的那个 daemon——上一代残留 daemon、别的实例、甚至
+  一个占位的监听者都能满足它。于是一次成功的 ready 可以是别人的进程，随后
+  `spawn_agent` 拿到的权力对应一个不是本代际的 daemon，表现为「授权失败 /
+  工具消失」。修复：新增 `lifecycle/daemon_ready.rs`，daemon 在私有 lifeline FD
+  上按随机 nonce 发一帧 `Ready{nonce, instance_id, build_id, ...}`，guardian 校验
+  nonce 与预期 instance/build，**只有这一帧**才算就绪；读到别的帧、
+  EOF、超预算一律拒绝并回收已 spawn 的组。
+- **根因二（发布后从不撤销）**：readiness 是一次性写入的，daemon 之后死掉或
+  关闭 lifeline，guardian 仍报 ready，客户端拿到一个静默丢帧的 runtime。
+  修复：`Guardian::daemon_lifeline_gone()` 用零等待 `poll` + `MSG_PEEK`
+  （不消费字节，避免抢走 authority pump 的帧；`POLLHUP/POLLERR` 单独不够，
+  两种可能带缓冲数据）判定 EOF；`revoke_ready_if_gone()` 只清**已发布状态**
+  与授权表，**不发信号、不动 registry**——撤销是观察，不是驱逐，一次监督
+  tick 不该杀掉只是可疑的进程；pid 复用由 `spawned_child_is_alive` 的
+  start-time 比对排除。监督循环每个 tick 调用一次，幂等。
+
+判别性（不是「跑了就算过」）：两处都做了变异验证，测试必须红。
+
+- 把 Ready 校验换回「Status 能应答即就绪」，`an_unrelated_status_responder_cannot_satisfy_readiness` 红（`start_daemon` 返回 `Ok(())`）。该用例要求一个**真实占位监听者**先占据业务 socket 并应答 Status，child 用「读掉 greeting 后静默 sleep」的脚本 —— 若 child 立刻退出，hello 写会先 `BrokenPipe`，测试就会在没碰 readiness 的情况下通过（实测踩到过，普通 `/usr/bin/true` 不构成判别用例）。
+- 顺带修掉一个真实缺陷：guardian 里探活曾用 `socket_path_for`（读**环境变量**），在 guardian 里那是它的启动者恰好导出的值，指向的可能是另一个实例；统一改为由 `RuntimeScope` 派生的 `daemon_socket(runtime_dir, instance_home)`。
+
+判据（全部实跑）：
+
+- `cargo test -p yi-agent-supervisors --test daemon_ready_authority`（6 passed），含
+  `an_unrelated_status_responder_cannot_satisfy_readiness`、
+  `a_silent_child_cannot_be_published_as_ready`、
+  `an_exiting_child_is_refused_rather_than_waited_out`、
+  `a_ready_for_another_launch_is_rejected`、
+  `every_launch_gets_a_distinct_nonce`、
+  `a_closed_lifeline_withdraws_readiness_and_touches_nothing`
+- `cargo test -p yi-agent-supervisors`（542 passed, 4 skipped）
+- 端到端（真实 LLM，隔离 `YI_AGENT_HOME`）：
+  `YI_AGENT_BRINGUP=managed yi-agent run --subagents --json '...spawn_agent... echo hello'`
+  → `spawn_agent` 返回 `queued`，`wait_agent` 返回 `status: completed`、
+  `report: "hello"`，`inspect_agent` 复核同一 task；同时生成
+  `sockets/<hash>/guardian-control.sock` 证明走的是 guardian 拥有 daemon 的受管路径。

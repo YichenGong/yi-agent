@@ -100,6 +100,11 @@ pub(crate) struct ServeLauncher<'a, F> {
     pub(crate) thread_roots: &'a ThreadRoots,
     /// The shell-brokered authority for this session, once the bootstrap installed it.
     pub(crate) managed: &'a crate::server::ManagedSlot,
+    /// The bring-up choice resolved once by the entry point.
+    ///
+    /// The driven session must attach with the same policy as a hand-started one;
+    /// re-reading the process policy here would let the two disagree.
+    pub(crate) bringup: &'a std::sync::Arc<yi_agent_subagent::binding::BringUpChoice>,
     /// 机器级模型清单路径:被驱动的会话的委派链路与手工会话读同一份,而非各自
     /// 重读 `$HOME`。
     pub(crate) models_path: &'a Path,
@@ -334,6 +339,7 @@ where
             self.thread_roots,
             self.managed,
             self.models_path,
+            self.bringup,
             self.cfg,
             workdir,
             crate::thread_store::ThreadMode::Yolo,
@@ -739,6 +745,7 @@ where
             self.thread_roots,
             self.managed,
             self.models_path,
+            self.bringup,
             self.cfg,
             &target.cwd,
             crate::thread_store::ThreadMode::Normal,

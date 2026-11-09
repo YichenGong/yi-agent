@@ -77,8 +77,12 @@ pub async fn serve_ws_with_binding(
     let resident_dir = yi_agent_store::resident::default_dir().unwrap_or_default();
     crate::server::migrate_legacy_model_keys_on_startup();
     crate::server::migrate_legacy_resident_requests_on_startup(&resident_dir);
-    crate::server::spawn_resident_watch_loop(resident_dir);
-    serve_ws_body_inner(listener, cfg, workspaces, pairing, binding).await
+    // Resolved once for this entry point. The watch loop and every attach below
+    // share this one value: two independent resolutions is how the loop and the
+    // attach came to disagree about whether this process owns an embedded daemon.
+    let bringup = std::sync::Arc::new(yi_agent_subagent::attach::process_bringup_choice());
+    crate::server::spawn_resident_watch_loop(resident_dir, std::sync::Arc::clone(&bringup));
+    serve_ws_body_inner(listener, cfg, workspaces, pairing, bringup, binding).await
 }
 
 /// [`serve_ws`] 去掉启动期工作的本体:可被测试直接调用(测试入参是隔离
@@ -89,8 +93,9 @@ pub(crate) async fn serve_ws_body(
     cfg: RuntimeConfig,
     workspaces: Arc<WorkspaceIndex>,
     pairing: Arc<PairingState>,
+    bringup: Arc<yi_agent_subagent::binding::BringUpChoice>,
 ) -> anyhow::Result<()> {
-    serve_ws_body_inner(listener, cfg, workspaces, pairing, None).await
+    serve_ws_body_inner(listener, cfg, workspaces, pairing, bringup, None).await
 }
 
 /// [`serve_ws_body`] 加上运行期设置绑定；`None` 走历史静态装配。
@@ -99,6 +104,7 @@ pub(crate) async fn serve_ws_body_inner(
     cfg: RuntimeConfig,
     workspaces: Arc<WorkspaceIndex>,
     pairing: Arc<PairingState>,
+    bringup: Arc<yi_agent_subagent::binding::BringUpChoice>,
     binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> anyhow::Result<()> {
     // 主题句柄:`ui/settings/read|write` 与每个 thread 的 `set_theme` 工具共用,
@@ -119,11 +125,17 @@ pub(crate) async fn serve_ws_body_inner(
         theme,
         binding,
         build_agent,
+        bringup,
     )
     .await
 }
 
 /// [`serve_ws`] 的可注入 agent 工厂版本:测试用 mock provider(如审批 E2E)。
+///
+/// 8 个参数:入口一次性解析的 bring-up 快照与运行期设置绑定各自独立（前者决定
+/// 谁拥有 daemon，后者是设置来源），合并成一个结构体只会让"哪些组合真的存在"
+/// 更难读；与文件内其它装配点保持一致。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_ws_inner<F>(
     listener: tokio::net::TcpListener,
     cfg: RuntimeConfig,
@@ -134,6 +146,9 @@ pub(crate) async fn serve_ws_inner<F>(
     // 决定，本函数不重新构造工厂），而是给内嵌项目 daemon 的 worker 工厂用。
     live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
     build_agent: F,
+    // The entry point's single resolution; threaded in rather than re-read so
+    // this seam cannot invent a second, possibly different answer.
+    bringup: Arc<yi_agent_subagent::binding::BringUpChoice>,
 ) -> anyhow::Result<()>
 where
     F: Fn(
@@ -184,6 +199,7 @@ where
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 managed: Arc::new(StdMutex::new(None)),
+                bringup,
                 models_path: yi_agent_runtime::models::models_path(),
                 websearch_path: yi_agent_tools::websearch_path(),
                 settings_path: yi_agent_runtime::settings::settings_path(),
@@ -666,6 +682,7 @@ mod tests {
             cfg,
             workspaces,
             Arc::clone(&pairing),
+            Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
         ));
         WsFixture {
             addr,
@@ -997,7 +1014,13 @@ mod tests {
         )));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(serve_ws_body(listener, cfg, workspaces, Arc::clone(&relay)));
+        let handle = tokio::spawn(serve_ws_body(
+            listener,
+            cfg,
+            workspaces,
+            Arc::clone(&relay),
+            Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
+        ));
 
         // 手机用桌面铸出的码连接 ws 兑换,必须成功拿到 token。
         let (mut ws, _) = tokio_tungstenite::connect_async(format!(

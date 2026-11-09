@@ -40,6 +40,9 @@ pub(crate) async fn start_thread_core(
     // The shell-brokered authority, when this sidecar serves a desktop shell.
     managed: &crate::server::ManagedSlot,
     models_path: &Path,
+    // The bring-up choice resolved once by the entry point: attach must not
+    // re-read the process policy, or it can disagree with watch/install.
+    bringup: &yi_agent_subagent::binding::BringUpChoice,
     cfg: &RuntimeConfig,
     cwd: &str,
     mode: crate::thread_store::ThreadMode,
@@ -118,6 +121,7 @@ pub(crate) async fn start_thread_core(
         &runtime_dir,
         crate::server::managed_snapshot(managed),
         models_path,
+        bringup,
         cfg,
         cwd,
         &thread_id,

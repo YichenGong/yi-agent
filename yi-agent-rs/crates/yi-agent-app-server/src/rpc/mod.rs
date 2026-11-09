@@ -28,6 +28,7 @@ pub(crate) mod resident;
 pub(crate) mod runtime;
 pub(crate) mod side;
 pub(crate) mod skill;
+pub(crate) mod startup;
 pub(crate) mod thread;
 pub(crate) mod turn;
 pub(crate) mod ui;
@@ -240,6 +241,15 @@ pub(crate) struct PluginChannelState {
     /// 实例以后归 managed 管，而这条连接此刻是否由一个持租约的壳代表，是另一件
     /// 事；后者才决定这次安装有没有人能负责把插件真正跑起来。
     pub(crate) managed_session: bool,
+    /// This process's effective bring-up policy, resolved once at the entry point.
+    ///
+    /// Distinct from `managed_session`, and neither substitutes for the other:
+    /// that one answers "may *this connection* be represented by the local shell",
+    /// this one answers "may *this host* start an unsupervised daemon at all".
+    /// A remote client on a managed host has no shell authority, so the
+    /// connection-level check alone would let it start an embedded daemon the
+    /// managed runtime is trying to retire.
+    pub(crate) bringup_policy: yi_agent_subagent::attach::BringUpPolicy,
     /// 供 `plugin/query` 判断"插件是否被自己的 flag 关着"。
     ///
     /// `None` = 不判定。测试装配就是 `None`；要用真判定时注入一个指向临时
@@ -470,6 +480,12 @@ pub(crate) struct AppState<'a> {
     /// built. `None` inside means "no shell": the conversation then attaches with its
     /// own key, which is the embedded path.
     pub(crate) managed: &'a crate::server::ManagedSlot,
+    /// The bring-up choice this process resolved once at its entry point.
+    ///
+    /// Passed down instead of re-read: `thread/start` and `thread/resume` must
+    /// attach with the same policy watch and plugin install already used, and a
+    /// second read is how those answers drift apart.
+    pub(crate) bringup: &'a Arc<yi_agent_subagent::binding::BringUpChoice>,
     /// 每 thread 一个进程状态守望者。`thread/start` 与 `thread/resume` 建立或
     /// 替换它(换掉生效 manager 时先停旧的,见 `server/turn/start.rs` 与
     /// `rpc/thread/lifecycle/resume.rs`),`thread/delete` 停它。

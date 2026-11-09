@@ -170,6 +170,7 @@ where
         runtimes,
         thread_roots,
         managed,
+        bringup,
         models_path,
         websearch_path,
         settings_path,
@@ -851,6 +852,7 @@ where
                             cfg: &cfg,
                             theme_handle: &theme_handle,
                             models_path: &models_path,
+                            bringup: &bringup,
                             websearch_path: &websearch_path,
                             settings_path: &settings_path,
                             live_settings: live_settings.as_ref(),
@@ -947,6 +949,10 @@ where
                                 .await
                                 .get(&client)
                                 .is_some(),
+                            // The host policy the entry point resolved, not the
+                            // connection's identity: a remote client must inherit
+                            // it, and its JSON cannot declare it.
+                            bringup_policy: bringup.policy,
                             fatal_tx: fatal_tx.clone(),
                         });
                         let req = req.clone();
@@ -1181,6 +1187,7 @@ where
                     &thread_roots,
                     &managed,
                     &models_path,
+                    &bringup,
                     &cfg,
                     &hub,
                     &turn_tx,
@@ -1259,6 +1266,7 @@ where
                         thread_roots: &thread_roots,
                         managed: &managed,
                         models_path: &models_path,
+                        bringup: &bringup,
                         live_settings: live_settings.as_ref(),
                         lead_agent_enabled,
                         cfg: &cfg,
@@ -1323,6 +1331,7 @@ where
                     thread_roots: &thread_roots,
                     managed: &managed,
                     models_path: &models_path,
+                    bringup: &bringup,
                     live_settings: live_settings.as_ref(),
                     lead_agent_enabled,
                     cfg: &cfg,
@@ -1377,6 +1386,7 @@ where
                     thread_roots: &thread_roots,
                     managed: &managed,
                     models_path: &models_path,
+                    bringup: &bringup,
                     live_settings: live_settings.as_ref(),
                     lead_agent_enabled,
                     cfg: &cfg,

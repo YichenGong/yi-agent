@@ -341,92 +341,89 @@ pub(crate) async fn handle_shared(
             // migration and put back exactly the daemon those three paths just stopped.
             let retired =
                 yi_agent_supervisors::lifecycle::retirement::is_retired(&state.plugin_home);
-            if state.managed_session || retired {
+            // 宿主策略是第三个独立判据：受管宿主上，一条没有壳授权的远程连接
+            // 也不得拉起 embedded daemon。只看 `managed_session` 会把「这次装
+            // 有没有人负责」误当成「这台机器允不允许自启」——前者说否时，后者
+            // 可能仍然允许，而 managed 要收敛的正是那个「允许」。
+            let host_allows_embedded =
+                state.bringup_policy == yi_agent_subagent::attach::BringUpPolicy::Embedded;
+            if state.managed_session || retired || !host_allows_embedded {
                 startup = "awaiting-demand";
                 tracing::info!(
                     project = %project.display(),
                     plugin = %plugin,
                     managed_session = state.managed_session,
                     retired,
+                    host_allows_embedded,
                     "installed under managed lifecycle; the plugin starts when a client demands it"
                 );
             } else {
                 // 拉起 daemon 是 best-effort：清单与开关已经落盘，常驻监视线程每
                 // ~30s 会再扫一遍。这里失败只是「这次没立刻起来」，不该让一次已经
                 // 成功的安装回滚成失败。
-                let ensure = std::sync::Arc::clone(&state.ensure_daemon);
-                let daemon_project = project.clone();
-                match tokio::task::spawn_blocking(move || ensure(&daemon_project)).await {
-                    Ok(Ok(true)) => startup = "running",
-                    Ok(Ok(false)) => {
-                        startup = "retrying";
-                        tracing::warn!(
-                            project = %project.display(),
-                            plugin = %plugin,
-                            "installed the plugin but its daemon did not become ready; the resident watch will retry"
-                        );
-                    }
-                    Ok(Err(error)) => {
-                        startup = "retrying";
-                        tracing::warn!(
-                            project = %project.display(),
-                            plugin = %plugin,
-                            "installed the plugin but could not start its daemon: {error}"
-                        );
-                    }
-                    Err(error) => {
-                        startup = "retrying";
-                        tracing::warn!(
-                            project = %project.display(),
-                            plugin = %plugin,
-                            "the daemon-start task failed: {error}"
-                        );
-                    }
-                }
-                // 等插件自己的查询通道就绪。只等 daemon 的 `Status` 不够：转发表由
-                // daemon 的监督循环每 500ms 登记一次，插件还要 bind socket；调用方
-                // （桌面建看板）紧接着就发 `plugin/query`。
                 //
-                // 阻塞轮询放进 blocking 池。超时不算失败：清单与开关已落盘，常驻
-                // 监督会继续重试；回包用 `queryable` 如实告诉调用方。
-                queryable = {
-                    let ready_project = project.clone();
-                    let manifest = ready_manifest;
-                    match tokio::task::spawn_blocking(move || {
-                        crate::server::wait_for_plugin_query_socket(&ready_project, &manifest)
-                    })
-                    .await
-                    {
-                        Ok(ready) => ready,
-                        Err(error) => {
-                            tracing::warn!(%error, "the plugin-readiness task failed");
-                            true
+                // 三步（ensure → 等查询通道 → 装值守）必须在**一个**持闸单元里
+                // 完成。此前它们是三个独立任务：每一步各自向闸外伸手，于是迁移
+                // 可以插在 ensure 之后、**常驻时就在 stop 之间**把 daemon 停掉，
+                // 而这里还在等它就绪；更糟的是第三步能在迁移写 freeze 之后把
+                // 值守装回去——正是这次迁移要消掉的自愈源。
+                //
+                // 一个 blocking 工作单元 = 一次取闸、一个预算、一个所有权。调用
+                // 方丢弃 future 不会提前释放闸，因为闸由真正干活的 worker 持有
+                // 到它结束。
+                // One blocking worker owns all three steps: ensure, the query-channel
+                // wait, and the watchman install.
+                //
+                // Run as three independent tasks they were three separate gate
+                // acquisitions, so a migration could land between them -- stopping the
+                // daemon this step had just started, or (worse) letting the last step
+                // reinstall the very self-healing watchman the migration exists to
+                // remove. The unit also fixes the budget: one deadline for everything,
+                // and steps still to run are skipped once it is spent.
+                //
+                // A blocking worker, not an async task, because every step blocks on a
+                // child process or a socket poll; and because the gate has to be owned
+                // by the worker: if the caller drops the future, the worker still
+                // finishes and only then releases the gate.
+                let ensure = std::sync::Arc::clone(&state.ensure_daemon);
+                let install = std::sync::Arc::clone(&state.watchman_install);
+                let workdir = state.theme_handle.workdir().to_path_buf();
+                let home = state.watchman_home.clone();
+                let instance_home = crate::server::instance_home_dir();
+                let daemon_project = project.clone();
+                let ready_project = project.clone();
+                let manifest = ready_manifest;
+                let unit = tokio::task::spawn_blocking(move || {
+                    crate::rpc::startup::start_plugin(
+                        &daemon_project,
+                        &ready_project,
+                        &manifest,
+                        &workdir,
+                        &home,
+                        &instance_home,
+                        &ensure,
+                        &install,
+                    )
+                })
+                .await;
+                match unit {
+                    Ok(outcome) => {
+                        startup = outcome.startup;
+                        queryable = outcome.queryable;
+                        if let Some(warning) = outcome.warning {
+                            tracing::warn!(
+                                project = %project.display(),
+                                plugin = %plugin,
+                                "{warning}"
+                            );
                         }
                     }
-                };
-                if !queryable {
-                    tracing::warn!(
-                        project = %project.display(),
-                        plugin = %plugin,
-                        "installed the plugin but its query channel was not ready in time; the resident watch will retry"
-                    );
-                }
-                // 值守的登录项：`board/create` 时代由建板路径 best-effort 安装，那
-                // 条路径随域删除后没有替代落点。安装一个需要常驻的插件正是它的通用
-                // 对应物——开关为开、plist 未指向当前 exe 时装一次。
-                //
-                // 放在安装收尾：`launchctl` 是同步子进程，别让一次安装卡住 async worker。
-                // 失败只 warn：清单与开关已经落盘，登录自启装不上不该把成功改成失败。
-                {
-                    let workdir = state.theme_handle.workdir().to_path_buf();
-                    let home = state.watchman_home.clone();
-                    let install = std::sync::Arc::clone(&state.watchman_install);
-                    if let Err(error) = tokio::task::spawn_blocking(move || {
-                        crate::server::ensure_watchman_installed(&workdir, &home, &install)
-                    })
-                    .await
-                    {
-                        tracing::warn!(%error, "the watchman-install task failed");
+                    Err(error) => {
+                        // The worker panicked. Nothing about the world is known, so the
+                        // honest answer is the retrying one: the manifest is on disk and
+                        // the resident watch may still pick it up.
+                        startup = "retrying";
+                        tracing::warn!(%error, "the plugin-startup unit failed");
                     }
                 }
             }

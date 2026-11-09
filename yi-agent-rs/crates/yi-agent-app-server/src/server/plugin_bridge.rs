@@ -7,7 +7,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // 这些项仍由 `server.rs`（或其子模块经其 re-export）提供。
-use crate::server::wait_for_plugin_query_socket_within;
+
+/// One budget for a whole resident-watch tick.
+///
+/// The tick runs under the instance gate, so this is also the longest a migration
+/// can be made to wait by a tick that is already in flight. Long enough to start a
+/// couple of cold daemons, short enough that a wedged one cannot wedge migrations.
+const WATCH_TICK_BUDGET: Duration = Duration::from_secs(30);
 
 /// `plugin/install` 等插件查询通道就绪的上限。
 ///
@@ -41,16 +47,6 @@ pub(crate) fn plugin_query_socket_ready(
         // 路径深到回退后仍放不下：插件不会在那个位置 bind，等下去只会白等。
         Some(Err(_)) => true,
     }
-}
-/// 等插件查询通道就绪，最多 [`PLUGIN_READY_TIMEOUT`]。
-///
-/// 阻塞调用（含 sleep），调用方放进 blocking 池。返回是否在期限内就绪；
-/// 超时**不是错误**——清单与开关已落盘，常驻监督会继续重试。
-pub(crate) fn wait_for_plugin_query_socket(
-    project: &Path,
-    manifest: &yi_agent_supervisors::manifest::SupervisorManifest,
-) -> bool {
-    wait_for_plugin_query_socket_within(project, manifest, PLUGIN_READY_TIMEOUT)
 }
 /// Why a plugin-channel query produced no answer.
 ///
@@ -323,24 +319,60 @@ pub(crate) fn plugin_scope(workdir: &Path, params: &serde_json::Value) -> PathBu
 ///
 /// 它是通用的:登记表里**任何**要求常驻的项目都会被确保有一个活着的进程,
 /// 与是哪个插件无关。
-pub(crate) fn spawn_resident_watch_loop(resident_dir: PathBuf) {
+pub(crate) fn spawn_resident_watch_loop(
+    resident_dir: PathBuf,
+    bringup: std::sync::Arc<yi_agent_subagent::binding::BringUpChoice>,
+) {
     // The resident directory *is* the instance home (`paths::instance_home`), so the
     // retirement marker sits beside the registration it governs. Deriving it instead
     // of re-reading `YI_AGENT_HOME` also keeps the injected dir used in tests.
     let instance_home = resident_dir.clone();
+    // Whether this process owns an embedded daemon, decided once from the entry
+    // point's own declaration. A managed frontend already has the guardian's
+    // daemon; starting an embedded `daemon serve` here would make the two bind the
+    // same socket, and the guardian's daemon is the one that loses -- every later
+    // conversation then runs without delegation because its project can never
+    // reach `managedReady`. Reading it outside the loop is deliberate: the entry
+    // point cannot change while the process lives, and a per-tick read would make
+    // the two branches look interchangeable.
+    // Read from the same snapshot the attach path uses. Asking the entry point's
+    // declaration a second time is how watch and attach came to disagree: an env
+    // override would flip one and not the other.
+    let embedded = bringup.policy == yi_agent_subagent::attach::BringUpPolicy::Embedded;
     tokio::spawn(async move {
         loop {
-            // 迁移到 managed 之后这个循环就不再启动 daemon：登记仍然读，但「无人时
-            // 应运行」的旧语义已被 managed 生命周期取代。循环**不退出**，因为迁移
-            // 标记可以在同一进程存活期间写入（用户在 App 里确认迁移），退出会让状态
-            // 永远停在旧判断上。
-            yi_agent_supervisors::watch::once_unattended(
-                &instance_home,
-                &resident_dir,
-                &mut |projects| {
-                    yi_agent_supervisors::watch::ensure_daemons(projects);
-                },
-            );
+            // 两道闸门都在 `once_unattended_as` 里：进程级（本前端是不是 managed）
+            // 与实例级（迁移标记）。前者是本轮补的——一个**全新**实例没有迁移标记，
+            // 却已经是 managed，只看标记就会让它在这里起一个 embedded daemon，与
+            // guardian 的 daemon 抢同一个 socket。登记仍然读，但「无人时应运行」的旧
+            // 语义已被 managed 生命周期取代。循环**不退出**，因为迁移标记可以在同一
+            // 进程存活期间写入（用户在 App 里确认迁移），退出会让状态永远停在旧判断上。
+            // The tick is blocking on purpose: acquiring the instance gate,
+            // re-reading the markers and starting daemons are all synchronous, and
+            // doing them on a Tokio worker would stall every other task on that
+            // thread for as long as a cold daemon takes to answer. `spawn_blocking`
+            // also keeps the gate tied to the worker: dropping the async task does
+            // not release it early, because the worker owns it.
+            let tick_home = instance_home.clone();
+            let tick_dir = resident_dir.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                // One budget for the whole tick, spent by both the gate wait and
+                // the ensure calls. A tick that ran out of time starts nothing.
+                let budget = yi_agent_lifecycle::deadline::Deadline::after(WATCH_TICK_BUDGET);
+                yi_agent_supervisors::watch::once_unattended_within(
+                    &tick_home,
+                    &tick_dir,
+                    embedded,
+                    &budget,
+                    &mut |projects| {
+                        yi_agent_supervisors::watch::ensure_daemons_until(projects, &budget);
+                    },
+                );
+            })
+            .await
+            {
+                tracing::warn!(%error, "the resident-watch tick failed");
+            }
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });

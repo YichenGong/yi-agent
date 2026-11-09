@@ -194,17 +194,78 @@ fn every_production_entry_runs_the_migration_at_startup() {
 
     // 会话期自愈循环同理：三条入口都要起，否则 ws 模式没有常驻兜底。
     // 按**调用形态**收，别按函数名收——函数定义本身也含那个前缀。
+    //
+    // 循环现在还要一份 bring-up 快照：它是 attach 也必须用的同一份策略。
+    // 只数「起了循环」不够——传错一份（或自己再解析一次）就等于两块代码
+    // 对「本进程是不是受管前端」给出不同答案，而那正是要修的缺陷。
     assert_eq!(
         production
-            .matches("spawn_resident_watch_loop(resident_dir.clone())")
+            .matches("spawn_resident_watch_loop(resident_dir.clone(), ")
             .count(),
-        2
+        2,
+        "both stdio entries must start the watch loop with the shared snapshot"
     );
     assert_eq!(
-        ws_production
-            .matches("spawn_resident_watch_loop(resident_dir)")
-            .count(),
-        1
+        production.matches("process_bringup_choice()").count(),
+        2,
+        "each stdio entry resolves the snapshot exactly once"
+    );
+    assert_eq!(
+        ws_production.matches("spawn_resident_watch_loop(").count(),
+        1,
+        "`ws::serve_ws` must start the watch loop too"
+    );
+    // ws 也必须只解析一次并把同一份快照传下去(`serve_ws_body` 与 attach)。
+    assert_eq!(
+        ws_production.matches("process_bringup_choice()").count(),
+        1,
+        "`ws::serve_ws` resolves the snapshot exactly once, then threads it through"
+    );
+}
+
+/// 会话期自愈循环必须按「本进程是不是受管前端」区分,而不只看迁移标记。
+///
+/// 一个**全新**实例没有迁移标记,却已经被声明为 managed;只查标记就会让这个
+/// 循环拉起 embedded `daemon serve`,与 guardian 的 daemon 抢同一个 socket,
+/// 抢输的那一方退出后项目永远进不了 `managedReady`。这条测试钉住接线本身:
+/// 判据必须来自入口**传入的那份快照**,且必须以 `embedded` 形参传给
+/// `once_unattended_as`。
+///
+/// 判据不得在本文件里重新解析一次:attach 用的是入口的快照,循环若自己再问
+/// 一遍进程状态,两者就可能对同一件事给出不同答案——**同一进程里两块代码
+/// 对"我是不是受管前端"意见不一致**,正是本缺陷的成因。
+#[test]
+fn the_watch_loop_defers_to_the_managed_frontend_declaration() {
+    let bridge = include_str!("plugin_bridge.rs");
+    let production = bridge
+        .split("#[cfg(test)]")
+        .next()
+        .expect("plugin_bridge.rs must have a production part");
+
+    assert!(
+        production.contains("bringup.policy == yi_agent_subagent::attach::BringUpPolicy::Embedded"),
+        "the loop must derive its gate from the snapshot the entry point passed in"
+    );
+    assert!(
+        !production.contains("is_managed_frontend()"),
+        "the loop must not re-ask the process what the entry point already decided"
+    );
+    // The gate-taking variant is now the budget-aware one: the loop must still
+    // route through a variant that takes the instance gate *and* enforces a budget.
+    // Calling the marker-only `once_unattended` is still the bypass this guards.
+    assert!(
+        production.contains("once_unattended_within("),
+        "the loop must call the gate-taking, budget-aware variant"
+    );
+    assert!(
+        production.contains("Deadline::after(WATCH_TICK_BUDGET)"),
+        "the loop must bound its own tick, or a wedged daemon holds the gate forever"
+    );
+    // `once_unattended` 仍然存在(embedded 调用方还在用),所以这里要看的是
+    // 本文件里**没有**再调它——调了就说明闸门被绕过。
+    assert!(
+        !production.contains("watch::once_unattended(\n"),
+        "the loop must not call the marker-only variant"
     );
 }
 

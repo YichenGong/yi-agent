@@ -4,6 +4,9 @@
 //! 不认识任何插件。launchctl 调用经 `_with` 变体注入，测试不需要真的动 launchd。
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use yi_agent_lifecycle::deadline::Deadline;
 
 /// 本 crate 装的 LaunchAgent 标签。通用：不含任何插件名。
 pub const LABEL: &str = "ai.yi-agent.resident-daemon-watchman";
@@ -96,6 +99,117 @@ fn default_launchctl(args: &[String]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("launchctl {} failed: {status}", args.join(" ")))
+    }
+}
+
+/// How often an over-budget `launchctl` child is re-checked.
+const LAUNCHCTL_POLL: Duration = Duration::from_millis(20);
+
+/// Run `command args` under `deadline`, killing the child if it overruns.
+///
+/// `Command::status` blocks for as long as the child lives, which is the wrong
+/// primitive for something that runs under the instance gate: one wedged
+/// `launchctl` would stall every cooperating start behind it. Spawning and polling
+/// keeps the *call* bounded.
+///
+/// What is deliberately **not** claimed: that launchd did not act. Killing the
+/// child stops us from waiting, it does not undo a `bootstrap` the child may
+/// already have performed. So an overrun is reported as unknown, and the caller
+/// keeps its gate-serialisation duty rather than pretending the world is clean.
+fn run_bounded(command: &Path, args: &[String], deadline: &Deadline) -> Result<(), String> {
+    let mut child = std::process::Command::new(command)
+        .args(args)
+        .spawn()
+        .map_err(|error| format!("could not run {}: {error}", command.display()))?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{} {} failed: {status}",
+                        command.display(),
+                        args.join(" ")
+                    ))
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not wait for launchctl: {error}"));
+            }
+        }
+        if deadline.is_expired() {
+            // Only *this* child: killing anything broader would take down a real
+            // launchd interaction another thread owns.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "launchctl {} did not answer within the budget; whether launchd acted is unknown",
+                args.join(" ")
+            ));
+        }
+        std::thread::sleep(deadline.clamp(LAUNCHCTL_POLL));
+    }
+}
+
+/// [`install_with`] bounded by an explicit budget.
+///
+/// The budget is checked before each step, and every blocking child is bounded by
+/// it. Local plist writes are not interruptible, so "every step observed the
+/// budget" is the honest promise, not "the whole call finishes inside it".
+pub fn install_until(exe: &Path, home: &Path, deadline: &Deadline) -> Result<(), String> {
+    let launchctl = PathBuf::from("launchctl");
+    install_until_with(&launchctl, exe, home, &[], deadline)
+}
+
+/// The injected-command form, so tests can prove the bounding on a real child.
+///
+/// `command`/`extra` name the program to spawn in place of `launchctl`; production
+/// passes `launchctl` and no extra args.
+pub(crate) fn install_until_with(
+    command: &Path,
+    exe: &Path,
+    home: &Path,
+    extra: &[String],
+    deadline: &Deadline,
+) -> Result<(), String> {
+    if deadline.is_expired() {
+        return Err("the watchman-install budget was already spent".to_string());
+    }
+    let mut call = |args: &[String]| -> Result<(), String> {
+        let mut all: Vec<String> = extra.to_vec();
+        all.extend_from_slice(args);
+        // The already-loaded case must still be read as success, so the error text
+        // is inspected rather than shortcut to failure.
+        run_bounded(command, &all, deadline)
+    };
+    remove_legacy_plist(home, &mut call);
+    write_plist(home, &plist_contents(exe, home))?;
+    if deadline.is_expired() {
+        return Err(format!(
+            "the watchman-install budget ran out before launchctl bootstrap for {}",
+            plist_path(home).display()
+        ));
+    }
+    match run_bounded(
+        command,
+        &{
+            let mut all: Vec<String> = extra.to_vec();
+            all.extend_from_slice(&[
+                "bootstrap".into(),
+                uid_domain(),
+                plist_path(home).display().to_string(),
+            ]);
+            all
+        },
+        deadline,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if is_already_loaded(&error) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -196,6 +310,65 @@ mod tests {
         assert!(plist.contains("/usr/local/bin/yi-agent"));
         assert!(plist.contains("<string>resident</string>"));
         assert!(plist.contains("<string>watch</string>"));
+    }
+
+    /// A `launchctl` that never returns must not hold the caller forever: the
+    /// install runs under the instance gate, so a stuck child would wedge every
+    /// cooperating start behind it.
+    ///
+    /// Proven against a *real* child process (`sleep`) rather than a mock: the
+    /// defect being guarded against lives in `Command::status`, which has no way to
+    /// bound its wait. A fake launchctl cannot exhibit the hang it must catch.
+    #[test]
+    fn watchman_launchctl_obeys_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let exe = directory.path().join("yi-agent");
+        std::fs::write(&exe, "#!/bin/sh\ntrue\n").unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // `sleep 30` stands in for a launchctl that answers far too late. The
+        // budget is 300ms, so returning inside a few seconds proves the child was
+        // abandoned rather than waited out.
+        let deadline = yi_agent_lifecycle::deadline::Deadline::after(Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        // `sleep 30` is spawned *as* the launchctl stand-in, so the budget bounds a
+        // genuinely slow child rather than a mock that could not hang.
+        let outcome = run_bounded(Path::new("/bin/sleep"), &["30".to_string()], &deadline);
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "an over-budget launchctl must be reported, not treated as success"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the install must abandon the child instead of waiting it out: {elapsed:?}"
+        );
+        let error = outcome.unwrap_err();
+        assert!(
+            error.contains("budget") || error.contains("unknown"),
+            "the error must say the budget ran out and that launchd's state is unknown: {error}"
+        );
+    }
+
+    /// The positive witness for the same path: a `launchctl` that answers within
+    /// budget must be reported as success, and the deadline must not be treated as
+    /// "always fail".
+    #[test]
+    fn watchman_launchctl_within_deadline_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let exe = directory.path().join("yi-agent");
+        std::fs::write(&exe, "#!/bin/sh\ntrue\n").unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let deadline = yi_agent_lifecycle::deadline::Deadline::after(Duration::from_secs(5));
+        let outcome = run_bounded(Path::new("/usr/bin/true"), &[], &deadline);
+        assert!(
+            outcome.is_ok(),
+            "a quick launchctl must succeed: {outcome:?}"
+        );
     }
 
     /// The log path is what a human reads when the watchman misbehaves; a

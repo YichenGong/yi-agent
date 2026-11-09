@@ -786,3 +786,119 @@ async fn a_managed_install_waits_for_demand_instead_of_starting_a_daemon() {
 
     h.shutdown().await;
 }
+
+/// A managed host must not let a plain (non-shell) connection start an embedded
+/// daemon on install.
+///
+/// `managed_session` answers "is this connection represented by the local shell";
+/// the host policy answers "may this machine start an unsupervised daemon at all".
+/// On a managed host the second answer is no regardless of who is connected, so a
+/// remote client -- which by construction can never carry shell authority -- would
+/// otherwise slip past the connection-level check and put back exactly the daemon
+/// the managed runtime is retiring.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_managed_host_remote_install_does_not_ensure() {
+    let instance = tempfile::TempDir::new().unwrap();
+    let mut h = Harness::with_host_policy(
+        yi_agent_subagent::attach::BringUpPolicy::Managed,
+        // A remote/plain client: no shell authorization can ever be attached.
+        Scope::Observe,
+        instance.path(),
+    )
+    .await;
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    let manifest = serde_json::json!({
+        "name": "demo-plugin",
+        "command": "/bin/true",
+        "args": [],
+        "switch_key": "demo_plugin_on",
+    });
+    fake_plugin_printing(&h, "demo-plugin", &manifest.to_string());
+
+    send_install(&mut h, 21, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert!(
+        response.get("error").is_none(),
+        "the install itself must still succeed: {response}"
+    );
+    assert_eq!(
+        response["result"]["installed"], true,
+        "the manifest stays durable: {response}"
+    );
+    assert_eq!(
+        response["result"]["startup"], "awaiting-demand",
+        "a managed host must not start an embedded daemon for a remote client: {response}"
+    );
+    assert_eq!(
+        response["result"]["queryable"], false,
+        "nothing may be listening before a real demand: {response}"
+    );
+    assert!(
+        h.daemon_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty(),
+        "ensure must not run on a managed host, whatever the connection's authority: {:?}",
+        h.daemon_calls.lock().unwrap_or_else(|p| p.into_inner())
+    );
+    assert!(
+        h.watchman_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty(),
+        "no legacy resident watchman may be installed on a managed host"
+    );
+
+    h.shutdown().await;
+}
+
+/// The other half of the same rule: on an embedded host a plain connection keeps
+/// its historical behaviour, including actually starting the daemon.
+///
+/// Without this, "never ensure" would pass the managed test above while silently
+/// breaking every CLI and embedded deployment.
+#[tokio::test(flavor = "multi_thread")]
+async fn embedded_host_plain_install_still_ensures() {
+    let instance = tempfile::TempDir::new().unwrap();
+    let mut h = Harness::with_host_policy(
+        yi_agent_subagent::attach::BringUpPolicy::Embedded,
+        Scope::Observe,
+        instance.path(),
+    )
+    .await;
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    let manifest = serde_json::json!({
+        "name": "demo-plugin",
+        "command": "/bin/true",
+        "args": [],
+        "switch_key": "demo_plugin_on",
+    });
+    fake_plugin_printing(&h, "demo-plugin", &manifest.to_string());
+
+    send_install(&mut h, 22, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert!(
+        response.get("error").is_none(),
+        "an embedded install must succeed: {response}"
+    );
+    let calls = h
+        .daemon_calls
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "an embedded host must still ensure exactly one daemon: {calls:?}"
+    );
+    assert!(
+        calls[0].ends_with(project.path().file_name().unwrap_or_default()),
+        "the daemon must be ensured for the project being installed into: {calls:?}"
+    );
+
+    h.shutdown().await;
+}

@@ -53,6 +53,9 @@ pub(crate) async fn driver_tick<F>(
     thread_roots: &ThreadRoots,
     managed: &crate::server::ManagedSlot,
     models_path: &Path,
+    // The bring-up choice the entry point resolved once. Driven sessions must
+    // attach with the same policy as hand-started ones.
+    bringup: &Arc<yi_agent_subagent::binding::BringUpChoice>,
     cfg: &RuntimeConfig,
     hub: &Arc<crate::broadcast::Broadcaster>,
     turn_tx: &mpsc::Sender<TurnEvent>,
@@ -159,6 +162,7 @@ pub(crate) async fn driver_tick<F>(
                 thread_roots,
                 managed,
                 models_path,
+                bringup,
                 live_settings,
                 lead_agent_enabled,
                 cfg,

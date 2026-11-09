@@ -138,14 +138,22 @@ impl MigrationWorld for SystemWorld {
         };
         let guard = match CoordinationGuard::acquire(scope, deadline.clone()) {
             Ok(guard) => guard,
-            // The gate is released by dropping it, which is the correct answer: a
-            // contended scope means another coordinator is already replacing this
-            // runtime, and holding the instance gate would only serialise the wait.
+            // The gate is released by dropping it below (it never enters `HeldScope`),
+            // which is the correct answer: a contended scope means another coordinator
+            // is already replacing this runtime, and holding the instance gate would
+            // only serialise the wait.
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) => return Err(error),
         };
-        drop(gate);
-        Ok(Some(HeldScope { guard, deadline }))
+        // The gate travels with the held scope, not beside it: the migration has to
+        // keep it until its freeze is durable. Releasing here would leave a window in
+        // which a cooperating start passes the gate check while the freeze marker is
+        // still absent, which is precisely the race the gate exists to prevent.
+        Ok(Some(HeldScope {
+            guard,
+            deadline,
+            retirement_gate: Some(gate),
+        }))
     }
 
     fn run(

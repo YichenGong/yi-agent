@@ -329,7 +329,7 @@ impl<'a> MigrationCoordinator<'a> {
     pub fn confirm(
         &self,
         request: MigrationRequest<'_>,
-        held: HeldScope,
+        mut held: HeldScope,
         backend: &dyn MigrationBackend,
     ) -> Result<MigrationJournal, MigrationRefusal> {
         let MigrationRequest {
@@ -403,6 +403,17 @@ impl<'a> MigrationCoordinator<'a> {
                     journal.phase = step.phase();
                     journal.updated_at_unix = now_unix();
                     self.write(&journal)?;
+                    // Only after the freeze marker is on disk may the instance gate
+                    // go: until then a cooperating start that takes the gate would
+                    // see no marker and legitimately start an embedded daemon, which
+                    // is the very daemon this migration is replacing.
+                    //
+                    // Written *after* `self.write(&journal)?`, so a failed journal
+                    // write leaves the gate held (RAII drops it on the error return)
+                    // rather than opening the window.
+                    if matches!(step, Step::Freeze) {
+                        drop(held.retirement_gate.take());
+                    }
                     if fault == Some(step.fault_after()) {
                         return Ok(journal);
                     }
@@ -893,11 +904,16 @@ impl MigrationBackend for SystemMigrationBackend<'_> {
         expected: &ArtifactIdentity,
         intent: BringUpIntent,
     ) -> std::io::Result<BringUpResult> {
-        super::bringup::ensure_managed_under_guard(
+        // The explicit business-aware entry rather than the forwarding wrapper: this
+        // is the path a migration takes, and a migration that starts a second daemon
+        // over a live business channel is the worst case of the A6 failure -- it can
+        // lose the user's in-flight work while also breaking its own journal.
+        super::bringup::ensure_managed_under_guard_with_business(
             held,
             expected,
             intent,
             self.probes.probe,
+            &super::bringup::BusinessChannelProbe,
             self.probes.launcher,
             self.required_capabilities,
         )

@@ -127,13 +127,14 @@ pub(crate) use migration::{
 pub(crate) use plugin_bridge::{
     PLUGIN_READY_TIMEOUT, PluginQueryError, PluginSummary, list_installed_plugins, plugin_query,
     plugin_query_self, plugin_query_socket_ready, plugin_scope, project_arg,
-    spawn_resident_watch_loop, wait_for_plugin_query_socket,
+    spawn_resident_watch_loop,
 };
 #[allow(unused_imports)]
 pub(crate) use watchman::{
     PLUGIN_READY_POLL, agent_trace_row, ensure_watchman_installed, ensure_watchman_installed_in,
-    production_watchman_install, production_watchman_uninstall, project_has_plugin_manifest,
-    should_evict, skills_home_from, wait_for_plugin_query_socket_within, watchman_home_from,
+    ensure_watchman_installed_until, production_watchman_install, production_watchman_uninstall,
+    project_has_plugin_manifest, should_evict, skills_home_from,
+    wait_for_plugin_query_socket_until, wait_for_plugin_query_socket_within, watchman_home_from,
 };
 
 pub(crate) mod assembly;
@@ -181,10 +182,14 @@ pub(crate) use turn::{
     start_thread_core, start_turn_core, turn_prepare_rpc_error,
 };
 
+/// Test seam only: production callers must pass the entry point's snapshot to
+/// [`attach_cwd_runtime_with`] instead of resolving a second one.
+#[cfg(test)]
+pub(crate) use assembly::attach_cwd_runtime;
 #[allow(unused_imports)]
 pub(crate) use assembly::{
     RuntimeTooling, SESSION_EXTRA_ROOTS, SESSION_MODEL_REF, SESSION_REASONING_EFFORT,
-    attach_cwd_runtime, attached_runtimes, build_runtime_tooling, current_session_extra_roots,
+    attach_cwd_runtime_with, attached_runtimes, build_runtime_tooling, current_session_extra_roots,
     current_session_model_ref, current_session_reasoning_effort, detach_unused_runtimes,
     rebuild_thread_agent_with_theme, register_theme_tool, registry_with_theme_tool,
     with_session_extra_roots, with_session_model_ref, with_session_reasoning_effort,
@@ -351,6 +356,14 @@ pub(crate) type ViewFrames = Arc<tokio::sync::Mutex<HashMap<String, crate::git_d
 /// 正是「每个会话应当有自己的 root」这条不变量最危险的破坏方式。
 pub(crate) struct RuntimeAttachments {
     pub(crate) runtimes: ProjectRuntimes,
+    /// The bring-up choice resolved once by the entry point.
+    ///
+    /// Shared rather than re-read: attach, delegation, watch and plugin install
+    /// must all answer "does this process own an embedded daemon" the same way,
+    /// and a second read of the process-global policy (or of an env var) is how
+    /// the answers drift apart. Immutable for the life of the process because the
+    /// entry point cannot change while it runs.
+    pub(crate) bringup: Arc<yi_agent_subagent::binding::BringUpChoice>,
     pub(crate) thread_roots: ThreadRoots,
     /// The shell-brokered root authority, when this sidecar serves a desktop shell.
     ///

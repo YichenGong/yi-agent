@@ -603,6 +603,11 @@ pub(crate) struct Harness {
     pub(crate) managed: crate::server::ManagedSlot,
     pub(crate) plugins_dir: tempfile::TempDir,
     pub(crate) daemon_calls: DaemonCalls,
+    /// The host policy this harness installed. Kept (rather than dropped after
+    /// wiring) so a test can assert on the exact choice without rebuilding it;
+    /// no test reads it today, hence the allow.
+    #[allow(dead_code)]
+    pub(crate) bringup: Arc<yi_agent_subagent::binding::BringUpChoice>,
 }
 
 pub(crate) type WatchmanCalls = Arc<StdMutex<Vec<(bool, PathBuf)>>>;
@@ -1072,7 +1077,7 @@ impl Harness {
             + Sync
             + 'static,
     {
-        Self::with_config_and_scope_and_watchman_in(
+        Self::with_bringup_in(
             cfg,
             build,
             permission_timeout,
@@ -1082,11 +1087,62 @@ impl Harness {
             calls,
             lead_agent_enabled,
             side_registry,
+            // instance_home_override: 本构造器让 harness 自造 tempdir。
             None,
+            // management: 这些用例不承载本地管理句柄。
             None,
+            Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
             // 默认静态装配；只有 `with_live_settings` 才注入共享实例。
             None,
             side_gate,
+        )
+    }
+
+    /// A harness on a host that declared `policy` instead of the default.
+    ///
+    /// Needed because the host policy and the connection's shell authority are
+    /// different questions: a test has to be able to build "managed host, plain
+    /// remote client" without touching process-wide state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn with_host_policy(
+        policy: yi_agent_subagent::attach::BringUpPolicy,
+        scope: Scope,
+        instance_home: &Path,
+    ) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_bringup_in(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            scope,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            None,
+            Some(instance_home.to_path_buf()),
+            None,
+            Arc::new(yi_agent_subagent::binding::BringUpChoice {
+                policy,
+                expected: None,
+                instance_home: Some(instance_home.to_path_buf()),
+            }),
+            None,
+            Arc::new(|| true),
         )
     }
 
@@ -1109,6 +1165,52 @@ impl Harness {
         side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
         instance_home_override: Option<PathBuf>,
         management: Option<Arc<crate::server::local_management::ManagementHandle>>,
+        live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+        side_gate: crate::side_gate::SideGate,
+    ) -> Self
+    where
+        F: Fn(
+                Option<yi_agent_core::Session>,
+                &std::path::Path,
+                crate::thread_store::ThreadMode,
+            ) -> anyhow::Result<BuiltAgent>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::with_bringup_in(
+            cfg,
+            build,
+            permission_timeout,
+            scope,
+            install,
+            uninstall,
+            calls,
+            lead_agent_enabled,
+            side_registry,
+            instance_home_override,
+            management,
+            Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
+            live_settings,
+            side_gate,
+        )
+    }
+
+    /// 见 [`Harness::with_config_and_scope_and_watchman_in`],外加宿主策略。
+    #[allow(clippy::too_many_arguments)]
+    fn with_bringup_in<F>(
+        cfg: RuntimeConfig,
+        build: F,
+        permission_timeout: Duration,
+        scope: Scope,
+        install: WatchmanInstall,
+        uninstall: WatchmanUninstall,
+        calls: WatchmanCalls,
+        lead_agent_enabled: bool,
+        side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
+        instance_home_override: Option<PathBuf>,
+        management: Option<Arc<crate::server::local_management::ManagementHandle>>,
+        bringup: Arc<yi_agent_subagent::binding::BringUpChoice>,
         live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
         side_gate: crate::side_gate::SideGate,
     ) -> Self
@@ -1222,6 +1324,7 @@ impl Harness {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 managed: Arc::clone(&managed),
+                bringup: Arc::clone(&bringup),
                 models_path: models_dir.path().join("models.json"),
                 websearch_path: models_dir.path().join("websearch.json"),
                 settings_path: models_dir.path().join("settings.json"),
@@ -1293,6 +1396,7 @@ impl Harness {
             managed,
             plugins_dir,
             daemon_calls,
+            bringup,
         }
     }
 
@@ -1889,6 +1993,7 @@ pub(crate) async fn serve_ws_with_permission_agent(
         // 这条测试接缝没有设置来源：静态装配，与历史行为一致。
         None,
         build_permission_agent,
+        Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
     )
     .await
 }
@@ -2932,6 +3037,7 @@ impl MergedHarness {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 managed: Arc::new(StdMutex::new(None)),
+                bringup: Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
                 models_path: PathBuf::new(),
                 websearch_path: PathBuf::new(),
                 settings_path: PathBuf::new(),

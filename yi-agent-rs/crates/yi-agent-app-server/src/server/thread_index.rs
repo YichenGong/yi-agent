@@ -16,7 +16,7 @@ use yi_agent_subagent::thread_root::ThreadRoot;
 
 // 这些项仍由 `server.rs`（或其子模块经其 re-export）提供。
 use crate::server::{
-    BuiltAgent, ProjectRuntimes, ThreadRoots, attach_cwd_runtime, build_runtime_tooling,
+    BuiltAgent, ProjectRuntimes, ThreadRoots, attach_cwd_runtime_with, build_runtime_tooling,
     err_response, project_key, read_task_trace, wrap_for_delegation, write_notification,
     write_response,
 };
@@ -71,6 +71,9 @@ pub(crate) fn attach_delegation(
     // `None` is the embedded shape and keeps the old behaviour byte for byte.
     managed: Option<Arc<crate::server::ManagedAuthority>>,
     models_path: &Path,
+    // The snapshot the entry point resolved once: attach must not re-read the
+    // process policy, or watch/install and attach can disagree.
+    bringup: &yi_agent_subagent::binding::BringUpChoice,
     cfg: &RuntimeConfig,
     cwd: &str,
     thread_id: &str,
@@ -120,11 +123,15 @@ pub(crate) fn attach_delegation(
         thread_cfg.sandbox = baseline.mode;
         thread_cfg.sandbox_promotable = baseline.promotable;
     }
-    let binding = match attach_cwd_runtime(
+    // The choice was resolved once by the caller and the settings snapshot beside
+    // it: both describe the same entry point, so passing only one would attach
+    // with a policy the settings were not read under.
+    let binding = match attach_cwd_runtime_with(
         runtimes,
         runtime_dir,
         &thread_cfg,
         models_path,
+        bringup,
         live_settings,
     ) {
         Ok(binding) => binding,

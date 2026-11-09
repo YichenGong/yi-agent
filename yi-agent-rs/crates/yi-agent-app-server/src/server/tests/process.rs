@@ -1189,6 +1189,7 @@ async fn trace_unwatch_rpc_preserves_children_watch() {
                 runtimes: &runtimes,
                 thread_roots: &thread_roots,
                 managed: &managed,
+                bringup: &std::sync::Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
                 process_watches: &mut process_watches,
                 trace_watches: &mut trace_watches,
                 children_watches: &mut children_watches,

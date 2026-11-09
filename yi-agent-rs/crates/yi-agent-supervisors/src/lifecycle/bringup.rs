@@ -105,6 +105,71 @@ pub trait ControlProbe {
     fn probe(&self, control_path: &Path, deadline: &Deadline) -> ProbeOutcome;
 }
 
+/// What a read-only probe learned from the *business* socket.
+///
+/// A separate channel from the control one, because the two answer different
+/// questions. Control says "is a supervised runtime here?"; business says "is
+/// anything already serving work on this database?". The second one is what an
+/// unsupervised `daemon serve` answers -- it has no guardian and therefore no
+/// control channel at all -- so asking only control reads a live daemon as absent
+/// and starts a second one on top of it.
+///
+/// Deliberately carries no identity: a business `Status` has no generation, so
+/// turning one into a [`RuntimeIdentity`] would invent a claim the daemon never
+/// made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BusinessProbeOutcome {
+    /// Provably nothing is listening: the socket is gone or the connect was refused.
+    Absent,
+    /// Something answered a well-formed `Status`.
+    Answered,
+    /// Something may be there but did not answer usably. Never read as absence.
+    Unresponsive(String),
+}
+
+/// Reading the business channel, read-only. Injectable so no test needs a socket.
+pub trait BusinessProbe {
+    fn probe(&self, scope: &RuntimeScope, deadline: &Deadline) -> BusinessProbeOutcome;
+}
+
+/// The real business channel: one bounded `Status` query.
+pub struct BusinessChannelProbe;
+
+impl BusinessProbe for BusinessChannelProbe {
+    fn probe(&self, scope: &RuntimeScope, deadline: &Deadline) -> BusinessProbeOutcome {
+        // Derived from the scope like the control path, not from the environment: a
+        // probe that resolves the socket differently from the daemon reports a
+        // missing file for a daemon that is right there.
+        let socket =
+            yi_agent_lifecycle::scope::daemon_socket(&scope.runtime_dir, &scope.instance_home);
+        match yi_agent_store::ipc::send_status_until(&socket, deadline) {
+            Ok(yi_agent_store::ipc::IpcResponse::Status { .. }) => BusinessProbeOutcome::Answered,
+            // An answer of the wrong shape is still something being there. It must not
+            // become "absent", because that is the value that starts a daemon.
+            Ok(_) => BusinessProbeOutcome::Unresponsive(
+                "the business socket answered something other than Status".to_string(),
+            ),
+            Err(error) => classify_business_error(error),
+        }
+    }
+}
+
+/// Only "nothing is listening" may read as absent.
+///
+/// `ENOENT` (no socket file) and `ECONNREFUSED` (a file, nobody accepting) are
+/// proofs of absence. Everything else -- a timeout, a permission error, a truncated
+/// frame, an identity mismatch -- means something *may* be there, and is reported as
+/// such so the caller asks instead of launching.
+fn classify_business_error(error: yi_agent_store::ipc::IpcError) -> BusinessProbeOutcome {
+    let yi_agent_store::ipc::IpcError::Io(io) = &error else {
+        return BusinessProbeOutcome::Unresponsive(error.to_string());
+    };
+    match io.raw_os_error() {
+        Some(libc::ENOENT) | Some(libc::ECONNREFUSED) => BusinessProbeOutcome::Absent,
+        _ => BusinessProbeOutcome::Unresponsive(error.to_string()),
+    }
+}
+
 /// Starting a guardian, which in turn starts the one daemon.
 ///
 /// A trait rather than a function pointer because a launcher carries configuration
@@ -270,6 +335,42 @@ pub fn ensure_managed_with(
     launcher: &dyn GuardianLauncher,
     required_capabilities: &[String],
 ) -> io::Result<BringUpResult> {
+    // Forwards, and deliberately does not repeat the decision: production callers go
+    // through the business channel, and a second copy of the branch here is a second
+    // place for the check to be forgotten.
+    ensure_managed_with_business(
+        scope,
+        expected,
+        intent,
+        deadline,
+        probe,
+        &BusinessChannelProbe,
+        launcher,
+        required_capabilities,
+    )
+}
+
+/// [`ensure_managed_with`] with the business channel injected.
+///
+/// The business pre-check is separate from the control probe because the two answer
+/// different questions: control reports a *supervised* runtime, business reports
+/// anything serving this database. An unsupervised daemon answers the second and not
+/// the first, and starting beside it would put two writers on one database.
+// Eight arguments, all of them injected dependencies of one decision: two probes, a
+// launcher, the scope, the expectation, the intent, the budget and the capability
+// list. Bundling them into a struct would move the same eight fields one line up and
+// make the call sites read worse, which is the opposite of what the lint is for.
+#[allow(clippy::too_many_arguments)]
+pub fn ensure_managed_with_business(
+    scope: &RuntimeScope,
+    expected: &ArtifactIdentity,
+    intent: BringUpIntent,
+    deadline: Deadline,
+    probe: &dyn ControlProbe,
+    business: &dyn BusinessProbe,
+    launcher: &dyn GuardianLauncher,
+    required_capabilities: &[String],
+) -> io::Result<BringUpResult> {
     let path = control_path(scope);
 
     // Inspection stops here when nothing answers. It must not take the lock: taking
@@ -281,9 +382,26 @@ pub fn ensure_managed_with(
             ProbeOutcome::Answered(identity) => {
                 interpret(identity, &path, expected, required_capabilities, intent)
             }
-            ProbeOutcome::Absent => BringUpResult::ManualActionRequired {
-                reason: "no managed runtime is running, and inspection never starts one"
-                    .to_string(),
+            // Control is silent, so nothing supervised is here -- but something may
+            // still be serving the database, an unsupervised `daemon serve` the user
+            // started. Reporting that as "nothing is running" is the answer a user
+            // acts on by starting one, so the business channel is asked too. Still
+            // read-only, and still before the coordination lock: it creates nothing.
+            ProbeOutcome::Absent => match business.probe(scope, &deadline) {
+                BusinessProbeOutcome::Absent => BringUpResult::ManualActionRequired {
+                    reason: "no managed runtime is running, and inspection never starts one"
+                        .to_string(),
+                },
+                BusinessProbeOutcome::Answered => BringUpResult::ManualActionRequired {
+                    reason: "a daemon is serving this runtime without a supervisor; \
+                             inspection will not replace it"
+                        .to_string(),
+                },
+                BusinessProbeOutcome::Unresponsive(reason) => BringUpResult::ManualActionRequired {
+                    reason: format!(
+                        "the business socket did not answer ({reason}); refusing to guess"
+                    ),
+                },
             },
             ProbeOutcome::Unresponsive(reason) => BringUpResult::ManualActionRequired {
                 reason: format!("the runtime did not answer ({reason}); refusing to guess"),
@@ -297,11 +415,16 @@ pub fn ensure_managed_with(
     // Business/lease callers get the full budget; the inspection ceiling only
     // applies to reads, never to a start that may legitimately take 30 seconds.
     let guard = CoordinationGuard::acquire(scope, deadline.clone())?;
-    ensure_managed_under_guard(
-        &HeldScope { guard, deadline },
+    ensure_managed_under_guard_with_business(
+        &HeldScope {
+            guard,
+            deadline,
+            retirement_gate: None,
+        },
         expected,
         intent,
         probe,
+        business,
         launcher,
         required_capabilities,
     )
@@ -317,6 +440,14 @@ pub fn ensure_managed_with(
 pub struct HeldScope {
     pub guard: CoordinationGuard,
     pub deadline: Deadline,
+    /// The instance-wide retirement gate, when this caller took one.
+    ///
+    /// A migration must hold it until its freeze is *durable*: releasing it as soon
+    /// as the scope lock is taken reopens exactly the window the gate exists to
+    /// close -- a cooperating start could acquire the gate and begin an embedded
+    /// daemon while the freeze marker is not yet on disk. `None` is the ordinary
+    /// case (a plain managed start, or a caller whose own work already held it).
+    pub retirement_gate: Option<super::migration_operation::RetirementGate>,
 }
 
 /// [`ensure_managed_with`] for a caller that already owns this scope's guard.
@@ -330,6 +461,33 @@ pub fn ensure_managed_under_guard(
     expected: &ArtifactIdentity,
     intent: BringUpIntent,
     probe: &dyn ControlProbe,
+    launcher: &dyn GuardianLauncher,
+    required_capabilities: &[String],
+) -> io::Result<BringUpResult> {
+    // Forwarder only: the decision lives in one place, the business-aware entry.
+    ensure_managed_under_guard_with_business(
+        held,
+        expected,
+        intent,
+        probe,
+        &BusinessChannelProbe,
+        launcher,
+        required_capabilities,
+    )
+}
+
+/// [`ensure_managed_under_guard`] with the business channel injected.
+///
+/// The business check runs *inside* the coordination lock and before anything is
+/// recorded or launched. Inside the lock because two attaches must not each decide
+/// from a snapshot taken before the peer acted; before any write because a refusal
+/// must leave no selection file, no database and no process behind.
+pub fn ensure_managed_under_guard_with_business(
+    held: &HeldScope,
+    expected: &ArtifactIdentity,
+    intent: BringUpIntent,
+    probe: &dyn ControlProbe,
+    business: &dyn BusinessProbe,
     launcher: &dyn GuardianLauncher,
     required_capabilities: &[String],
 ) -> io::Result<BringUpResult> {
@@ -383,6 +541,31 @@ pub fn ensure_managed_under_guard(
         // Handled by the loop above.
         ProbeOutcome::Unresponsive(_) => unreachable!("the wait loop drains this case"),
         ProbeOutcome::Absent => {}
+    }
+
+    // Nothing supervised answered, but something may still be serving this database:
+    // an unsupervised `daemon serve` from an older build, or one the user started by
+    // hand. Control cannot see it, so the business socket is asked directly. A
+    // refusal here is the whole point of this check -- launching would put a second
+    // daemon on the same database and the loser would be whichever one the user was
+    // already using.
+    match business.probe(scope, &deadline) {
+        BusinessProbeOutcome::Absent => {}
+        BusinessProbeOutcome::Answered => {
+            return Ok(BringUpResult::ManualActionRequired {
+                reason: "a daemon is already serving this runtime without a supervisor; \
+                         stop it before starting a managed one"
+                    .to_string(),
+            });
+        }
+        BusinessProbeOutcome::Unresponsive(reason) => {
+            return Ok(BringUpResult::ManualActionRequired {
+                reason: format!(
+                    "the business socket did not answer ({reason}); refusing to start a \
+                     second daemon beside it"
+                ),
+            });
+        }
     }
 
     // The directory may belong to another project or configuration instance. That

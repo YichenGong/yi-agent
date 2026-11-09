@@ -140,11 +140,40 @@ pub(crate) fn test_identity(dir: &Path) -> yi_agent_lifecycle::types::ArtifactId
 }
 
 /// 取出(或建立)该 cwd 的项目 runtime。
+///
+/// Test seam: resolves the process-wide bring-up choice for callers that have no
+/// snapshot of their own.
+///
+/// Production callers must use [`attach_cwd_runtime_with`] with the choice taken
+/// once at the entry point, so attach cannot disagree with watch/install about the
+/// policy. Gated to tests on purpose: leaving it callable in production is exactly
+/// how a second, disagreeing resolution creeps back in.
+#[cfg(test)]
 pub(crate) fn attach_cwd_runtime(
     runtimes: &ProjectRuntimes,
     runtime_dir: &Path,
     cfg: &RuntimeConfig,
     models_path: &Path,
+    live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+) -> Result<Arc<RuntimeBinding>, String> {
+    let bringup = yi_agent_subagent::attach::process_bringup_choice();
+    attach_cwd_runtime_with(
+        runtimes,
+        runtime_dir,
+        cfg,
+        models_path,
+        &bringup,
+        live_settings,
+    )
+}
+
+/// The explicit form: the caller supplies the bring-up choice it resolved.
+pub(crate) fn attach_cwd_runtime_with(
+    runtimes: &ProjectRuntimes,
+    runtime_dir: &Path,
+    cfg: &RuntimeConfig,
+    models_path: &Path,
+    bringup: &yi_agent_subagent::binding::BringUpChoice,
     live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> Result<Arc<RuntimeBinding>, String> {
     let key = project_key(&cfg.workdir);
@@ -181,12 +210,14 @@ pub(crate) fn attach_cwd_runtime(
     // dies after this point (e.g. its terminal closes) no longer strands the
     // thread's delegation tools.
     //
-    // This is the seam: the process's bring-up choice decides whether we own an
-    // embedded daemon or join a shared guardian-managed one. A production path
-    // that never consults the policy cannot honour `YI_AGENT_BRINGUP=managed` at
-    // all -- the policy, and everything behind it, would only ever run in tests.
-    let bringup = yi_agent_subagent::attach::process_bringup_choice();
-    let outcome = bring_up_with(&bringup, cfg, runtime_dir, models_path, live_settings);
+    // This is the seam: the bring-up choice decides whether we own an embedded
+    // daemon or join a shared guardian-managed one. Production callers pass the
+    // snapshot they resolved once; this explicit form is what makes the attach
+    // unable to disagree with watch/install about the policy. The live-settings
+    // binding travels with it, because the choice and the settings are decided at
+    // the same entry point and a bring-up that saw only one of them could serve a
+    // daemon with the other's configuration.
+    let outcome = bring_up_with(bringup, cfg, runtime_dir, models_path, live_settings);
     let mut cache = runtimes.lock().unwrap_or_else(|p| p.into_inner());
     match &outcome {
         // Only durable conclusions are worth remembering. A transient failure is

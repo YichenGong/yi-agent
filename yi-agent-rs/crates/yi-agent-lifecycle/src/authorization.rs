@@ -56,6 +56,25 @@ pub struct LifelineHello {
     pub daemon_instance_id: DaemonInstanceId,
     /// Raw key material, hex encoded so the frame stays a plain JSON document.
     pub generation_secret: String,
+    /// The nonce this launch issued for the daemon's readiness proof.
+    ///
+    /// `serde(default)` because this is additive: a hello written before the field
+    /// existed reads as "no nonce", which a managed launch then refuses rather than
+    /// treats as a satisfied agreement. Tests that only need a greeting keep using
+    /// [`LifelineHello::new`] and leave it absent.
+    #[serde(default)]
+    pub startup_nonce: Option<String>,
+}
+
+/// Bytes in one startup nonce.
+const STARTUP_NONCE_BYTES: usize = 32;
+
+impl LifelineHello {
+    /// The same greeting, carrying this launch's readability nonce.
+    pub fn with_startup_nonce(mut self, nonce: String) -> Self {
+        self.startup_nonce = Some(nonce);
+        self
+    }
 }
 
 impl LifelineHello {
@@ -68,6 +87,7 @@ impl LifelineHello {
             scope_key: scope_key.into(),
             daemon_instance_id: daemon_instance_id.into(),
             generation_secret: hex_encode(&secret),
+            startup_nonce: None,
         }
     }
 
@@ -78,6 +98,20 @@ impl LifelineHello {
     pub fn secret(&self) -> Result<[u8; SECRET_BYTES], String> {
         hex_decode(&self.generation_secret)
     }
+}
+
+/// A fresh nonce for one daemon launch's readiness proof.
+///
+/// Deliberately independent of the generation secret: deriving it from the secret
+/// would make the two agree by construction, so a daemon that had merely *seen* the
+/// secret -- rather than this launch -- could still produce the proof. An OS failure
+/// is returned rather than papered over with a predictable value.
+pub fn fresh_startup_nonce() -> std::io::Result<String> {
+    let mut bytes = [0u8; STARTUP_NONCE_BYTES];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        std::io::Error::other(format!("the OS random source is unavailable: {error}"))
+    })?;
+    Ok(hex_encode(&bytes))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

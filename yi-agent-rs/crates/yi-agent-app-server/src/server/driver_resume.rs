@@ -251,6 +251,7 @@ where
             &runtime_dir,
             crate::server::managed_snapshot(self.managed),
             self.models_path,
+            self.bringup,
             self.cfg,
             &cwd,
             thread_id,

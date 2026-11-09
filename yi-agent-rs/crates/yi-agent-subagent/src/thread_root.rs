@@ -92,6 +92,32 @@ pub fn managed_bind_operation_id(thread_id: &str) -> String {
     format!("managed-root:{thread_id}")
 }
 
+/// What a conversation asks the guardian to authorize.
+///
+/// One constructor, because the two halves of a managed start must agree on it *exactly*:
+/// the frontend authorizes before it builds its root, and the root later resolves that
+/// same authority. The daemon keys a reservation by root id and refuses a second intent
+/// under the same `operation_id` that differs in any field. An authorization that named
+/// the bare thread key while the root named `thread:<id>` therefore reserved one operation
+/// twice with two different intents, and every managed `run` died with
+/// `the daemon refused the install: OperationConflict` -- then reported it as
+/// *this session has no brokered authority*.
+pub fn root_bind_intent(
+    thread_id: &str,
+    workspace: PathBuf,
+    extra_roots: Vec<PathBuf>,
+) -> yi_agent_lifecycle::foreground::RootBindIntent {
+    yi_agent_lifecycle::foreground::RootBindIntent {
+        // Stable per conversation: a retried authorization resolves to the same
+        // root instead of minting a second one.
+        operation_id: managed_bind_operation_id(thread_id),
+        thread_key: application_root_key(thread_id),
+        workspace,
+        extra_roots,
+        previous_root_capability: None,
+    }
+}
+
 /// Why a conversation's root could not be attached.
 ///
 /// The two arms exist because they demand different responses: a managed admission
@@ -487,6 +513,32 @@ impl ThreadRoot {
         if let Some(cached) = self.live_session_container(generation) {
             return Ok(cached);
         }
+        // A managed daemon resolves the attach key through the guardian's ledger,
+        // where the key *is* the `rootcap1:` capability the shell brokered for this
+        // conversation. Presenting the conversation's stable `thread:<id>` key is
+        // therefore an unattributed attach that the daemon refuses -- and because
+        // `AdmissionClosed` reaches the client as a stripped `Internal`/`None`, that
+        // refusal used to surface as the opaque
+        // *the daemon did not attach a session container* on every delegated turn.
+        //
+        // Resolving goes through the same call the legacy attach makes, so a store
+        // that has not been filled yet asks the shell's broker instead of giving up.
+        // A refusal is terminal here: falling back to the legacy key would be exactly
+        // the unattributed attach that fails, only later and without naming the cause.
+        let attach_key = match self.managed.as_ref() {
+            None => application_root_key(&self.thread_id),
+            Some(context) => context
+                .resolve(&application_root_key(&self.thread_id), &self.bind_intent())
+                .map_err(|error| {
+                    SessionClientError::Protocol(format!(
+                        "this session has no brokered authority for {}: {error}",
+                        self.thread_id
+                    ))
+                })?
+                .capability
+                .expose()
+                .to_string(),
+        };
         // A revive is tried here rather than inside the binding so the failure stays
         // classifiable: only a request that provably never left this process may be
         // sent again, and a repair+retry has to know that. Repair first when the
@@ -496,7 +548,7 @@ impl ThreadRoot {
             crate::attach::RuntimeProbe::Healthy => send_request(
                 &shared.socket_path,
                 IpcRequest::AttachSessionContainer {
-                    idempotency_key: application_root_key(&self.thread_id),
+                    idempotency_key: attach_key,
                     workspace: self.project_dir.clone(),
                     extra_roots: self
                         .extra_roots
@@ -628,15 +680,11 @@ impl ThreadRoot {
     /// at the daemon rather than silently binding one conversation's intent to
     /// another's root.
     fn bind_intent(&self) -> yi_agent_lifecycle::foreground::RootBindIntent {
-        yi_agent_lifecycle::foreground::RootBindIntent {
-            // Stable per conversation: a retried authorization resolves to the same
-            // root instead of minting a second one.
-            operation_id: managed_bind_operation_id(&self.thread_id),
-            thread_key: application_root_key(&self.thread_id),
-            workspace: self.project_dir.clone(),
-            extra_roots: self.extra_roots.clone(),
-            previous_root_capability: None,
-        }
+        root_bind_intent(
+            &self.thread_id,
+            self.project_dir.clone(),
+            self.extra_roots.clone(),
+        )
     }
 
     /// This conversation's root task id, once attached.
@@ -1247,6 +1295,31 @@ mod tests {
             application_root_key("thread-b"),
             "two conversations must not share one root"
         );
+    }
+
+    /// The authorization and the attach must describe the *same* intent.
+    ///
+    /// The daemon reserves per root id and refuses a second intent under one
+    /// `operation_id` that differs in any field (`OperationConflict`). A managed start
+    /// that authorized the bare thread key while the root later resolved `thread:<id>`
+    /// therefore reserved one operation twice with two intents, and the turn died as
+    /// *this session has no brokered authority*. The two sides now share one
+    /// constructor, so the agreement is a property of the code rather than of two
+    /// call sites staying in step.
+    #[test]
+    fn the_authorized_intent_is_the_one_the_root_attaches_with() {
+        let workspace = PathBuf::from("/tmp/project");
+        let extras = vec![PathBuf::from("/tmp/extra")];
+        let intent = root_bind_intent("run:1:abc", workspace.clone(), extras.clone());
+        assert_eq!(intent.operation_id, managed_bind_operation_id("run:1:abc"));
+        assert_eq!(
+            intent.thread_key,
+            application_root_key("run:1:abc"),
+            "the reservation is keyed by the conversation key, not the bare thread id"
+        );
+        assert_eq!(intent.workspace, workspace);
+        assert_eq!(intent.extra_roots, extras);
+        assert_eq!(intent.previous_root_capability, None);
     }
     // ---------------------------------------------------------------------
     // The guardian entry point, against a real guardian over a real socket.

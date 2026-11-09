@@ -10,6 +10,21 @@ pub fn ensure_daemons(projects: &[PathBuf]) {
     ensure_daemons_with(projects, &mut crate::daemon::ensure_running);
 }
 
+/// [`ensure_daemons`] on a shared budget: once it is spent, no further daemon is
+/// started.
+///
+/// Checking the budget *between* projects rather than only once up front matters
+/// for the contract the caller published: "I did not start anything after the
+/// budget" must hold for every project, not just the first one.
+pub fn ensure_daemons_until(
+    projects: &[PathBuf],
+    budget: &yi_agent_lifecycle::deadline::Deadline,
+) -> Vec<PathBuf> {
+    ensure_daemons_with(projects, &mut |project: &Path| {
+        crate::daemon::ensure_running_until(project, budget)
+    })
+}
+
 /// 注入版：返回本次真正拉起的项目。单个失败只记日志，不影响其余项目。
 pub fn ensure_daemons_with(
     projects: &[PathBuf],
@@ -74,13 +89,62 @@ pub fn once_unattended(
     resident_dir: &Path,
     ensure: &mut dyn FnMut(&[PathBuf]),
 ) -> Option<usize> {
+    once_unattended_as(instance_home, resident_dir, true, ensure)
+}
+
+/// [`once_unattended`] with the caller's own declaration of whether it is a
+/// *managed* frontend.
+///
+/// A managed frontend must not start daemons here at all, and the retirement
+/// marker cannot express that: the marker means "this instance finished moving to
+/// the managed runtime", while a *fresh* instance has no marker and is already
+/// managed by declaration. Conflating the two is what let a managed App start an
+/// embedded `daemon serve` beside the guardian's daemon. Both bind the same
+/// socket, so the guardian's daemon loses the race and dies -- and a dead managed
+/// daemon means the project never becomes `managedReady`, so every conversation
+/// runs without delegation.
+///
+/// `embedded` is passed in rather than read from a process global so the two
+/// branches stay testable in one test binary; the process owner (the app-server)
+/// already knows the answer from its own bring-up policy.
+pub fn once_unattended_as(
+    instance_home: &Path,
+    resident_dir: &Path,
+    embedded: bool,
+    ensure: &mut dyn FnMut(&[PathBuf]),
+) -> Option<usize> {
+    once_unattended_within(
+        instance_home,
+        resident_dir,
+        embedded,
+        &yi_agent_lifecycle::deadline::Deadline::after(GATE_WAIT),
+        ensure,
+    )
+}
+
+/// [`once_unattended_as`] against a caller-supplied budget.
+///
+/// The budget matters because this whole tick runs *under* the instance gate: a
+/// tick whose budget is spent before it acquires the gate must not go on to start
+/// daemons, or the gate is held for work the caller already gave up on. The check
+/// is inside the gate so the answer cannot change between check and use.
+pub fn once_unattended_within(
+    instance_home: &Path,
+    resident_dir: &Path,
+    embedded: bool,
+    budget: &yi_agent_lifecycle::deadline::Deadline,
+    ensure: &mut dyn FnMut(&[PathBuf]),
+) -> Option<usize> {
+    if !embedded {
+        return None;
+    }
     if !may_start_unattended(instance_home) {
         return None;
     }
-    let deadline = yi_agent_lifecycle::deadline::Deadline::after(GATE_WAIT);
+    let deadline = budget.clone();
     let gate = match crate::lifecycle::migration_operation::RetirementGate::acquire(
         instance_home,
-        deadline,
+        deadline.clone(),
     ) {
         Ok(gate) => gate,
         // A migration holds the gate: it is either stopping daemons right now or
@@ -93,7 +157,17 @@ pub fn once_unattended(
     if !may_start_unattended(instance_home) {
         return None;
     }
-    let count = once(resident_dir, ensure);
+    // The budget is re-read under the gate. Waiting for a migration may have spent
+    // all of it, and starting daemons now would be work nobody is waiting for --
+    // while still holding the gate.
+    //
+    // Only a *count* of registrations is reported in that case: nothing was
+    // ensured, and `None` would wrongly tell the caller to stand down for good.
+    let count = if deadline.is_expired() {
+        0
+    } else {
+        once(resident_dir, ensure)
+    };
     drop(gate);
     Some(count)
 }
@@ -135,6 +209,74 @@ mod tests {
         assert!(seen.borrow().is_empty(), "no ensure call may happen");
     }
 
+    /// A tick must not start daemons on a budget somebody else already spent.
+    ///
+    /// The gate is held for the whole tick, so starting work after the caller gave
+    /// up would keep *every* cooperating start blocked behind a tick that is not
+    /// serving anyone. `Some(0)` rather than `None`: the instance is still this
+    /// loop's job, it just had no time this round.
+    #[test]
+    fn an_expired_budget_starts_nothing_unattended() {
+        let instance = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            yi_agent_store::resident::registry_path(dir.path()),
+            "{\"projects\":[{\"project\":\"/tmp/a\"},{\"project\":\"/tmp/b\"}]}",
+        )
+        .unwrap();
+        let seen = RefCell::new(Vec::new());
+        let budget = yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::ZERO);
+
+        let outcome = once_unattended_within(
+            instance.path(),
+            dir.path(),
+            true,
+            &budget,
+            &mut |projects| {
+                seen.borrow_mut().push(projects.len());
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            Some(0),
+            "an expired tick did no work, but still ran"
+        );
+        assert!(
+            seen.borrow().is_empty(),
+            "an expired tick must not ensure any daemon"
+        );
+    }
+
+    /// The positive witness: the same call with budget left *does* ensure, so the
+    /// assertion above is about the budget and not about a tick that never works.
+    #[test]
+    fn a_live_budget_still_ensures() {
+        let instance = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            yi_agent_store::resident::registry_path(dir.path()),
+            "{\"projects\":[{\"project\":\"/tmp/a\"}]}",
+        )
+        .unwrap();
+        let seen = RefCell::new(Vec::new());
+        let budget =
+            yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::from_secs(5));
+
+        let outcome = once_unattended_within(
+            instance.path(),
+            dir.path(),
+            true,
+            &budget,
+            &mut |projects| {
+                seen.borrow_mut().push(projects.len());
+            },
+        );
+
+        assert_eq!(outcome, Some(1));
+        assert_eq!(seen.borrow().as_slice(), &[1], "the tick must ensure once");
+    }
+
     /// 「没有登记」与「不再是我负责」必须是两个不同答案。
     /// A running (or failed) migration freezes unattended starting without claiming
     /// the migration finished.
@@ -155,6 +297,56 @@ mod tests {
             seen.borrow().is_empty(),
             "a frozen instance does not ensure"
         );
+    }
+
+    /// A managed frontend must never start a daemon nobody supervises.
+    ///
+    /// The registration says a project *wants* a daemon when a frontend is around.
+    /// A managed frontend already has one -- the guardian's -- and starting a
+    /// second, embedded one here is not merely redundant: both bind the same
+    /// socket, so the guardian's daemon loses the race, dies, and the project can
+    /// never reach `managedReady`. The App then runs every conversation without
+    /// delegation, which is what "the subagent tool is missing" looked like.
+    ///
+    /// Distinguishing this from the retirement marker matters: a *fresh* instance
+    /// has no marker at all (nothing was migrated yet), so the marker cannot be
+    /// what protects the managed path.
+    #[test]
+    fn a_managed_frontend_starts_nothing_unattended() {
+        let instance = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        yi_agent_store::resident::require(dir.path(), Path::new("/a"), "example-plugin").unwrap();
+        // No retirement or freeze marker: this is a fresh instance, exactly the
+        // shape the marker-only check let through.
+        assert!(may_start_unattended(instance.path()));
+        let seen = RefCell::new(Vec::new());
+
+        let outcome = once_unattended_as(instance.path(), dir.path(), false, &mut |projects| {
+            seen.borrow_mut().push(projects.len());
+        });
+
+        assert_eq!(outcome, None);
+        assert!(
+            seen.borrow().is_empty(),
+            "a managed frontend must not ensure any daemon behind the guardian's back"
+        );
+    }
+
+    /// An embedded frontend keeps the old behaviour, so the fix cannot silently
+    /// disable self-healing for the callers that really do own their daemon.
+    #[test]
+    fn an_embedded_frontend_still_ensures_registered_projects() {
+        let instance = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        yi_agent_store::resident::require(dir.path(), Path::new("/a"), "example-plugin").unwrap();
+        let seen = RefCell::new(Vec::new());
+
+        let outcome = once_unattended_as(instance.path(), dir.path(), true, &mut |projects| {
+            seen.borrow_mut().push(projects.len());
+        });
+
+        assert_eq!(outcome, Some(1));
+        assert_eq!(*seen.borrow(), vec![1]);
     }
 
     #[test]

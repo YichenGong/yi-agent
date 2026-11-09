@@ -29,7 +29,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use yi_agent_lifecycle::deadline::Deadline;
-use yi_agent_lifecycle::foreground::RootBindIntent;
 use yi_agent_lifecycle::types::{ArtifactIdentity, ClientKind, RootAuthorization};
 use yi_agent_subagent::managed_startup::{
     ManagedStart, ManagedStartObserver, ManagedStartRefusal, ManagedStartStage,
@@ -102,11 +101,9 @@ impl PendingManagedStart {
         cfg: &yi_agent_runtime::config::RuntimeConfig,
         thread_id: impl Into<String>,
     ) -> Result<Arc<yi_agent_subagent::thread_root::ThreadRoot>, String> {
-        use yi_agent_subagent::managed_binding::{
-            LeaseRootAuthority, ManagedContext, RootAuthorityStore,
-        };
-        let mut store = RootAuthorityStore::new();
-        store.bind_epoch(self.authorization.daemon_instance_id.clone())?;
+        use yi_agent_subagent::managed_binding::{LeaseRootAuthority, ManagedContext};
+        let thread_id = thread_id.into();
+        let store = authority_store_for(&self.authorization, &self.scope_key, &thread_id)?;
         let context = Arc::new(
             ManagedContext::new(
                 Arc::new(std::sync::Mutex::new(store)),
@@ -226,6 +223,41 @@ fn scope_key_for(workdir: &Path, runtime_dir: &Path) -> String {
         .unwrap_or_else(|_| runtime_dir.to_string_lossy().into_owned())
 }
 
+/// The authority store a managed conversation's root is built from.
+///
+/// The authorization the start just obtained *is* this conversation's authority, so it
+/// is installed here rather than left for the first attach to fetch. An empty store
+/// makes `ManagedContext::resolve` miss and ask the broker a *second* time for a root
+/// whose authority the daemon has already installed; the daemon answers that second
+/// round trip with `StaleAttempt`, because its `Renew` arm refuses a binding epoch the
+/// guardian has already moved past. The failure then surfaces on a *different*
+/// frontend's start as `the daemon refused the install: StaleAttempt`, which points at
+/// a client that did nothing wrong.
+///
+/// The entry's `thread_key` is the conversation key the attach will present
+/// (`thread:<id>`), which is exactly what the intent named, so the lookup hits.
+fn authority_store_for(
+    authorization: &RootAuthorization,
+    scope_key: &str,
+    thread_id: &str,
+) -> Result<yi_agent_subagent::managed_binding::RootAuthorityStore, String> {
+    let mut store = yi_agent_subagent::managed_binding::RootAuthorityStore::new();
+    store.bind_epoch(authorization.daemon_instance_id.clone())?;
+    store.install_entry(yi_agent_lifecycle::production::RootAuthorityEntry {
+        key: yi_agent_lifecycle::production::RootAuthorityKey {
+            scope_key: scope_key.to_string(),
+            generation: authorization.daemon_instance_id.clone(),
+            client_run_id: authorization.client_run_id.clone(),
+            thread_key: yi_agent_subagent::thread_root::application_root_key(thread_id),
+            root_id: authorization.root_id.clone(),
+        },
+        capability: yi_agent_lifecycle::foreground::SecretCapability::new(
+            authorization.capability.clone(),
+        ),
+    })?;
+    Ok(store)
+}
+
 /// Runs the start up to the point where a turn could be admitted.
 ///
 /// `observer` receives the trace; the CLI installs one that appends to
@@ -267,15 +299,11 @@ pub fn begin_managed_frontend(
             .map_err(|error| format!("the frontend lease cannot be renewed: {error}"))
     })?;
 
-    let intent = RootBindIntent {
-        operation_id: yi_agent_subagent::thread_root::managed_bind_operation_id(
-            &request.thread_key,
-        ),
-        thread_key: request.thread_key.clone(),
-        workspace: request.workspace.clone(),
-        extra_roots: request.extra_roots.clone(),
-        previous_root_capability: None,
-    };
+    let intent = yi_agent_subagent::thread_root::root_bind_intent(
+        &request.thread_key,
+        request.workspace.clone(),
+        request.extra_roots.clone(),
+    );
     let authorization = start.step(ManagedStartStage::AuthorizeRoot, || {
         lease
             .authorize_root(&intent, &request.deadline)
@@ -446,6 +474,42 @@ mod tests {
         assert!(
             key.contains("runtime"),
             "the key must describe the runtime directory: {key}"
+        );
+    }
+
+    /// The store a managed root is built from must already hold the authorization the
+    /// start obtained, keyed by the conversation the attach will name.
+    ///
+    /// Without this the store is an empty cache: `ThreadRoot::attach_session_container`
+    /// calls `ManagedContext::resolve`, misses, and asks the broker a *second* time for
+    /// a root whose authority the daemon has already installed. The daemon answers that
+    /// second round trip with `StaleAttempt` (its `Renew` arm refuses a binding epoch
+    /// the guardian has already moved past), which then surfaces on a *different*
+    /// frontend's start as `the daemon refused the install: StaleAttempt` -- so the
+    /// symptom points at a client that did nothing wrong.
+    #[test]
+    fn the_managed_root_starts_from_the_authorization_its_start_obtained() {
+        let authorization = yi_agent_lifecycle::types::RootAuthorization {
+            scope_key: "/private/tmp/scope".into(),
+            daemon_instance_id: "daemon-1-2".into(),
+            client_run_id: "run:7:conv".into(),
+            root_id: "root-7".into(),
+            capability: "rootcap1:abc".into(),
+        };
+        let conversation = "run:7:conv";
+
+        let store = authority_store_for(&authorization, &authorization.scope_key, conversation)
+            .expect("the store is built from the start's own authorization");
+
+        let found = store.entry_for(
+            &authorization.scope_key,
+            &authorization.client_run_id,
+            &yi_agent_subagent::thread_root::application_root_key(conversation),
+        );
+        assert_eq!(
+            found.map(|entry| entry.capability.expose().to_string()),
+            Some(authorization.capability.clone()),
+            "the attach key must resolve locally, without a second broker round trip"
         );
     }
 }
