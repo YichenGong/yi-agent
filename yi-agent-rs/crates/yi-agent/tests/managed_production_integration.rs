@@ -2491,7 +2491,7 @@ fn the_apps_first_conversation_attaches_its_delegation_runtime() -> anyhow::Resu
     // 5. Evidence, not the RPC result: the sidecar reports a degraded thread by
     //    returning `tooling_error` instead of failing the call, so only the trace
     //    can distinguish "attached" from "kept going without delegation".
-    let trace = std::fs::read_dir(&fixture.instance_home.join(".yi-agent/trace"))
+    let trace = std::fs::read_dir(fixture.instance_home.join(".yi-agent/trace"))
         .map(|entries| {
             entries
                 .flatten()
