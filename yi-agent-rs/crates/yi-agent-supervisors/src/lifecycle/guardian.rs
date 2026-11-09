@@ -1666,6 +1666,24 @@ impl Guardian {
         });
         self.authorizations = Some(ledger);
         self.daemon_lifeline = Some(guardian_end);
+        // A new daemon generation starts with an empty ledger, so every fact the
+        // previous one knew has to be told again -- including which clients hold a
+        // lease. Without this replay, a daemon that restarted under a live App would
+        // refuse that App's next project attach, and its `spawn_agent` would vanish
+        // for reasons that look like a fresh bug.
+        //
+        // Leases survive a daemon restart by design: they belong to the frontend, not
+        // to the daemon that happened to serve it.
+        let live_leases: Vec<(String, yi_agent_lifecycle::types::LeaseMode)> = self
+            .reclaim
+            .leases()
+            .snapshot()
+            .into_iter()
+            .map(|(client, mode, _connected)| (client, mode))
+            .collect();
+        for (client, mode) in live_leases {
+            self.announce_client_lease(&client, mode);
+        }
         // Only now: a bridge attached to a daemon that never proved readiness would
         // invite the guardian to install authority into a process that is not serving
         // anything. The pair is non-blocking so a wedged peer can never stall the
@@ -1761,6 +1779,40 @@ impl Guardian {
         // believing its guardian still exists.
         self.daemon_lifeline = None;
         result
+    }
+
+    /// Tells the daemon that this client holds a business lease here.
+    ///
+    /// Called right after a registration succeeds, and it is what lets a desktop
+    /// open its connection at all. The order inside a managed start is fixed by the
+    /// protocols involved: the runtime must exist before a lease can be registered
+    /// against it, and the project attach -- the first thing a client does once it
+    /// has a runtime -- can only be authorized by a lease that already exists. A
+    /// daemon told nothing therefore refuses the attach, delegation setup dies at
+    /// step one, and `spawn_agent` never gets registered.
+    ///
+    /// Best effort, like every other lifeline push: a write failure means the daemon
+    /// may be gone, and the reclaimer's leases are what stop work in that case. The
+    /// local ledger keeps the fact either way, so a daemon that comes back is told
+    /// again by the replay on the next handshake rather than being forgotten.
+    ///
+    /// A lease-only observer is *not* pushed. It never authorizes work, and treating
+    /// observation as vouching for an App run would let a watcher attach roots.
+    pub fn announce_client_lease(
+        &mut self,
+        client_run_id: &str,
+        mode: yi_agent_lifecycle::types::LeaseMode,
+    ) {
+        if mode != yi_agent_lifecycle::types::LeaseMode::Business {
+            return;
+        }
+        let update = yi_agent_lifecycle::authorization::AuthorizationUpdate::ClientLeased {
+            client_run_id: client_run_id.to_string(),
+        };
+        if let Some(ledger) = self.authorizations.as_mut() {
+            let _ = ledger.apply(update.clone());
+        }
+        let _ = self.push_authorization(update);
     }
 
     /// Mints authority to attach one root, and pushes the binding to the daemon.
@@ -3947,9 +3999,17 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
             let now = lease_now();
             match guardian
                 .reclaimer_mut()
-                .register(client_run_id, kind, mode, now)
+                .register(client_run_id.clone(), kind, mode, now)
             {
-                Ok(grant) => ControlResponse::Granted(grant),
+                Ok(grant) => {
+                    // The daemon learns the lease *after* it exists, never before: a
+                    // vouching sent for a registration that then failed would let a
+                    // client the guardian refused attach anyway. Sent for the mode that
+                    // was actually granted, not the one requested -- a queued
+                    // (`WaitingNextGeneration`) grant authorizes nothing yet.
+                    guardian.announce_client_lease(&grant.client_run_id, grant.mode);
+                    ControlResponse::Granted(grant)
+                }
                 Err(reason) => ControlResponse::Rejected {
                     code: yi_agent_lifecycle::types::ControlErrorCode::Conflict,
                     reason,
@@ -4621,6 +4681,67 @@ mod authorization_tests {
             ledger.generation_secret(),
         );
         (guardian, daemon_end, verifier)
+    }
+
+    /// Registering a business lease tells the daemon, before any root exists.
+    ///
+    /// This is the frame that makes a desktop's first attach possible. Without it the
+    /// daemon knows of no client at all when the project attach arrives -- the
+    /// guardian has minted no capability yet, because the conversation that would
+    /// need one has not been started -- and it refuses the attach. Every later step
+    /// (root bind, spawn) then never runs, which is what "the tools disappeared"
+    /// looks like from the outside.
+    #[test]
+    fn registering_a_business_lease_tells_the_daemon_before_any_root_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, peer, verifier) = guardian_with_peer(directory.path(), "guardian-1");
+        let grant = guardian
+            .reclaimer_mut()
+            .register(
+                "app-run-1".to_string(),
+                ClientKind::App,
+                LeaseMode::Business,
+                lease_now(),
+            )
+            .unwrap();
+        // Nothing has been minted: this is the pre-conversation state.
+        assert!(verifier.authorized_clients().is_empty());
+
+        guardian.announce_client_lease(&grant.client_run_id, grant.mode);
+
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut &peer).unwrap();
+        let update: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
+        assert_eq!(
+            update,
+            AuthorizationUpdate::ClientLeased {
+                client_run_id: "app-run-1".to_string()
+            }
+        );
+
+        // And the daemon's own view now answers "this client may attach" while still
+        // holding no capability it could be tricked into honouring as a root.
+        let mut applied = verifier.clone();
+        applied.apply(update).unwrap();
+        assert!(applied.authorized_clients().contains("app-run-1"));
+        assert!(applied.holds_lease("app-run-1"));
+        assert!(applied.resolve("app-run-1").is_err());
+    }
+
+    /// A lease-only observer is never announced: it does not authorize work.
+    #[test]
+    fn a_lease_only_observer_is_not_announced_to_the_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, mut peer, _) = guardian_with_peer(directory.path(), "guardian-1");
+        guardian.announce_client_lease("observer", LeaseMode::LeaseOnly);
+
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        use std::io::Read;
+        assert!(
+            peer.read(&mut byte).is_err(),
+            "an observer must not cause a vouching frame"
+        );
     }
 
     #[test]
