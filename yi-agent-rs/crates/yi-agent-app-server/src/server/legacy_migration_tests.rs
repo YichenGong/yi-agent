@@ -250,9 +250,16 @@ fn the_watch_loop_defers_to_the_managed_frontend_declaration() {
         !production.contains("is_managed_frontend()"),
         "the loop must not re-ask the process what the entry point already decided"
     );
+    // The gate-taking variant is now the budget-aware one: the loop must still
+    // route through a variant that takes the instance gate *and* enforces a budget.
+    // Calling the marker-only `once_unattended` is still the bypass this guards.
     assert!(
-        production.contains("once_unattended_as("),
-        "the loop must call the gate-taking variant, not the embedded-only one"
+        production.contains("once_unattended_within("),
+        "the loop must call the gate-taking, budget-aware variant"
+    );
+    assert!(
+        production.contains("Deadline::after(WATCH_TICK_BUDGET)"),
+        "the loop must bound its own tick, or a wedged daemon holds the gate forever"
     );
     // `once_unattended` 仍然存在(embedded 调用方还在用),所以这里要看的是
     // 本文件里**没有**再调它——调了就说明闸门被绕过。

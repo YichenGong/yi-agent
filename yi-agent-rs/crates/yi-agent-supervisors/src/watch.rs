@@ -10,6 +10,21 @@ pub fn ensure_daemons(projects: &[PathBuf]) {
     ensure_daemons_with(projects, &mut crate::daemon::ensure_running);
 }
 
+/// [`ensure_daemons`] on a shared budget: once it is spent, no further daemon is
+/// started.
+///
+/// Checking the budget *between* projects rather than only once up front matters
+/// for the contract the caller published: "I did not start anything after the
+/// budget" must hold for every project, not just the first one.
+pub fn ensure_daemons_until(
+    projects: &[PathBuf],
+    budget: &yi_agent_lifecycle::deadline::Deadline,
+) -> Vec<PathBuf> {
+    ensure_daemons_with(projects, &mut |project: &Path| {
+        crate::daemon::ensure_running_until(project, budget)
+    })
+}
+
 /// 注入版：返回本次真正拉起的项目。单个失败只记日志，不影响其余项目。
 pub fn ensure_daemons_with(
     projects: &[PathBuf],
@@ -98,16 +113,38 @@ pub fn once_unattended_as(
     embedded: bool,
     ensure: &mut dyn FnMut(&[PathBuf]),
 ) -> Option<usize> {
+    once_unattended_within(
+        instance_home,
+        resident_dir,
+        embedded,
+        &yi_agent_lifecycle::deadline::Deadline::after(GATE_WAIT),
+        ensure,
+    )
+}
+
+/// [`once_unattended_as`] against a caller-supplied budget.
+///
+/// The budget matters because this whole tick runs *under* the instance gate: a
+/// tick whose budget is spent before it acquires the gate must not go on to start
+/// daemons, or the gate is held for work the caller already gave up on. The check
+/// is inside the gate so the answer cannot change between check and use.
+pub fn once_unattended_within(
+    instance_home: &Path,
+    resident_dir: &Path,
+    embedded: bool,
+    budget: &yi_agent_lifecycle::deadline::Deadline,
+    ensure: &mut dyn FnMut(&[PathBuf]),
+) -> Option<usize> {
     if !embedded {
         return None;
     }
     if !may_start_unattended(instance_home) {
         return None;
     }
-    let deadline = yi_agent_lifecycle::deadline::Deadline::after(GATE_WAIT);
+    let deadline = budget.clone();
     let gate = match crate::lifecycle::migration_operation::RetirementGate::acquire(
         instance_home,
-        deadline,
+        deadline.clone(),
     ) {
         Ok(gate) => gate,
         // A migration holds the gate: it is either stopping daemons right now or
@@ -120,7 +157,17 @@ pub fn once_unattended_as(
     if !may_start_unattended(instance_home) {
         return None;
     }
-    let count = once(resident_dir, ensure);
+    // The budget is re-read under the gate. Waiting for a migration may have spent
+    // all of it, and starting daemons now would be work nobody is waiting for --
+    // while still holding the gate.
+    //
+    // Only a *count* of registrations is reported in that case: nothing was
+    // ensured, and `None` would wrongly tell the caller to stand down for good.
+    let count = if deadline.is_expired() {
+        0
+    } else {
+        once(resident_dir, ensure)
+    };
     drop(gate);
     Some(count)
 }
@@ -160,6 +207,74 @@ mod tests {
 
         assert_eq!(outcome, None);
         assert!(seen.borrow().is_empty(), "no ensure call may happen");
+    }
+
+    /// A tick must not start daemons on a budget somebody else already spent.
+    ///
+    /// The gate is held for the whole tick, so starting work after the caller gave
+    /// up would keep *every* cooperating start blocked behind a tick that is not
+    /// serving anyone. `Some(0)` rather than `None`: the instance is still this
+    /// loop's job, it just had no time this round.
+    #[test]
+    fn an_expired_budget_starts_nothing_unattended() {
+        let instance = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            yi_agent_store::resident::registry_path(dir.path()),
+            "{\"projects\":[{\"project\":\"/tmp/a\"},{\"project\":\"/tmp/b\"}]}",
+        )
+        .unwrap();
+        let seen = RefCell::new(Vec::new());
+        let budget = yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::ZERO);
+
+        let outcome = once_unattended_within(
+            instance.path(),
+            dir.path(),
+            true,
+            &budget,
+            &mut |projects| {
+                seen.borrow_mut().push(projects.len());
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            Some(0),
+            "an expired tick did no work, but still ran"
+        );
+        assert!(
+            seen.borrow().is_empty(),
+            "an expired tick must not ensure any daemon"
+        );
+    }
+
+    /// The positive witness: the same call with budget left *does* ensure, so the
+    /// assertion above is about the budget and not about a tick that never works.
+    #[test]
+    fn a_live_budget_still_ensures() {
+        let instance = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            yi_agent_store::resident::registry_path(dir.path()),
+            "{\"projects\":[{\"project\":\"/tmp/a\"}]}",
+        )
+        .unwrap();
+        let seen = RefCell::new(Vec::new());
+        let budget =
+            yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::from_secs(5));
+
+        let outcome = once_unattended_within(
+            instance.path(),
+            dir.path(),
+            true,
+            &budget,
+            &mut |projects| {
+                seen.borrow_mut().push(projects.len());
+            },
+        );
+
+        assert_eq!(outcome, Some(1));
+        assert_eq!(seen.borrow().as_slice(), &[1], "the tick must ensure once");
     }
 
     /// 「没有登记」与「不再是我负责」必须是两个不同答案。

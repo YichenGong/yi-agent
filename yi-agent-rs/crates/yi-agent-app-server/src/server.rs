@@ -127,13 +127,14 @@ pub(crate) use migration::{
 pub(crate) use plugin_bridge::{
     PLUGIN_READY_TIMEOUT, PluginQueryError, PluginSummary, list_installed_plugins, plugin_query,
     plugin_query_self, plugin_query_socket_ready, plugin_scope, project_arg,
-    spawn_resident_watch_loop, wait_for_plugin_query_socket,
+    spawn_resident_watch_loop,
 };
 #[allow(unused_imports)]
 pub(crate) use watchman::{
     PLUGIN_READY_POLL, agent_trace_row, ensure_watchman_installed, ensure_watchman_installed_in,
-    production_watchman_install, production_watchman_uninstall, project_has_plugin_manifest,
-    should_evict, skills_home_from, wait_for_plugin_query_socket_within, watchman_home_from,
+    ensure_watchman_installed_until, production_watchman_install, production_watchman_uninstall,
+    project_has_plugin_manifest, should_evict, skills_home_from,
+    wait_for_plugin_query_socket_until, wait_for_plugin_query_socket_within, watchman_home_from,
 };
 
 pub(crate) mod assembly;

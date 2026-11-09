@@ -298,7 +298,11 @@ pub fn ensure_managed_with(
     // applies to reads, never to a start that may legitimately take 30 seconds.
     let guard = CoordinationGuard::acquire(scope, deadline.clone())?;
     ensure_managed_under_guard(
-        &HeldScope { guard, deadline },
+        &HeldScope {
+            guard,
+            deadline,
+            retirement_gate: None,
+        },
         expected,
         intent,
         probe,
@@ -317,6 +321,14 @@ pub fn ensure_managed_with(
 pub struct HeldScope {
     pub guard: CoordinationGuard,
     pub deadline: Deadline,
+    /// The instance-wide retirement gate, when this caller took one.
+    ///
+    /// A migration must hold it until its freeze is *durable*: releasing it as soon
+    /// as the scope lock is taken reopens exactly the window the gate exists to
+    /// close -- a cooperating start could acquire the gate and begin an embedded
+    /// daemon while the freeze marker is not yet on disk. `None` is the ordinary
+    /// case (a plain managed start, or a caller whose own work already held it).
+    pub retirement_gate: Option<super::migration_operation::RetirementGate>,
 }
 
 /// [`ensure_managed_with`] for a caller that already owns this scope's guard.

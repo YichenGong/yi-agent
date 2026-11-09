@@ -59,14 +59,45 @@ fn socket_for(project: &Path) -> Result<PathBuf, yi_agent_store::ipc::IpcError> 
 /// caller relies on, so it is part of this function's contract rather than of
 /// any particular launcher.
 pub fn ensure_running(project: &Path) -> Result<bool, String> {
+    ensure_running_for(project, READY_TIMEOUT)
+}
+
+/// [`ensure_running`] with an explicit budget, so a caller that holds the
+/// instance gate can bound how long it holds it.
+///
+/// The budget is checked *before* spawning: once a detached daemon exists, no
+/// budget can un-spawn it. That ordering is what lets the caller say truthfully
+/// "I did not start anything" when it runs out of time.
+pub fn ensure_running_until(
+    project: &Path,
+    deadline: &yi_agent_lifecycle::deadline::Deadline,
+) -> Result<bool, String> {
+    ensure_running_for_deadline(project, deadline)
+}
+
+fn ensure_running_for(project: &Path, timeout: Duration) -> Result<bool, String> {
+    let deadline = yi_agent_lifecycle::deadline::Deadline::after(timeout);
+    ensure_running_for_deadline(project, &deadline)
+}
+
+fn ensure_running_for_deadline(
+    project: &Path,
+    deadline: &yi_agent_lifecycle::deadline::Deadline,
+) -> Result<bool, String> {
     if is_running(project) {
         return Ok(true);
+    }
+    // Refuse to start a side effect whose result we would have no budget to
+    // observe: a daemon launched now would be an orphan the caller believes it
+    // never started.
+    if deadline.is_expired() {
+        return Err("the daemon-start budget was already spent".to_string());
     }
     let exe = std::env::current_exe()
         .map_err(|error| format!("cannot locate this executable to start the daemon: {error}"))?;
     spawn_detached(&exe, project)
         .map_err(|error| format!("could not start the daemon: {error}"))?;
-    Ok(wait_ready(project, READY_TIMEOUT))
+    Ok(wait_ready_for(project, deadline))
 }
 
 /// Spawn `exe daemon serve` for `project` in a new session, detached from the
@@ -100,7 +131,20 @@ pub fn spawn_detached(exe: &Path, project: &Path) -> std::io::Result<u32> {
 /// Poll `project`'s daemon socket until it answers a `Status`, or `timeout`
 /// elapses. Returns whether it became ready in time.
 pub fn wait_ready(project: &Path, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
+    wait_ready_until(
+        project,
+        &yi_agent_lifecycle::deadline::Deadline::after(timeout),
+    )
+}
+
+/// [`wait_ready`] against a shared budget, so the wait cannot outlive the
+/// caller's own remaining time.
+pub fn wait_ready_until(project: &Path, limit: &yi_agent_lifecycle::deadline::Deadline) -> bool {
+    wait_ready_for(project, limit)
+}
+
+fn wait_ready_for(project: &Path, limit: &yi_agent_lifecycle::deadline::Deadline) -> bool {
+    let deadline = Instant::now() + limit.remaining();
     loop {
         if is_running(project) {
             return true;

@@ -28,6 +28,7 @@ pub(crate) mod resident;
 pub(crate) mod runtime;
 pub(crate) mod side;
 pub(crate) mod skill;
+pub(crate) mod startup;
 pub(crate) mod thread;
 pub(crate) mod turn;
 pub(crate) mod ui;

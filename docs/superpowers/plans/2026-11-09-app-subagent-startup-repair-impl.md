@@ -185,7 +185,7 @@ supervisors `watchman.rs` 新增 `install_until` 与budget-aware launchctl接缝
 
 追加逐单元red/green：① watch blocking调度及expired-budget ensure=0；② plugin中ensure耗尽预算后query/install=0；③注入迟到worker，caller超时后竞争者仍取不到闸，worker结束才释放；④ launchctl fixture沉默/退出慢，不碰真实launchd。命名 `expired_startup_budget_prevents_later_side_effects`、`timed_out_caller_does_not_release_worker_gate`、`watchman_launchctl_obeys_deadline`，前两项放app-server现有plugin tests，最后放supervisors watchman tests。分别运行 `cargo test --all-features -p yi-agent-app-server expired_startup_budget_prevents_later_side_effects`、同crate第二名、`cargo test --all-features -p yi-agent-supervisors --lib watchman_launchctl_obeys_deadline`；逐条确认非零命中。先旧闭包行为red，再修改签名/生产接线green，不以编译失败代替行为red。
 
-- [ ] **Step 1：写 `migration_keeps_gate_until_freeze_is_durable` red 测试。** 用真实隔离 gate 和两个线程/channel：迁移已取得 scope、freeze 尚未写；线程 B 用短 Deadline 尝试取 gate，必须 WouldBlock。放行 freeze，确认标记存在后 B 取闸成功但自动启动拒绝。线程 B 成功取得闸却未见 freeze 时测试失败；所有 recv 用 recv_timeout，不用固定 sleep 决定时序。
+- [x] **Step 1：写 `migration_keeps_gate_until_freeze_is_durable` red 测试。** 用真实隔离 gate 和两个线程/channel：迁移已取得 scope、freeze 尚未写；线程 B 用短 Deadline 尝试取 gate，必须 WouldBlock。放行 freeze，确认标记存在后 B 取闸成功但自动启动拒绝。线程 B 成功取得闸却未见 freeze 时测试失败；所有 recv 用 recv_timeout，不用固定 sleep 决定时序。
 
 ```rust
 // 屏障事件的次序是测试契约；各 channel 由测试构造。
@@ -196,8 +196,8 @@ frozen_rx.recv_timeout(budget).expect("freeze persisted");
 assert!(retirement::is_frozen(&instance_home));
 ```
 
-- [ ] **Step 2：运行 red。** `cargo test --all-features -p yi-agent-supervisors --lib migration_keeps_gate_until_freeze_is_durable`，预期现有立即 drop gate 违反断言。测试需记录 B 确实尝试，不因未调度假绿。
-- [ ] **Step 3：最小锁修改。** `take_locks` 返回 HeldScope 时保存 Some(gate)，协调器在 Freeze 成功后 `held.retirement_gate.take()` 释放；held 需可变。Accepted/证据检查/故障注入提前返回由 RAII 释放，不再取第二次 gate。普通 ensure 的 HeldScope=None。用同一 deadline 覆盖 gate→scope→freeze，不将 root/lease callback 留在 lock 区间。
+- [x] **Step 2：运行 red。** `cargo test --all-features -p yi-agent-supervisors --lib migration_keeps_gate_until_freeze_is_durable`，预期现有立即 drop gate 违反断言。测试需记录 B 确实尝试，不因未调度假绿。
+- [x] **Step 3：最小锁修改。** `take_locks` 返回 HeldScope 时保存 Some(gate)，协调器在 Freeze 成功后 `held.retirement_gate.take()` 释放；held 需可变。Accepted/证据检查/故障注入提前返回由 RAII 释放，不再取第二次 gate。普通 ensure 的 HeldScope=None。用同一 deadline 覆盖 gate→scope→freeze，不将 root/lease callback 留在 lock 区间。
 
 ```rust
 // Freeze 成功持久化之后；失败返回保留 RAII 语义。
@@ -206,8 +206,23 @@ if matches!(step, Step::Freeze) {
 }
 ```
 
-- [ ] **Step 4：自动启动实现与 tests。** watch、旧 plugin 收尾、UI watchman 启用在 blocking pool 取一次 gate，持闸重查 retired/frozen。plugin 的 ensure→query-wait→watchman-install 同一预算同一 gate，under-gate helper 不再取闸。managed 直接拒绝；plugin 已落盘返回 awaiting-demand/queryable=false；UI 启用偏好保留、ok+warning，禁用仅卸载。新增测试 `plugin_startup_gate_covers_ensure_query_and_watchman`、`managed_watchman_preference_is_saved_without_install`，计数断言与 A5 屏障一起 green。
-- [ ] **Step 5：覆盖失败释放及正面 witness。** freeze 写失败/取 scope 超时/Accepted 后 fault，另一线程随后可取 gate；其他 scope 等待仍有界。无标记 embedded 对照实际 ensure；检查同调用 helper 不自锁。运行 `just test-crate yi-agent-supervisors`、`just test-crate yi-agent-app-server`；变异恢复立即 drop gate，屏障测试必须红，恢复后绿。
+- [x] **Step 4：自动启动实现与 tests。** watch、旧 plugin 收尾、UI watchman 启用在 blocking pool 取一次 gate，持闸重查 retired/frozen。plugin 的 ensure→query-wait→watchman-install 同一预算同一 gate，under-gate helper 不再取闸。managed 直接拒绝；plugin 已落盘返回 awaiting-demand/queryable=false；UI 启用偏好保留、ok+warning，禁用仅卸载。新增测试 `plugin_startup_gate_covers_ensure_query_and_watchman`、`managed_watchman_preference_is_saved_without_install`，计数断言与 A5 屏障一起 green。
+- [x] **Step 5：覆盖失败释放及正面 witness。** freeze 写失败/取 scope 超时/Accepted 后 fault，另一线程随后可取 gate；其他 scope 等待仍有界。无标记 embedded 对照实际 ensure；检查同调用 helper 不自锁。运行 `just test-crate yi-agent-supervisors`、`just test-crate yi-agent-app-server`；变异恢复立即 drop gate，屏障测试必须红，恢复后绿。
+
+  **实现与判别性证据（本轮实测）：**
+
+  | 判别点 | 变异 | 结果 |
+  |---|---|---|
+  | 闸必须活过「freeze 可见」 | `take_locks` 取到 scope 后立刻 `drop(gate)` | `migration_keeps_gate_until_freeze_is_durable` FAIL（5s 内失败，报「the gate must still be held while the freeze is not yet durable」） |
+  | 失败必须归还闸 | 失败路径 `mem::forget(held.retirement_gate.take())` | `a_failed_freeze_returns_the_instance_gate` FAIL（报「the gate must be released when the migration fails」） |
+  | 预算耗尽不得再动副作用 | query 等待去掉 `!budget.is_expired()` | `expired_startup_budget_prevents_later_side_effects` FAIL（报「a spent budget must not be spent further on a query wait」） |
+  | launchctl 必须受预算约束 | `run_bounded` 改回 `Command::status()` | `watchman_launchctl_obeys_deadline` FAIL（`sleep 30` 真等到 30s 才返，超过 5s 断言） |
+
+  - 关键修正一：屏障测试最初**自己构造** `HeldScope`，所以「`take_locks` 立刻放闸」的变异打不中（变异下仍 PASS）。改为经生产的 `SystemWorld::take_locks` 取锁后才具备判别力——这正是计划要求的「测试看似覆盖、实则打不到」的修正。
+  - 关键修正二：`freeze` 失败时 `confirm` **不返回 Err**，而是把 `failed_at` 记进 journal 并返回 Ok（既有契约）。测试按此断言，而不是假设 Err。
+  - 关键修正三：plugin 的 query 等待若直接吃满 30s 单元预算，会让既有 `plugin_install_succeeds_but_reports_not_queryable_when_the_socket_never_appears`（等 30s 事件）超时。改为 `budget.clamp(PLUGIN_READY_TIMEOUT)`，保留原 5s 上限。
+  - 覆盖范围：`take_locks` 现在把 gate 放进 `HeldScope.retirement_gate`，`confirm` 在 **Freeze 阶段 journal 落盘之后**才 `take()`；失败/提前返回由 RAII 释放。plugin 的 ensure→query-wait→watchman-install 合并为一个持闸 blocking worker（`rpc/startup.rs::start_plugin`），调用方丢 future 不提前放闸。
+  - 验证：`-p yi-agent-supervisors` 522 passed / 0 failed；`-p yi-agent-app-server` 1508 passed，2 failed 均为既有并发 flake（`compact_does_not_erase_last_item_id`、`a_failed_append_still_records_the_completion`，单跑与定向复跑全绿，失败集合逐轮漂移，见 `docs/bug-list.md`）；`-p yi-agent-subagent` 244 passed；`cargo clippy --all-targets --all-features -p yi-agent-app-server -p yi-agent-supervisors -- -D warnings` 干净。
 - [ ] **Step 6：按规则提交。** `fix: serialize embedded startup with durable migration freeze`。A1–A5 有证据后才可勾入口统一项，计数相应更新。
 
 ### Task 3：业务 socket 只读预检（A6、A8 的准入）

@@ -1168,6 +1168,7 @@ mod operation {
         LegacyEvidence, LegacyEvidenceProbe, MigrationPreview, Observation, PlatformFacts,
     };
     use yi_agent_supervisors::lifecycle::migration::LoadedJob;
+    use yi_agent_supervisors::lifecycle::migration_gateway::{MigrationWorld, SystemWorld};
     use yi_agent_supervisors::lifecycle::migration_operation::{
         FaultPoint, MigrationBackend, MigrationCoordinator, MigrationPhase, MigrationProbes,
         MigrationRequest, OwnershipProof, RetirementGate, SystemMigrationBackend, read_journals,
@@ -1383,10 +1384,14 @@ mod operation {
 
     /// A migration takes ownership of the lock it was given: that is what lets it
     /// release the lock after `ManagedConnected` and then acknowledge ownership.
+    ///
+    /// `retirement_gate: None` is the ordinary case -- a caller that already held the
+    /// instance gate for the duration of its own work, or a test that never takes one.
     fn held(guard: CoordinationGuard) -> HeldScope {
         HeldScope {
             guard,
             deadline: deadline(),
+            retirement_gate: None,
         }
     }
 
@@ -1634,6 +1639,62 @@ mod operation {
     }
 
     // -- the instance gate ----------------------------------------------------
+
+    #[test]
+    fn a_failed_freeze_returns_the_instance_gate() {
+        // The gate is a resource with an owner, not a flag that gets cleared: if a
+        // migration dies before its freeze is durable, everything it was keeping out
+        // must be able to proceed. Otherwise one failed migration would wedge the
+        // instance forever, which is indistinguishable from a hang to the user.
+        let directory = TempDir::new().unwrap();
+        let scope = scope(&directory);
+        let (evidence, digest) = evidence_for(&directory, &scope);
+        let backend = Recorder::default();
+        backend.fail_on("freeze");
+        let coordinator = MigrationCoordinator::new(&scope.instance_home, deadline());
+
+        let held = <SystemWorld as MigrationWorld>::take_locks(&SystemWorld, &scope, deadline())
+            .expect("locks are free in an isolated instance")
+            .expect("an uncontended instance grants them");
+        assert!(
+            RetirementGate::is_held(&scope.instance_home),
+            "taking the locks must hold the instance gate"
+        );
+
+        let outcome = coordinator.confirm(
+            MigrationRequest {
+                operation_id: "op-failed-freeze",
+                target: &artifact(),
+                evidence: &evidence,
+                preview_digest: &digest,
+                fault: None,
+            },
+            held,
+            &backend,
+        );
+        // A failed step is *recorded*, not returned as an error: the journal is the
+        // durable answer to "what did this migration do". What must not happen is the
+        // gate surviving the failure.
+        let journal = outcome.expect("a failed step is recorded in the journal");
+        assert!(
+            journal.failed_at.is_some(),
+            "the journal must record where the migration stopped: {journal:?}"
+        );
+
+        // RAII, not a compensating call: no second release path to forget.
+        assert!(
+            !RetirementGate::is_held(&scope.instance_home),
+            "the gate must be released when the migration fails"
+        );
+        assert!(
+            RetirementGate::acquire(
+                &scope.instance_home,
+                Deadline::after(Duration::from_millis(200))
+            )
+            .is_ok(),
+            "a later migration must be able to start after the failure"
+        );
+    }
 
     #[test]
     fn a_second_migration_on_the_same_instance_is_refused() {
