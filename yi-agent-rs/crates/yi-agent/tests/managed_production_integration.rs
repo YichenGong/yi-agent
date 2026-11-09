@@ -688,6 +688,76 @@ fn read_until_id(
     }
 }
 
+/// Reads frames until `wanted_id`, answering the shell's half of the root handshake.
+///
+/// The desktop learns of a conversation's root request as an outbound `_shell/`
+/// frame on this same stdout, asks its guardian for a capability, and writes the
+/// answer back. Doing that here is not test scaffolding around the product: it is the
+/// other end of a contract the sidecar cannot complete alone, and leaving it silent
+/// would make every conversation look like a delegation failure.
+fn read_until_id_answering_authorize(
+    sidecar: &mut Sidecar,
+    wanted_id: &str,
+    lease: &yi_agent_lifecycle::client::FrontendLease,
+    budget: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    let deadline = Instant::now() + budget;
+    loop {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "no answer to {wanted_id} within {budget:?}"
+        );
+        let frame = sidecar.read_frame(Duration::from_secs(5))?;
+
+        // An outbound root request, not a response: answer it and keep reading.
+        if frame.get("method").and_then(|v| v.as_str()) == Some("_shell/authorizeRoot") {
+            answer_authorize(sidecar, &frame, lease)?;
+            continue;
+        }
+
+        if frame.get("id").and_then(|v| v.as_str()) == Some(wanted_id) {
+            return Ok(frame);
+        }
+    }
+}
+
+/// Asks the guardian for the root the sidecar requested, and writes the reply back.
+fn answer_authorize(
+    sidecar: &mut Sidecar,
+    request: &serde_json::Value,
+    lease: &yi_agent_lifecycle::client::FrontendLease,
+) -> anyhow::Result<()> {
+    let id = request
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("an authorize request without an id: {request}"))?;
+    let intent: yi_agent_lifecycle::foreground::RootBindIntent = serde_json::from_value(
+        request
+            .get("params")
+            .and_then(|params| params.get("intent"))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("an authorize request without an intent: {request}"))?,
+    )?;
+    let authorization = lease.authorize_root(&intent, &Deadline::after(Duration::from_secs(30)))?;
+    let entry = yi_agent_lifecycle::production::RootAuthorityEntry {
+        key: yi_agent_lifecycle::production::RootAuthorityKey {
+            scope_key: authorization.scope_key.clone(),
+            generation: authorization.daemon_instance_id.clone(),
+            client_run_id: authorization.client_run_id.clone(),
+            thread_key: intent.thread_key.clone(),
+            root_id: authorization.root_id.clone(),
+        },
+        capability: yi_agent_lifecycle::foreground::SecretCapability::new(authorization.capability),
+    };
+    sidecar.write(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "sidecar_epoch": sidecar.epoch.clone(),
+        "result": serde_json::to_value(entry)?,
+    }))?;
+    Ok(())
+}
+
 /// A v4-shaped random string without pulling in a uuid dependency for the test.
 fn uuid_like() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2308,4 +2378,179 @@ fn journal_generation(runtime_dir: &Path) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(str::to_owned)
     })
+}
+
+// ---------------------------------------------------------------------------
+// A22: the App's first conversation gets its delegation tools.
+// ---------------------------------------------------------------------------
+
+/// The desktop's own startup order, end to end, ending in a working delegation attach.
+///
+/// This is the acceptance test for the failure that read to a user as "`spawn_agent`
+/// is missing from the tool list", and it is written at this level because every
+/// in-process test missed it by construction:
+///
+/// * a unit test of the attach gate can hand the daemon a `Bind` frame, but the
+///   desktop never sends one -- no conversation exists yet, so no capability does
+///   either;
+/// * an in-process fixture can also pre-register a lease, but the desktop does that
+///   *after* `prepare` connects, which is the only order the real protocols allow.
+///
+/// So the fixture here performs exactly the shell's sequence: bootstrap the private
+/// channel, `_shell/prepare`, register the App's business lease under the same run
+/// id the handshake will carry, and only then `initialize` + `thread/start`. If the
+/// guardian fails to vouch for that lease to the daemon, the project attach is
+/// refused and the assistant runs without delegation -- which is what this asserts
+/// did not happen.
+#[test]
+fn the_apps_first_conversation_attaches_its_delegation_runtime() -> anyhow::Result<()> {
+    let mut fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+    let mut sidecar = Sidecar::spawn(&mut fixture)?;
+
+    // 1. Prepare: starts the guardian, which starts the one business daemon.
+    let params = serde_json::to_value(yi_agent_lifecycle::production::PrepareRequest {
+        scope: fixture.scope(),
+        expected: fixture.artifact().clone(),
+        attempt_id: format!("attempt-{}", uuid_like()),
+    })?;
+    let answer = sidecar.call("_shell/prepare", params, START_BUDGET)?;
+    let prepared = answer
+        .get("result")
+        .ok_or_else(|| anyhow::anyhow!("prepare refused: {answer}"))?;
+    anyhow::ensure!(
+        prepared.get("Connected").is_some() || prepared.get("VersionChoiceRequired").is_some(),
+        "prepare did not connect to this build's runtime: {prepared}"
+    );
+
+    // 2. Register the App's lease. The desktop does this from `ensure_project`, under
+    //    the same run id it stamps on `initialize`; the guardian must announce it to
+    //    the daemon, because that announcement is the only thing that lets a project
+    //    attach be attributed before any conversation root exists.
+    let client_run_id = format!("app-run-{}", uuid_like());
+    // The fixture's own instance home, passed in explicitly: `control_path` reads the
+    // *test process's* environment, which points at the developer's real `~/.yi-agent`
+    // -- a socket that either does not exist or, worse, belongs to another instance.
+    let control_path = yi_agent_lifecycle::scope::guardian_socket(
+        &fixture.runtime_dir,
+        &fixture.instance_home.join(".yi-agent"),
+    );
+    let lease = yi_agent_lifecycle::client::FrontendLease::register_if_served(
+        &control_path,
+        client_run_id.clone(),
+        yi_agent_lifecycle::types::ClientKind::App,
+        yi_agent_lifecycle::types::LeaseMode::Business,
+        &Deadline::after(Duration::from_secs(30)),
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no guardian answered at {}; prepare connected without a control channel",
+            control_path.display()
+        )
+    })?;
+
+    // 3. The business handshake, stamped exactly as `bridge::stamp_shell_identity`
+    //    stamps it. The run id is the one above on purpose: a different one would
+    //    name a client the guardian never vouched for.
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "initialize-1",
+        "method": "initialize",
+        "params": {
+            "shellAuthorization": {
+                "client_run_id": client_run_id,
+                "issued_by_shell": true,
+            }
+        }
+    });
+    sidecar.write(&initialize)?;
+    let ack = read_until_id(&mut sidecar, "initialize-1", Duration::from_secs(60))?;
+    anyhow::ensure!(
+        ack.get("result").is_some(),
+        "the sidecar refused the business handshake: {ack}"
+    );
+
+    // 4. The first conversation. `attach_delegation` runs inside this call: it does
+    //    the project attach and then asks the shell for the conversation's own root.
+    //
+    //    The shell half is this test's job, and it cannot be skipped -- a sidecar that
+    //    asks and gets no answer reports `the authorize request did not answer in
+    //    time` and degrades exactly like a broken attach, so a test that ignored the
+    //    request would not be measuring the fix at all.
+    sidecar.write(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "start-1",
+        "method": "thread/start",
+        "params": { "cwd": fixture.workdir.to_string_lossy() },
+    }))?;
+    let started = read_until_id_answering_authorize(&mut sidecar, "start-1", &lease, START_BUDGET)?;
+    anyhow::ensure!(
+        started.get("result").is_some(),
+        "thread/start failed: {started}"
+    );
+
+    // 5. Evidence, not the RPC result: the sidecar reports a degraded thread by
+    //    returning `tooling_error` instead of failing the call, so only the trace
+    //    can distinguish "attached" from "kept going without delegation".
+    let trace = std::fs::read_dir(&fixture.instance_home.join(".yi-agent/trace"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    anyhow::ensure!(
+        !trace.is_empty(),
+        "the fixture produced no trace, so this test cannot see why the attach failed"
+    );
+    assert!(
+        !trace.contains("no root authorization matches this capability"),
+        "the daemon refused the App's first project attach; delegation setup dies there \
+         and the conversation runs without `spawn_agent`:\n{trace}"
+    );
+    assert!(
+        !trace.contains("subagent delegation unavailable"),
+        "the conversation fell back to a runtime without delegation:\n{trace}"
+    );
+
+    // 6. And the daemon recorded the connection: a project attach is a row, so an
+    //    empty table means the attach was refused rather than merely untraced.
+    let database = fixture.runtime_dir.join("runtime.sqlite");
+    assert!(
+        database.exists(),
+        "the business daemon never created {}; nothing was admitted",
+        database.display()
+    );
+    let attachments = sqlite_count(&database, "application_root_attachments");
+    assert!(
+        attachments > 0,
+        "the App's project attach left no application_root_attachments row in {}",
+        database.display()
+    );
+
+    drop(lease);
+    Ok(())
+}
+
+/// Counts rows in one table of a sqlite file, as a whole number.
+///
+/// Read from the file rather than through the daemon's API on purpose: the assertion
+/// is about what was *persisted*, and a query through the process could be answered
+/// from memory while nothing durable had been written.
+///
+/// Absent `sqlite3` answers 0, which fails the caller's assertion -- the honest
+/// outcome, because a count nobody could take is not evidence of a row.
+fn sqlite_count(database: &Path, table: &str) -> i64 {
+    let output = Command::new("sqlite3")
+        .arg(database)
+        .arg(format!("SELECT COUNT(*) FROM {table};"))
+        .output();
+    let Ok(output) = output else {
+        return 0;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i64>()
+        .unwrap_or(0)
 }

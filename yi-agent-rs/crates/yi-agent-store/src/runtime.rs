@@ -4316,6 +4316,12 @@ impl RuntimeCoordinator {
     /// Derived from the ledger rather than tracked separately: two views of "who is
     /// authorized" would eventually disagree, and the disagreement would be an
     /// attach admitted for a client whose authority was withdrawn.
+    ///
+    /// "Authorized" here means both things the guardian can vouch for: a client that
+    /// holds a root binding, and a client it registered a business lease for. The
+    /// second is what makes a *project* attach reachable at all -- the lease exists
+    /// before any conversation does, while a binding only appears once a conversation
+    /// asks for its root, so a gate reading bindings alone refuses every first attach.
     fn refresh_attach_authority(&self) {
         let managed = self
             .managed_authorizations
@@ -4346,10 +4352,17 @@ impl RuntimeCoordinator {
     /// project attach only opens the connection a conversation will later attach
     /// its own root over, so there is no per-conversation capability to present
     /// yet. What it can name is the App run it speaks for, and the guardian does
-    /// authorize App runs -- `AttachAuthority` is exactly the set it authorized.
-    /// So a key that resolves to nothing is admitted only if the caller names a
-    /// client the guardian vouched for, and the attach is then owned by that
-    /// client rather than by an invented key.
+    /// vouch for App runs independently of any root -- it registers their business
+    /// lease and announces it on the lifeline (`ClientLeased`). So a key that
+    /// resolves to nothing is admitted only if the caller names such a client, and
+    /// the attach is then owned by that client rather than by an invented key.
+    ///
+    /// The client id arriving on the request is acceptable *here* and nowhere else:
+    /// this attach creates no authority of its own (`authorized_root()` stays
+    /// `None`), so the worst a caller gains by naming a client is a connection the
+    /// guardian already vouched for that client to open. Every operation that would
+    /// actually do work still demands a root authorization minted by the guardian
+    /// and delivered as a capability.
     ///
     /// Refusing instead (the previous behaviour) is what broke the desktop: the
     /// first thing delegation setup does is the project attach, so failing it

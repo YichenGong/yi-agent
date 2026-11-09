@@ -193,26 +193,28 @@ async fn a_managed_daemon_admits_a_project_attach_that_names_an_authorized_clien
     let coordinator = coordinator(&directory);
     let workspace = workspace(&directory);
 
-    let mut guardian = guardian_for(&directory, &coordinator);
+    let guardian = guardian_for(&directory, &coordinator);
     let secret = guardian.generation_secret();
-    // The guardian authorizes the App run. The root id it mints is irrelevant to
-    // this attach: a project attach opens a connection, not a particular root, so
-    // the daemon must still choose its own root id.
-    let authorization = guardian
-        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
-        .expect("a business client must be authorizable");
+    // Only the *lease* is announced, never a binding: this is the real order, and
+    // the order is the whole point. A desktop registers its business lease as soon
+    // as the runtime answers, and the very next thing it does is this project
+    // attach. No conversation exists yet, so the guardian has minted no root
+    // capability at all -- a gate that read only bindings would refuse every first
+    // attach, which is exactly how `spawn_agent` disappeared from the desktop.
     let mut daemon = verifier_for(&directory, &coordinator, secret);
     daemon
-        .apply(AuthorizationUpdate::Bind(Box::new(authorization)))
-        .expect("the verifier must accept its guardian\'s binding");
+        .apply(AuthorizationUpdate::ClientLeased {
+            client_run_id: "app-run-1".to_string(),
+        })
+        .expect("the verifier must accept a lease its guardian announced");
     coordinator
         .adopt_managed_authority(daemon)
-        .expect("the ledger names this coordinator\'s generation");
+        .expect("the ledger names this coordinator's generation");
 
     let attached = coordinator
         .attach_application_root("project:1234:/p:uuid", &workspace, &[], Some("app-run-1"))
         .await
-        .expect("a project attach naming an authorized client must be admitted");
+        .expect("a project attach naming a client the guardian leased must be admitted");
     assert_ne!(
         attached.root_task_id.to_string(),
         ROOT_ID,
@@ -958,4 +960,87 @@ async fn session_delegation_lifecycle_an_unjoined_stop_is_not_a_stop_proof() {
         ),
         "an unproven execution must keep blocking the next driver: {blocked}"
     );
+}
+
+/// A lease opens a connection; it does not authorize a root.
+///
+/// This is the boundary the `ClientLeased` announcement must not cross. A
+/// client with only a lease can perform the project attach (that is what makes
+/// `spawn_agent` reachable at all), but it must not be able to attach *as* a
+/// conversation root -- and it must not be able to present its own name where the
+/// protocol demands a capability. Otherwise announcing leases would be a general
+/// root grant wearing a smaller name.
+#[tokio::test]
+async fn a_lease_opens_a_connection_but_authorizes_no_root() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+
+    let guardian = guardian_for(&directory, &coordinator);
+    let secret = guardian.generation_secret();
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
+    daemon
+        .apply(AuthorizationUpdate::ClientLeased {
+            client_run_id: "app-run-1".to_string(),
+        })
+        .unwrap();
+    coordinator
+        .adopt_managed_authority(daemon)
+        .expect("the ledger names this coordinator's generation");
+
+    // The lease client may open a connection...
+    coordinator
+        .attach_application_root("project:1234:/p:uuid", &workspace, &[], Some("app-run-1"))
+        .await
+        .expect("a leased client may open the project connection");
+
+    // ...but the project root it got is *not* the conversation root: it was created
+    // under a daemon-chosen id, and the client still holds no capability. The
+    // guardian's ledger answers "no" for every capability the client could invent,
+    // so presenting its own name as one must be refused.
+    let error = coordinator
+        .attach_application_root("app-run-1", &workspace, &[], None)
+        .await
+        .expect_err("a lease must not double as a root capability");
+    let rendered = format!("{error}");
+    assert!(
+        rendered.contains("no root authorization"),
+        "the refusal must say the capability resolved to nothing: {rendered}"
+    );
+}
+
+/// Releasing the lease takes the connection permission away with it.
+///
+/// A project attach is only legitimate while the guardian still vouches for that
+/// client. If releasing left it admitted, a departed App could keep opening
+/// connections under a lease nobody holds -- and the reclaim that follows would
+/// target work it never agreed to supervise.
+#[tokio::test]
+async fn releasing_the_lease_stops_the_project_attach() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+
+    let guardian = guardian_for(&directory, &coordinator);
+    let secret = guardian.generation_secret();
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
+    daemon
+        .apply(AuthorizationUpdate::ClientLeased {
+            client_run_id: "app-run-1".to_string(),
+        })
+        .unwrap();
+    coordinator
+        .adopt_managed_authority(daemon)
+        .expect("the ledger names this coordinator's generation");
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::RevokeClient {
+            client_run_id: "app-run-1".to_string(),
+        })
+        .expect("the release must reach the daemon");
+
+    let error = coordinator
+        .attach_application_root("project:9999:/p:uuid", &workspace, &[], Some("app-run-1"))
+        .await
+        .expect_err("a released client must not open a new connection");
+    assert!(format!("{error}").contains("app-run-1"), "{error}");
 }

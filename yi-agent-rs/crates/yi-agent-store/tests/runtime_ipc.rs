@@ -7224,21 +7224,19 @@ fn a_managed_daemon_admits_a_project_attach_over_the_wire_when_it_names_its_clie
         guardian.generation_secret(),
     );
 
-    // The guardian authorizes the App run and hands the binding to the daemon's
-    // half. Its root id belongs to the conversation root this project attach will
-    // *later* be followed by, so the project attach must not adopt it.
-    let authorization = guardian
-        .issue(
-            "app-run-1",
-            "0b7c1d2e-3f40-4a51-b662-738495a6b7c8",
-            yi_agent_lifecycle::types::LeaseMode::Business,
-        )
-        .expect("a business client is authorizable");
+    // The guardian announces the App run's *lease*, not a root binding, and that
+    // is the realistic frame order: a desktop registers its lease as soon as the
+    // runtime answers and then immediately does this project attach, so no
+    // conversation -- and therefore no capability -- exists yet. A fixture that
+    // pre-installed a binding would make this test pass against the broken gate.
+    let _ = &mut guardian;
     yi_agent_lifecycle::authorization::AuthorizationLedger::apply(
         &mut verifier,
-        yi_agent_lifecycle::authorization::AuthorizationUpdate::Bind(Box::new(authorization)),
+        yi_agent_lifecycle::authorization::AuthorizationUpdate::ClientLeased {
+            client_run_id: "app-run-1".to_string(),
+        },
     )
-    .expect("the verifier accepts its guardian's binding");
+    .expect("the verifier accepts the lease its guardian announced");
 
     let starts = Arc::new(Mutex::new(Vec::new()));
     let daemon = Daemon::start_with_factory_and_authority(
