@@ -8,4 +8,6 @@ pub mod client;
 pub mod daemon_socket;
 pub mod server;
 pub mod socket;
+/// Status 探活的有界 IO（crate 私有）。
+mod status_io;
 pub mod wire;

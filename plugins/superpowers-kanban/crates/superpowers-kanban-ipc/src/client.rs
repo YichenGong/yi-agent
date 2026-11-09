@@ -7,13 +7,44 @@ use crate::wire::{
     Command, MAX_FRAME_BYTES, PROTOCOL_VERSION, Reply, RequestEnvelope, ResponseEnvelope,
 };
 
+/// 探活卡在哪个阶段。超时诊断必须说清「连不上」还是「连上了但不说话」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeStage {
+    Connect,
+    Write,
+    Read,
+}
+
+impl std::fmt::Display for ProbeStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeStage::Connect => write!(f, "connect"),
+            ProbeStage::Write => write!(f, "write"),
+            ProbeStage::Read => write!(f, "read"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ClientError {
     Io(std::io::Error),
+    /// 共享预算耗尽；`stage` 说明卡在哪一步。
+    Timeout {
+        stage: ProbeStage,
+    },
     Malformed(String),
-    ProtocolVersion { found: u32, expected: u32 },
-    RequestIdMismatch { found: String, expected: String },
-    FrameTooLarge { bytes: usize, limit: usize },
+    ProtocolVersion {
+        found: u32,
+        expected: u32,
+    },
+    RequestIdMismatch {
+        found: String,
+        expected: String,
+    },
+    FrameTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
     Truncated,
 }
 
@@ -21,6 +52,9 @@ impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::Io(error) => write!(f, "ipc io error: {error}"),
+            ClientError::Timeout { stage } => {
+                write!(f, "ipc probe timeout during {stage}")
+            }
             ClientError::Malformed(message) => write!(f, "malformed ipc frame: {message}"),
             ClientError::ProtocolVersion { found, expected } => write!(
                 f,
