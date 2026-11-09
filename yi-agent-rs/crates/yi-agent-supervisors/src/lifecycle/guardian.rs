@@ -1489,11 +1489,24 @@ impl Guardian {
             self.scope.key.clone(),
             instance_id.clone(),
         );
+        // One nonce per launch, from the OS source rather than derived from the
+        // generation secret. This is what a leftover daemon cannot reproduce: it never
+        // saw this value, so its `Status` on a stale socket cannot be mistaken for the
+        // readiness of the process above.
+        let startup_nonce = yi_agent_lifecycle::authorization::fresh_startup_nonce()?;
         let hello = yi_agent_lifecycle::authorization::LifelineHello::new(
             self.scope.key.clone(),
             instance_id.clone(),
             ledger.generation_secret(),
-        );
+        )
+        .with_startup_nonce(startup_nonce.clone());
+        let expected_ready = super::daemon_ready::DaemonReady {
+            startup_nonce,
+            scope_key: self.scope.key.clone(),
+            daemon_instance_id: instance_id.clone(),
+            build_id: self.artifact.build_id.clone(),
+            business_protocol: self.artifact.business_protocol_max,
+        };
         // The descriptor that proves to the daemon that it was started by a guardian.
         // The guardian-side end is kept for the daemon's whole life: closing it would
         // tell the daemon its launcher is gone while the guardian still supervises it.
@@ -1555,10 +1568,13 @@ impl Guardian {
         // `spawn` consumes its deadline, and the wait below needs the same budget:
         // re-deriving it rather than shrinking it keeps "start plus bind" inside one
         // caller-visible window instead of two.
+        // The *same* deadline as the ready wait below, not a fresh budget: two Budgets
+        // would make "start plus bind" as long as the sum, and the caller's window is
+        // what the guardian promised.
         let started = registry
             .lock()
             .map_err(|_| io::Error::other("process registry mutex poisoned"))?
-            .spawn(command, Deadline::after(budget));
+            .spawn(command, deadline.clone());
         let process_id = match started {
             Ok(process_id) => process_id,
             Err(error) => {
@@ -1570,69 +1586,151 @@ impl Guardian {
         };
 
         // The greeting goes out before we wait for the socket: the daemon reads it
-        // first thing and refuses to serve without it. Failing to write here is not
-        // fatal to the start -- the daemon falls back to unmanaged, which is the
-        // compatibility path -- but it is recorded, because an App attach will then
-        // be refused with a reason nobody could otherwise explain.
+        // first thing and refuses to serve without it. A failed write is a failed
+        // start, not a warning: the hello carries the nonce the readiness proof must
+        // echo, so a daemon that never got it can never prove readiness -- waiting for
+        // it would burn the whole budget and then reclaim the child anyway.
         if let Err(error) = yi_agent_lifecycle::codec::write_frame(&mut guardian_end, &hello) {
-            tracing::warn!(
-                error = %error,
-                "the managed daemon could not be told its authorization secret"
-            );
+            drop(guardian_end);
+            reclaim_spawned(&registry, &instance_id, &process_id);
+            return Err(error);
         }
 
-        let socket = yi_agent_store::ipc::socket_path_for(&self.scope.runtime_dir)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        // The socket may be the *previous* daemon's leftover node. Waiting for a
-        // `Status` answer, rather than for the file to exist, is what distinguishes
-        // "our daemon bound" from "a dead node is still on disk".
-        while !deadline.is_expired() {
-            if yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Status)
-                .is_ok()
-            {
-                self.daemon = Some(GuardianDaemon {
-                    instance_id: instance_id.clone(),
-                    // The bytes are the ones this guardian launched: the guardian is
-                    // the authority on which artifact it pinned, and it does not
-                    // pretend to have read a self-description the daemon never sends.
-                    build_id: self.artifact.build_id.clone(),
-                    display_version: self.artifact.display_version.clone(),
-                    business_protocol: self.artifact.business_protocol_max,
-                    capabilities: self.artifact.capabilities.clone(),
-                    process_id,
-                });
-                self.authorizations = Some(ledger);
-                self.daemon_lifeline = Some(guardian_end);
-                // Only now: a bridge attached to a daemon that never answered would
-                // invite the guardian to install authority into a process that is not
-                // serving anything. The pair is non-blocking so a wedged peer can never
-                // stall the control loop that owns it.
-                bridge_guardian_end.set_nonblocking(true)?;
-                self.attach_bridge(bridge_guardian_end);
-                return Ok(());
+        // Readiness is proven over the *private* lifeline, not by asking the business
+        // socket for a `Status`. A listening socket proves only that *something* bound
+        // the path: an old daemon from a previous launch answers `Status` perfectly
+        // well, and a guardian that accepted it would publish authority for a process
+        // it does not own. The child writes one Ready frame over the descriptor only
+        // this launch holds, and it must echo the nonce above.
+        let ready = match super::daemon_ready::read_ready(&mut guardian_end, &deadline) {
+            Ok(ready) => ready,
+            Err(error) => {
+                drop(guardian_end);
+                reclaim_spawned(&registry, &instance_id, &process_id);
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("the managed daemon never proved readiness: {error}"),
+                ));
             }
-            std::thread::sleep(deadline.clamp(Duration::from_millis(20)));
+        };
+        if let Err(error) = super::daemon_ready::validate_ready(&ready, &expected_ready) {
+            drop(guardian_end);
+            reclaim_spawned(&registry, &instance_id, &process_id);
+            return Err(error);
         }
-        // A daemon that never answered is not a daemon, and leaving it running would
-        // put an unreachable process group beside the next generation.
-        let mut registry = registry
-            .lock()
-            .map_err(|_| io::Error::other("process registry mutex poisoned"))?;
-        let _ = registry.terminate_granted(
-            &ProcessOwner::daemon(&instance_id),
-            &process_id,
-            Deadline::after(Duration::from_secs(5)),
-        );
-        drop(guardian_end);
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "the managed daemon did not answer within {}s",
-                budget.as_secs()
-            ),
-        ))
-    }
 
+        // Everything fallible is finished before any field is committed. Setting
+        // `self.daemon` first and then failing on the bridge would publish a daemon
+        // whose authority was never attached -- a partial ready that reads as healthy.
+        if let Err(error) = bridge_guardian_end.set_nonblocking(true) {
+            drop(guardian_end);
+            reclaim_spawned(&registry, &instance_id, &process_id);
+            return Err(error);
+        }
+
+        // Last check before publishing: the process that proved readiness must still
+        // be the one this guardian spawned. Without it a daemon that exited right after
+        // writing the frame -- and whose pid the OS has already recycled -- would be
+        // recorded as serving.
+        let alive = {
+            let registry = registry
+                .lock()
+                .map_err(|_| io::Error::other("process registry mutex poisoned"))?;
+            spawned_child_is_alive(&registry, &process_id)
+        };
+        match alive {
+            Ok(true) => {}
+            Ok(false) => {
+                drop(guardian_end);
+                return Err(io::Error::other(
+                    "the managed daemon exited after proving readiness",
+                ));
+            }
+            Err(error) => {
+                drop(guardian_end);
+                reclaim_spawned(&registry, &instance_id, &process_id);
+                return Err(error);
+            }
+        }
+
+        self.daemon = Some(GuardianDaemon {
+            instance_id: instance_id.clone(),
+            // The bytes are the ones this guardian launched: the guardian is the
+            // authority on which artifact it pinned, and it does not pretend to have
+            // read a self-description the daemon never sends.
+            build_id: self.artifact.build_id.clone(),
+            display_version: self.artifact.display_version.clone(),
+            business_protocol: self.artifact.business_protocol_max,
+            capabilities: self.artifact.capabilities.clone(),
+            process_id,
+        });
+        self.authorizations = Some(ledger);
+        self.daemon_lifeline = Some(guardian_end);
+        // Only now: a bridge attached to a daemon that never proved readiness would
+        // invite the guardian to install authority into a process that is not serving
+        // anything. The pair is non-blocking so a wedged peer can never stall the
+        // control loop that owns it.
+        self.attach_bridge(bridge_guardian_end);
+        Ok(())
+    }
+}
+
+/// Reclaims the child *this* start spawned, and only that one.
+///
+/// Named by process id and owner rather than by whatever currently holds the socket:
+/// killing a pid read off the business socket is how a failed start takes down the
+/// daemon a user was already running. The reclaim gets its own bounded budget because
+/// the start's budget is already spent by definition here -- and it is a *cleanup*
+/// window, not an extension of the success wait.
+fn reclaim_spawned(
+    registry: &std::sync::Arc<std::sync::Mutex<ProcessRegistry>>,
+    instance_id: &str,
+    process_id: &str,
+) {
+    let Ok(mut registry) = registry.lock() else {
+        tracing::warn!(
+            process = %instance_id,
+            "could not reclaim the managed daemon: the process registry mutex is poisoned"
+        );
+        return;
+    };
+    if let Err(error) = registry.terminate_granted(
+        &ProcessOwner::daemon(instance_id),
+        process_id,
+        Deadline::after(Duration::from_secs(5)),
+    ) {
+        tracing::warn!(
+            error = %error,
+            process = %instance_id,
+            "could not confirm the failed managed start was reclaimed"
+        );
+    }
+}
+
+/// Whether the process this start spawned is still the one running.
+///
+/// Compares the journaled birth identity rather than asking `kill(pid, 0)`: a
+/// recycled pid answers "alive" about an unrelated process, and this answer decides
+/// whether a daemon gets published.
+fn spawned_child_is_alive(registry: &ProcessRegistry, process_id: &str) -> io::Result<bool> {
+    let Some(record) = registry
+        .records()
+        .iter()
+        .find(|record| record.process_id == process_id)
+    else {
+        return Ok(false);
+    };
+    // `ProcessBirth::of` reads the pid's start time and reports "gone" as a typed
+    // error; comparing microseconds within one platform is exactly what the journal
+    // recorded for this reason.
+    match processes::ProcessBirth::of(record.pid) {
+        Ok(birth) => Ok(birth.started_at() == record.start_micros),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+impl Guardian {
     /// Stops the daemon this guardian started, proving its group stopped.
     ///
     /// Idempotent: a guardian with no daemon has nothing to stop, and a second call
@@ -2028,8 +2126,88 @@ impl Guardian {
         }
     }
 
+    /// Installs a lifeline peer without a ledger, for tests that only observe the
+    /// channel's liveness.
+    ///
+    /// Production never reaches this state -- a lifeline exists only under a daemon
+    /// that answered on it -- but the withdrawal logic is exactly about a channel
+    /// whose daemon is gone, so it has to be constructible.
+    pub fn attach_daemon_lifeline_for_test(&mut self, lifeline: std::os::unix::net::UnixStream) {
+        self.daemon_lifeline = Some(lifeline);
+    }
+
     pub fn attach_bridge_for_test(&mut self, bridge: std::os::unix::net::UnixStream) {
         self.bridge = Some(bridge);
+    }
+
+    /// Whether the daemon's private lifeline has closed under a live child.
+    ///
+    /// Readiness is proven once, over that descriptor, and the descriptor then stays
+    /// open for the daemon's whole life. Its EOF therefore means the daemon is gone
+    /// even when the process still exists -- a daemon that closed the channel can no
+    /// longer answer authority frames, so continuing to report it as ready would hand
+    /// clients a runtime that silently drops their roots.
+    ///
+    /// Non-consuming on purpose: `peek` looks at the same bytes the authority pump
+    /// reads, so a frame in flight is left for it. `POLLHUP`/`POLLERR` alone is not
+    /// enough either -- both can be reported with data still buffered.
+    pub fn daemon_lifeline_gone(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let Some(lifeline) = self.daemon_lifeline.as_ref() else {
+            return false;
+        };
+        let mut descriptor = libc::pollfd {
+            fd: lifeline.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Zero wait: this runs on the supervision tick, and blocking here would stall
+        // lease maintenance for every other client of this guardian.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if ready <= 0 {
+            return false;
+        }
+        if descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return true;
+        }
+        if descriptor.revents & libc::POLLIN == 0 {
+            return false;
+        }
+        let mut byte = 0u8;
+        let peeked = unsafe {
+            libc::recv(
+                lifeline.as_raw_fd(),
+                &mut byte as *mut u8 as *mut libc::c_void,
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        // `0` from `recv` on a stream socket is the EOF: the peer closed its end.
+        peeked == 0
+    }
+
+    /// Withdraws readiness when the daemon or its channel is gone.
+    ///
+    /// Deliberately only clears the *published* state: it does not signal anything and
+    /// does not touch the registry. A withdrawal is an observation, and turning it into
+    /// a kill would let a supervision tick take down a process it merely suspects.
+    /// Returns whether anything was withdrawn.
+    pub fn revoke_ready_if_gone(&mut self) -> bool {
+        let closed = self.daemon_lifeline_gone();
+        let exited = match (self.daemon.as_ref(), self.registry.as_ref()) {
+            (Some(daemon), Some(registry)) => {
+                let registry = registry.lock().expect("process registry mutex poisoned");
+                !spawned_child_is_alive(&registry, &daemon.process_id).unwrap_or(true)
+            }
+            _ => false,
+        };
+        if !closed && !exited {
+            return false;
+        }
+        let published = self.daemon.take().is_some();
+        self.daemon_lifeline = None;
+        self.authorizations = None;
+        published
     }
 
     /// Whether this guardian holds the handles needed to stop what it started.
@@ -2365,6 +2543,15 @@ pub fn serve_with_lifeline(
                     Err(error) => return Err(error),
                 }
             }
+        }
+        // A daemon that closed its lifeline, or whose recorded child is gone, must
+        // stop being advertised as ready here rather than at the next client's first
+        // failed request.
+        if guardian.revoke_ready_if_gone() {
+            tracing::warn!(
+                scope = %guardian.scope.key,
+                "the managed daemon is no longer serving; withdrawing readiness"
+            );
         }
         let _ = guardian.maintain(lease_now());
         // The last client leaving ends this generation: the daemon is stopped with

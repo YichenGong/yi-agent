@@ -450,6 +450,43 @@ pub fn run_managed_daemon(
         bridge,
     )
     .map_err(|error| anyhow::anyhow!("could not start the managed daemon: {error}"))?;
+    // The daemon is listening at this point, and this is the *only* moment it can
+    // prove that honestly: it holds the socket, so a frame sent now names the process
+    // that owns it. A `Status` on the socket could have been answered by an older
+    // daemon; this frame cannot, because it carries the nonce only this launch saw.
+    //
+    // Written before the authority pump takes the descriptor: two readers on one
+    // channel would race for the guardian's frames, and the pump would swallow the
+    // rest of a half-read Ready.
+    if let (Some(nonce), Some(lifeline)) = (hello.startup_nonce.clone(), lifeline.as_ref()) {
+        let ready = yi_agent_supervisors::lifecycle::daemon_ready::DaemonReady {
+            startup_nonce: nonce,
+            scope_key: hello.scope_key.clone(),
+            daemon_instance_id: hello.daemon_instance_id.clone(),
+            // The daemon's own compile-time identity and the protocol it speaks, not
+            // values copied from the greeting: the guardian compares these against the
+            // artifact it pinned, and a daemon echoing the guardian's expectation back
+            // would make that comparison say nothing.
+            build_id: crate::build_info::DAEMON_BUILD_ID.to_string(),
+            business_protocol: yi_agent_store::ipc::PROTOCOL_VERSION,
+        };
+        let mut stream = unsafe {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            // Borrowed, not taken: `lifeline` stays the owner and the pump below
+            // still needs it.
+            std::mem::ManuallyDrop::new(std::os::unix::net::UnixStream::from_raw_fd(
+                lifeline.as_raw_fd(),
+            ))
+        };
+        yi_agent_supervisors::lifecycle::daemon_ready::write_ready(
+            &mut stream,
+            &ready,
+            &yi_agent_lifecycle::deadline::Deadline::after(
+                yi_agent_supervisors::lifecycle::daemon_ready::handshake_budget(),
+            ),
+        )
+        .map_err(|error| anyhow::anyhow!("the daemon could not prove readiness: {error}"))?;
+    }
     // Only now does listening for further authority make sense: the coordinator
     // exists, so a binding frame has somewhere to land. Until the daemon stops, this
     // loop also *is* the death monitor -- it returns when the guardian closes the
