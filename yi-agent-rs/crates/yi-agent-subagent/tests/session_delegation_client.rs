@@ -947,3 +947,104 @@ fn stop_evidence(
         process_identity: None,
     }
 }
+
+/// A managed conversation's container attach must present the guardian's
+/// capability, not the conversation's stable key.
+///
+/// A managed daemon resolves an attach key through the guardian's ledger, where the
+/// key *is* the `rootcap1:` capability the shell brokered (see
+/// `managed_attach_authority`). `thread:<id>` appears nowhere in that ledger, so a
+/// container attach that presents it is refused with
+/// `no root authorization matches this capability` -- which is exactly what made
+/// every delegated turn on a managed runtime fail with
+/// `the daemon did not attach a session container`.
+///
+/// The two halves are asserted separately: without authority the attach must fail
+/// closed (never silently fall back to the legacy key), and with it the same
+/// conversation must attach.
+#[test]
+fn session_delegation_lifecycle_a_managed_container_attach_presents_the_brokered_capability() {
+    use yi_agent_lifecycle::authorization::{AuthorizationLedger, AuthorizationUpdate};
+    use yi_agent_lifecycle::types::LeaseMode;
+    use yi_agent_subagent::managed_binding::{ManagedContext, RootAuthorityStore};
+    use yi_agent_subagent::thread_root::application_root_key;
+
+    let directory = tempfile::tempdir().unwrap();
+    let daemon = daemon_in(&directory);
+    let workspace = directory.path().join("project");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    // The daemon's half of the handshake: a verifier bound to the generation the
+    // daemon actually reports, fed by the guardian's minted authorization.
+    let scope = "managed-scope";
+    let generation = daemon.coordinator_for_test().generation().to_string();
+    let mut guardian = AuthorizationLedger::new(scope, generation.clone());
+    let mut verifier =
+        AuthorizationLedger::verifier(scope, generation.clone(), guardian.generation_secret());
+    let root_id = "5c4a1f0e-2d3b-4a6c-8e7f-90a1b2c3d4e5";
+    let authorization = guardian
+        .issue("app-run-1", root_id, LeaseMode::Business)
+        .expect("a business client is authorizable");
+    verifier
+        .apply(AuthorizationUpdate::Bind(Box::new(authorization.clone())))
+        .expect("the verifier accepts its guardian's binding");
+    daemon
+        .coordinator_for_test()
+        .adopt_managed_authority(verifier)
+        .expect("the ledger names this daemon's generation");
+
+    // The sidecar's half: the shell brokered this conversation's authority under the
+    // authenticated epoch, keyed by the five-part key the attach path looks up.
+    let mut store = RootAuthorityStore::new();
+    store
+        .bind_epoch(&generation)
+        .expect("the handshake fixed an epoch");
+    store
+        .install_entry(yi_agent_lifecycle::production::RootAuthorityEntry {
+            key: yi_agent_lifecycle::production::RootAuthorityKey {
+                scope_key: scope.into(),
+                generation: generation.clone(),
+                client_run_id: "app-run-1".into(),
+                thread_key: application_root_key("thread-managed"),
+                root_id: root_id.into(),
+            },
+            capability: SecretCapability::new(authorization.capability.clone()),
+        })
+        .expect("the entry belongs to this session");
+    let context = Arc::new(ManagedContext::new(
+        Arc::new(std::sync::Mutex::new(store)),
+        scope,
+        "app-run-1",
+    ));
+
+    let root = ThreadRoot::managed(
+        RuntimeBinding::fixed(RuntimeHandle {
+            socket_path: daemon.socket_path().to_path_buf(),
+            workspace_root: workspace.clone(),
+            session_id: String::new(),
+            task_id: String::new(),
+            capability: String::new(),
+        }),
+        "thread-managed",
+        workspace,
+        Vec::new(),
+        context,
+    );
+
+    let attachment = root
+        .attach_session_container(
+            &SessionIdentity::Embedded(SecretCapability::new("resume-secret")),
+            "op-attach-1",
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "a managed container attach must present the brokered capability; \
+                 presenting thread:<id> is refused by the ledger: {error:?}"
+            )
+        });
+    assert_eq!(
+        attachment.root_id, root_id,
+        "the container must be the root the guardian authorized"
+    );
+}

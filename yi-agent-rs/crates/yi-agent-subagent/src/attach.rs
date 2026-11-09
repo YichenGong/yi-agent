@@ -653,6 +653,76 @@ mod tests {
     };
     use yi_agent_store::ipc::Daemon;
 
+    /// A fixture identity: the mapping never inspects the fields, so only their
+    /// presence is asserted.
+    fn context_fixture(declared: bool) -> super::ManagedContext {
+        super::ManagedContext {
+            expected: yi_agent_lifecycle::types::ArtifactIdentity {
+                build_id: "fixture-build".into(),
+                display_version: "0.0.0".into(),
+                executable: std::path::PathBuf::from("/usr/bin/true"),
+                sha256: String::new(),
+                schema_min: 1,
+                schema_max: 1,
+                handover_version: 1,
+                business_protocol_min: 1,
+                business_protocol_max: 1,
+                capabilities: Vec::new(),
+            },
+            instance_home: std::path::PathBuf::from("/fixture/instance"),
+            managed_frontend: declared,
+        }
+    }
+
+    /// The precedence table must not depend on a process-global env var or the
+    /// `OnceLock`: the pure half takes both inputs, so each case is independent.
+    #[test]
+    fn effective_bringup_choice_preserves_context_and_overrides() {
+        let cases = [
+            (true, None, BringUpPolicy::Managed),
+            (false, None, BringUpPolicy::Embedded),
+            (true, Some("embedded"), BringUpPolicy::Embedded),
+            (false, Some("managed"), BringUpPolicy::Managed),
+            (true, Some("invalid"), BringUpPolicy::Managed),
+            (false, Some("invalid"), BringUpPolicy::Embedded),
+        ];
+        for (declared, value, expected_policy) in cases {
+            let context = context_fixture(declared);
+            let choice = super::bringup_choice_from(value, Some(&context));
+            assert_eq!(
+                choice.policy, expected_policy,
+                "declared={declared} value={value:?}"
+            );
+            // A policy carried without its identity would fail every later repair
+            // with "needs the artifact identity" long after the launch looked fine.
+            assert_eq!(
+                choice.expected.as_ref(),
+                Some(&context.expected),
+                "expected must survive the mapping (declared={declared} value={value:?})"
+            );
+            assert_eq!(
+                choice.instance_home.as_ref(),
+                Some(&context.instance_home),
+                "instance home must survive the mapping (declared={declared} value={value:?})"
+            );
+        }
+        let absent = super::bringup_choice_from(None, None);
+        assert_eq!(absent.policy, BringUpPolicy::Embedded);
+        assert!(absent.expected.is_none());
+        assert!(absent.instance_home.is_none());
+    }
+
+    /// A process that never installed a context may still be pinned by env, but it
+    /// has no artifact identity to classify -- the fields stay absent so a managed
+    /// bring-up refuses instead of guessing.
+    #[test]
+    fn a_contextless_process_carries_no_identity() {
+        let choice = super::bringup_choice_from(Some("managed"), None);
+        assert_eq!(choice.policy, BringUpPolicy::Managed);
+        assert!(choice.expected.is_none());
+        assert!(choice.instance_home.is_none());
+    }
+
     /// A fully-populated config for the factory tests. Every field the resolved
     /// catalog entry could clobber is set to a recognizable "base" value so a
     /// test can tell the entry's value from the process cfg's.
@@ -1240,6 +1310,23 @@ pub fn managed_context() -> Option<&'static ManagedContext> {
     MANAGED_CONTEXT.get()
 }
 
+/// Whether this process's entry point declared itself a managed frontend.
+///
+/// `false` covers both "an embedded entry point" and "nothing installed a
+/// context": each means the same thing to a caller asking whether a
+/// guardian-owned runtime is what this process uses, and neither is a claim that
+/// a managed runtime exists.
+///
+/// Unattended daemon starters consult this. A managed frontend already has the
+/// guardian's daemon, and starting an embedded one beside it makes the two fight
+/// over one socket -- the loser exits, and a `managedReady` project becomes
+/// unreachable, which reads to a user as "the delegation tools disappeared".
+pub fn is_managed_frontend() -> bool {
+    MANAGED_CONTEXT
+        .get()
+        .is_some_and(|context| context.managed_frontend)
+}
+
 /// The bring-up choice this process should use, assembled from the installed context.
 ///
 /// One function so the two call sites (the app-server's project attach and the
@@ -1260,14 +1347,33 @@ pub fn managed_context() -> Option<&'static ManagedContext> {
 /// context-presence rule (rather than an explicit declaration) would sweep a manual
 /// `daemon` into a guardian-owned runtime it never asked for.
 pub fn process_bringup_choice() -> crate::binding::BringUpChoice {
-    let declared = managed_context().is_some_and(|context| context.managed_frontend);
-    let policy = match std::env::var("YI_AGENT_BRINGUP").ok().as_deref() {
+    bringup_choice_from(
+        std::env::var("YI_AGENT_BRINGUP").ok().as_deref(),
+        managed_context(),
+    )
+}
+
+/// The pure half of [`process_bringup_choice`].
+///
+/// Takes both inputs explicitly so the precedence table can be tested without
+/// mutating a process-global environment variable or the `OnceLock` every other
+/// test in the binary also reads. The production caller is the only place that
+/// reads either.
+///
+/// The mapping is the documented one: an explicit `YI_AGENT_BRINGUP` wins in both
+/// directions, then the entry point's own declaration, then the build default.
+pub fn bringup_choice_from(
+    value: Option<&str>,
+    context: Option<&ManagedContext>,
+) -> crate::binding::BringUpChoice {
+    let declared = context.is_some_and(|context| context.managed_frontend);
+    let policy = match value {
         Some("managed") => BringUpPolicy::Managed,
         Some("embedded") => BringUpPolicy::Embedded,
         _ if declared => BringUpPolicy::for_managed_frontend(),
         _ => BringUpPolicy::default_for_build(),
     };
-    match managed_context() {
+    match context {
         Some(context) => crate::binding::BringUpChoice {
             policy,
             expected: Some(context.expected.clone()),

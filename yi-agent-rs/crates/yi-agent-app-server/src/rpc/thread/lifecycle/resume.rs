@@ -171,6 +171,7 @@ pub(crate) async fn handle(
                 &runtime_dir,
                 crate::server::managed_snapshot(state.managed),
                 state.models_path,
+                state.bringup,
                 state.cfg,
                 &cwd,
                 &thread_id,

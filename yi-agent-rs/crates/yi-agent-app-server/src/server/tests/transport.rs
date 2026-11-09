@@ -34,6 +34,7 @@ async fn write_or_fatal_reports_a_local_write_failure_on_the_fatal_channel() {
         watchman_uninstall: std::sync::Arc::new(|_home: &Path| -> Result<(), String> { Ok(()) }),
         plugin_gate: None,
         managed_session: false,
+        bringup_policy: yi_agent_subagent::attach::BringUpPolicy::Embedded,
         fatal_tx,
     };
 
@@ -109,6 +110,7 @@ async fn agent_factory_failure_returns_internal_error() {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             managed: Arc::new(StdMutex::new(None)),
+            bringup: Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             settings_path: PathBuf::new(),

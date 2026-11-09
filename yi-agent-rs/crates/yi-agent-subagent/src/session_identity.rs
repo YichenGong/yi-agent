@@ -72,15 +72,23 @@ impl SessionIdentityStore {
         }
     }
 
-    /// The file for one thread, refusing anything that could escape the directory.
+    /// The file for one thread, named so that no id can address another's secret.
+    ///
+    /// The id is the runtime's own vocabulary, not a file name: the daemon mints
+    /// colon-separated keys everywhere (`thread:<id>`, `app-server:<pid>`), and
+    /// `run` names its conversation `run:<pid>:<uuid>`. Refusing those characters
+    /// here broke a managed `run` before its first turn. So the id is encoded,
+    /// not narrowed: `[A-Za-z0-9._-]` passes through verbatim (existing secrets
+    /// keep their names) and every other byte becomes `%XX`. A `/` or a `..`
+    /// therefore stays inside this directory instead of climbing out of it.
     fn path_for(&self, thread_id: &str) -> std::io::Result<PathBuf> {
-        if !is_safe_thread_id(thread_id) {
-            return Err(std::io::Error::new(
+        match thread_file_stem(thread_id) {
+            Some(stem) => Ok(self.directory.join(format!("{stem}.json"))),
+            None => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "a thread id may only contain letters, digits, '-', '_' and '.'",
-            ));
+                "a thread id must be non-empty and must not be '.' or '..'",
+            )),
         }
-        Ok(self.directory.join(format!("{thread_id}.json")))
     }
 
     fn ensure_directory(&self) -> std::io::Result<()> {
@@ -179,18 +187,55 @@ fn write_new(path: &Path, secret: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Whether a thread id is a plain file name component.
+/// The longest encoded stem written verbatim.
 ///
-/// Deliberately narrow: a thread id reaches a file path, and `.`/`..` or a slash
-/// would let one conversation address another's secret.
-fn is_safe_thread_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value != "."
-        && value != ".."
-        && value.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
-        })
+/// A path component is capped at 255 bytes on the filesystems this runs on, and
+/// `path.with_extension("tmp")` in the writer appends to the same stem. Anything
+/// longer is flattened to a digest below instead of failing.
+const MAX_STEM_LEN: usize = 200;
+
+/// The file-name stem for one thread id.
+///
+/// `None` means the id cannot name a conversation at all (empty, `.`, `..`).
+///
+/// Everything else is *encoded*, never rejected: the id is the runtime's own
+/// vocabulary (`thread:<id>`, `app-server:<pid>`, `run:<pid>:<uuid>`), so the store
+/// has to carry the ids the daemon actually mints. Percent-encoding is injective
+/// and never emits a path separator, so one conversation can only ever address its
+/// own secret. Ids made only of the plain characters keep their old file name, so
+/// an existing secret is still found.
+fn thread_file_stem(thread_id: &str) -> Option<String> {
+    if thread_id.is_empty() || thread_id == "." || thread_id == ".." {
+        return None;
+    }
+    let mut encoded = String::with_capacity(thread_id.len());
+    for byte in thread_id.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                encoded.push(*byte as char);
+            }
+            // `` is not in the pass-through set, so no encoded stem can be
+            // mistaken for the digest form below.
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    if encoded.len() <= MAX_STEM_LEN {
+        return Some(encoded);
+    }
+    // A percent-encoded overlong id would not fit in one path component, and
+    // refusing it would deny delegation to a conversation whose only sin is a long
+    // id. Flattening keeps the mapping stable and collision-resistant instead.
+    let digest = Sha256::digest(thread_id.as_bytes());
+    let mut stem = String::with_capacity(1 + digest.len() * 2);
+    stem.push('~');
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(stem, "{byte:02x}");
+    }
+    Some(stem)
 }
 
 /// The digest the daemon stores for a resume secret.
@@ -238,10 +283,57 @@ mod tests {
                 & 0o777
                 == 0o700
         );
-        assert!(store.load_or_create("../escape").is_err());
         assert!(store.load_or_create("..").is_err());
         assert!(store.load_or_create("").is_err());
         assert!(!format!("{a:?}").contains(a.expose()));
+    }
+
+    /// An id that looks like a path stays inside the store's own directory.
+    ///
+    /// The old rule refused `../escape` outright; the id is now encoded instead, so
+    /// the security property has to be asserted on where the file landed rather
+    /// than on whether the call failed.
+    #[test]
+    fn session_delegation_lifecycle_a_path_like_thread_id_cannot_escape_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionIdentityStore::new(dir.path().join("identities"));
+        store.load_or_create("../escape").unwrap();
+        store.load_or_create("/etc/passwd").unwrap();
+        // Exactly the store's own files, and nothing one level up.
+        let mut names: Vec<String> = std::fs::read_dir(store.directory())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["%2Fetc%2Fpasswd.json", "..%2Fescape.json"],
+            "both ids stay inside the store, encoded"
+        );
+        assert!(!dir.path().join("escape.json").exists());
+        assert!(!dir.path().join("escape").exists());
+    }
+
+    /// A thread id is the runtime's own vocabulary, not a file name: every key the
+    /// daemon mints is colon-separated (`thread:<id>`, `app-server:<pid>`), and
+    /// `run` names its conversation `run:<pid>:<uuid>`. Refusing `:` here made a
+    /// managed `run` delegation die before its first turn with
+    /// "the conversation's resume credential is unusable", so the store must carry
+    /// those ids instead of narrowing the caller's vocabulary.
+    #[test]
+    fn session_delegation_lifecycle_a_colon_separated_thread_id_gets_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionIdentityStore::new(dir.path().join("identities"));
+        let run_id = "run:4321:6f1d1f4c-1111-4222-8333-944455556666";
+        let first = store.load_or_create(run_id).unwrap();
+        let second = store.load_or_create(run_id).unwrap();
+        assert_eq!(first, second, "one conversation, one stable credential");
+        // Two conversations whose ids differ only after a colon must not share a
+        // credential: a collision here would hand one host another's session.
+        let other = store
+            .load_or_create("run:4321:7f1d1f4c-1111-4222-8333-944455556666")
+            .unwrap();
+        assert_ne!(first, other);
     }
 
     #[test]

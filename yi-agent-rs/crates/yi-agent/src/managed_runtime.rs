@@ -32,9 +32,15 @@ pub fn run_executor(
     // control channel carries work, never authority to pick a provider, a model,
     // or a credential.
     let models_path = config_path.unwrap_or_else(yi_agent_runtime::models::models_path);
-    let runtime_socket = yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir);
+    // A worker's tools dial the daemon's socket. The runtime *directory* is where the
+    // database and the lock live; connecting to it is refused by the OS with
+    // `Socket operation on non-socket`, which a child then reports as
+    // "daemon is unavailable" from inside its own `spawn_agent`.
+    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir);
+    let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)
+        .map_err(|error| anyhow::anyhow!("the runtime socket is unresolvable: {error}"))?;
     let factory =
-        yi_agent_subagent::attach::worker_factory(&invocation, runtime_socket, &models_path)?;
+        yi_agent_subagent::attach::worker_factory(&invocation, socket_path, &models_path)?;
     // A managed executor always offers the gate: the daemon above it is the only
     // place a machine-wide limit can be enforced.
     serve_executor(control, owner, factory, true)?;
@@ -193,6 +199,13 @@ fn read_lifeline_hello(
     }
     let mut body = vec![0u8; length];
     stream.read_exact(&mut body)?;
+    // The deadline above exists to bound *this* greeting, and it must not outlive it.
+    // The same descriptor is the authority lifeline for the daemon's whole life, and a
+    // socket timeout is a property of the socket, not of the call that set it. Leaving
+    // it behind made the pump fail with `Resource temporarily unavailable` the first
+    // time the guardian was quiet that long, and the pump then returned -- so the
+    // daemon silently stopped accepting authority updates and plugin demand.
+    stream.set_read_timeout(None)?;
     // `decode` takes a *whole* frame, header included. Handing it the body alone
     // made it read the first four JSON bytes as a length and refuse the frame as
     // oversized -- a bug the tests never saw only because the greeting was never
@@ -410,9 +423,14 @@ pub fn run_managed_daemon(
     // (the *root* being served) is taken from the invocation.
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir);
     let database = runtime_dir.join("runtime.sqlite");
+    // The daemon mints the socket its own clients dial; workers must be handed that
+    // address, not the directory it lives in. Passing the directory made every
+    // subagent's own delegation tools fail with `Socket operation on non-socket`.
+    let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)
+        .map_err(|error| anyhow::anyhow!("the runtime socket is unresolvable: {error}"))?;
     let factory = yi_agent_subagent::attach::worker_factory(
         &invocation,
-        runtime_dir.clone(),
+        socket_path,
         &yi_agent_runtime::models::models_path(),
     )?;
     let (ledger, lifeline) = match managed {
@@ -509,6 +527,118 @@ mod tests {
         assert!(
             !call.contains("socket"),
             "passing the socket path partitions routes where nothing reads them: {call}"
+        );
+    }
+
+    /// A worker's tools are bound to the daemon's *socket*, never its directory.
+    ///
+    /// `worker_factory` takes the address a tool process dials. Handing it the
+    /// runtime directory makes every worker connect to a path that is a directory
+    /// instead of a socket, which the OS refuses with
+    /// `Socket operation on non-socket (os error 38)`. The child was still spawned
+    /// -- only its own `spawn_agent` failed -- so the symptom looked like a broken
+    /// delegation tool rather than a wrong argument at startup.
+    ///
+    /// Pinned at the source because the call is what carries the guarantee and there
+    /// is no value to assert on: the factory is constructed, not returned.
+    #[test]
+    fn the_worker_factory_is_given_the_daemon_socket_not_its_directory() {
+        let source = include_str!("managed_runtime.rs");
+        for (entry, marker) in [
+            ("run_executor", "pub fn run_executor"),
+            ("run_managed_daemon", "pub fn run_managed_daemon"),
+        ] {
+            let body = source
+                .split(marker)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{entry} must exist"));
+            let factory = balanced_call(body, "attach::worker_factory(")
+                .unwrap_or_else(|| panic!("{entry} must build a worker factory"));
+            assert!(
+                factory.contains("socket_path"),
+                "{entry} must pass the daemon's socket to its workers: {factory}"
+            );
+            assert!(
+                !factory.contains("runtime_dir"),
+                "{entry} passes the runtime directory, which is not a socket: {factory}"
+            );
+        }
+    }
+
+    /// The text of one call, from `needle` to its matching close paren.
+    ///
+    /// Slicing to the first `);` is not enough: the call here ends in `)?;`, and a
+    /// naive search runs on into the *next* statement, which is a different call with
+    /// different arguments -- so the assertions would read the wrong text and could
+    /// pass while the real call site stayed wrong.
+    fn balanced_call(source: &str, needle: &str) -> Option<String> {
+        let start = source.find(needle)?;
+        let mut depth = 0usize;
+        for (offset, character) in source[start..].char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(source[start..=start + offset].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Reading the greeting must not leave a deadline on the channel it shares with
+    /// the authority pump.
+    ///
+    /// Both roles use the *same* descriptor: this function peeks and reads the hello
+    /// under `LIFELINE_READ_BUDGET`, then `pump_lifeline_authority` keeps reading it
+    /// for the daemon's whole life. A socket-level read timeout outlives the call that
+    /// set it, so leaving it in place makes the pump fail with
+    /// `Resource temporarily unavailable (os error 35)` the first time the guardian is
+    /// quiet for that long -- and the pump returns, so the daemon silently stops
+    /// accepting authority updates and plugin demand for the rest of its life.
+    #[test]
+    fn the_greeting_leaves_no_read_deadline_on_the_lifeline() {
+        use std::io::Write;
+        use std::os::fd::IntoRawFd;
+        let (daemon_end, mut guardian_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let hello =
+            yi_agent_lifecycle::authorization::LifelineHello::new("scope", "daemon-1", [7u8; 32]);
+        let frame = yi_agent_lifecycle::codec::encode(&hello).unwrap();
+        guardian_end.write_all(&frame).unwrap();
+
+        let raw = daemon_end.into_raw_fd();
+        // SAFETY: the stream was consumed by `into_raw_fd`, so this is the only owner.
+        let lifeline = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        let received = read_lifeline_hello(&lifeline).unwrap().expect("a hello");
+        assert_eq!(received.daemon_instance_id, "daemon-1");
+
+        // Borrow, do not take: `lifeline` below is still the owner.
+        let mut idle = std::mem::ManuallyDrop::new(unsafe {
+            std::os::unix::net::UnixStream::from_raw_fd(std::os::fd::AsRawFd::as_raw_fd(&lifeline))
+        });
+        assert_eq!(
+            idle.read_timeout().unwrap(),
+            None,
+            "a deadline left on the socket would end the authority pump on the first \
+             quiet moment, and the daemon would never hear the guardian again"
+        );
+        // The pump must also see a *blocking* socket, which is what telling "idle"
+        // from "broken" depends on: with no deadline an idle lifeline parks instead of
+        // reporting an error.
+        use std::io::Read;
+        idle.set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let outcome = idle.read(&mut byte);
+        assert!(
+            matches!(
+                outcome.as_ref().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "the test's own deadline must be the one that fires: {outcome:?}"
         );
     }
 

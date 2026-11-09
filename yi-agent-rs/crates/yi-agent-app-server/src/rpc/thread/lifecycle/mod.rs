@@ -136,6 +136,7 @@ pub(crate) async fn handle(
                 state.thread_roots,
                 state.managed,
                 state.models_path,
+                state.bringup,
                 state.cfg,
                 &cwd,
                 mode,

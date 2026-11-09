@@ -166,6 +166,9 @@ struct Host {
     thread_roots: ThreadRoots,
     /// No shell in these tests, so the conversation attaches with its own key.
     managed: crate::server::ManagedSlot,
+    /// Isolated bring-up choice: tests must not inherit whatever this test binary
+    /// happens to have installed process-wide.
+    bringup: Arc<yi_agent_subagent::binding::BringUpChoice>,
     cfg: RuntimeConfig,
     hub: Arc<crate::broadcast::Broadcaster>,
     turn_tx: mpsc::Sender<TurnEvent>,
@@ -215,6 +218,7 @@ impl Host {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             managed: Arc::new(StdMutex::new(None)),
+            bringup: Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
             cfg: test_config(),
             hub: Arc::new(crate::broadcast::Broadcaster::new()),
             turn_tx,
@@ -268,6 +272,7 @@ impl Host {
             thread_roots: &self.thread_roots,
             managed: &self.managed,
             models_path: &self.models_path,
+            bringup: &self.bringup,
             cfg: &self.cfg,
             hub: &self.hub,
             turn_tx: &self.turn_tx,
@@ -356,6 +361,7 @@ impl Host {
             &self.thread_roots,
             &self.managed,
             &self.models_path,
+            &self.bringup,
             &self.cfg,
             &self.hub,
             &self.turn_tx,

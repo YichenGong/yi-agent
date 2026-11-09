@@ -63,8 +63,12 @@ pub async fn serve_ws(
     let resident_dir = yi_agent_store::resident::default_dir().unwrap_or_default();
     crate::server::migrate_legacy_model_keys_on_startup();
     crate::server::migrate_legacy_resident_requests_on_startup(&resident_dir);
-    crate::server::spawn_resident_watch_loop(resident_dir);
-    serve_ws_body(listener, cfg, workspaces, pairing).await
+    // Resolved once for this entry point. The watch loop and every attach below
+    // share this one value: two independent resolutions is how the loop and the
+    // attach came to disagree about whether this process owns an embedded daemon.
+    let bringup = std::sync::Arc::new(yi_agent_subagent::attach::process_bringup_choice());
+    crate::server::spawn_resident_watch_loop(resident_dir, std::sync::Arc::clone(&bringup));
+    serve_ws_body(listener, cfg, workspaces, pairing, bringup).await
 }
 
 /// [`serve_ws`] 去掉启动期工作的本体:可被测试直接调用(测试入参是隔离
@@ -74,6 +78,7 @@ pub(crate) async fn serve_ws_body(
     cfg: RuntimeConfig,
     workspaces: Arc<WorkspaceIndex>,
     pairing: Arc<PairingState>,
+    bringup: Arc<yi_agent_subagent::binding::BringUpChoice>,
 ) -> anyhow::Result<()> {
     // 主题句柄:`ui/settings/read|write` 与每个 thread 的 `set_theme` 工具共用,
     // 与 stdio 路径同构——工厂闭包是 `'static`,拿不到 `serve_ws_inner` 里的
@@ -84,7 +89,16 @@ pub(crate) async fn serve_ws_body(
     let catalog =
         yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
     let build_agent = production_factory(cfg.clone(), theme_for_factory, catalog);
-    serve_ws_inner(listener, cfg, workspaces, pairing, theme, build_agent).await
+    serve_ws_inner(
+        listener,
+        cfg,
+        workspaces,
+        pairing,
+        theme,
+        build_agent,
+        bringup,
+    )
+    .await
 }
 
 /// [`serve_ws`] 的可注入 agent 工厂版本:测试用 mock provider(如审批 E2E)。
@@ -95,6 +109,9 @@ pub(crate) async fn serve_ws_inner<F>(
     pairing: Arc<PairingState>,
     theme: crate::theme_tool::ThemeHandle,
     build_agent: F,
+    // The entry point's single resolution; threaded in rather than re-read so
+    // this seam cannot invent a second, possibly different answer.
+    bringup: Arc<yi_agent_subagent::binding::BringUpChoice>,
 ) -> anyhow::Result<()>
 where
     F: Fn(
@@ -145,6 +162,7 @@ where
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 managed: Arc::new(StdMutex::new(None)),
+                bringup,
                 models_path: yi_agent_runtime::models::models_path(),
                 websearch_path: yi_agent_tools::websearch_path(),
                 settings_path: yi_agent_runtime::settings::settings_path(),
@@ -623,6 +641,7 @@ mod tests {
             cfg,
             workspaces,
             Arc::clone(&pairing),
+            Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
         ));
         WsFixture {
             addr,
@@ -954,7 +973,13 @@ mod tests {
         )));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(serve_ws_body(listener, cfg, workspaces, Arc::clone(&relay)));
+        let handle = tokio::spawn(serve_ws_body(
+            listener,
+            cfg,
+            workspaces,
+            Arc::clone(&relay),
+            Arc::new(yi_agent_subagent::binding::BringUpChoice::default()),
+        ));
 
         // 手机用桌面铸出的码连接 ws 兑换,必须成功拿到 token。
         let (mut ws, _) = tokio_tungstenite::connect_async(format!(

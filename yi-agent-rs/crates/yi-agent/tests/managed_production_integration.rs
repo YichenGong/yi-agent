@@ -757,6 +757,64 @@ fn a_prepare_over_the_private_channel_brings_up_one_managed_runtime() -> anyhow:
 }
 
 /// The same channel refuses a `_shell/` call that did not bootstrap first.
+/// A managed sidecar must not start a *second* daemon behind the guardian's back.
+///
+/// This is the failure that read to a user as "the delegation tools disappeared":
+/// the App registers its own project as resident (a plugin needs it), and the
+/// sidecar's unattended self-healing loop used to honour that registration even
+/// when the shell was already running a guardian. Two daemons then bound the same
+/// socket, the guardian's lost the race and exited, the project could never reach
+/// `managedReady`, and every conversation ran without delegation.
+///
+/// The registration is what makes the old loop start something, so the test writes
+/// one and then does nothing else: whatever daemon appears came from that path.
+#[test]
+fn a_managed_sidecar_starts_no_daemon_alongside_the_guardian() -> anyhow::Result<()> {
+    let mut fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+    // Ask for a daemon the way a plugin would. Nothing else in this test starts
+    // one -- only the self-healing loop reads this file.
+    yi_agent_store::resident::require(
+        &fixture.instance_home.join(".yi-agent"),
+        &fixture.workdir,
+        "fixture-plugin",
+    )?;
+
+    let mut sidecar = Sidecar::spawn(&mut fixture)?;
+    // Let the first self-healing tick run. The loop fires immediately and then
+    // every 30s; a second tick is outside any test budget, so one wait is enough.
+    std::thread::sleep(Duration::from_secs(6));
+
+    // The socket has to be computed from the *fixture's* instance home. Asking
+    // `socket_path_for` here would read this test process's own environment and
+    // point at the developer's real `~/.yi-agent` -- a wrong path that always
+    // reports "absent" and would make the assertion below vacuous.
+    let socket = yi_agent_lifecycle::scope::daemon_socket(
+        &fixture.runtime_dir,
+        &fixture.instance_home.join(".yi-agent"),
+    );
+    assert!(
+        !socket.exists(),
+        "a managed sidecar started an embedded daemon and bound {}; \
+         that daemon is what the guardian's own daemon would lose to",
+        socket.display()
+    );
+    // Independent of the socket: no supervised process may be recorded either.
+    // A daemon that failed to bind would leave the socket absent yet still appear
+    // here, and that half-dead process is the one that starves the guardian.
+    let journal = journal_records(&fixture.runtime_dir);
+    assert!(
+        journal.is_empty(),
+        "a managed sidecar started a process it does not supervise: {journal:?}"
+    );
+    // The sidecar must still be alive: "no daemon" must not be achieved by the
+    // process having died before its first tick.
+    assert!(
+        sidecar.child.try_wait()?.is_none(),
+        "the sidecar exited instead of simply declining to start a daemon"
+    );
+    Ok(())
+}
+
 ///
 /// Fail-closed matters here more than anywhere else in this file: `prepare` starts a
 /// runtime, so an unauthenticated caller reaching it would let any local process
@@ -1425,7 +1483,8 @@ fn quitting_one_frontend_leaves_the_others_work_running() -> anyhow::Result<()> 
     let run_port = run_listener.local_addr()?.port();
     let _run_gateway = spawn_tool_calling_gateway(run_listener, marker_work_command(&run_marker));
     let mut run = HeadlessRun::spawn(&mut fixture, run_port, "run the command")?;
-    let run_work = await_marker_pid(&run_marker, Duration::from_secs(60))?;
+    let run_work = await_marker_pid(&run_marker, Duration::from_secs(60))
+        .map_err(|error| anyhow::anyhow!("{error}; run stderr: {}", run.take_stderr()))?;
 
     // Let the runtime record both clients before either leaves: a reclaim can only
     // leave alone work it knows is somebody else's.
@@ -1632,6 +1691,56 @@ fn a_retired_instance_does_not_resurrect_a_daemon_across_watch_ticks() -> anyhow
     assert!(
         !fixture.runtime_dir.join("runtime.sqlite").exists(),
         "no daemon may start unattended after retirement"
+    );
+    Ok(())
+}
+
+/// A *fresh* instance in a managed frontend starts nothing, even though no marker
+/// exists to stop it.
+///
+/// The sibling test above covers retirement, and retirement is a marker on disk.
+/// This one covers the case the marker cannot express: an instance that never
+/// migrated because it was managed from the start. Its registration is a real
+/// request for a daemon, `may_start_unattended` answers true, and only the entry
+/// point's own declaration says no.
+///
+/// Leaving this to the marker check is exactly the bug: an embedded `daemon serve`
+/// from this path binds the business socket first, the guardian's daemon then
+/// refuses to start ("a daemon is already running", verified directly), and every
+/// conversation in the project runs without delegation because it never reaches
+/// `managedReady`.
+#[test]
+fn a_managed_frontend_starts_no_daemon_even_without_a_retirement_marker() -> anyhow::Result<()> {
+    let fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+    let instance_home = fixture.instance_home.clone();
+    let resident_dir = instance_home.clone();
+    yi_agent_store::resident::require(&resident_dir, &fixture.workdir, "fixture-plugin")?;
+    // Deliberately *not* retired: a fresh instance is already managed.
+    assert!(
+        yi_agent_supervisors::watch::may_start_unattended(&instance_home),
+        "the premise is that the marker check says yes; otherwise this tests the sibling case"
+    );
+
+    let mut starts = 0usize;
+    for _ in 0..3 {
+        let outcome = yi_agent_supervisors::watch::once_unattended_as(
+            &instance_home,
+            &resident_dir,
+            false,
+            &mut |projects| starts += projects.len(),
+        );
+        assert_eq!(
+            outcome, None,
+            "a managed frontend must stand down, not report an idle tick"
+        );
+    }
+    assert_eq!(
+        starts, 0,
+        "a managed frontend started work the guardian already owns"
+    );
+    assert!(
+        !fixture.runtime_dir.join("runtime.sqlite").exists(),
+        "no embedded daemon may start beside the guardian's"
     );
     Ok(())
 }

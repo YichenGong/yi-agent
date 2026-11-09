@@ -341,13 +341,20 @@ pub(crate) async fn handle_shared(
             // migration and put back exactly the daemon those three paths just stopped.
             let retired =
                 yi_agent_supervisors::lifecycle::retirement::is_retired(&state.plugin_home);
-            if state.managed_session || retired {
+            // 宿主策略是第三个独立判据：受管宿主上，一条没有壳授权的远程连接
+            // 也不得拉起 embedded daemon。只看 `managed_session` 会把「这次装
+            // 有没有人负责」误当成「这台机器允不允许自启」——前者说否时，后者
+            // 可能仍然允许，而 managed 要收敛的正是那个「允许」。
+            let host_allows_embedded =
+                state.bringup_policy == yi_agent_subagent::attach::BringUpPolicy::Embedded;
+            if state.managed_session || retired || !host_allows_embedded {
                 startup = "awaiting-demand";
                 tracing::info!(
                     project = %project.display(),
                     plugin = %plugin,
                     managed_session = state.managed_session,
                     retired,
+                    host_allows_embedded,
                     "installed under managed lifecycle; the plugin starts when a client demands it"
                 );
             } else {

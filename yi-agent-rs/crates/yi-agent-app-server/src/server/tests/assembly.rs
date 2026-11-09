@@ -662,6 +662,7 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         // No shell in these tests: the embedded attach path.
         None,
         &isolated_models_path(runtime.path()),
+        &test_bringup(),
         &cfg,
         &cwd,
         "thread-a",
@@ -688,6 +689,7 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         // No shell in these tests: the embedded attach path.
         None,
         &isolated_models_path(runtime.path()),
+        &test_bringup(),
         &cfg,
         &cwd,
         "thread-b",
@@ -1276,4 +1278,85 @@ fn an_embedded_choice_needs_no_instance_home() {
             error.cause
         );
     }
+}
+
+/// The policy every test in this file attaches with: the default (embedded)
+/// bring-up, isolated from whatever the test binary happens to have installed.
+fn test_bringup() -> yi_agent_subagent::binding::BringUpChoice {
+    yi_agent_subagent::binding::BringUpChoice::default()
+}
+
+/// Attach must run the choice it was handed, not re-derive one.
+///
+/// Drives the real wiring (`attach_delegation`), not `attach_cwd_runtime_with`:
+/// the property under test is that the *call chain* threads the snapshot through.
+/// A test that calls the lower helper directly stays green even when
+/// `attach_delegation` re-reads the process policy, which is the exact defect.
+///
+/// The discriminator is a managed choice with no artifact identity: it must be
+/// refused for that reason. A re-read would fall back to the build default --
+/// embedded -- and attach successfully here.
+#[test]
+fn production_attach_uses_injected_bringup_choice() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+    let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+    let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
+    let cwd = cfg.workdir.to_string_lossy().to_string();
+
+    let managed_without_identity = yi_agent_subagent::binding::BringUpChoice {
+        policy: yi_agent_subagent::attach::BringUpPolicy::Managed,
+        // Deliberately absent: a managed launch that cannot name the artifact it
+        // expects must refuse rather than guess.
+        expected: None,
+        instance_home: Some(runtime.path().to_path_buf()),
+    };
+    let activation = attach_delegation(
+        &runtimes,
+        &thread_roots,
+        runtime.path(),
+        None,
+        &isolated_models_path(runtime.path()),
+        &managed_without_identity,
+        &cfg,
+        &cwd,
+        "thread-managed",
+        &test_theme(),
+        &crate::git_diff_tool::GitDiffHandle::new(),
+        Vec::new(),
+        &crate::lead::LeadInbox::new(),
+        &crate::lead::LeadReplies::new(),
+        &crate::lead_control::LeadControlInbox::new(),
+        &crate::lead_control::LeadControlReplies::new(),
+        None,
+        None,
+        Vec::new(),
+        build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
+    );
+    let error = activation
+        .tooling_error
+        .expect("the injected managed policy must refuse here, not attach an embedded daemon");
+    assert!(
+        error.contains("artifact identity"),
+        "the refusal must name the managed reason, proving the injected choice ran: {error}"
+    );
+    // A durable refusal *is* cached, so the last session does not re-run a doomed
+    // bring-up on every thread. What must never appear is a successful binding:
+    // that would mean an embedded daemon was started under a managed policy.
+    assert!(
+        yi_agent_app_server_runtimes_has_no_success(&runtimes),
+        "a managed refusal must not leave a usable runtime behind"
+    );
+}
+
+/// True when no project ended up with a usable runtime.
+fn yi_agent_app_server_runtimes_has_no_success(runtimes: &ProjectRuntimes) -> bool {
+    runtimes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .all(|entry| entry.is_err())
 }

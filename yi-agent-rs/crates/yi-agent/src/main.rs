@@ -1989,6 +1989,29 @@ fn build_tui_foreground_root(
     }
 }
 
+/// The `ThreadRoot` one `run` invocation drives its delegation through.
+///
+/// A managed start already built this conversation's root from the authority the
+/// guardian granted, and that root is the *only* thing the daemon will accept a
+/// container attach for: on a managed runtime the attach key is the brokered
+/// `rootcap1:` capability, which lives in the managed context. Rebuilding a plain
+/// `ThreadRoot` from the attach handle therefore presenters the stable `thread:<id>`
+/// key instead, which the guardian's ledger cannot resolve -- so every delegated turn
+/// failed with the opaque *the daemon did not attach a session container*.
+///
+/// Embedded has no such authority, and the attach handle is all it needs.
+fn foreground_root_for_run(
+    managed_root: Option<Arc<yi_agent_subagent::thread_root::ThreadRoot>>,
+    embedded: impl FnOnce() -> Arc<yi_agent_subagent::thread_root::ThreadRoot>,
+) -> Arc<yi_agent_subagent::thread_root::ThreadRoot> {
+    match managed_root {
+        // Rebuilding a managed conversation's root would attach the same
+        // conversation twice, and under the wrong authority.
+        Some(root) => root,
+        None => embedded(),
+    }
+}
+
 /// Prepares one TUI turn's delegation: the only place a turn is opened for the
 /// interactive host.
 ///
@@ -2792,12 +2815,21 @@ fn run_headless(
             yi_agent_lifecycle::foreground::ExecutionIdentity,
         )> = None;
         if let Some(runtime) = headless_runtime_ref {
-            let root = build_tui_foreground_root(
-                &runtime.attached_root.workspace.path,
-                runtime.socket_path.clone(),
-                runtime.attached_root.clone(),
-                session_store.as_ref().map(|store| store.thread_id()),
-            );
+            // A managed run already holds the root its authority names; rebuilding one
+            // here would re-attach the conversation under the stable `thread:<id>` key,
+            // which a managed daemon's ledger cannot resolve.
+            let managed_root = runtime
+                .managed
+                .as_ref()
+                .and_then(|managed| managed.root.clone());
+            let root = foreground_root_for_run(managed_root, || {
+                build_tui_foreground_root(
+                    &runtime.attached_root.workspace.path,
+                    runtime.socket_path.clone(),
+                    runtime.attached_root.clone(),
+                    session_store.as_ref().map(|store| store.thread_id()),
+                )
+            });
             let identity_directory = session_store
                 .as_ref()
                 .map(|store| store.session_identity_directory())
@@ -7980,6 +8012,60 @@ mod tests {
         // behaviour stands rather than inventing a key.
         let unkeyed = build_tui_foreground_root(workdir, socket, attached(), None);
         assert_eq!(unkeyed.thread_id(), "session-minted-per-attach");
+    }
+
+    /// A managed `run` must delegate through the root its start obtained.
+    ///
+    /// The managed start already attached this conversation's container under the
+    /// guardian's brokered capability. Rebuilding a plain root from the attach handle
+    /// presents the stable `thread:<id>` key instead, which a managed daemon's ledger
+    /// cannot resolve -- the reported symptom being every delegated turn failing with
+    /// *the daemon did not attach a session container*.
+    #[test]
+    fn a_managed_run_delegates_through_the_root_its_start_obtained() {
+        let workdir = std::path::Path::new("/tmp/managed-run-root");
+        let socket = std::path::PathBuf::from("/tmp/managed-run-root/rt/runtime.sock");
+        let attached = || crate::tui::subagents::AttachedRoot {
+            session_id: "session-minted-per-attach".into(),
+            task_id: "root-1".into(),
+            capability: "cap-1".into(),
+            workspace: yi_agent_core::subagent::worker::WorkerWorkspace {
+                lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+                repository_root: std::path::PathBuf::from("/tmp/managed-run-root"),
+                path: std::path::PathBuf::from("/tmp/managed-run-root"),
+                branch: String::new(),
+                parent_branch: String::new(),
+                base_commit: String::new(),
+            },
+        };
+        // The root a managed start built: keyed by the conversation, adopted from the
+        // authorized attach.
+        let managed_root = build_tui_foreground_root(
+            workdir,
+            socket.clone(),
+            attached(),
+            Some("conversation-managed"),
+        );
+        let used = foreground_root_for_run(Some(Arc::clone(&managed_root)), || {
+            panic!("a managed run must not rebuild the root its start already built")
+        });
+        assert!(
+            Arc::ptr_eq(&used, &managed_root),
+            "the managed start's root is the only one its authority names"
+        );
+
+        // Embedded has no start to reuse, so the attach handle is what it builds from.
+        let rebuilt = build_tui_foreground_root(
+            workdir,
+            std::path::PathBuf::from("/tmp/managed-run-root/rt/runtime.sock"),
+            attached(),
+            Some("conversation-embedded"),
+        );
+        let used = foreground_root_for_run(None, || Arc::clone(&rebuilt));
+        assert!(
+            Arc::ptr_eq(&used, &rebuilt),
+            "an embedded run keeps the root it built from its attach handle"
+        );
     }
 
     /// Both frontends must consult the bring-up policy before starting a daemon.

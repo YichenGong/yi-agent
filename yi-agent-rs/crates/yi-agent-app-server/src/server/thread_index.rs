@@ -16,7 +16,7 @@ use yi_agent_subagent::thread_root::ThreadRoot;
 
 // 这些项仍由 `server.rs`（或其子模块经其 re-export）提供。
 use crate::server::{
-    BuiltAgent, ProjectRuntimes, ThreadRoots, attach_cwd_runtime, build_runtime_tooling,
+    BuiltAgent, ProjectRuntimes, ThreadRoots, attach_cwd_runtime_with, build_runtime_tooling,
     err_response, project_key, read_task_trace, wrap_for_delegation, write_notification,
     write_response,
 };
@@ -71,6 +71,9 @@ pub(crate) fn attach_delegation(
     // `None` is the embedded shape and keeps the old behaviour byte for byte.
     managed: Option<Arc<crate::server::ManagedAuthority>>,
     models_path: &Path,
+    // The snapshot the entry point resolved once: attach must not re-read the
+    // process policy, or watch/install and attach can disagree.
+    bringup: &yi_agent_subagent::binding::BringUpChoice,
     cfg: &RuntimeConfig,
     cwd: &str,
     thread_id: &str,
@@ -105,22 +108,23 @@ pub(crate) fn attach_delegation(
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
     thread_cfg.workdir = PathBuf::from(cwd);
-    let binding = match attach_cwd_runtime(runtimes, runtime_dir, &thread_cfg, models_path) {
-        Ok(binding) => binding,
-        Err(cause) => {
-            tracing::warn!(
-                stage = "attach",
-                %cause,
-                cwd,
-                "subagent delegation unavailable for this thread"
-            );
-            return Activation {
-                built,
-                runtime: None,
-                tooling_error: Some(format!("subagent runtime unavailable: {cause}")),
-            };
-        }
-    };
+    let binding =
+        match attach_cwd_runtime_with(runtimes, runtime_dir, &thread_cfg, models_path, bringup) {
+            Ok(binding) => binding,
+            Err(cause) => {
+                tracing::warn!(
+                    stage = "attach",
+                    %cause,
+                    cwd,
+                    "subagent delegation unavailable for this thread"
+                );
+                return Activation {
+                    built,
+                    runtime: None,
+                    tooling_error: Some(format!("subagent runtime unavailable: {cause}")),
+                };
+            }
+        };
     // The daemon is shared per project, but the root is per conversation: the
     // root is what carries the child budget, so two conversations in one
     // directory must never share it.

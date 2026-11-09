@@ -323,20 +323,38 @@ pub(crate) fn plugin_scope(workdir: &Path, params: &serde_json::Value) -> PathBu
 ///
 /// 它是通用的:登记表里**任何**要求常驻的项目都会被确保有一个活着的进程,
 /// 与是哪个插件无关。
-pub(crate) fn spawn_resident_watch_loop(resident_dir: PathBuf) {
+pub(crate) fn spawn_resident_watch_loop(
+    resident_dir: PathBuf,
+    bringup: std::sync::Arc<yi_agent_subagent::binding::BringUpChoice>,
+) {
     // The resident directory *is* the instance home (`paths::instance_home`), so the
     // retirement marker sits beside the registration it governs. Deriving it instead
     // of re-reading `YI_AGENT_HOME` also keeps the injected dir used in tests.
     let instance_home = resident_dir.clone();
+    // Whether this process owns an embedded daemon, decided once from the entry
+    // point's own declaration. A managed frontend already has the guardian's
+    // daemon; starting an embedded `daemon serve` here would make the two bind the
+    // same socket, and the guardian's daemon is the one that loses -- every later
+    // conversation then runs without delegation because its project can never
+    // reach `managedReady`. Reading it outside the loop is deliberate: the entry
+    // point cannot change while the process lives, and a per-tick read would make
+    // the two branches look interchangeable.
+    // Read from the same snapshot the attach path uses. Asking the entry point's
+    // declaration a second time is how watch and attach came to disagree: an env
+    // override would flip one and not the other.
+    let embedded = bringup.policy == yi_agent_subagent::attach::BringUpPolicy::Embedded;
     tokio::spawn(async move {
         loop {
-            // 迁移到 managed 之后这个循环就不再启动 daemon：登记仍然读，但「无人时
-            // 应运行」的旧语义已被 managed 生命周期取代。循环**不退出**，因为迁移
-            // 标记可以在同一进程存活期间写入（用户在 App 里确认迁移），退出会让状态
-            // 永远停在旧判断上。
-            yi_agent_supervisors::watch::once_unattended(
+            // 两道闸门都在 `once_unattended_as` 里：进程级（本前端是不是 managed）
+            // 与实例级（迁移标记）。前者是本轮补的——一个**全新**实例没有迁移标记，
+            // 却已经是 managed，只看标记就会让它在这里起一个 embedded daemon，与
+            // guardian 的 daemon 抢同一个 socket。登记仍然读，但「无人时应运行」的旧
+            // 语义已被 managed 生命周期取代。循环**不退出**，因为迁移标记可以在同一
+            // 进程存活期间写入（用户在 App 里确认迁移），退出会让状态永远停在旧判断上。
+            yi_agent_supervisors::watch::once_unattended_as(
                 &instance_home,
                 &resident_dir,
+                embedded,
                 &mut |projects| {
                     yi_agent_supervisors::watch::ensure_daemons(projects);
                 },

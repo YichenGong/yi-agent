@@ -74,6 +74,33 @@ pub fn once_unattended(
     resident_dir: &Path,
     ensure: &mut dyn FnMut(&[PathBuf]),
 ) -> Option<usize> {
+    once_unattended_as(instance_home, resident_dir, true, ensure)
+}
+
+/// [`once_unattended`] with the caller's own declaration of whether it is a
+/// *managed* frontend.
+///
+/// A managed frontend must not start daemons here at all, and the retirement
+/// marker cannot express that: the marker means "this instance finished moving to
+/// the managed runtime", while a *fresh* instance has no marker and is already
+/// managed by declaration. Conflating the two is what let a managed App start an
+/// embedded `daemon serve` beside the guardian's daemon. Both bind the same
+/// socket, so the guardian's daemon loses the race and dies -- and a dead managed
+/// daemon means the project never becomes `managedReady`, so every conversation
+/// runs without delegation.
+///
+/// `embedded` is passed in rather than read from a process global so the two
+/// branches stay testable in one test binary; the process owner (the app-server)
+/// already knows the answer from its own bring-up policy.
+pub fn once_unattended_as(
+    instance_home: &Path,
+    resident_dir: &Path,
+    embedded: bool,
+    ensure: &mut dyn FnMut(&[PathBuf]),
+) -> Option<usize> {
+    if !embedded {
+        return None;
+    }
     if !may_start_unattended(instance_home) {
         return None;
     }
@@ -155,6 +182,56 @@ mod tests {
             seen.borrow().is_empty(),
             "a frozen instance does not ensure"
         );
+    }
+
+    /// A managed frontend must never start a daemon nobody supervises.
+    ///
+    /// The registration says a project *wants* a daemon when a frontend is around.
+    /// A managed frontend already has one -- the guardian's -- and starting a
+    /// second, embedded one here is not merely redundant: both bind the same
+    /// socket, so the guardian's daemon loses the race, dies, and the project can
+    /// never reach `managedReady`. The App then runs every conversation without
+    /// delegation, which is what "the subagent tool is missing" looked like.
+    ///
+    /// Distinguishing this from the retirement marker matters: a *fresh* instance
+    /// has no marker at all (nothing was migrated yet), so the marker cannot be
+    /// what protects the managed path.
+    #[test]
+    fn a_managed_frontend_starts_nothing_unattended() {
+        let instance = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        yi_agent_store::resident::require(dir.path(), Path::new("/a"), "example-plugin").unwrap();
+        // No retirement or freeze marker: this is a fresh instance, exactly the
+        // shape the marker-only check let through.
+        assert!(may_start_unattended(instance.path()));
+        let seen = RefCell::new(Vec::new());
+
+        let outcome = once_unattended_as(instance.path(), dir.path(), false, &mut |projects| {
+            seen.borrow_mut().push(projects.len());
+        });
+
+        assert_eq!(outcome, None);
+        assert!(
+            seen.borrow().is_empty(),
+            "a managed frontend must not ensure any daemon behind the guardian's back"
+        );
+    }
+
+    /// An embedded frontend keeps the old behaviour, so the fix cannot silently
+    /// disable self-healing for the callers that really do own their daemon.
+    #[test]
+    fn an_embedded_frontend_still_ensures_registered_projects() {
+        let instance = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        yi_agent_store::resident::require(dir.path(), Path::new("/a"), "example-plugin").unwrap();
+        let seen = RefCell::new(Vec::new());
+
+        let outcome = once_unattended_as(instance.path(), dir.path(), true, &mut |projects| {
+            seen.borrow_mut().push(projects.len());
+        });
+
+        assert_eq!(outcome, Some(1));
+        assert_eq!(*seen.borrow(), vec![1]);
     }
 
     #[test]
