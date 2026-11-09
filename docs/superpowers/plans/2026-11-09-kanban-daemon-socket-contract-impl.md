@@ -8,6 +8,16 @@
 
 **Tech Stack:** Rust edition 2024 / 插件 rust-version 1.85；现有 std、sha2、serde/serde_json、libc、tempfile；Bash、Python 3 unittest、just；Linux 与 macOS。
 
+**Revision:** rev2（2026-11-09 plan 专项复审）；[复审与验证记录](../reviews/2026-11-09-kanban-daemon-socket-plan-review.md)。当前未发现未决计划阻断项，不代表实现或部署已通过。
+
+## 审查/执行清单
+
+- [x] 接口、可见性、示例编译与源码一致性复核。
+- [x] 测试身份、时间预算、私有接缝和信号负例复核。
+- [x] gate失败传播、零用例、环境及CI依赖复核。
+- [x] 逐项修订后重走Task1–8/A01–A14覆盖与文档验证。
+- [ ] 执行任何实现任务或部署验收（本轮未授权）。
+
 ## Global Constraints
 
 - 权威 spec：[rev3](../specs/2026-11-09-kanban-daemon-socket-contract-design.md)，基线 `dcfad0d6`；本计划未执行。
@@ -20,6 +30,10 @@
 - 禁止在 main 编辑。文档分支保留；执行时从含本 spec/plan 的提交创建 `fix/kanban-daemon-socket` worktree，按 using-git-worktrees 流程，不自动 merge/push/入队。
 - 代码提交前在宿主跑 cargo fmt --all 与 just ci；插件亦格式检查和 plugin-check。合并获准后复跑。每个任务 commit 同步模块证据，功能未全面验收保持 `[ ]`。
 - 所有命令工作目录为执行 worktree 根；本机 PATH 使用 `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"`。CI 使用配置的 Rust 工具链，不写本机路径。
+
+- 私有接缝只位于IPC crate：`exchange` 用 `pub(super)` 供兄弟client模块调用；`connect_before` / `wait_ready` / `exchange_connected` / `ProbeIo` 留在status_io私有范围，其直接测试和signal worker放同模块 `#[cfg(test)] mod tests`，外部integration只调用公开Status入口，不扩大生产API。
+- TDD口径：新接口缺失可用编译失败作首次红证据；已经正确实现的行为测试第一次可以绿，不能写“必须先红”并伪造结果。每一关键防回归行为用受控变异取得真实红证据；所有红绿命令记录确切测试名/退出码。
+- 进程与日志口径：stub的请求计数只在解码完整RequestEnvelope且command为Status后增加，不把accept/EOF视为请求；每条失败诊断从stderr稳定文件解析，不能用成功响应数量代替失败次数。
 
 ---
 
@@ -36,7 +50,7 @@
 | runner src/client.rs / src/single_instance.rs / src/main.rs | probe、计数、诊断、启动顺序 | 5 |
 | runner tests/daemon_liveness.rs / tests/support/daemon.rs | 隔离 CLI 子进程与只读桩 | 6 |
 | scripts/plugins/check-daemon-socket-contract.sh / check-daemon-socket-wiring.py / test_check_daemon_socket_contract.py | 必执行 gate、静态接线与负例 | 7 |
-| yi-agent-rs/justfile / .github/workflows/ci.yml | Linux/macOS 调用链 | 7 |
+| yi-agent-rs/justfile / .github/workflows/ci.yml / .gitlab-ci.yml | 两平台调用链与Python依赖 | 7 |
 | plugins/contracts/README.md / plugins/superpowers-kanban/INSTALL.md / docs/project-management/{superpowers-kanban.md,README.md} | 契约、排障、证据 | 各任务、8 |
 | docs/superpowers/reports/2026-11-09-kanban-daemon-socket-validation.md | 实现后的脱敏实测，不预填通过 | 8 |
 
@@ -100,7 +114,9 @@ fn short_and_deep_use_instance_socket_directory() {
 
 - [ ] **Step 3: 实现纯环境优先级、规范化及包装。** 核心代码：
 ```rust
-let nonempty = |v: Option<&std::ffi::OsStr>| v.filter(|s| !s.is_empty());
+fn nonempty(value: Option<&std::ffi::OsStr>) -> Option<&std::ffi::OsStr> {
+    value.filter(|s| !s.is_empty())
+}
 if let Some(value) = nonempty(instance) { return Ok(value.into()); }
 if let Some(value) = nonempty(override_home) {
     let p = std::path::PathBuf::from(value);
@@ -113,14 +129,14 @@ nonempty(home).map(|h| std::path::PathBuf::from(h).join(".yi-agent"))
 ```
 `canonicalize_allowing_missing` 按宿主 scope.rs 顺序实现（绝对化→词法点段→canonicalize 全路径→寻找已存在祖先追加尾部）；内部返回 io::Result，调用点 `.unwrap_or_else(|_| original.to_path_buf())`。用 Sha256::digest(canonical_runtime.as_os_str().as_encoded_bytes())，前8字节 lowercase hex；canonical_home.join("sockets").join(hash).join("runtime.sock")，最终原始 bytes >103 报错。生产包装读取三个 var_os 后借用传纯函数，不全局 set_var。原 socket 查询分支一个字不改。
 
-- [ ] **Step 4: 逐项补红绿路径测试。** 每新增一组测试先运行该名称确认红，再实现/调整并复跑；fixture Case IDs 必须有消费断言。
+- [ ] **Step 4: 逐项补红绿路径测试。** 每新增一组测试先运行该名称记录真实结果；若已绿，不伪造红，用仅破坏该行为的变异确认它会拦截回归，再恢复绿。fixture Case IDs 必须有消费断言。
   - `instance_priority_and_suffix_are_exact`：显式三值、空 INSTANCE、空 override、仅 HOME、全空；INSTANCE 即使未带后缀也不补。
   - `canonical_spelling_and_missing_tail_match`：runtime/home 各自 symlink、相对+点段、symlink+.. 先词法处理、symlink祖先下缺失尾部创建前后一致；相对/cwd专用子进程见Task2，不在本测试进程 chdir。
   - `instances_and_runtimes_are_isolated`：换 runtime/home 各变地址；TMPDIR影响只在环境子进程测。
   - `non_utf8_and_length_are_raw_bytes`：OsStringExt::from_vec 将0xff放目录名；长home生成候选恰好103与104，home绝对且不存在末级，先canonicalize父根；104断言 bytes=104，不用 display 长度。
   - 双侧 `root_vector_and_fixture_schema_are_pinned`：读取同一 JSON 调真实 daemon_socket，根目录固定输出；宿主在本侧用 scope::instance_home_from_env 验证低层后缀，全优先级留Task2。插件 include_str 路径 `../../../../contracts/fixtures/daemon-socket.json`；宿主 `../../../../plugins/contracts/fixtures/daemon-socket.json`（均从 tests 文件位置计算）。
 
-- [ ] **Step 5: 清除所有旧 daemon 布局断言并复跑查询回归。** 原 `client.rs::the_socket_lives_beside_its_runtime_directory` 不能再用继承 HOME 测，改为纯入口新布局；`socket.rs::the_daemon_rule_matches_the_host` / `a_short_runtime_dir_keeps_the_socket_inside_it` 替换，查询原 fixture / 深路径 bind 保持。
+- [ ] **Step 5: 清除所有旧 daemon 布局断言并复跑查询回归。** 原 `client.rs::the_socket_lives_beside_its_runtime_directory` 不能再用继承 HOME 测，改为纯入口新布局；`socket.rs::the_daemon_rule_matches_the_host` / `a_short_runtime_dir_keeps_the_socket_inside_it` 替换，查询原 fixture / 深路径 bind 保持。同步socket.rs模块表与兼容wrapper、client::socket_path注释，删除旧daemon直通/TMPDIR地址描述；仅更新文案，不改变查询实现/SocketPathError/原fixture。
 ```bash
 cargo test --manifest-path plugins/superpowers-kanban/Cargo.toml -p superpowers-kanban-ipc
 cargo test --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-lifecycle --test daemon_socket_contract
@@ -151,8 +167,9 @@ fn cross_process_daemon_socket_contract() {
         .expect("KANBAN_HOST_SOCKET_PROBE is required; no skip permitted");
     assert!(std::path::Path::new(&probe).is_file(), "host probe missing");
     // 测试随后遍历 fixture 每个case；调用下述run_contract_child并比较完整JSON投影。
-    let output = std::process::Command::new(&probe).arg("2f")
-        .env_clear().env("YI_AGENT_INSTANCE_HOME", "/").output().unwrap();
+    let mut command = std::process::Command::new(&probe);
+    command.arg("2f").env_clear().env("YI_AGENT_INSTANCE_HOME", "/");
+    let output = run_contract_child(command, std::time::Duration::from_secs(5));
     assert!(output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["socket_hex"], serde_json::Value::String(
@@ -172,7 +189,7 @@ command.args(["--exact", "plugin_environment_worker", "--nocapture"])
     .env("YI_AGENT_INSTANCE_HOME", instance_value)
     .current_dir(&dedicated_child_cwd);
 ```
-每个case分配两份等价空cwd；删除cwdcase runtime使用相同相对字节，实例home绝对，两child各自remove空cwd后调用生产入口；相对runtime退回原输入的hash两侧必须一致。其他case提供相同canonical短根环境，遍历INSTANCE/override/HOME、空值、TMPDIR变化、dot/symlink/非UTF8及103/104；比较address原始hex或明确错误类别/bytes，不仅比较成功root示例；断言已消费case_ids集合完全相等。
+每个case使用同一个canonical cwd，host与插件child顺序运行，不能用两个不同目录假称同一runtime。删除cwdcase使用相同相对runtime字节：创建专用空cwd→host删除自身cwd并调用生产入口→parent在相同路径重建空cwd→插件child删除并调用；两child结束后才清理。非删除case也共用同一cwd，relative home/override 的语义才能真实比较。实例home绝对，两child相对runtime回退原输入的hash必须一致。其他case提供相同canonical短根环境，遍历INSTANCE/override/HOME、空值、TMPDIR变化、dot/symlink/非UTF8及103/104；比较address原始hex或明确错误类别/bytes，不仅比较成功root示例；断言已消费case_ids集合完全相等。
 
 - [ ] **Step 4: 独立构建探针，再执行cross test。**
 ```bash
@@ -207,7 +224,7 @@ fn wait_ready(fd: std::os::fd::RawFd, events: libc::c_short,
 
 - [ ] **Step 1: 写红connect预算及NUL测试。** `nul_is_rejected_before_connect` 使用 OsStringExt::from_vec(b"/tmp/a\0b".to_vec())，断言 Io.kind InvalidInput；`connect_backlog_obeys_deadline` 创建短根 listener，用非阻塞原生connect填满accept backlog，deadline=100ms，再调用connect_before，断言Timeout Connect且elapsed<1秒。积压构造最多1秒，未形成EAGAIN/EINPROGRESS必须报失败不是skip。Linux验证EAGAIN，macOS验证实际pending errno；同步测试接缝额外证明有界重试，不能替代真实积压覆盖或以平台差异放行gate。Run `cargo test --manifest-path plugins/superpowers-kanban/Cargo.toml -p superpowers-kanban-ipc status_io::tests -- --test-threads=1`，先因模块/方法缺失红。
 
-- [ ] **Step 2: 实现地址、fd与readiness。** 实现 std::fmt::Display：ProbeStage显示小写 `connect` / `write` / `read`，ClientError::Timeout显示 `ipc probe timeout during {stage}`，保留既有所有错误variants的Display分支。使用zeroed sockaddr_un、检查原始bytes<=103且不含0；复制bytes且末尾NUL，socklen=`offset_of!(libc::sockaddr_un,sun_path)+bytes.len()+1`，macOS设置sun_len。socket后立即OwnedFd::from_raw_fd；fcntl F_GETFL/F_SETFL O_NONBLOCK、F_GETFD/F_SETFD FD_CLOEXEC，任一失败drop。macOS SO_NOSIGPIPE在首次send前配置。所有unsafe块注明地址初始化、指针寿命与fd唯一所有者。
+- [ ] **Step 2: 实现地址、fd与readiness。** 实现 std::fmt::Display：ProbeStage显示小写 `connect` / `write` / `read`，ClientError::Timeout显示 `ipc probe timeout during {stage}`，保留既有所有错误variants的Display分支。使用zeroed sockaddr_un、检查原始bytes<=103且不含0；复制bytes且末尾NUL，socklen=`offset_of!(libc::sockaddr_un,sun_path)+bytes.len()+1`，macOS设置sun_len。socket syscall返回负fd先报last_os_error，不能对-1构造OwnedFd；合法fd立即OwnedFd::from_raw_fd；fcntl F_GETFL/F_SETFL O_NONBLOCK、F_GETFD/F_SETFD FD_CLOEXEC，任一失败drop。macOS SO_NOSIGPIPE在首次send前配置。所有unsafe块注明地址初始化、指针寿命与fd唯一所有者。
 ```rust
 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
 if remaining.is_zero() { return Err(ClientError::Timeout { stage }); }
@@ -217,9 +234,9 @@ let rc = unsafe { libc::poll(&mut item, 1, ms) };
 ```
 poll前/返回后重查同deadline；EINTR重试，不延长；POLLNVAL报InvalidInput/EBADF，HUP/ERR返回revents给连接/读写处理，不先丢数据。rc=0重查deadline，不对剩余时间做无界block。
 
-- [ ] **Step 3: 实现connect状态机。** 0立即成功；EINPROGRESS/EALREADY/EINTR按pending处理，poll后getsockopt(SO_ERROR)，0才成功，非0保留errno。Linux EAGAIN/EWOULDBLOCK为积压：drop此fd，在剩余deadline内sleep最多10ms后新fd重试；不能poll一个未连fd并把SO_ERROR0当成功。EISCONN成功；其他errno立即返回。deadline每次新fd前后及poll后都检查。
+- [ ] **Step 3: 实现connect状态机。** 0立即成功（返回前再查deadline）；EINPROGRESS/EALREADY按pending处理，poll后getsockopt(SO_ERROR)，0才成功，非0保留errno。EINTR先重查deadline，关闭当前fd并重新创建/连接，不能将可能未建立连接的fd直接按SO_ERROR=0认作成功。Linux EAGAIN/EWOULDBLOCK为积压：drop此fd，在剩余deadline内sleep最多10ms后新fd重试；不能poll一个未连fd并把SO_ERROR0当成功。EISCONN成功；其他errno立即返回。deadline每次新fd前后及poll后都检查。
 
-- [ ] **Step 4: 红绿验证并添加确定性中断接缝。** `connect_retries_keep_original_deadline` 将“新fd尝试”的私有闭包输入精确到 `(deadline: Instant) -> io::Result<OwnedFd>`，测试返回EAGAIN并记录调用deadline相同；`poll_eintr_keeps_deadline` 窄poll syscall封装接缝连续EINTR直到原deadline，超时Connect；`failed_attempts_close_descriptors` 在私有fd guard drop计数测试或 Linux `/proc/self/fd` / macOS F_GETFD 检查已记录fd为EBADF，避免全局fd数量受并发影响。真实积压与fake并用，不能只测假clock。
+- [ ] **Step 4: 红绿验证并添加确定性中断接缝。** `connect_retries_keep_original_deadline` 将“新fd尝试”的私有闭包输入精确到 `(deadline: Instant) -> io::Result<OwnedFd>`，测试返回EAGAIN并记录调用deadline相同；`poll_eintr_keeps_deadline` 窄poll syscall封装接缝连续EINTR直到原deadline，超时Connect；`failed_attempts_close_descriptors` 优先用可注入syscall封装记录每次open/close的配对与失败路径（socket失败不创建guard、fcntl/connect/poll/timeout失败恰好关闭一次）；真实OwnedFd的EBADF检查只在独占测试且关闭后不再open任何fd时做，不能用进程全局fd数量或已被复用的fd号作为证据。真实积压与fake并用，不能只测假clock。
 
 - [ ] **Step 5: 完整验证及提交。** Task1/2的路径和跨端test回归，两个workspace fmt+宿主just ci+插件plugin-check；模块记录connect测试证据，提交 `fix: bound status socket connection before first connect`。
 
@@ -236,7 +253,7 @@ poll前/返回后重查同deadline；EINTR重试，不延长；POLLNVAL报Invali
 pub fn send_status_with_budget(socket: &std::path::Path, budget: std::time::Duration)
     -> Result<crate::wire::Reply, ClientError>;
 // status_io.rs私有，消耗Task3 connect_before；client负责ID与编解码。
-fn exchange(socket: &std::path::Path, request: &[u8], deadline: std::time::Instant)
+pub(super) fn exchange(socket: &std::path::Path, request: &[u8], deadline: std::time::Instant)
     -> Result<Vec<u8>, crate::client::ClientError>;
 trait ProbeIo {
     fn send(&mut self, bytes: &[u8]) -> std::io::Result<usize>;
@@ -263,7 +280,7 @@ decode_response(&response, &request_id)
 ```
 write offset直到request长度，0→WriteZero；WouldBlock→wait(write=true)，Interrupted→重查，其他errno透传。read只读最多剩余MAX_FRAME_BYTES+1，查首LF，返回完整首frame；EOF无LF→Truncated；达到上限且无LF→FrameTooLarge；如LF恰在MAX_FRAME_BYTES位置则接受（JSON字节上限不含LF）。每次IO前后检查deadline，缓冲不超过MAX+1，不用read_until无界累积。Linux send MSG_NOSIGNAL，macOS沿Task3 SO_NOSIGPIPE，不能全局signal忽略。
 
-- [ ] **Step 3: fake IO红绿补部分写与中断。** `short_writes_and_interrupted_io_complete_one_frame`：fake send先Interrupted，再每次1字节，recv先WouldBlock再2字节，wait记录同一deadline，最终request字节与encode_request完全一致；`write_stall_times_out_at_write_stage`：fake永远WouldBlock，wait到deadline返回Timeout Write；`hup_with_complete_frame_is_not_truncated`：真实peer write完整帧后shutdown，仍成功；`broken_peer_does_not_raise_sigpipe`：子进程在默认SIGPIPE处理下真实连接、peer关闭后写大测试frame，通过私有worker调用exchange，断言正常返回Io错误而非signal13。仅Status公开入口小frame，短写/写背压必须通过私有执行器接缝，不捏造Status一定填满缓冲。
+- [ ] **Step 3: fake IO红绿补部分写与中断。** `short_writes_and_interrupted_io_complete_one_frame`：fake send先Interrupted，再每次1字节，recv先WouldBlock再2字节，wait记录同一deadline，最终request字节与encode_request完全一致；`write_stall_times_out_at_write_stage`：fake永远WouldBlock，wait到deadline返回Timeout Write；`hup_with_complete_frame_is_not_truncated`：真实peer write完整帧后shutdown，仍成功；`broken_peer_does_not_raise_sigpipe` 位于 `status_io::tests`：用current_exe带 `--exact status_io::tests::sigpipe_worker --nocapture --test-threads=1` 只跑worker（CONNECTED必须即时可见，不能被libtest捕获），env_clear传专用socket路径；worker进入后先 `unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }`（只改child信号，Rust启动默认忽略不能作为测试条件），调用connect_before拿fd，stdout发并flush `CONNECTED`，等待父进程stdin一个GO字节。parent有5秒watchdog，观察CONNECTED后accept peer、shutdown(Both)+drop，再写GO；worker通过exchange_connected发送大frame直到出错，断言Io BrokenPipe/ConnectionReset，正常退出而非signal13。worker输入缺失时正常返回，不计负例；parent必须看到CONNECTED及正常退出。将局部防SIGPIPE去掉并独占运行此测试时child必须signal13失败，再恢复绿。仅Status公开入口小frame，短写/写背压必须通过私有执行器接缝，不捏造Status一定填满缓冲。
 
 - [ ] **Step 4: 补负帧和成功语义。** 测试名 `valid_status_and_business_error_are_replies`、`truncated_frame_is_rejected`、`malformed_frame_is_rejected`、`oversized_stream_is_bounded`、`protocol_and_request_id_mismatches_are_rejected`、`frame_limit_excludes_newline`。桩读取RequestEnvelope取真实ID，按PROTOCOL_VERSION构造ResponseEnvelope；合法Error保留Reply::Error而非探活失败。MAX/ MAX+1体积用event padding或未知Reply生成合法JSON，不只用invalid repeated x测长度；无LF超限也测。gate中每测试错误variant精确断言。
 
@@ -301,7 +318,21 @@ fn misses_accessor_tracks_only_consecutive_failures() {
     assert!(l.observe(false, 3)); assert_eq!(l.misses(), 3);
 }
 ```
-runner client unit `probe_preserves_error_and_accepts_business_error` 使用Task4真实短根合法Error桩与不存在socket，分别Ok和Io ConnectionRefused/NotFound；调用 `cargo test --manifest-path plugins/superpowers-kanban/Cargo.toml -p superpowers-kanban-runner`，新methods缺失红。
+runner client unit `probe_preserves_error_and_accepts_business_error` 不引用Task4 crate的私有测试桩，而在本 `client::tests` 内构造独立短根UnixListener：非阻塞accept最多1秒；accept后设stream blocking且read/write timeout各1秒；BufReader读取受控Status一行、反序列化RequestEnvelope，生成匹配ID的合法Reply::Error后write_all。核心响应代码如下（server线程持stream与request，父test持同一短根socket）：
+```rust
+let reply = superpowers_kanban_ipc::wire::ResponseEnvelope {
+    protocol_version: superpowers_kanban_ipc::wire::PROTOCOL_VERSION,
+    request_id: request.request_id,
+    event_id: None, event: None,
+    result: superpowers_kanban_ipc::wire::Reply::Error {
+        code: "TestOnly".into(), message: None,
+    },
+};
+let mut bytes = serde_json::to_vec(&reply).unwrap();
+bytes.push(b'\n');
+std::io::Write::write_all(&mut stream, &bytes).unwrap();
+```
+父test断言BoardDaemon::new(socket).probe()为Ok、join有界线程；另用不存在socket断言Io ConnectionRefused/NotFound。调用 `cargo test --manifest-path plugins/superpowers-kanban/Cargo.toml -p superpowers-kanban-runner`，新methods缺失红。
 
 - [ ] **Step 2: 实现窄方法并重排run。**
 ```rust
@@ -323,7 +354,7 @@ if let Err(error) = result {
 }
 if should_exit { std::process::exit(0); }
 ```
-探活仍在开关之前；成功只清零，不逐拍打印。不保留“daemon is gone”无证据断言。注释退出预算改为spec P/I/W口径，不再写3×interval硬上界。
+探活仍在开关之前；成功只清零，不逐拍打印。进入loop前仅一次打印 `daemon probe loop starting runtime={} socket={}`，位置必须在迁移/查询启动之后、首次probe之前，供进程测试启动计时；不得每拍输出或用首次错误日志替代。不保留“daemon is gone”无证据断言。注释退出预算改为spec P/I/W口径，不再写3×interval硬上界。
 
 - [ ] **Step 4: 回归、证据与提交。** 跑runner单测与IPC/cross tests，完整fmt/just ci/plugin-check，模块记录Task5尚待进程验收，提交 `fix: report kanban probe failures without hiding socket errors`。
 
@@ -335,9 +366,9 @@ if should_exit { std::process::exit(0); }
 - Modify: `docs/project-management/superpowers-kanban.md`。
 
 **Interfaces:**
-- `TestLayout::new() -> TestLayout` 持短根TempDir，字段home/runtime/state/project均独立。
-- `spawn_runner(layout: &TestLayout, home_present: bool) -> ChildGuard`；用env!("CARGO_BIN_EXE_superpowers-kanban")而非假设target/debug固定路径。
-- `StatusStub::start(path: &Path, replies: Vec<StubReply>) -> StatusStub`；StubReply为Status/BusinessError/Close/Silent，AtomicUsize请求数，stop flag，Drop停止join。非空replies按连接依次取，耗尽重复最后一个；主accept线程不被沉默连接阻塞，每条连接独立有界处理并可由stop中断，Drop join所有handler。
+- `TestLayout::new() -> TestLayout`：用 `tempfile::Builder::new().prefix("kd").tempdir_in("/tmp")` 持短根并canonicalize，home=`root/i`、runtime=`root/r`、project=`root/p`、state=`project/.yi-agent/superpowers-kanban`。只预建home、home/tmp、runtime、project；state和其配置父目录由各用例显式创建，缺home/超长零副作用用例可保持state不存在。
+- `spawn_runner(layout: &TestLayout, instance_home: Option<&Path>) -> ChildGuard`；Some传入可替换的实际INSTANCE并始终给HOME隔离目录，None同时不设置INSTANCE/override/HOME；因此缺home与超长home均能复用，无含糊bool参数。用env!("CARGO_BIN_EXE_superpowers-kanban")而非假设target/debug固定路径。
+- `StatusStub::start(path: &Path, replies: Vec<StubReply>) -> StatusStub`：只对本TestLayout下socket创建parent目录后bind；StubReply为Status/BusinessError/Close/Silent，AtomicUsize请求数，stop flag，Drop停止join。非空replies按连接依次取，耗尽重复最后一个；主accept线程不被沉默连接阻塞，每条连接独立有界处理并可由stop中断，Drop join所有handler。
 - layout.state固定 `<project>/.yi-agent/superpowers-kanban`；创建默认测试开关使用真实 `superpowers_kanban_core::switch::write_layer(&superpowers_kanban_core::layout::project_preferences_path(&layout.state), SwitchValue::Enabled)`；只有关闭开关用例写Disabled，缺home/超长零副作用用例不调用写开关（避免先创建state父目录）。
 - ChildGuard日志tempfile、`wait_before(deadline: Instant) -> ExitStatus`、`stderr() -> String`、Drop kill/wait；不用pipe导致无法read至EOF或阻塞子进程。
 
@@ -354,9 +385,9 @@ std::process::Command::new(env!("CARGO_BIN_EXE_superpowers-kanban"))
 ```
 等待stub>=6请求（最多12秒），期间try_wait None、id保持初始值，旧两桩count0。先临时恢复旧业务解析器运行该单例，确认红，再还原新实现绿；此task新测试在已修代码上预期绿，不能伪称先前运行过红。
 
-- [ ] **Step 2: 失联/开关/重置用例。** `three_misses_exit_and_release_lock`：无daemon，空inbox/no archive，进程在首次诊断后的12秒内exit0，日志次数1/2/3恰好三行、runtime/socket/errno清晰，single_instance::acquire成功；启动前到首诊断另有5秒startup watchdog。`disabled_switch_still_probes`：用项目board switch API先写关闭再启动，不只是改全局flag；三次一样退出。`success_resets_the_streak`：桩Close,Close,Status,Close,Close,Close，断言计数1,2,1,2,3（成功不打印）且至少6请求；合法Error替代Status再跑一次。
+- [ ] **Step 2: 失联/开关/重置用例。** `three_misses_exit_and_release_lock`：无daemon，空inbox/no archive，进程从首次probe前的 `daemon probe loop starting` 标记开始计时，12秒内exit0；标记等待单独最多5秒startup watchdog，绝不从首条失败诊断开始计时漏掉第一次超时。，日志次数1/2/3恰好三行、runtime/socket/errno清晰，single_instance::acquire成功；标记之前的初始化不计入失联窗口（启动watchdog已单独覆盖）。`disabled_switch_still_probes`：用项目board switch API先写关闭再启动，不只是改全局flag；三次一样退出。`success_resets_the_streak`：桩Close,Close,Status,Close,Close,Close，断言计数1,2,1,2,3（成功不打印）且至少6请求；合法Error替代Status再跑一次。
 
-- [ ] **Step 3: 沉默进程仍有界退出。** `silent_status_peer_exits_under_empty_loop_budget`：三次accept后保持沉默直到client关闭，每次read Timeout诊断；12秒内exit0、三条misses、释放锁。测试不能通过服务端主动close代替沉默。child/source工作与loop空载条件在报告写明，不外推全工作负载硬上界。
+- [ ] **Step 3: 沉默进程仍有界退出。** `silent_status_peer_exits_under_empty_loop_budget`：三次accept后保持沉默直到client关闭，每次read Timeout诊断；从同一首次probe前标记计时12秒内exit0、三条misses、释放锁。测试不能通过服务端主动close代替沉默。child/source工作与loop空载条件在报告写明，不外推全工作负载硬上界。
 
 - [ ] **Step 4: 解析失败零副作用。** `missing_instance_home_fails_before_state_side_effects`：child env_clear且不设置HOME/INSTANCE/override，预先state放最小board/inbox快照；exit1，包含socket unresolved/实例错误，plugin.lock不存在、query新旧候选不存在，快照逐字节不变；state原本不存在的另一个case保持不存在。`long_instance_home_fails_before_state_side_effects`：超限候选显示bytes/limit，其他相同。运行态保全测试 `bound_card_state_is_not_changed_by_probing`：在启用开关的layout写含已绑定thread的Running、Queued、NeedsYou三卡，enqueued_at使用当前chrono RFC3339、next_order=4，各卡order=1/2/3；让合法Status桩应答>=6次后读取board投影比较ID/order/state/thread。创建数据：
 ```rust
@@ -387,23 +418,117 @@ cargo test --manifest-path plugins/superpowers-kanban/Cargo.toml -p superpowers-
 - Create: `scripts/plugins/check-daemon-socket-wiring.py`
 - Create/Test: `scripts/plugins/test_check_daemon_socket_contract.py`
 - Modify: `yi-agent-rs/justfile::plugin-contracts-check`，新增 `plugin-daemon-socket-check`。
-- Modify: `.github/workflows/ci.yml::macos`（Linux plugins已有调用链不重复加）；`.gitlab-ci.yml` 仅核查现有ci-plugins链，不需要修改。
+- Modify: `.github/workflows/ci.yml::macos`（Linux plugins已有调用链不重复加）；`.gitlab-ci.yml::ci-plugins.before_script` 显式安装 `python3`，后续script保留现有contracts调用。
 - Modify: `plugins/contracts/README.md`、`docs/project-management/superpowers-kanban.md`。
 
 **Interfaces:**
 - gate脚本从自身绝对位置解析repo root；默认只host example +两个fixture测试+ignored cross+IPC/runner预算/进程测试，无Node。
 - 从cargo metadata取host target_directory；支持绝对/相对CARGO_TARGET_DIR，build与metadata统一cd根，避免两个workspace解释相对路径不同。
-- Python `check(root: pathlib.Path) -> list[str]` 静态守卫读取具体recipe和workflow jobs，不全局grep碰巧出现字符串。自测使用临时root文件，变异不能编辑真实main。
+- Python `check(root: pathlib.Path) -> list[str]` 静态守卫读取具体recipe和workflow jobs，不全局grep碰巧出现字符串。对shell的明确接线识别固定 `run_one cross_process_daemon_socket_contract ignored` 调用、run_one函数非空 `flags=(--exact)` 与ignored分支 `flags+=(--ignored)` 的实际参数组合，不能要求它们相邻而误判具名函数封装；自测使用临时root文件，变异不能编辑真实main。
 
-- [ ] **Step 1: 写gate负例红测试。** Python unittest名 `test_missing_probe_is_not_success`、`test_zero_cross_tests_is_rejected`、`test_missing_recipe_dependency_is_rejected`、`test_linux_gitlab_and_macos_call_chains_are_required`。脚本测试用临时PATH假cargo，metadata输出target_directory，build exit0但缺example→gate非0；假test输出running0/testresult0pass→非0。fake success输出精确testname和1passed，不调用网络/cargo真实构建。
+- [ ] **Step 1: 写gate负例红测试。** Python unittest名 `test_valid_gate_executes_required_tests`、`test_missing_probe_is_not_success`、`test_zero_cross_tests_is_rejected`、`test_missing_required_io_test_is_rejected`、`test_stale_or_cross_target_probe_is_rejected`、`test_invalid_metadata_is_rejected`、`test_missing_recipe_dependency_is_rejected`、`test_linux_gitlab_and_macos_call_chains_are_required`。临时root复制待测shell并放在scripts/plugins，创建必要manifest占位文件及临时PATH假cargo，所有构建/test操作由fake分派，不访问真实cargo。fake记录每次argv到文件：metadata返回target_directory，build返回compiler-artifact JSON/executable；正常case为所需test输出精确running/成功名称/summary，显式用 `/bin/bash` 执行（macOS为Bash3.2），预期exit0且8个阶段实际被调用；非空flags数组不可改为空数组再展开（Bash3.2 set -u会报unbound且可能错误exit0，调用清单必须拦住）。负例只改变一个阶段，其他保持有效。build exit0但缺example→非0；build指向不同target的产物→非0；非法metadata→非0；cross输出0test→非0；删一条关键IO成功记录→非0。不得只跑负例来放行永远exit1的脚本。
 
-- [ ] **Step 2: 实现shell gate。** `set -euo pipefail`；显式build host probe、test fixture；确认helper `-x` 后执行Task2命令到temp日志。不是 `cargo test | tee` 未设pipefail；执行失败cat日志并退出。固定cross名称，结果同时检查：
+- [ ] **Step 2: 实现shell gate并校验实际产物/测试执行。** 脚本主体固定如下；run_one拒绝0test/ignored跳过，完整包回归日志再核查关键测试名称。stderr/stdout不依赖继承的capture/color环境。probe来源同时核对cargo metadata目录与本次compiler-artifact JSON，拒绝build.target配置或陈旧native路径错配，而非从磁盘碰巧找到旧example就继续。
 ```bash
-grep -Fqx 'running 1 test' "$log"
-grep -Eq '^test cross_process_daemon_socket_contract \.\.\. ok$' "$log"
-grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/../.." && pwd -P)
+cd "$ROOT"
+command -v python3 >/dev/null
+if [[ -n ${CARGO_BUILD_TARGET:-} ]]; then
+  echo 'cross-target execution is not supported' >&2
+  exit 1
+fi
+unset RUST_TEST_NOCAPTURE KANBAN_CONTRACT_RUNTIME_HEX KANBAN_CONTRACT_DELETE_CWD
+export CARGO_TERM_COLOR=never
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+HOST_TARGET=$(cargo metadata --manifest-path yi-agent-rs/Cargo.toml --no-deps --format-version 1 |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+cargo build --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-lifecycle \
+  --example daemon_socket_contract_probe --message-format=json >"$TMP/build.json"
+PROBE=$(python3 - "$TMP/build.json" "$HOST_TARGET" <<'PY'
+import json, os, sys
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+paths = [r['executable'] for r in rows
+         if r.get('reason') == 'compiler-artifact'
+         and r.get('target', {}).get('name') == 'daemon_socket_contract_probe'
+         and 'example' in r.get('target', {}).get('kind', [])
+         and r.get('executable')]
+assert len(paths) == 1, 'missing or ambiguous host probe artifact'
+expected = os.path.join(sys.argv[2], 'debug', 'examples', 'daemon_socket_contract_probe')
+assert os.path.realpath(paths[0]) == os.path.realpath(expected), 'cross-target or stale artifact path'
+assert os.path.isfile(paths[0]) and os.access(paths[0], os.X_OK), 'host probe is missing'
+print(os.path.abspath(paths[0]))
+PY
+)
+export KANBAN_HOST_SOCKET_PROBE="$PROBE"
+run_one() {
+  local name=$1 mode=$2
+  shift 2
+  local flags=(--exact)
+  if [[ $mode == ignored ]]; then flags+=(--ignored); fi
+  local log="$TMP/one.log"
+  if ! cargo test "$@" "$name" -- "${flags[@]}" --format pretty --color never >"$log" 2>&1; then
+    cat "$log" >&2; return 1
+  fi
+  cat "$log"
+  grep -Fqx 'running 1 test' "$log"
+  grep -Fqx "test $name ... ok" "$log"
+  grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
+}
+run_one root_vector_and_fixture_schema_are_pinned normal \
+  --manifest-path yi-agent-rs/Cargo.toml -p yi-agent-lifecycle --test daemon_socket_contract
+run_one root_vector_and_fixture_schema_are_pinned normal \
+  --manifest-path plugins/superpowers-kanban/Cargo.toml -p superpowers-kanban-ipc --test daemon_socket_contract
+run_one cross_process_daemon_socket_contract ignored \
+  --manifest-path plugins/superpowers-kanban/Cargo.toml -p superpowers-kanban-ipc --test daemon_socket_contract
+if ! cargo test --manifest-path plugins/superpowers-kanban/Cargo.toml \
+  -p superpowers-kanban-ipc -- --format pretty --color never >"$TMP/ipc.log" 2>&1; then
+  cat "$TMP/ipc.log" >&2; exit 1
+fi
+cat "$TMP/ipc.log"
+for name in status_io::tests::nul_is_rejected_before_connect \
+  status_io::tests::connect_backlog_obeys_deadline \
+  status_io::tests::connect_retries_keep_original_deadline \
+  status_io::tests::poll_eintr_keeps_deadline \
+  status_io::tests::failed_attempts_close_descriptors \
+  status_io::tests::short_writes_and_interrupted_io_complete_one_frame \
+  status_io::tests::write_stall_times_out_at_write_stage \
+  status_io::tests::broken_peer_does_not_raise_sigpipe \
+  silent_peer_times_out_during_read drip_feed_cannot_renew_budget \
+  hup_with_complete_frame_is_not_truncated \
+  valid_status_and_business_error_are_replies truncated_frame_is_rejected \
+  malformed_frame_is_rejected oversized_stream_is_bounded \
+  protocol_and_request_id_mismatches_are_rejected frame_limit_excludes_newline; do
+  grep -Fqx "test $name ... ok" "$TMP/ipc.log"
+done
+if ! cargo test --manifest-path plugins/superpowers-kanban/Cargo.toml \
+  -p superpowers-kanban-runner --test daemon_liveness \
+  -- --test-threads=1 --format pretty --color never >"$TMP/runner.log" 2>&1; then
+  cat "$TMP/runner.log" >&2; exit 1
+fi
+cat "$TMP/runner.log"
+for name in new_socket_keeps_same_pid_and_old_sockets_are_untouched \
+  three_misses_exit_and_release_lock disabled_switch_still_probes \
+  success_resets_the_streak silent_status_peer_exits_under_empty_loop_budget \
+  missing_instance_home_fails_before_state_side_effects \
+  long_instance_home_fails_before_state_side_effects bound_card_state_is_not_changed_by_probing; do
+  grep -Fqx "test $name ... ok" "$TMP/runner.log"
+done
+if ! cargo test --manifest-path plugins/superpowers-kanban/Cargo.toml \
+  -p superpowers-kanban-runner --lib -- --format pretty --color never >"$TMP/runner-lib.log" 2>&1; then
+  cat "$TMP/runner-lib.log" >&2; exit 1
+fi
+cat "$TMP/runner-lib.log"
+for name in client::tests::probe_preserves_error_and_accepts_business_error \
+  single_instance::tests::misses_accessor_tracks_only_consecutive_failures; do
+  grep -Fqx "test $name ... ok" "$TMP/runner-lib.log"
+done
 ```
-cross输出使用`--format pretty`而非nocapture避免worker输出混入行；随后正常IPC/runner（包括daemon_liveness）测试，`--test-threads=1`只给进程target。脚本trap删temp logs，正常输出fixture/cross/预算/进程各成功数量；CARGO_BUILD_TARGET非空显式报不支持跨编译执行（不能错误找本机debug artifact）；不尊重不明确的release参数，固定debug。
+`hup_with_complete_frame_is_not_truncated` 放 `tests/status_budget.rs`；fixture的环境/路径用例由IPC整包回归执行。Rust-only gate已执行runner --lib，确保macOS覆盖probe/计数单测且不重复daemon_liveness。Task7自测严格模拟每阶段argv与成功记录；变更测试名时同commit同步列表，遗漏执行记录即失败。
+
+- [ ] **Step 2a: 接线守卫自身实现/自测。** Python仅用pathlib/re/sys/unittest，不新增PyYAML。`check(root)`按固定缩进切出just顶层recipe、GitHub二级job、GitLab顶层job，忽略注释和空行；检查plugin-contracts-check依赖plugin-daemon-socket-check、两recipe主体与script显式cross名称/ignored/exact参数、Linux/GitLab调用contracts、macOS调用Rust-onlygate及安装just、GitLab安装python3。动态/不认识的写法返回非空错误而不是猜测放行；自测在临时root先构造全部合法块断言无错，再分别删依赖/调用/安装或改测试名断言点名错误。main打印每条错误到stderr并exit1，无错exit0。
 
 - [ ] **Step 3: 接recipe与macOS。**
 ```just
@@ -416,7 +541,7 @@ plugin-contracts-check: plugin-daemon-socket-check
     node ../scripts/plugins/check-contracts.mjs
     node --test ../scripts/plugins/check-contracts.test.mjs
 ```
-macos job新增Install just步骤 `uses: taiki-e/install-action@v2` / `tool: just`，然后 `working-directory: yi-agent-rs` / `run: just plugin-daemon-socket-check`。不能假设macOS已装just，也不跑需要Node的plugin-contracts-check。静态守卫检查Linux plugins/GitLab ci-plugins调用plugin-contracts-check且recipe依赖存在，macos固定macos-15有Rust-onlygate调用。
+macos job新增Install just步骤 `uses: taiki-e/install-action@v2` / `tool: just`，然后 `working-directory: yi-agent-rs` / `run: just plugin-daemon-socket-check`。GitLab ci-plugins首条apt安装列表加 `python3`：`apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg git python3 >/dev/null`；不改变job权限/rules/runner。不能假设macOS已装just，也不跑需要Node的plugin-contracts-check。静态守卫检查Linux plugins/GitLab ci-plugins调用plugin-contracts-check且recipe依赖存在，macos固定macos-15有Rust-onlygate调用。
 
 - [ ] **Step 4: 独占四类变异，必须红。** 在执行worktree逐项临时变异→单命令→记录rc/testname→立即还原；从clean checkpoint开始，只还原本轮变异文件，不能git reset --hard丢他人工作。
   1. 旧daemon布局：Task6 `new_socket_keeps_same_pid_and_old_sockets_are_untouched` 必红。
@@ -475,4 +600,5 @@ GitHub Linux/macOS及GitLab实际运行链接在MR/PR可用时归档；本机不
 - 需求覆盖：spec §1–3→全局边界/Task1；§4→Task1/2/5/6；§5→Task3–6；§6→Task2/7；§7→覆盖表；§8–9→Task8。
 - 类型一致：业务错误独立于查询错误；probe只返Result<(),ClientError>，Status入口返Reply；host路径函数返PathBuf、env返Option；跨端比较原始hex/错误类别。
 - 实测红绿、四类变异、Linux/macOS运行和真机结果均由实施者记录，本计划没有预先填任何通过结果。
-- 执行选择：subagent-driven-development逐任务双阶段审查，或executing-plans在当前会话分批执行。用户本轮只授权复审spec与写plan，不开始实现或部署。
+- 本轮plan专项复审已有最小Rust示例编译与内嵌gate语法/mock正反例证据，见[plan复审记录](../reviews/2026-11-09-kanban-daemon-socket-plan-review.md)；不等同原项目单测、跨端真实函数或真机通过。
+- 执行选择：subagent-driven-development逐任务双阶段审查，或executing-plans在当前会话分批执行。用户本轮只授权反复检查plan，不开始实现或部署。
