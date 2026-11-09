@@ -153,6 +153,19 @@ fn canonical_spelling_and_missing_tail_match() {
         direct
     );
 
+    // 实例家目录本身也必须是 canonical 的：macOS 上 `/var` 与 `/private/var`
+    // 是同一目录，两种拼写若各产生一个 socket 目录，守护绑定一个、客户端探另一个，
+    // 就回到本模块要消灭的超时。只测 runtime 的 symlink 抓不到这一点。
+    let real_home = canonical_root.join("i");
+    std::fs::create_dir_all(&real_home).unwrap();
+    let home_link = canonical_root.join("i-link");
+    std::os::unix::fs::symlink(&real_home, &home_link).unwrap();
+    assert_eq!(
+        daemon_socket_with_home(&real.join("runtime"), &home_link).unwrap(),
+        daemon_socket_with_home(&real.join("runtime"), &real_home).unwrap(),
+        "a symlinked instance home must resolve to the same socket directory"
+    );
+
     // 缺失尾部的 runtime 在创建前后解析一致；home 尾部缺失同理。
     let missing = canonical_root.join("missing/runtime");
     let before = daemon_socket_with_home(&missing, &canonical_root.join("new-home")).unwrap();
