@@ -1284,4 +1284,33 @@ mod settled_parent_wire_tests {
             "a settled parent is an invalid-state refusal, not internal: {message}"
         );
     }
+
+    /// The attach gate's two refusals must not share a wire code.
+    ///
+    /// A client decides whether to retry from the code alone -- the daemon strips
+    /// the message before the frame leaves, so "the guardian has not vouched for you
+    /// yet" is indistinguishable from "your root stopped admitting" unless the codes
+    /// differ. They mean opposite things: the first is a startup race that resolves
+    /// in milliseconds, the second is a settled refusal that retrying cannot fix.
+    #[test]
+    fn an_unvouched_client_is_denied_on_its_authority_not_by_a_closed_admission() {
+        let unvouched = IpcError::Runtime(RuntimeCoordinatorError::AuthorityDenied(
+            "client app-run-1 holds no root authorization on this daemon".into(),
+        ));
+        assert_eq!(
+            ipc_error_code(&unvouched),
+            IpcErrorCode::AuthorityDenied,
+            "an unvouched client must be retryable, and only the code can say so"
+        );
+        let closed = IpcError::Runtime(RuntimeCoordinatorError::AdmissionClosed(
+            "this root is not admitting work".into(),
+        ));
+        assert_eq!(ipc_error_code(&closed), IpcErrorCode::Internal);
+        assert_ne!(
+            ipc_error_code(&unvouched),
+            ipc_error_code(&closed),
+            "a retryable authority refusal and a settled admission closure must not collapse \
+             into the same code, or a client either retries forever or gives up too early"
+        );
+    }
 }

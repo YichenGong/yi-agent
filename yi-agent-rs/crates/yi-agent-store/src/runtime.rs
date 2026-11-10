@@ -4400,12 +4400,22 @@ impl RuntimeCoordinator {
                 // A managed daemon with no authorized client is not "open": the
                 // guardian exists and vouched for nobody, so there is no owner to
                 // attribute this attach to.
+                //
+                // The refusal is `AuthorityDenied`, not `AdmissionClosed`, because
+                // the two say different things to the caller. Admission is closed
+                // for a *root* that exists; this one is about whether the guardian
+                // has vouched for the caller *yet*. That distinction is load-bearing
+                // at startup: the shell registers a lease and pushes `ClientLeased`
+                // on the guardian's lifeline, while the sidecar attaches in parallel.
+                // A `ClientLeased` still in flight looks exactly like a client that
+                // was never authorized, and only the code can tell the client which
+                // one it is -- the daemon strips the message before the wire.
                 let authority = self
                     .attach_authority
                     .lock()
                     .expect("attach authority mutex poisoned");
                 authority.admits(client).map_err(|reason| {
-                    RuntimeCoordinatorError::AdmissionClosed(format!(
+                    RuntimeCoordinatorError::AuthorityDenied(format!(
                         "{reason} (project attach for {client})"
                     ))
                 })?;

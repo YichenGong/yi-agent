@@ -19,7 +19,7 @@ use yi_agent_core::subagent::worker::{
 };
 use yi_agent_lifecycle::authorization::{AuthorizationLedger, AuthorizationUpdate};
 use yi_agent_lifecycle::types::LeaseMode;
-use yi_agent_store::runtime::RuntimeCoordinator;
+use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeCoordinatorError};
 
 struct JoinedFactory;
 
@@ -257,6 +257,73 @@ async fn a_managed_daemon_refuses_a_project_attach_naming_an_unknown_client() {
         .expect_err("a client the guardian never authorized must not attach");
     let rendered = format!("{error}");
     assert!(rendered.contains("app-run-impostor"), "{rendered}");
+    // The refusal must be `AuthorityDenied` rather than an admission closure: the
+    // client has to be able to tell "no one vouchsafed you" from "your root stopped
+    // admitting", because the first is retried while a lease is in flight and the
+    // second is not. Only the code survives the trip to the client; the daemon
+    // strips the message.
+    assert!(
+        matches!(error, RuntimeCoordinatorError::AuthorityDenied(_)),
+        "an unpublished client is an authority denial, not a closed admission, got {error:?}"
+    );
+}
+
+/// A lease that arrives *after* the first attach must make the retry succeed.
+///
+/// This is the startup race the desktop hit: the shell registers its business lease
+/// and pushes `ClientLeased` down the guardian's lifeline while the sidecar attaches
+/// in parallel, so the first attach can beat the lease. The daemon cannot make that
+/// ordering impossible, so the contract is narrower and stronger: a refusal while the
+/// lease is missing must be *identifiable* as an authority denial, so the caller knows
+/// to retry instead of caching a permanent failure for the whole process.
+///
+/// Both halves are asserted here, because either alone would leave the defect open: a
+/// retryable caller that cannot recognise the refusal still gives up, and a
+/// recognisable refusal that the caller caches still strands every later conversation.
+#[tokio::test]
+async fn a_lease_arriving_after_the_first_attach_makes_the_retry_succeed() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+
+    let guardian = guardian_for(&directory, &coordinator);
+    let secret = guardian.generation_secret();
+    coordinator
+        .adopt_managed_authority(verifier_for(&directory, &coordinator, secret))
+        .expect("the ledger names this coordinator's generation");
+
+    // The lease has not been announced yet: the first attach is refused.
+    let refused = coordinator
+        .attach_application_root(
+            "project:1234:/p:uuid",
+            &workspace,
+            &[],
+            Some("app-run-late-lease"),
+        )
+        .await
+        .expect_err("a client with no announced lease must not attach yet");
+    assert!(
+        matches!(refused, RuntimeCoordinatorError::AuthorityDenied(_)),
+        "the pre-lease refusal must be an authority denial so the caller retries, got {refused:?}"
+    );
+
+    // The lease lands, exactly as `announce_client_lease` pushes it.
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::ClientLeased {
+            client_run_id: "app-run-late-lease".to_string(),
+        })
+        .expect("the serving daemon must accept the lease its guardian announced");
+
+    // The retry — the same request, a moment later — is admitted.
+    coordinator
+        .attach_application_root(
+            "project:1234:/p:uuid",
+            &workspace,
+            &[],
+            Some("app-run-late-lease"),
+        )
+        .await
+        .expect("the retry must be admitted once the guardian's lease arrives");
 }
 
 /// The authorized case, end to end: a capability the guardian minted *is* the

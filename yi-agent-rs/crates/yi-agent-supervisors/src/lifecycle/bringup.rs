@@ -997,11 +997,37 @@ pub fn verify_pinned(instance_home: &Path, expected: &ArtifactIdentity) -> io::R
 
 /// The program to launch: the pinned copy when the selection names one, otherwise
 /// the caller's own executable.
-fn pinned_program(instance_home: &Path, expected: &ArtifactIdentity) -> io::Result<PathBuf> {
+///
+/// A selection that carries a digest names bytes that must be *pinned* before they
+/// can be launched, and nothing else in the startup path pins them: `record_selection`
+/// only writes the intent, and the launcher runs strictly after it. So a first start
+/// for a build has no copy yet, and [`verify_pinned`] would answer `NotFound` for a
+/// directory that was never created. That is not "the bytes changed", it is "the
+/// bytes were never staged", and the two must not be conflated: refusing here made
+/// every fresh install unable to start its managed runtime at all.
+///
+/// Pinning is not a fallback to the bundle. [`pin_artifact`] reads
+/// `expected.executable`, refuses to finish unless the digest it computed equals
+/// `expected.sha256`, and only then `rename`s the copy into place. The bytes that
+/// end up launched are therefore the bytes the selection approved -- exactly what
+/// `verify_pinned` would have demanded. A copy that exists but disagrees with the
+/// recorded digest is still an error and is left untouched: that case really is a
+/// committed selection whose bytes changed, and silently overwriting it would hide
+/// an in-place upgrade from the supervisor.
+pub fn pinned_program(instance_home: &Path, expected: &ArtifactIdentity) -> io::Result<PathBuf> {
     if expected.sha256.is_empty() {
         return Ok(expected.executable.clone());
     }
-    verify_pinned(instance_home, expected)
+    match verify_pinned(instance_home, expected) {
+        Ok(path) => Ok(path),
+        // Only `NotFound` means "not staged yet". `digest_of` turns a missing file
+        // into exactly this kind, while a digest mismatch is `InvalidData`.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            pin_artifact(instance_home, expected)?;
+            verify_pinned(instance_home, expected)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn digest_of(path: &Path) -> io::Result<String> {

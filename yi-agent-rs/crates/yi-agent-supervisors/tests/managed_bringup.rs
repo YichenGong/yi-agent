@@ -19,7 +19,7 @@ use yi_agent_supervisors::lifecycle::CoordinationGuard;
 use yi_agent_supervisors::lifecycle::bringup::{
     BringUpIntent, BringUpResult, BusinessProbe, BusinessProbeOutcome, Compatibility, ControlProbe,
     GuardianLauncher, ProbeOutcome, classify_compatibility, ensure_managed_with,
-    ensure_managed_with_business, pin_artifact, verify_pinned,
+    ensure_managed_with_business, pin_artifact, pinned_program, verify_pinned,
 };
 
 fn test_scope(directory: &TempDir) -> RuntimeScope {
@@ -746,6 +746,121 @@ fn a_changed_source_during_pinning_is_refused() {
             .join("artifacts/build-changed/yi-agent")
             .exists(),
         "a rejected pin must not leave a half-trusted file behind"
+    );
+}
+
+/// A first start for a build has no pinned copy yet, and that must not be fatal.
+///
+/// Regression (measured 2026-11-10): `record_selection` writes the intent but
+/// nothing pins the bytes, so on a fresh install `artifacts/<build_id>/` does not
+/// exist at all. The launcher then asked for the pinned copy, got `NotFound` from a
+/// directory nobody created, and reported it as `could not start the managed
+/// runtime`. The managed runtime never started, so the App never registered a lease,
+/// the guardian reported zero clients, the daemon refused the project attach naming
+/// an unauthorized client, and `spawn_agent` was never advertised.
+///
+/// Staging the copy is not a fallback to the bundle: `pin_artifact` refuses to
+/// finish unless the digest it computed equals the recorded one, so the launched
+/// bytes are the approved bytes.
+#[test]
+fn a_first_start_stages_the_pinned_artifact_it_was_never_given() {
+    let directory = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let source_path = source_dir.path().join("yi-agent");
+    let bytes = b"#!/bin/sh\nexit 0\n";
+    std::fs::write(&source_path, bytes).unwrap();
+    std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+
+    let mut expected = artifact("build-first-start");
+    expected.executable = source_path.clone();
+    expected.sha256 = digest;
+
+    assert!(
+        !directory.path().join("artifacts").exists(),
+        "the failure needs a home that has never staged anything"
+    );
+
+    let program = pinned_program(directory.path(), &expected).expect("a first start must not fail");
+    assert_ne!(
+        program, source_path,
+        "the launched program must be the pinned copy, not the bundle"
+    );
+    assert_eq!(std::fs::read(&program).unwrap(), bytes);
+    assert_eq!(
+        program,
+        directory
+            .path()
+            .join("artifacts/build-first-start/yi-agent")
+    );
+    // The second start reuses the copy instead of staging it again.
+    assert_eq!(
+        pinned_program(directory.path(), &expected).unwrap(),
+        program
+    );
+}
+
+/// A staged copy that disagrees with the selection is not silently replaced.
+///
+/// This is the case `verify_pinned`'s comment is about: the selection's bytes
+/// changed underneath a committed runtime. Overwriting it would let an in-place
+/// upgrade pass as if nothing happened.
+#[test]
+fn a_staged_copy_that_disagrees_is_refused_rather_than_overwritten() {
+    let directory = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let source_path = source_dir.path().join("yi-agent");
+    std::fs::write(&source_path, b"the approved bytes").unwrap();
+
+    let mut expected = artifact("build-disagree");
+    expected.executable = source_path;
+    let pinned = pin_artifact(directory.path(), &expected).unwrap();
+    std::fs::write(&pinned.path, b"someone replaced this").unwrap();
+    expected.sha256 = pinned.identity.sha256;
+
+    let error = pinned_program(directory.path(), &expected).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read(&pinned.path).unwrap(),
+        b"someone replaced this",
+        "a disagreement must be reported, not repaired"
+    );
+}
+
+/// A source that does not match the selection is refused on the first start too.
+///
+/// Staging must not become a hole that lets unapproved bytes through just because
+/// no copy existed yet.
+#[test]
+fn a_first_start_refuses_a_source_the_selection_did_not_approve() {
+    let directory = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let source_path = source_dir.path().join("yi-agent");
+    std::fs::write(&source_path, b"not the approved bytes").unwrap();
+
+    let mut expected = artifact("build-unapproved");
+    expected.executable = source_path;
+    expected.sha256 =
+        "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+
+    let error = pinned_program(directory.path(), &expected).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        !directory
+            .path()
+            .join("artifacts/build-unapproved/yi-agent")
+            .exists(),
+        "a refused first start must not stage the unapproved bytes"
     );
 }
 

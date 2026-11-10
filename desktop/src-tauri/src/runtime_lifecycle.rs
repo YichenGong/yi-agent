@@ -2434,6 +2434,38 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Condvar;
 
+    /// The shell's instance home must be the one the runtime owner is recorded
+    /// under, not the bare user home.
+    ///
+    /// Regression (measured 2026-11-10): this function used to return
+    /// `dirs::home_dir()` unchanged when `YI_AGENT_HOME` was unset -- missing the
+    /// `.yi-agent` suffix every other component appends. `scope::resolve` then saw
+    /// a runtime owned by `~/.yi-agent` described by a client claiming `~`, refused
+    /// the acquisition as "two configurations sharing one database", and the App
+    /// never took a lease: the guardian stayed at zero clients, the daemon rejected
+    /// the project attach for a client it had never authorized, and `spawn_agent`
+    /// never reached the tool list.
+    ///
+    /// Asserting "has the `.yi-agent` suffix" rather than "equals
+    /// `$HOME/.yi-agent`" keeps the test honest when `YI_AGENT_HOME` is set: the
+    /// suffix is the rule, the specific directory is the environment's choice.
+    #[test]
+    fn the_shell_resolves_the_instance_home_the_runtime_is_owned_by() {
+        let resolved = instance_home().expect("a test host has an instance home");
+        assert_eq!(
+            resolved.file_name(),
+            Some(std::ffi::OsStr::new(".yi-agent")),
+            "the instance home must carry the `.yi-agent` suffix, got {}",
+            resolved.display()
+        );
+        // The shared resolver is the single source of truth; a second spelling here
+        // is exactly how the two sides drifted apart.
+        assert_eq!(
+            Some(resolved),
+            yi_agent_lifecycle::scope::instance_home_for_sockets(),
+        );
+    }
+
     /// A control backend whose releases arrive immediately but return only when
     /// the test says so, which is what makes "parallel under one deadline"
     /// observable instead of inferred.
@@ -4959,14 +4991,31 @@ fn runtime_dir_for(project: &std::path::Path) -> std::path::PathBuf {
 
 /// The instance home this shell is running as.
 ///
-/// Mirrors `bridge::instance_home`: `YI_AGENT_HOME` wins, then the user's home.
-/// Two instances must never silently share one runtime, and the scope records
-/// this value so a mismatch is a visible conflict rather than a shared database.
+/// Delegates to the shared resolver rather than keeping a third copy of the rule.
+/// The copy that used to live here returned the *user's home* when `YI_AGENT_HOME`
+/// was unset, missing the `.yi-agent` suffix every other component appends. The
+/// scope therefore recorded `/Users/<user>` where the runtime directory's owner was
+/// `/Users/<user>/.yi-agent`, and `scope::resolve` refused the acquisition as two
+/// configurations sharing one database:
+///
+/// ```text
+/// runtime directory .../yi-agent/.yi-agent/runtime belongs to instance home
+/// /Users/<user>/.yi-agent, but this client uses /Users/<user>
+/// ```
+///
+/// That refusal happened before any lease was taken, so the guardian kept zero
+/// clients, the daemon refused the App's project attach for a client it never
+/// authorized, and `spawn_agent` was never registered (measured 2026-11-10).
+///
+/// Two instances must never silently share one runtime, and the scope records this
+/// value so a mismatch stays a visible conflict -- but a mismatch this shell invents
+/// by mis-spelling its own home is not a conflict, it is a bug.
 fn instance_home() -> std::io::Result<std::path::PathBuf> {
-    if let Some(value) = std::env::var_os("YI_AGENT_HOME").filter(|value| !value.is_empty()) {
-        return Ok(std::path::PathBuf::from(value));
-    }
-    dirs::home_dir().ok_or_else(|| std::io::Error::other("the home directory is unavailable"))
+    yi_agent_lifecycle::scope::instance_home_for_sockets().ok_or_else(|| {
+        std::io::Error::other(
+            "the instance home is unavailable: no YI_AGENT_HOME and no home directory",
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
