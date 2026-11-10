@@ -103,7 +103,7 @@ DMG_TARGET_DIR="$(cargo metadata --manifest-path "$HERE/src-tauri/Cargo.toml" \
 #       写下的 digest 作废）。
 APP_BUNDLE="$DMG_TARGET_DIR/release/bundle/macos/yi-agent.app"
 if [ ! -d "$APP_BUNDLE" ]; then
-  echo "ERROR: 未找到 tauri 产出的 .app（$APP_BUNDLE）" >&2
+  echo "ERROR: 未找到 tauri 产出的 .app（${APP_BUNDLE}）" >&2
   ls -l "$DMG_TARGET_DIR/release/bundle/macos/" >&2 || true
   exit 1
 fi

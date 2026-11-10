@@ -56,7 +56,7 @@ if command -v ruby >/dev/null 2>&1; then
     for want in audit mutants real-llm; do
       case ",$jobs," in
         *",$want,"*) ok "job 存在：$want" ;;
-        *) no "缺 job：$want（实际 jobs: $jobs）" ;;
+        *) no "缺 job：${want}（实际 jobs: ${jobs}）" ;;
       esac
     done
   else
@@ -93,7 +93,7 @@ else
       if [ -x "$root/yi-agent-rs/$s" ]; then
         ok "script 存在且可执行：$s"
       else
-        no "script 不可执行：$s（chmod +x）"
+        no "script 不可执行：${s}（chmod +x）"
       fi
     else
       no "workflow 引用了不存在的脚本：$s"

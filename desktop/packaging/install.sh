@@ -149,10 +149,10 @@ main() {
   # 1. 位置校验：不降级，避免 App 路径变成不确定事实。
   local app_parent; app_parent="$(dirname "$dest")"
   if [ ! -w "$app_parent" ]; then
-    echo "ERROR: 无法写入 $app_parent（当前用户无权限）。" >&2
+    echo "ERROR: 无法写入 ${app_parent}（当前用户无权限）。" >&2
     echo "请用管理员权限重跑：" >&2
     echo "    sudo bash install.sh $dmg" >&2
-    echo "不要改安装目录：LaunchAgent、命令行入口与升级流程都绑定 $dest。" >&2
+    echo "不要改安装目录：LaunchAgent、命令行入口与升级流程都绑定 ${dest}。" >&2
     return 1
   fi
 
@@ -198,7 +198,7 @@ main() {
   # 4. 退出 GUI（其 sidecar 靠 stdin EOF 自行退出）。
   local gui; gui="$(gui_pids "$dest" | head -1)"
   if [ -n "$gui" ]; then
-    echo "正在退出 yi-agent（pid $gui）..."
+    echo "正在退出 yi-agent（pid ${gui}）..."
     if ! quit_gui "$gui" "$dest"; then
       echo "ERROR: 无法退出 App，已保留现有版本。请手动退出后重跑。" >&2
       return 1
@@ -225,7 +225,7 @@ main() {
           ;;
         shadowed:*)
           local hit="${status#shadowed:}"
-          echo "WARN: 当前 'yi-agent' 命中的是 $hit，不是刚安装的这条。" >&2
+          echo "WARN: 当前 'yi-agent' 命中的是 ${hit}，不是刚安装的这条。" >&2
           echo "      PATH 中更靠前的目录有同名程序（常见于 brew / npm 全局安装）。" >&2
           ;;
       esac

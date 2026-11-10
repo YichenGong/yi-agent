@@ -253,6 +253,46 @@ else bad "guardian.pid: killed an unrelated process that reused the pid"; fi
 kill -KILL "$impostor" 2>/dev/null || true
 wait "$impostor" 2>/dev/null || true
 
+# 停止 guardian 的那行提示里，`$pid` 紧跟着全角括号。在 UTF-8 locale 下 bash 把
+# `（` 当成变量名的一部分，把 `$pid（` 读成一个不存在的变量；`set -u` 于是让脚本
+# 在**发出 SIGTERM 之后**中止。危害不是让脚本报错，而是让它看起来成功了：进程确实
+# 被 TERM 掉了，但 `count` 不再累加、`wait_gone` 与兜底 `kill -KILL` 全被跳过，
+# 重建于是停在「停了 guardian」这一步，daemon 与之后的构建都不再发生。
+# 2026-11-10 的实际故障就是它：`./scripts/rebuild.sh all` 退出码 1，App 里
+# `spawn_agent` 一直不出现。
+#
+# 必须在**新的 bash 进程**里用 UTF-8 locale 重跑整个脚本：变量名边界是在解析阶段
+# 根据 locale 决定的，`LANG=... some_function` 这种前缀只影响运行期，复现不出来。
+if command -v ps >/dev/null 2>&1; then
+  ( exec -a "yi-agent internal-runtime guardian" sleep 30 ) &
+  fake_guardian=$!
+  sleep 0.3
+  mkdir -p "$ROOT/.yi-agent/runtime"
+  printf '{"pid": %s, "start_micros": 1}\n' "$fake_guardian" > "$ROOT/.yi-agent/runtime/guardian.pid"
+  # `ROOT` 必须在这个子进程里 *source 之后* 再赋值：rebuild.sh 用
+  # `dirname "${BASH_SOURCE[0]}"/..` 重算它，从环境里传进去会被覆盖成真实仓库，
+  # 于是这条用例会去读真实的 guardian.pid —— 那既测不到 fixture，也可能误杀
+  # 真进程。
+  out="$(FIXTURE_ROOT="$ROOT" LANG=zh_CN.UTF-8 LC_ALL=zh_CN.UTF-8 bash -c '
+    set -uo pipefail
+    source "'"$SCRIPT"'"
+    ROOT="$FIXTURE_ROOT"
+    stop_recorded_guardians
+    echo COMPLETED
+  ' 2>&1)"
+  case "$out" in
+    *COMPLETED*) ok "guardian.pid: stopping a guardian runs to completion under zh_CN.UTF-8" ;;
+    *) bad "guardian.pid: stopping a guardian aborted under zh_CN.UTF-8 (unbraced \$pid before a multibyte char): $(printf '%s' "$out" | tail -1)" ;;
+  esac
+  if is_alive "$fake_guardian"; then
+    bad "guardian.pid: the guardian survived the stop under zh_CN.UTF-8"
+    kill -KILL "$fake_guardian" 2>/dev/null || true
+  else
+    ok "guardian.pid: the guardian is stopped under zh_CN.UTF-8"
+  fi
+  wait "$fake_guardian" 2>/dev/null || true
+fi
+
 echo
 if [ "$failn" -ne 0 ]; then echo "$failn failed, $pass passed"; exit 1; fi
 echo "$pass passed"
