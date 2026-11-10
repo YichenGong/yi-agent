@@ -444,6 +444,10 @@ impl ThreadRoot {
                     .iter()
                     .map(|path| path.to_string_lossy().to_string())
                     .collect(),
+                // A conversation root authenticates by its key -- the brokered
+                // capability -- so it names no client: the binding the daemon
+                // resolves already says whose root this is.
+                client_run_id: None,
             })
             .map_err(RootAttachError::Daemon)?;
         let IpcResponse::ApplicationRootAttached {

@@ -135,6 +135,7 @@ fn forked_daemon() -> (
             idempotency_key: "fork-ipc".into(),
             workspace: project,
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()

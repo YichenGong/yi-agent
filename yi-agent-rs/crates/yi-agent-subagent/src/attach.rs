@@ -380,6 +380,9 @@ pub fn attach_project_runtime_with_environment_and_binding(
             // This attach path carries no linked roots, so the root session
             // stays single-root -- today's behavior, byte for byte.
             extra_roots: Vec::new(),
+            // An embedded daemon has no guardian and no managed attach, so it has
+            // nothing to attribute this root to beyond the key itself.
+            client_run_id: None,
         },
     )
     .map_err(|error| match &error {
@@ -749,6 +752,7 @@ pub fn ensure_owned_runtime_with_policy(
         policy,
         expected,
         None,
+        None,
     )
 }
 
@@ -765,6 +769,7 @@ pub fn ensure_owned_runtime_with_policy_and_binding(
     policy: BringUpPolicy,
     expected: Option<&yi_agent_lifecycle::types::ArtifactIdentity>,
     binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+    client_run_id: Option<&str>,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
     match policy {
         BringUpPolicy::Embedded => {
@@ -793,6 +798,7 @@ pub fn ensure_owned_runtime_with_policy_and_binding(
                 expected,
                 yi_agent_supervisors::lifecycle::bringup::BringUpIntent::Business,
                 deadline,
+                client_run_id,
             )
         }
     }
@@ -1680,7 +1686,7 @@ pub fn attach_authorized_root(
     runtime_dir: &Path,
     capability: &str,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
-    attach_to_answer(cfg, runtime_dir, None, Some(capability.to_string()))
+    attach_to_answer(cfg, runtime_dir, None, Some(capability.to_string()), None)
 }
 
 pub fn attach_managed_project_runtime(
@@ -1690,14 +1696,23 @@ pub fn attach_managed_project_runtime(
     expected: &yi_agent_lifecycle::types::ArtifactIdentity,
     intent: yi_agent_supervisors::lifecycle::bringup::BringUpIntent,
     deadline: yi_agent_lifecycle::deadline::Deadline,
+    // The App run this attach speaks for, when the caller knows one. A shell-launched
+    // sidecar does (it comes off the authenticated `initialize`), and a managed
+    // daemon needs it to attribute a *project* attach -- see `attach_to_answer`.
+    client_run_id: Option<&str>,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
     prepare_managed_runtime(cfg, &runtime_dir, instance_home, expected, intent, deadline)?;
-    // No capability here on purpose. This is the *project* attach: it opens the
+    // No root capability here on purpose. This is the *project* attach: it opens the
     // connection a conversation will later attach its own root over. Minting or
     // carrying a root capability at this level is exactly the coupling this design
     // removes -- a project-wide credential would be the "pre-attach a root for the
     // whole project and hope every conversation inherits it" shape, and the daemon
     // would see one root shared by conversations that must not share one.
+    //
+    // What does travel is the *identity* of the run doing the attaching. The daemon
+    // still requires one for a managed attach; without it this call was refused with
+    // `no root authorization matches this capability`, which aborted delegation
+    // setup at its first step and left `spawn_agent` unregistered.
     attach_to_answer(
         cfg,
         &runtime_dir,
@@ -1706,6 +1721,7 @@ pub fn attach_managed_project_runtime(
         // attach re-derive it from the environment.
         Some(instance_home),
         None,
+        client_run_id,
     )
 }
 
@@ -1718,6 +1734,7 @@ fn attach_to_answer(
     runtime_dir: &Path,
     instance_home: Option<&Path>,
     idempotency_key: Option<String>,
+    client_run_id: Option<&str>,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
     // A caller that knows the instance home is authoritative: re-deriving it from the
     // environment would target a different instance than the daemon it just brought
@@ -1763,6 +1780,7 @@ fn attach_to_answer(
             idempotency_key,
             workspace: cfg.workdir.clone(),
             extra_roots: Vec::new(),
+            client_run_id: client_run_id.map(str::to_string),
         },
     )
     .map_err(|error| match &error {

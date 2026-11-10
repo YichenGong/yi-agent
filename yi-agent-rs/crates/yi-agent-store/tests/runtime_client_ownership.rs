@@ -459,7 +459,7 @@ async fn attaching_an_application_root_binds_its_owner() {
     let (_directory, coordinator) = open_coordinator();
     let workspace = tempfile::tempdir().unwrap();
     let attached = coordinator
-        .attach_application_root("app", workspace.path(), &[])
+        .attach_application_root("app", workspace.path(), &[], None)
         .await
         .unwrap();
 
@@ -483,13 +483,13 @@ async fn a_released_owner_cannot_reattach() {
     let (_directory, coordinator) = open_coordinator();
     let workspace = tempfile::tempdir().unwrap();
     coordinator
-        .attach_application_root("app", workspace.path(), &[])
+        .attach_application_root("app", workspace.path(), &[], None)
         .await
         .unwrap();
     coordinator.close_client_admission("app");
 
     let error = coordinator
-        .attach_application_root("app", workspace.path(), &[])
+        .attach_application_root("app", workspace.path(), &[], None)
         .await
         .expect_err("a closed owner must not re-attach in the same generation");
     assert!(

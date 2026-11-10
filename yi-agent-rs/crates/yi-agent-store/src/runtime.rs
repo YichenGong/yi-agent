@@ -84,6 +84,47 @@ pub struct AutonomousSession {
     pub root_task_id: TaskId,
 }
 
+/// Who an application-root attach is owned by, as the guardian's authority allows.
+///
+/// The three cases are kept distinct rather than collapsed into
+/// `Option<RootAuthorization>`, because they differ in more than "did a capability
+/// resolve": an unmanaged daemon must keep attributing the root to the request's
+/// own key, a conversation root takes its owner *from* the verified binding, and a
+/// project attach takes its owner from the client it named. Folding the last two
+/// together would let a project attach mint an `authorized_root` it never received,
+/// which is the "name the root you were not granted" confusion this gate refuses.
+#[derive(Debug, Clone)]
+pub(crate) enum AttachOwner {
+    /// No guardian: the key is the owner, unchanged from the embedded path.
+    Unmanaged,
+    /// The key was a capability this daemon's guardian minted for one conversation.
+    Authorized(Box<yi_agent_lifecycle::types::RootAuthorization>),
+    /// A project attach by a client the guardian authorized, carrying no capability.
+    Project(String),
+}
+
+impl AttachOwner {
+    /// The client this root is owned by.
+    fn client(&self, idempotency_key: &str) -> String {
+        match self {
+            Self::Unmanaged => idempotency_key.to_string(),
+            Self::Authorized(authorization) => authorization.client_run_id.clone(),
+            Self::Project(client) => client.clone(),
+        }
+    }
+
+    /// The root this attach was authorized for, when the guardian named one.
+    ///
+    /// `None` for a project attach: it was authorized as a *connection*, not for a
+    /// particular root, so the daemon still chooses the root id.
+    fn authorized_root(&self) -> Option<&yi_agent_lifecycle::types::RootAuthorization> {
+        match self {
+            Self::Authorized(authorization) => Some(authorization.as_ref()),
+            Self::Unmanaged | Self::Project(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeCoordinatorError {
     #[error(transparent)]
@@ -1079,32 +1120,32 @@ impl RuntimeCoordinator {
         idempotency_key: &str,
         requested_workspace: &Path,
         extra_roots: &[String],
+        client_run_id: Option<&str>,
     ) -> Result<AttachedApplicationRoot, RuntimeCoordinatorError> {
         let _attach_guard = self
             .application_root_attach_lock
             .lock()
             .expect("runtime application root attach mutex poisoned");
         self.ensure_admitting()?;
-        // On a managed daemon the presented key *is* the guardian's capability, so
-        // this both authenticates the attach and names its owner. The client id is
-        // then read from the verified binding, never from the request: a caller
-        // that could fill in "who I am" would be naming an owner it does not speak
-        // for, which is the exact confusion this gate exists to prevent.
+        // On a managed daemon the presented key *is* the guardian's capability for a
+        // conversation root, so this both authenticates the attach and names its
+        // owner. The client id is then read from the verified binding, never from the
+        // request: a caller that could fill in "who I am" would be naming an owner it
+        // does not speak for, which is the exact confusion this gate exists to
+        // prevent. A project attach carries no such capability and is attributed from
+        // the client it names instead -- see `authorize_attach_key`.
         //
         // On an unmanaged daemon (CLI, tests, `daemon serve`) nothing changes: the
         // key is the app-server's own idempotency key and the owner is that key.
-        let authorized = self.authorize_attach_key(idempotency_key)?;
-        let owner = authorized
-            .as_ref()
-            .map(|authorization| authorization.client_run_id.clone())
-            .unwrap_or_else(|| idempotency_key.to_string());
+        let owner_kind = self.authorize_attach_key(idempotency_key, client_run_id)?;
+        let owner = owner_kind.client(idempotency_key);
         // Which project a capability belongs to is a question about the *intent* the
         // guardian reserved, not about the root id. A root id is a daemon identity
         // (the guardian derives it as a digest of scope and thread key), so treating
         // it as a path would refuse every managed attach whose id does not happen to
         // spell the directory -- and would accept one whose id happens to spell a
         // different directory that shares the string.
-        if let Some(authorization) = authorized.as_ref() {
+        if let Some(authorization) = owner_kind.authorized_root() {
             let reserved = self.with_foreground_bridge(|bridge| {
                 bridge
                     .reservation_workspace_for(&authorization.root_id)
@@ -1207,11 +1248,13 @@ impl RuntimeCoordinator {
             });
         }
 
-        // A managed attach creates the root the guardian already authorized, not a
-        // fresh one: the install wrote authority for that id and the bridge's foreign
-        // key wants the task row to carry it. An unmanaged attach keeps minting its own.
-        let authorized_root = authorized
-            .as_ref()
+        // A conversation attach creates the root the guardian already authorized, not
+        // a fresh one: the install wrote authority for that id and the bridge's foreign
+        // key wants the task row to carry it. An unmanaged attach and a project attach
+        // both keep minting their own -- the latter was authorized as a connection, not
+        // for a particular root.
+        let authorized_root = owner_kind
+            .authorized_root()
             .map(|authorization| authorization.root_id.parse::<yi_agent_core::TaskId>())
             .transpose()
             .map_err(|_| {
@@ -1300,9 +1343,10 @@ impl RuntimeCoordinator {
         );
         // The root row exists now, so an install that had to defer its classification
         // (the guardian authorizes before the attach creates the task) can be written.
-        // Only for a managed attach: an unmanaged one installed no authority, and
-        // asking the bridge to classify it would be refused -- correctly so.
-        if authorized.is_some() {
+        // Only for a conversation attach: neither an unmanaged attach nor a project
+        // attach installed an authority for this root, and asking the bridge to
+        // classify one would be refused -- correctly so.
+        if owner_kind.authorized_root().is_some() {
             self.with_foreground_bridge(|bridge| {
                 let mut repository = self
                     .repository
@@ -4272,6 +4316,12 @@ impl RuntimeCoordinator {
     /// Derived from the ledger rather than tracked separately: two views of "who is
     /// authorized" would eventually disagree, and the disagreement would be an
     /// attach admitted for a client whose authority was withdrawn.
+    ///
+    /// "Authorized" here means both things the guardian can vouch for: a client that
+    /// holds a root binding, and a client it registered a business lease for. The
+    /// second is what makes a *project* attach reachable at all -- the lease exists
+    /// before any conversation does, while a binding only appears once a conversation
+    /// asks for its root, so a gate reading bindings alone refuses every first attach.
     fn refresh_attach_authority(&self) {
         let managed = self
             .managed_authorizations
@@ -4291,29 +4341,77 @@ impl RuntimeCoordinator {
 
     /// Checks the presented key against the guardian's authority, when managed.
     ///
-    /// An unmanaged daemon returns `Ok(None)` and the caller keeps its old
+    /// An unmanaged daemon returns `Unmanaged` and the caller keeps its old
     /// behaviour byte for byte. A managed one must resolve the key to a binding the
-    /// guardian minted: the key *is* the capability, so resolving it and verifying
-    /// it is the same act.
+    /// guardian minted: for a *conversation* root the key *is* the capability, so
+    /// resolving it and verifying it is the same act.
+    ///
+    /// A *project* attach is the exception, and it is why `client_run_id` is a
+    /// parameter rather than inferred. Its key is its own idempotency string
+    /// (`project:<pid>:<path>:<uuid>`) and resolves to nothing, by design: the
+    /// project attach only opens the connection a conversation will later attach
+    /// its own root over, so there is no per-conversation capability to present
+    /// yet. What it can name is the App run it speaks for, and the guardian does
+    /// vouch for App runs independently of any root -- it registers their business
+    /// lease and announces it on the lifeline (`ClientLeased`). So a key that
+    /// resolves to nothing is admitted only if the caller names such a client, and
+    /// the attach is then owned by that client rather than by an invented key.
+    ///
+    /// The client id arriving on the request is acceptable *here* and nowhere else:
+    /// this attach creates no authority of its own (`authorized_root()` stays
+    /// `None`), so the worst a caller gains by naming a client is a connection the
+    /// guardian already vouched for that client to open. Every operation that would
+    /// actually do work still demands a root authorization minted by the guardian
+    /// and delivered as a capability.
+    ///
+    /// Refusing instead (the previous behaviour) is what broke the desktop: the
+    /// first thing delegation setup does is the project attach, so failing it
+    /// meant no conversation ever got far enough to attach its own root.
     fn authorize_attach_key(
         &self,
         idempotency_key: &str,
-    ) -> Result<Option<yi_agent_lifecycle::types::RootAuthorization>, RuntimeCoordinatorError> {
+        client_run_id: Option<&str>,
+    ) -> Result<AttachOwner, RuntimeCoordinatorError> {
         let managed = self
             .managed_authorizations
             .lock()
             .expect("managed authorizations mutex poisoned");
         let Some(ledger) = managed.as_ref() else {
-            return Ok(None);
+            return Ok(AttachOwner::Unmanaged);
         };
-        let authorization = ledger
-            .resolve(idempotency_key)
-            .map_err(|reason| RuntimeCoordinatorError::AdmissionClosed(reason.clone()))?
-            .clone();
-        ledger
-            .verify(&authorization)
-            .map_err(RuntimeCoordinatorError::AdmissionClosed)?;
-        Ok(Some(authorization))
+        // The capability path first: a key that names a binding is a conversation
+        // root and keeps the exact semantics it had. Only a key the ledger does not
+        // know can be the project attach.
+        match ledger.resolve(idempotency_key) {
+            Ok(authorization) => {
+                let authorization = authorization.clone();
+                ledger
+                    .verify(&authorization)
+                    .map_err(RuntimeCoordinatorError::AdmissionClosed)?;
+                Ok(AttachOwner::Authorized(Box::new(authorization)))
+            }
+            Err(reason) => {
+                // Keep the capability refusal for a caller that named no client:
+                // nothing identifies it, so it is exactly the unattributed attach
+                // this gate exists to refuse -- and with the message that says so.
+                let Some(client) = client_run_id else {
+                    return Err(RuntimeCoordinatorError::AdmissionClosed(reason));
+                };
+                // A managed daemon with no authorized client is not "open": the
+                // guardian exists and vouched for nobody, so there is no owner to
+                // attribute this attach to.
+                let authority = self
+                    .attach_authority
+                    .lock()
+                    .expect("attach authority mutex poisoned");
+                authority.admits(client).map_err(|reason| {
+                    RuntimeCoordinatorError::AdmissionClosed(format!(
+                        "{reason} (project attach for {client})"
+                    ))
+                })?;
+                Ok(AttachOwner::Project(client.to_string()))
+            }
+        }
     }
 
     pub fn bind_root(&self, client: &str, root: &str) -> Result<(), RuntimeCoordinatorError> {

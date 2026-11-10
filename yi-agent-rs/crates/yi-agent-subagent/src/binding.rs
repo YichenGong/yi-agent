@@ -48,6 +48,13 @@ struct RepairPlan {
     /// the settings UI still says the new values. The managed path resolves
     /// `settings.json` in its own process and ignores this.
     live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+    /// The App run this project's runtime is attached for, when there is one.
+    ///
+    /// Carried on the plan for the same reason as `bringup`: a repaired runtime is
+    /// the *same* runtime from the daemon's point of view, and a project attach
+    /// that could not name its client would be refused after a crash even though
+    /// the first attach succeeded.
+    client_run_id: Option<String>,
 }
 
 /// The bring-up a binding uses, together with the artifact a managed one expects.
@@ -156,6 +163,31 @@ impl RuntimeBinding {
         bringup: BringUpChoice,
         live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
     ) -> Arc<Self> {
+        Self::managed_with_live_settings_and_client(
+            cfg,
+            runtime_dir,
+            models_path,
+            initial,
+            bringup,
+            live_settings,
+            None,
+        )
+    }
+
+    /// [`Self::managed_with_live_settings`], plus the App run a repair speaks for.
+    ///
+    /// The client id has to survive a repair for the same reason `bringup` does: a
+    /// managed project attach is attributed to the client it names, so a binding
+    /// that forgot the client could not re-attach after the daemon died.
+    pub fn managed_with_live_settings_and_client(
+        cfg: &RuntimeConfig,
+        runtime_dir: PathBuf,
+        models_path: PathBuf,
+        initial: Arc<AttachedProjectRuntime>,
+        bringup: BringUpChoice,
+        live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+        client_run_id: Option<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(BindingState {
                 handle: Self::handle_of(&initial),
@@ -169,6 +201,7 @@ impl RuntimeBinding {
                 models_path,
                 bringup,
                 live_settings,
+                client_run_id,
             }),
             flight: Mutex::new(()),
             last_active: Mutex::new(Instant::now()),
@@ -347,8 +380,10 @@ impl RuntimeBinding {
                 ..BringUpChoice::default()
             },
             // The test fixture has no shared source, so a repair keeps the
-            // static factory -- the same choice `managed_with` makes.
+            // static factory -- the same choice `managed_with` makes. It also
+            // names no client: these fixtures never run a managed attach.
             live_settings: None,
+            client_run_id: None,
         };
         Arc::new(Self {
             state: Mutex::new(BindingState {
@@ -449,6 +484,7 @@ impl RuntimeBinding {
             plan.bringup.policy,
             plan.bringup.expected.as_ref(),
             plan.live_settings.clone(),
+            plan.client_run_id.as_deref(),
         )
         .map_err(|failure| format!("{}: {}", failure.stage, failure.cause))?;
         let handle = Self::handle_of(&fresh);

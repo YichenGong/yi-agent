@@ -314,6 +314,91 @@ ThreadSession的process/*查询和process watcher必须共享同一有效manager
 合法委派仍使用既有审核/sandbox 规则。日志不能输出模型 key、root capability、
 bootstrap secret 或 resume secret。
 
+## 6.3 追加缺陷（实施期发现）：project attach 的授权来源缺失
+
+A9 的实现过程暴露了一个与 §2–§6 全部内容正交的缺陷，且它是 App 里
+`spawn_agent` 消失的**直接**原因。前几节修的是「策略选错导致根本不起受管 runtime」，
+这一条修的是「受管 runtime 起来了，但桌面端第一次连接就被拒」。
+
+### 6.3.1 故障链
+
+桌面启动顺序由协议固定，不可重排：
+
+1. 壳经私有通道 `_shell/prepare` 让 guardian 起 daemon；
+2. `prepare` 连接成功后，壳用 `FrontendLease::register` 为项目登记 *business 租约*，
+   `client_run_id` 是本次 App 启动的 run id（`ensure_project` →
+   `SocketBackend::register`）；
+3. 业务 `initialize` 带上同一个 run id（`shellAuthorization`）；
+4. 首个 `thread/start` 触发 `attach_delegation`，其中第一步是 **project attach**
+   （`AttachApplicationRoot`，key 形如 `project:<pid>:<path>:<uuid>`）；
+5. 之后才会为该会话的 root 单独申请 capability。
+
+`crates/yi-agent-store/src/runtime.rs::authorize_attach_key` 先用
+`ledger.resolve(key)` 解析 attach key。project attach 的 key 不是 capability，
+必然解析失败；兜底走 `AttachAuthority::admits(client)`，而该集合由
+`refresh_attach_authority` 从 `ledger.authorized_clients()` 派生，后者原本**只**
+从 `by_client`（root 绑定）派生。
+
+第 4 步时没有任何 root 绑定——会话还没拿到 capability——于是集合为空，attach 被拒：
+
+```
+runtime root rejects new work: no root authorization matches this capability
+```
+
+`attach_delegation` 对失败降级：保留原 agent、记 `tooling_error`、不注册委派工具。
+用户看到的就是工具列表里没有 `spawn_agent`。
+
+责任提交：`b8b5d325 feat: carry per-root authority from the desktop shell to the daemon`
+引入 root 授权闸，未给 project attach 留出「租约已存在、root 尚未存在」这种合法时序。
+
+### 6.3.2 为什么既有测试没抓住
+
+`managed_attach_authority.rs` 的 fixture 在 attach 之前就 `apply(Bind)` 了一条
+root 绑定，等于把时间线跳到了第 5 步。真实桌面永远不会那么做。测试因此是**构造上
+的假阳性**：它验证的是「有绑定时 attach 通过」，而真实场景是「没有绑定时 attach 必须
+通过」。
+
+### 6.3.3 修法：为租约建立独立的授权来源
+
+关键约束是「不能因为 project attach 需要放行，就把 capability 语义整体放宽」。
+所以新增的是**第二个授权来源**，不是放宽第一个：
+
+- `AuthorizationLedger` 新增 `leased_clients: BTreeSet<ClientRunId>`；
+- 线协议 `AuthorizationUpdate` 新增 `ClientLeased { client_run_id }`；
+- guardian 在 `ControlRequest::Register` 成功后调用
+  `announce_client_lease`：先本地记账，再通过 lifeline 推给 daemon（best effort，
+  与既有 `push_authorization` 同一策略）；
+- `authorized_clients()` 返回 **root 授权 client ∪ 业务租约 client**；
+- `RevokeClient` 同时清 `leased_clients` 并落 tombstone，迟到的 `ClientLeased` 被拒；
+- daemon 重启时 `start_daemon` 重放 live lease，否则新 generation 的空 ledger 会让
+  App 的下一次 attach 再次被拒。
+
+安全边界必须同时成立，缺一即等于把租约变成通配授权：
+
+| 性质 | 为什么不能松 |
+|---|---|
+| `ClientLeased` 不授予任何 root | `AttachOwner::Project` 的 `authorized_root()` 仍为 `None`，daemon 自铸 root id；install/bind/spawn 仍要求真 capability |
+| `LeaseOnly` 观察者不推送 | 只观察不授权工作，推送它等于让旁观者打开 root |
+| `RevokeClient` 后迟到帧被拒 | tombstone 记录的是决策，重复帧是陈旧而更新 |
+| 未知 client 仍被拒 | 否则「报自己的 id」就成了 attach 陌生人的凭据 |
+
+### 6.3.4 验收
+
+- 新增 `the_apps_first_conversation_attaches_its_delegation_runtime`
+  （`crates/yi-agent/tests/managed_production_integration.rs`）：真实进程、真实私有
+  通道 bootstrap、真实 `_shell/prepare`、真实 `FrontendLease::register`、真实
+  `initialize` + `thread/start`，并由测试扮演壳应答 `_shell/authorizeRoot`。
+  断言 trace 无 `no root authorization matches this capability`、无
+  `subagent delegation unavailable`，且 `runtime.sqlite` 的
+  `application_root_attachments` 非空。
+- 判别性已验证：把 `authorized_clients()` 的租约合并临时回退，该测试立即变红，报的
+  正是 App 里那条拒绝；恢复后转绿。
+- 反向边界各有单测：`a_lease_opens_a_connection_but_authorizes_no_root`、
+  `releasing_the_lease_stops_the_project_attach`、
+  `a_lease_only_observer_is_not_announced_to_the_daemon`、
+  `registering_a_business_lease_tells_the_daemon_before_any_root_exists`。
+- 真实 socket 层：`runtime_ipc` 的同名用例改用 `ClientLeased` 复现真实时序。
+
 ## 7. 验收矩阵
 
 以下为实施时必须新增/加强的判据；不是已经存在的测试名或已完成结果。
@@ -331,6 +416,7 @@ bootstrap secret 或 resume secret。
 | A9 | 真侧车本地授权 + 可控模型网关 | 模型请求含 spawn_agent；子代理实际 echo hello；父 wait 得成功终态 |
 | A10 | 打包真实 App + 真实模型 | 真实窗口完成同一 echo hello 闭环，不借 CLI run 替代 |
 | A11 | runtime/root 失败、迟到回答及代际恢复 | 无 scope 也显示原因；旧请求不覆盖新成功；新 turn 恢复工具且不重放旧 turn、无秘密泄漏 |
+| A12 | 真实 App 启动顺序（bootstrap→prepare→登记租约→initialize→thread/start），见 §6.3 | 首个会话的 project attach 被接纳：trace 无 root 授权拒绝、无 delegation unavailable，`application_root_attachments` 非空；临时回退租约授权来源时该判据必须变红 |
 
 ### 7.1 判别性要求
 

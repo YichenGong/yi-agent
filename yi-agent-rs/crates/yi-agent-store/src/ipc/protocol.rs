@@ -77,6 +77,25 @@ pub enum IpcRequest {
         /// and would only force the unrelated plugin crate to bump; no bump, per `fork_token`.
         #[serde(default)]
         extra_roots: Vec<String>,
+        /// The App run a *project* attach speaks for, when the caller has one.
+        ///
+        /// A managed daemon attributes every root to a client the guardian
+        /// authorized, and it learns which client from the attach key. That works
+        /// for a conversation root, whose key is the brokered `rootcap1:`
+        /// capability. A project attach has no such capability on purpose: it
+        /// opens the connection a conversation later attaches its own root over
+        /// (see `attach_managed_project_runtime`), so its key is its own
+        /// idempotency string and resolves to nothing in the ledger. Without a
+        /// way to name itself, it was refused with `no root authorization
+        /// matches this capability` -- which aborted the whole delegation setup
+        /// before any conversation root could be attached, so `spawn_agent`
+        /// never reached the tool list.
+        ///
+        /// Additive and `#[serde(default)]` like `extra_roots`: an old client
+        /// reads as "no client", and a managed daemon then keeps refusing the
+        /// way it always did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_run_id: Option<String>,
     },
     ActivateApplicationRoot {
         session_id: String,

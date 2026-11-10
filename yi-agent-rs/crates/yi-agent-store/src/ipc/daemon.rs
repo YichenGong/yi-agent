@@ -1588,6 +1588,7 @@ pub(crate) fn respond(
             idempotency_key,
             workspace,
             extra_roots,
+            client_run_id,
         } => {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1596,6 +1597,7 @@ pub(crate) fn respond(
                 &idempotency_key,
                 &workspace,
                 &extra_roots,
+                client_run_id.as_deref(),
             ))?;
             Ok(IpcResponse::ApplicationRootAttached {
                 session_id: attached.session_id.to_string(),

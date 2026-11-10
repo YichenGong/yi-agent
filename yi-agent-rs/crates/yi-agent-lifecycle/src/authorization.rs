@@ -159,6 +159,20 @@ fn hex_digit(byte: u8) -> Result<u8, String> {
 pub enum AuthorizationUpdate {
     /// The guardian minted this capability; the daemon may now honour it.
     Bind(Box<RootAuthorization>),
+    /// The guardian vouches for this App run: it holds a business lease here.
+    ///
+    /// Distinct from [`Self::Bind`] on purpose, and the difference is what a root
+    /// is *for*. A binding names one root and authorizes work under it; this names
+    /// a client and authorizes only the act of opening a connection. A daemon needs
+    /// it because the first thing a desktop client does is the *project* attach --
+    /// it has a lease and a shell on the other end, but no root yet, so a gate that
+    /// only consulted bindings would refuse it and no conversation would ever get
+    /// far enough to ask for a root.
+    ///
+    /// It grants nothing on its own: without a binding an attach still ends up
+    /// attributed to the client and nothing under it, and every later operation
+    /// (install, bind, spawn) keeps demanding a real root authority.
+    ClientLeased { client_run_id: ClientRunId },
     /// The client's lease ended. Every capability it held stops verifying.
     RevokeClient { client_run_id: ClientRunId },
     /// One root is gone but the client remains. Narrower than a client revoke.
@@ -213,6 +227,23 @@ pub struct AuthorizationLedger {
     /// stale duplicate `Bind` cannot re-grant what a release already took away.
     revoked_clients: BTreeSet<ClientRunId>,
     revoked_roots: BTreeSet<RootId>,
+    /// Clients the guardian vouched for as *App runs*, before any root exists.
+    ///
+    /// Kept apart from `by_client` because it answers a different question with a
+    /// different lifetime. `by_client` says "this client holds root R" and is only
+    /// written when a capability is minted, which happens after a conversation
+    /// exists. This says "this client holds a business lease on this daemon" and is
+    /// written when the lease is registered, which happens before any conversation
+    /// exists.
+    ///
+    /// The distinction is load-bearing, not cosmetic. A desktop's first attach is
+    /// the *project* attach, whose only purpose is to open the connection a
+    /// conversation will later attach its own root over; the shell has not asked
+    /// the guardian for that root yet, so `by_client` is necessarily empty at that
+    /// instant. Folding the two together would either refuse every project attach
+    /// (the desktop's `spawn_agent` disappeared this way) or, worse, let a client
+    /// with no lease attach on the strength of a stale binding.
+    leased_clients: BTreeSet<ClientRunId>,
 }
 
 impl AuthorizationLedger {
@@ -228,6 +259,7 @@ impl AuthorizationLedger {
             by_client: BTreeMap::new(),
             revoked_clients: BTreeSet::new(),
             revoked_roots: BTreeSet::new(),
+            leased_clients: BTreeSet::new(),
         }
     }
 
@@ -345,8 +377,21 @@ impl AuthorizationLedger {
                     .insert(authorization.capability.clone(), *authorization);
                 Ok(())
             }
+            AuthorizationUpdate::ClientLeased { client_run_id } => {
+                // A released client must not be re-granted by a late frame: the
+                // tombstone is the record of a decision, and a duplicate that
+                // arrives after it is stale rather than newer.
+                if self.revoked_clients.contains(&client_run_id) {
+                    return Err(format!(
+                        "client {client_run_id} already had its authority withdrawn"
+                    ));
+                }
+                self.leased_clients.insert(client_run_id);
+                Ok(())
+            }
             AuthorizationUpdate::RevokeClient { client_run_id } => {
                 self.revoked_clients.insert(client_run_id.clone());
+                self.leased_clients.remove(&client_run_id);
                 if let Some(roots) = self.by_client.remove(&client_run_id) {
                     for root in roots {
                         self.revoked_roots.insert(root);
@@ -419,13 +464,35 @@ impl AuthorizationLedger {
         }
     }
 
-    /// Every client that currently holds at least one root.
+    /// Every client the guardian vouched for on this daemon.
+    ///
+    /// Two sources, deliberately merged here rather than tracked as one set:
+    /// clients that hold a root binding, and clients the guardian registered a
+    /// business lease for. They answer "may this client open a connection" and
+    /// both are the guardian's own vouching, but they are established at different
+    /// moments -- a root binding only exists after a conversation has asked for one,
+    /// while a lease exists before any conversation does.
+    ///
+    /// Merging them here (rather than in each caller) keeps one answer to "who did
+    /// the guardian vouch for", which is what the attach gate consults.
     pub fn authorized_clients(&self) -> BTreeSet<ClientRunId> {
-        self.by_client
+        let mut out: BTreeSet<ClientRunId> = self
+            .by_client
             .iter()
             .filter(|(_, roots)| !roots.is_empty())
             .map(|(client, _)| client.clone())
-            .collect()
+            .collect();
+        out.extend(self.leased_clients.iter().cloned());
+        out
+    }
+
+    /// Whether the guardian registered a business lease for this client.
+    ///
+    /// Read on its own where the distinction matters: a caller that needs a *root*
+    /// must not be satisfied by a lease, so the attach gate has to be able to ask
+    /// "is there a lease" without conflating it with "is there authority for a root".
+    pub fn holds_lease(&self, client_run_id: &str) -> bool {
+        self.leased_clients.contains(client_run_id)
     }
 
     pub fn is_revoked(&self, client_run_id: &str) -> bool {

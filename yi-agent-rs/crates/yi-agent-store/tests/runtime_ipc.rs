@@ -349,6 +349,7 @@ fn a_parent_inspects_a_delivered_child_merges_it_and_the_child_completes() {
             idempotency_key: "inspect-loop".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -426,6 +427,7 @@ fn authorized_child_inspection_is_confined_to_the_caller_subtree() {
             idempotency_key: "authz-project".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -527,6 +529,7 @@ fn a_child_model_is_persisted_and_survives_a_daemon_restart() {
             idempotency_key: "model-project".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -708,6 +711,7 @@ fn attaching_to_a_version_10_database_succeeds() {
             idempotency_key: "tui:v10".into(),
             workspace,
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap();
@@ -759,6 +763,7 @@ fn application_roots_use_their_attaching_project_workspace() {
             idempotency_key: "project-a".into(),
             workspace: project_a.clone(),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -776,6 +781,7 @@ fn application_roots_use_their_attaching_project_workspace() {
             idempotency_key: "project-b".into(),
             workspace: project_b.clone(),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -841,6 +847,7 @@ fn application_root_reattach_rejects_a_different_project_workspace() {
             idempotency_key: "same-client".into(),
             workspace: project_a,
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap();
@@ -855,6 +862,7 @@ fn application_root_reattach_rejects_a_different_project_workspace() {
                 idempotency_key: "same-client".into(),
                 workspace: project_b,
                 extra_roots: Vec::new(),
+                client_run_id: None,
             },
         )
         .unwrap(),
@@ -879,6 +887,7 @@ fn application_root_attach_is_idempotent_and_returns_the_same_workspace() {
             idempotency_key: "tui-start-1".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap();
@@ -888,6 +897,7 @@ fn application_root_attach_is_idempotent_and_returns_the_same_workspace() {
             idempotency_key: "tui-start-1".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap();
@@ -940,6 +950,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
             idempotency_key: "tui-a".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -955,6 +966,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
             idempotency_key: "tui-b".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1000,6 +1012,7 @@ fn application_root_capability_is_not_derived_from_idempotency_key() {
             idempotency_key: "tui-random-capability".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1040,6 +1053,7 @@ fn concurrent_application_root_attach_reuses_one_durable_root() {
                         idempotency_key: "tui-concurrent".into(),
                         workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
                         extra_roots: Vec::new(),
+                        client_run_id: None,
                     },
                 )
                 .unwrap()
@@ -1101,6 +1115,7 @@ fn application_root_activate_marks_the_foreground_root_running_without_starting_
             idempotency_key: "tui-activate".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1147,6 +1162,7 @@ fn concurrent_application_root_activation_records_one_first_objective() {
             idempotency_key: "tui-concurrent-activate".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1222,6 +1238,7 @@ fn application_root_activation_keeps_the_first_objective() {
             idempotency_key: "tui-first-objective".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1281,6 +1298,7 @@ fn application_root_detach_requires_capability_and_does_not_complete_root() {
             idempotency_key: "tui-detach".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1353,6 +1371,7 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
             idempotency_key: "tui-send".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1423,6 +1442,7 @@ fn application_root_can_spawn_multiple_direct_children() {
             idempotency_key: "tui-multiple-spawn".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1485,6 +1505,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
             idempotency_key: "tui-second-spawn-while-running".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1566,6 +1587,7 @@ fn application_root_rejects_more_than_the_direct_child_limit() {
             idempotency_key: "tui-direct-child-limit".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1644,6 +1666,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
             idempotency_key: "tui-terminal-slot-reuse".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1727,6 +1750,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
             idempotency_key: "tui-paused-reattach".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1769,6 +1793,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
             idempotency_key: "tui-paused-reattach".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1837,6 +1862,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
             idempotency_key: "tui-reattach".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1867,6 +1893,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
             idempotency_key: "tui-reattach".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -1921,6 +1948,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
                 idempotency_key: "tui-restart".into(),
                 workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
                 extra_roots: Vec::new(),
+                client_run_id: None,
             },
         )
         .unwrap();
@@ -1946,6 +1974,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
             idempotency_key: "tui-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -3215,6 +3244,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
             idempotency_key: "tui-wait".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -3301,6 +3331,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
             idempotency_key: "tui-wait-timeout".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -3375,6 +3406,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             idempotency_key: "tui-wait-partial-timeout".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -3480,6 +3512,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
             idempotency_key: "tui-wait-any-terminal-only".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -3579,6 +3612,7 @@ fn daemon_wait_completed_report_wakes_before_timeout() {
             idempotency_key: "tui-wait-completed-wake".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -3660,6 +3694,7 @@ fn daemon_wait_timeout_does_not_bypass_application_capability() {
             idempotency_key: "tui-wait-timeout-auth".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -3725,6 +3760,7 @@ fn daemon_bounded_wait_keeps_other_ipc_clients_responsive() {
             idempotency_key: "tui-wait-concurrent-client".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -3806,6 +3842,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
             idempotency_key: "tui-wait-report-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -3864,6 +3901,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
             idempotency_key: "tui-wait-report-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -3935,6 +3973,7 @@ fn a_wait_longer_than_the_client_deadline_still_completes() {
             idempotency_key: "tui-wait-past-deadline".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -4017,6 +4056,7 @@ fn daemon_wait_agent_returns_completed_child_reports() {
             idempotency_key: "tui-wait-report".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -4106,6 +4146,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
             idempotency_key: "tui-worker-wait".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -4919,6 +4960,7 @@ fn daemon_spawn_agent_honors_the_coding_mode() {
             idempotency_key: "spawn-mode-coding".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -4972,6 +5014,7 @@ fn daemon_spawn_agent_defaults_to_read_only() {
             idempotency_key: "spawn-mode-default".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -5321,6 +5364,7 @@ fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
             idempotency_key: "tui-budget-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -5396,6 +5440,7 @@ fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
             idempotency_key: "tui-budget-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -5631,6 +5676,7 @@ fn two_conversation_roots_do_not_share_children_or_reach_across() {
                 idempotency_key: key.into(),
                 workspace: workspace.clone(),
                 extra_roots: Vec::new(),
+                client_run_id: None,
             },
         )
         .unwrap()
@@ -5742,6 +5788,7 @@ fn ending_one_conversation_reclaims_only_its_own_root() {
                 idempotency_key: key.into(),
                 workspace: workspace.clone(),
                 extra_roots: Vec::new(),
+                client_run_id: None,
             },
         )
         .unwrap()
@@ -5827,6 +5874,7 @@ fn cancelling_a_thread_cancels_only_its_own_children() {
             idempotency_key: "thread-scoped-cancel".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -5959,6 +6007,7 @@ fn foreground_root_lifecycle_a_refused_wire_spawn_leaves_no_child_and_no_owner()
             idempotency_key: "foreground-race".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -6041,6 +6090,7 @@ fn foreground_root_with_authority(
             idempotency_key: format!("{owner}-attach"),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .unwrap()
@@ -6161,7 +6211,7 @@ async fn foreground_root_lifecycle_a_managed_attach_creates_the_authorized_root(
         .expect("the bridge installs the guardian's authority");
 
     let attached = coordinator
-        .attach_application_root(&authorization.capability, &project, &[])
+        .attach_application_root(&authorization.capability, &project, &[], None)
         .await
         .expect("an authorized attach must be admitted");
     assert_eq!(
@@ -6223,7 +6273,7 @@ async fn foreground_root_lifecycle_a_capability_cannot_attach_another_project() 
         .expect("the bridge reserves the root for its project");
 
     let error = coordinator
-        .attach_application_root(&authorization.capability, &other, &[])
+        .attach_application_root(&authorization.capability, &other, &[], None)
         .await
         .expect_err("a capability issued for one project must not attach another");
     let rendered = format!("{error}");
@@ -7137,5 +7187,153 @@ fn foreground_root_lifecycle_recovery_round_trip_on_the_wire() {
     assert!(
         starts.lock().unwrap().is_empty(),
         "recovery must not start a worker"
+    );
+}
+
+/// A managed daemon on a real socket admits the desktop's *project* attach.
+///
+/// This is the wire-level shape of the desktop failure. Delegation setup begins
+/// with a project attach, whose key is its own idempotency string and therefore
+/// resolves to nothing in the guardian's ledger. Before the request could name
+/// the App run it speaks for, the daemon refused it with `no root authorization
+/// matches this capability` -- and because that is the *first* step, no
+/// conversation root was ever created and `spawn_agent` never reached the tool
+/// list.
+///
+/// Driving the real `Daemon` rather than the coordinator is what makes this an
+/// end-to-end check: the request has to survive the wire (serde), reach `respond`,
+/// and then be judged by the same ledger the guardian feeds.
+#[test]
+fn a_managed_daemon_admits_a_project_attach_over_the_wire_when_it_names_its_client() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let scope = directory.path().to_string_lossy().into_owned();
+
+    // The guardian's half. A managed daemon takes its generation from the
+    // guardian's ledger, so the two values are the same by construction -- and a
+    // ledger for another generation is refused, which is the cross-generation
+    // replay the design forbids rather than something a fixture should paper over.
+    let generation = "wire-generation-1".to_string();
+    let mut guardian = yi_agent_lifecycle::authorization::AuthorizationLedger::new(
+        scope.clone(),
+        generation.clone(),
+    );
+    let mut verifier = yi_agent_lifecycle::authorization::AuthorizationLedger::verifier(
+        scope,
+        generation,
+        guardian.generation_secret(),
+    );
+
+    // The guardian announces the App run's *lease*, not a root binding, and that
+    // is the realistic frame order: a desktop registers its lease as soon as the
+    // runtime answers and then immediately does this project attach, so no
+    // conversation -- and therefore no capability -- exists yet. A fixture that
+    // pre-installed a binding would make this test pass against the broken gate.
+    let _ = &mut guardian;
+    yi_agent_lifecycle::authorization::AuthorizationLedger::apply(
+        &mut verifier,
+        yi_agent_lifecycle::authorization::AuthorizationUpdate::ClientLeased {
+            client_run_id: "app-run-1".to_string(),
+        },
+    )
+    .expect("the verifier accepts the lease its guardian announced");
+
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let daemon = Daemon::start_with_factory_and_authority(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(StaticWorkspaceService),
+            starts: Arc::clone(&starts),
+        }),
+        yi_agent_store::foreground::ForegroundActivation::Disabled,
+        Some(verifier),
+        None,
+    )
+    .unwrap();
+
+    let workspace = directory.path().join("project");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "project:4242:/p:wire".into(),
+            workspace: workspace.clone(),
+            extra_roots: Vec::new(),
+            client_run_id: Some("app-run-1".into()),
+        },
+    )
+    .unwrap();
+    let IpcResponse::ApplicationRootAttached { root_task_id, .. } = response else {
+        panic!("a project attach naming an authorized client must be admitted, got {response:?}");
+    };
+    assert_ne!(
+        root_task_id, "0b7c1d2e-3f40-4a51-b662-738495a6b7c8",
+        "a project attach opens a connection: it must not claim the conversation's root"
+    );
+}
+
+/// The same wire, with no client named: still refused, byte for byte.
+///
+/// The fix must not turn "name a client" into "name anything". An unattributed
+/// attach on a managed daemon is exactly what the gate exists to refuse.
+#[test]
+fn a_managed_daemon_still_refuses_a_project_attach_that_names_no_client() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let scope = directory.path().to_string_lossy().into_owned();
+
+    let generation = "wire-generation-2".to_string();
+    let guardian = yi_agent_lifecycle::authorization::AuthorizationLedger::new(
+        scope.clone(),
+        generation.clone(),
+    );
+    let verifier = yi_agent_lifecycle::authorization::AuthorizationLedger::verifier(
+        scope,
+        generation,
+        guardian.generation_secret(),
+    );
+
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let daemon = Daemon::start_with_factory_and_authority(
+        directory.path().join("runtime"),
+        &database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(StaticWorkspaceService),
+            starts: Arc::clone(&starts),
+        }),
+        yi_agent_store::foreground::ForegroundActivation::Disabled,
+        Some(verifier),
+        None,
+    )
+    .unwrap();
+
+    let workspace = directory.path().join("project");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "project:4242:/p:wire-unattributed".into(),
+            workspace,
+            extra_roots: Vec::new(),
+            client_run_id: None,
+        },
+    )
+    .expect("the daemon answers every request; a refusal is an error frame");
+    // `send_request` hands back whatever frame the daemon sent, so the refusal is
+    // asserted on the frame rather than as a transport error.
+    let IpcResponse::Error { code, message } = response else {
+        panic!("an unattributed attach on a managed daemon must be refused, got {response:?}");
+    };
+    // The code is the pre-existing one for an admission refusal; what this test
+    // pins is that the fix did not turn "name nothing" into "name anything". The
+    // wire message is deliberately stripped for admission errors, so the code is
+    // the assertion that survives -- see `ipc_error_message`.
+    assert_eq!(
+        code,
+        IpcErrorCode::Internal,
+        "an unattributed attach must still be refused (message: {message:?})"
     );
 }

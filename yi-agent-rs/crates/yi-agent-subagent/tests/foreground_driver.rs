@@ -130,6 +130,7 @@ fn attach(
             idempotency_key: "foreground-driver".into(),
             workspace: workspace.to_path_buf(),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .expect("the root attaches")

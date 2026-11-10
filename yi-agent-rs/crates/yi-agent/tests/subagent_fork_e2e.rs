@@ -188,6 +188,7 @@ impl ForkFixture {
                 idempotency_key: "fork-e2e".into(),
                 workspace: repo.path().to_path_buf(),
                 extra_roots: Vec::new(),
+                client_run_id: None,
             },
         )
         .expect("the runtime socket must accept an application root")

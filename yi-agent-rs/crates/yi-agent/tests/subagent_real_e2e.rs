@@ -394,6 +394,7 @@ fn temporary_repository_allows_an_application_root_worktree() {
             idempotency_key: "fixture-root-worktree".into(),
             workspace: fixture.repository.clone(),
             extra_roots: Vec::new(),
+            client_run_id: None,
         },
     )
     .expect("attach application root");

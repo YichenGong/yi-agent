@@ -133,6 +133,13 @@ pub(crate) fn attach_delegation(
         models_path,
         bringup,
         live_settings,
+        // The App run this session speaks for. Taken from the same shell-brokered
+        // authority the conversation root will use, so a managed project attach is
+        // attributed to the client the guardian authorized rather than refused for
+        // presenting a key the ledger has never seen.
+        managed
+            .as_ref()
+            .map(|authority| authority.client_run_id.as_str()),
     ) {
         Ok(binding) => binding,
         Err(cause) => {
