@@ -603,8 +603,17 @@ const PEER_START_POLL: Duration = Duration::from_millis(25);
 ///
 /// The refusal has two causes that look identical on the wire: a guardian that
 /// never vouched for this client, and a `ClientLeased` still travelling the
-/// lifeline. The second resolves itself in milliseconds, so a short budget
-/// distinguishes them without making a genuine denial wait long.
+/// lifeline. The second resolves itself in milliseconds *when the shell is warm*,
+/// so this number alone would be enough -- but it is not the whole story on a cold
+/// start, where the guardian is still forking and the daemon is still coming up
+/// (that window is [`MANAGED_START_BUDGET`], 30 s). A fixed 5 s raced against it
+/// and lost, and losing once was enough to leave the conversation without
+/// `spawn_agent` for the rest of the process.
+///
+/// So this is now a *floor*, not the budget: callers that know the real bring-up
+/// window pass their own deadline, and the wait is that deadline clamped to never
+/// be shorter than this. A guardian that genuinely never vouched still fails,
+/// because it keeps answering the same refusal until whatever budget runs out.
 const ATTACH_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often the authority wait above re-sends the attach.
@@ -843,6 +852,58 @@ pub fn retire_if_wedged(socket_path: &std::path::Path) -> bool {
         send_request(socket_path, yi_agent_store::ipc::IpcRequest::Stop),
         Ok(yi_agent_store::ipc::IpcResponse::Stopping)
     )
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod authority_budget_tests {
+    use super::{ATTACH_AUTHORITY_TIMEOUT, MANAGED_START_BUDGET, authority_wait_budget};
+    use std::time::Duration;
+
+    /// The bug this guards: the wait used to be a fixed 5 s while a managed cold
+    /// start is allowed 30 s. The attach therefore lost a race it had no business
+    /// losing, and losing it once left the conversation without `spawn_agent`
+    /// until the process restarted.
+    #[test]
+    fn a_cold_managed_start_is_not_shorter_than_the_bring_up_it_waits_on() {
+        assert_eq!(
+            authority_wait_budget(Some(MANAGED_START_BUDGET)),
+            MANAGED_START_BUDGET,
+            "the authority wait must be allowed to use the whole bring-up window"
+        );
+        assert!(
+            MANAGED_START_BUDGET > ATTACH_AUTHORITY_TIMEOUT,
+            "if the bring-up budget ever drops below the floor this test stops proving anything"
+        );
+    }
+
+    /// An embedded caller has no deadline to offer, and must keep behaving exactly
+    /// as it did: a genuine refusal still fails, promptly.
+    #[test]
+    fn an_unknown_budget_keeps_the_historical_floor() {
+        assert_eq!(authority_wait_budget(None), ATTACH_AUTHORITY_TIMEOUT);
+    }
+
+    /// A caller whose budget is nearly gone must not have its wait collapsed to
+    /// zero: "the peer is slow" is not "this refusal is final".
+    #[test]
+    fn a_nearly_spent_budget_keeps_the_floor() {
+        assert_eq!(
+            authority_wait_budget(Some(Duration::from_millis(10))),
+            ATTACH_AUTHORITY_TIMEOUT
+        );
+        assert_eq!(
+            authority_wait_budget(Some(Duration::ZERO)),
+            ATTACH_AUTHORITY_TIMEOUT
+        );
+    }
+
+    /// More than the floor is spent, not clamped back down to it.
+    #[test]
+    fn a_budget_above_the_floor_is_spent() {
+        let generous = ATTACH_AUTHORITY_TIMEOUT + Duration::from_secs(7);
+        assert_eq!(authority_wait_budget(Some(generous)), generous);
+    }
 }
 
 #[cfg(test)]
@@ -1698,7 +1759,14 @@ pub fn attach_authorized_root(
     runtime_dir: &Path,
     capability: &str,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
-    attach_to_answer(cfg, runtime_dir, None, Some(capability.to_string()), None)
+    attach_to_answer(
+        cfg,
+        runtime_dir,
+        None,
+        Some(capability.to_string()),
+        None,
+        None,
+    )
 }
 
 pub fn attach_managed_project_runtime(
@@ -1713,7 +1781,14 @@ pub fn attach_managed_project_runtime(
     // daemon needs it to attribute a *project* attach -- see `attach_to_answer`.
     client_run_id: Option<&str>,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
-    prepare_managed_runtime(cfg, &runtime_dir, instance_home, expected, intent, deadline)?;
+    prepare_managed_runtime(
+        cfg,
+        &runtime_dir,
+        instance_home,
+        expected,
+        intent,
+        deadline.clone(),
+    )?;
     // No root capability here on purpose. This is the *project* attach: it opens the
     // connection a conversation will later attach its own root over. Minting or
     // carrying a root capability at this level is exactly the coupling this design
@@ -1725,6 +1800,9 @@ pub fn attach_managed_project_runtime(
     // still requires one for a managed attach; without it this call was refused with
     // `no root authorization matches this capability`, which aborted delegation
     // setup at its first step and left `spawn_agent` unregistered.
+    // What is left of the bring-up budget is what the authority wait may spend: the
+    // lease can only arrive inside the window this call was allowed to start in.
+    let remaining = deadline.remaining();
     attach_to_answer(
         cfg,
         &runtime_dir,
@@ -1734,6 +1812,7 @@ pub fn attach_managed_project_runtime(
         Some(instance_home),
         None,
         client_run_id,
+        Some(remaining),
     )
 }
 
@@ -1741,12 +1820,39 @@ pub fn attach_managed_project_runtime(
 ///
 /// Split from the bring-up so both paths share the attach request: a second copy of
 /// it is exactly how the two would drift apart on what a rejection means.
+/// How long the `AuthorityDenied` wait may last, given what the caller has left.
+///
+/// Split out so the rule is testable without a socket: the whole point of this
+/// change is that the wait must not be shorter than the bring-up it depends on,
+/// and that is exactly the kind of statement a comment cannot enforce.
+///
+/// * No deadline (embedded callers, and the authorized-root entry point): the
+///   historical short budget, unchanged.
+/// * A deadline with more left than the floor: spend it. On a cold start the
+///   guardian is still forking and the daemon is still coming up, so a lease can
+///   legitimately arrive many seconds after the attach begins.
+/// * A deadline with less left than the floor: keep the floor. A caller whose
+///   budget is nearly spent has already had its chance; collapsing the wait to
+///   zero would turn "the peer is slow" into "this refusal is final".
+fn authority_wait_budget(remaining: Option<Duration>) -> Duration {
+    match remaining {
+        Some(remaining) if remaining > ATTACH_AUTHORITY_TIMEOUT => remaining,
+        _ => ATTACH_AUTHORITY_TIMEOUT,
+    }
+}
+
 fn attach_to_answer(
     cfg: &RuntimeConfig,
     runtime_dir: &Path,
     instance_home: Option<&Path>,
     idempotency_key: Option<String>,
     client_run_id: Option<&str>,
+    // How long the caller is still willing to wait for its bring-up. `None` means
+    // "no opinion" and keeps the historical short budget. A managed attach always
+    // has one -- it is the same deadline the bring-up itself ran under, so the
+    // authority wait cannot outlive the start it is waiting on, and cannot be
+    // shorter than it either.
+    authority_budget: Option<Duration>,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
     // A caller that knows the instance home is authoritative: re-deriving it from the
     // environment would target a different instance than the daemon it just brought
@@ -1797,7 +1903,7 @@ fn attach_to_answer(
     // Only an *authority* refusal is retried here. Everything else -- a dirty
     // checkout, a stale capability, a bad workspace -- is the caller's to fix, and
     // retrying it would turn a clear answer into a delayed one.
-    let deadline = Instant::now() + ATTACH_AUTHORITY_TIMEOUT;
+    let deadline = Instant::now() + authority_wait_budget(authority_budget);
     let response = loop {
         let attempt = send_request(
             &socket_path,
