@@ -164,4 +164,4 @@ if [ "$fail" != 0 ]; then
   die "写入后回读不一致，拒绝以「成功」退出"
 fi
 
-echo "iOS 版本已同步到 $VERSION：tauri.conf.json / project.yml / Info.plist"
+echo "iOS 版本已同步到 ${VERSION}：tauri.conf.json / project.yml / Info.plist"

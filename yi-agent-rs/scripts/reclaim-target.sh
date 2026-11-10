@@ -593,7 +593,7 @@ for t in "${TARGETS[@]}"; do
   if [ "$SKIP_DEPS" = "0" ]; then
     line="$(scan_deps "$t" "$MIN_AGE" 2>/dev/null)" || { say "!! 扫描失败：$t"; line=$'0\t0\t0\t0\t0\t0\t0\t0'; }
     IFS=$'\t' read -r oc of ob uf ub tk tf skipped <<<"$line"
-    say "   .rcgu.o 文件数  : $tf（属 $tk 个编译单元）"
+    say "   .rcgu.o 文件数  : ${tf}（属 ${tk} 个编译单元）"
     say "   孤儿 .o         : $of 个文件 / $oc 个编译单元，$(human "$ob")"
     if [ "${skipped:-0}" = "1" ]; then
       say "   未被引用的 .o   : 已跳过（N_OSO 与磁盘 .o 无交集，可能是"

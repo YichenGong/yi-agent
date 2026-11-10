@@ -376,7 +376,7 @@ stop_recorded_guardians() {
     is_recorded_guardian "$pid" || continue
     kill -CONT "$pid" 2>/dev/null || true
     if kill -TERM "$pid" 2>/dev/null; then
-      echo "  停止 -> $pid（guardian.pid 记录）"
+      echo "  停止 -> ${pid}（guardian.pid 记录）"
       count=$((count + 1))
     fi
   done
@@ -530,7 +530,7 @@ link_global() {
   # 凭空建 /opt/homebrew/bin 只会让人误以为 brew 装好了；而这里也没有本该
   # 被接管的对象，谈不上分叉。warn 后继续，让 CLI / App / 插件照常编完。
   if [ ! -d "$dir" ]; then
-    warn "全局路径的父目录不存在：$dir（不代为创建），跳过全局软链。
+    warn "全局路径的父目录不存在：${dir}（不代为创建），跳过全局软链。
      没有 Homebrew 时请设 REBUILD_GLOBAL_BIN 指到 PATH 上的别处。"
     return 0
   fi
@@ -538,7 +538,7 @@ link_global() {
   # 目录在、但写不进去（/opt/homebrew 属 admin:admin 775）：此时路径是真实
   # 存在的，用户会以为它已被更新——必须失败。
   if [ ! -w "$dir" ]; then
-    die "全局路径的父目录不可写：$dir（需要 sudo 或调整属主）。"
+    die "全局路径的父目录不可写：${dir}（需要 sudo 或调整属主。）"
   fi
 
   ln -sfn "$target" "$GLOBAL_BIN"
