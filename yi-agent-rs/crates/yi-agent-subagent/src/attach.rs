@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use yi_agent_core::subagent::worker::AgentWorkerFactory;
 use yi_agent_runtime::config::RuntimeConfig;
-use yi_agent_store::ipc::{Daemon, IpcError, IpcResponse, send_request};
+use yi_agent_store::ipc::{Daemon, IpcError, IpcErrorCode, IpcResponse, send_request};
 
 use crate::AttachedRoot;
 
@@ -597,6 +597,18 @@ const PEER_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the wait above re-probes the socket.
 const PEER_START_POLL: Duration = Duration::from_millis(25);
+
+/// How long a project attach keeps retrying while the daemon answers
+/// `AuthorityDenied`.
+///
+/// The refusal has two causes that look identical on the wire: a guardian that
+/// never vouched for this client, and a `ClientLeased` still travelling the
+/// lifeline. The second resolves itself in milliseconds, so a short budget
+/// distinguishes them without making a genuine denial wait long.
+const ATTACH_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the authority wait above re-sends the attach.
+const ATTACH_AUTHORITY_POLL: Duration = Duration::from_millis(50);
 
 /// Whether a failed `attach` request can only be about the peer's startup window
 /// (the socket was not bound yet, or the daemon was still initialising).
@@ -1774,19 +1786,58 @@ fn attach_to_answer(
             uuid::Uuid::new_v4()
         )
     });
-    let response = send_request(
-        &socket_path,
-        yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
-            idempotency_key,
-            workspace: cfg.workdir.clone(),
-            extra_roots: Vec::new(),
-            client_run_id: client_run_id.map(str::to_string),
-        },
-    )
-    .map_err(|error| match &error {
-        IpcError::Io(io) if is_startup_io(io) => AttachFailure::transient("attach", error),
-        _ => AttachFailure::new("attach", error),
-    })?;
+    // The daemon answers `AuthorityDenied` while the guardian's `ClientLeased` is
+    // still on the lifeline, and that window is real rather than theoretical: the
+    // shell registers the lease and pushes it, while the sidecar attaches as soon
+    // as `_shell/prepare` returns, so the two race. Retry within a bounded budget
+    // so an in-flight lease is waited out. The budget is deliberately small -- a
+    // client the guardian genuinely never vouched for must still fail, and it keeps
+    // answering the same refusal until the budget runs out.
+    //
+    // Only an *authority* refusal is retried here. Everything else -- a dirty
+    // checkout, a stale capability, a bad workspace -- is the caller's to fix, and
+    // retrying it would turn a clear answer into a delayed one.
+    let deadline = Instant::now() + ATTACH_AUTHORITY_TIMEOUT;
+    let response = loop {
+        let attempt = send_request(
+            &socket_path,
+            yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
+                idempotency_key: idempotency_key.clone(),
+                workspace: cfg.workdir.clone(),
+                extra_roots: Vec::new(),
+                client_run_id: client_run_id.map(str::to_string),
+            },
+        )
+        .map_err(|error| match &error {
+            // A peer that holds the instance lock but has not bound its socket yet
+            // is *starting*, not broken: report it as transient so the caller waits
+            // instead of caching a miss.
+            IpcError::Io(io) if is_startup_io(io) => AttachFailure::transient("attach", error),
+            _ => AttachFailure::new("attach", error),
+        })?;
+        let refused_on_authority = matches!(
+            &attempt,
+            IpcResponse::Error {
+                code: IpcErrorCode::AuthorityDenied,
+                ..
+            }
+        );
+        if !refused_on_authority {
+            break attempt;
+        }
+        if Instant::now() >= deadline {
+            // Out of budget with the refusal still standing. Report it as
+            // *transient*: the guardian may still deliver the lease a moment from
+            // now, and the caller caches permanent failures for the whole process.
+            // Caching this one is precisely how a single startup race left every
+            // later conversation in the app without `spawn_agent` until a restart.
+            return Err(AttachFailure::transient(
+                "attach",
+                describe_rejection(&attempt),
+            ));
+        }
+        std::thread::sleep(ATTACH_AUTHORITY_POLL.min(deadline - Instant::now()));
+    };
     let IpcResponse::ApplicationRootAttached {
         session_id,
         root_task_id,

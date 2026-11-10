@@ -1812,7 +1812,21 @@ impl Guardian {
         if let Some(ledger) = self.authorizations.as_mut() {
             let _ = ledger.apply(update.clone());
         }
-        let _ = self.push_authorization(update);
+        // The local ledger above keeps the fact either way, and a later handshake
+        // replays it. What this push does is tell the daemon *now*, and a daemon that
+        // has not heard yet refuses the client's first project attach -- which is
+        // exactly the startup race that leaves a fresh App without `spawn_agent` for
+        // its first conversation. Swallowing the error made that race invisible: the
+        // only evidence was a refusal on the far side of a socket, attributed to a
+        // client the guardian had in fact registered. Reporting it costs one line and
+        // turns a silent ordering problem into a diagnosable one.
+        if let Err(error) = self.push_authorization(update) {
+            tracing::warn!(
+                client = %client_run_id,
+                error = %error,
+                "could not announce a client lease to the daemon; the next handshake replays it"
+            );
+        }
     }
 
     /// Mints authority to attach one root, and pushes the binding to the daemon.
