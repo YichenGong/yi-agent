@@ -896,11 +896,18 @@ fn hold_lifeline(parent_end: std::os::unix::net::UnixStream, guardian: std::proc
         .ok();
 }
 
-/// Where a pinned copy of the artifact lives for one build.
-pub fn cached_artifact_path(instance_home: &Path, build_id: &str) -> PathBuf {
+/// Where a pinned copy of one exact artifact lives.
+///
+/// A build id is embedded before packaging signs the executable. CLI and desktop
+/// signatures can therefore have the same build id but different approved bytes.
+/// Keeping the digest in the path lets both stay pinned without overwriting a
+/// committed artifact. Old build-only entries remain untouched; new callers stage
+/// their verified source into this layout instead of trusting or repairing them.
+pub fn cached_artifact_path(instance_home: &Path, build_id: &str, digest: &str) -> PathBuf {
     instance_home
         .join("artifacts")
         .join(build_id)
+        .join(digest)
         .join("yi-agent")
 }
 
@@ -925,19 +932,26 @@ pub fn pin_artifact(instance_home: &Path, source: &ArtifactIdentity) -> io::Resu
     let directory = instance_home.join("artifacts").join(&source.build_id);
     std::fs::create_dir_all(&directory)?;
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-    // A sibling temp name, so two clients pinning the same build cannot see each
-    // other's half-written file.
-    let destination = cached_artifact_path(instance_home, &source.build_id);
-    let temp = directory.join(format!(".yi-agent.{}.tmp", std::process::id()));
+    // Exclusive creation and a per-process sequence keep concurrent pins from
+    // truncating one another. Retry stale names left by a previous process id.
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut input = std::fs::File::open(&source.executable)?;
+    let (temp, mut output) = loop {
+        let sequence = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = directory.join(format!(".yi-agent.{}.{sequence}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o700)
+            .open(&temp)
+        {
+            Ok(output) => break (temp, output),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
 
     let digest = {
-        let mut input = std::fs::File::open(&source.executable)?;
-        let mut output = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o700)
-            .open(&temp)?;
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; 64 * 1024];
         loop {
@@ -962,6 +976,10 @@ pub fn pin_artifact(instance_home: &Path, source: &ArtifactIdentity) -> io::Resu
             ),
         ));
     }
+    let destination = cached_artifact_path(instance_home, &source.build_id, &digest);
+    let digest_directory = destination.parent().expect("an artifact has a parent");
+    std::fs::create_dir_all(digest_directory)?;
+    std::fs::set_permissions(digest_directory, std::fs::Permissions::from_mode(0o700))?;
     std::fs::rename(&temp, &destination)?;
     std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))?;
 
@@ -980,7 +998,7 @@ pub fn pin_artifact(instance_home: &Path, source: &ArtifactIdentity) -> io::Resu
 /// A missing or changed copy is an error. Falling back to the bundle or to `PATH`
 /// would run bytes the selection never approved.
 pub fn verify_pinned(instance_home: &Path, expected: &ArtifactIdentity) -> io::Result<PathBuf> {
-    let path = cached_artifact_path(instance_home, &expected.build_id);
+    let path = cached_artifact_path(instance_home, &expected.build_id, &expected.sha256);
     let digest = digest_of(&path)?;
     if expected.sha256.is_empty() || digest != expected.sha256 {
         return Err(io::Error::new(
@@ -1023,7 +1041,19 @@ pub fn pinned_program(instance_home: &Path, expected: &ArtifactIdentity) -> io::
         // Only `NotFound` means "not staged yet". `digest_of` turns a missing file
         // into exactly this kind, while a digest mismatch is `InvalidData`.
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            pin_artifact(instance_home, expected)?;
+            // Preserve a previously pinned selection even if its bundle is gone.
+            // The old layout can also hold another approved signature of this
+            // build, so only migrate it when its bytes match this exact selection.
+            let legacy = instance_home
+                .join("artifacts")
+                .join(&expected.build_id)
+                .join("yi-agent");
+            let mut source = expected.clone();
+            if digest_of(&legacy).is_ok_and(|digest| digest == expected.sha256) {
+                source.executable = legacy;
+            }
+            // Recheck the digest while copying, including legacy migration.
+            pin_artifact(instance_home, &source)?;
             verify_pinned(instance_home, expected)
         }
         Err(error) => Err(error),

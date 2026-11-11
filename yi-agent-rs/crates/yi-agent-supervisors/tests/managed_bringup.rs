@@ -707,6 +707,85 @@ fn the_pinned_artifact_is_a_verified_private_copy() {
     );
 }
 
+/// Re-signing one build changes its bytes, not its build id. Both approved
+/// artifacts must remain runnable; pinning the second must not replace the first.
+#[test]
+fn different_digests_of_one_build_keep_independent_pinned_artifacts() {
+    use sha2::{Digest, Sha256};
+
+    let home = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let path = source_dir.path().join("yi-agent");
+    let mut source = artifact("same-build-different-signatures");
+    source.executable = path.clone();
+    std::fs::write(&path, b"CLI signature").unwrap();
+    let first = pin_artifact(home.path(), &source).unwrap();
+
+    let bytes = b"desktop signature";
+    std::fs::write(&path, bytes).unwrap();
+    source.sha256 = format!("{:x}", Sha256::digest(bytes));
+    let second = pinned_program(home.path(), &source)
+        .expect("a separately approved signature must not conflict with the CLI cache");
+
+    assert_ne!(first.path, second);
+    assert_eq!(std::fs::read(&first.path).unwrap(), b"CLI signature");
+    assert_eq!(std::fs::read(&second).unwrap(), bytes);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        verify_pinned(home.path(), &first.identity).unwrap(),
+        first.path
+    );
+    assert_eq!(verify_pinned(home.path(), &source).unwrap(), second);
+}
+
+/// The old build-only cache may contain another signature. Leave it untouched
+/// and stage the approved source separately, rather than weakening verification.
+#[test]
+fn a_legacy_build_only_cache_does_not_block_an_approved_artifact() {
+    use sha2::{Digest, Sha256};
+
+    let home = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let old = home.path().join("artifacts/build-legacy-cache/yi-agent");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(&old, b"previous signature").unwrap();
+    let bytes = b"approved desktop signature";
+    let path = source_dir.path().join("yi-agent");
+    std::fs::write(&path, bytes).unwrap();
+    let mut expected = artifact("build-legacy-cache");
+    expected.executable = path;
+    expected.sha256 = format!("{:x}", Sha256::digest(bytes));
+
+    let program = pinned_program(home.path(), &expected)
+        .expect("the legacy cache must not reserve every signature of this build");
+    assert_ne!(program, old);
+    assert_eq!(std::fs::read(&program).unwrap(), bytes);
+    assert_eq!(std::fs::read(&old).unwrap(), b"previous signature");
+}
+
+/// An upgrade must retain a previously approved private copy after its bundle is
+/// gone; migration verifies those bytes again and leaves the old copy untouched.
+#[test]
+fn a_verified_legacy_cache_survives_the_original_bundle_disappearing() {
+    use sha2::{Digest, Sha256};
+
+    let home = TempDir::new().unwrap();
+    let bytes = b"previously approved signature";
+    let old = home.path().join("artifacts/build-migrate/yi-agent");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(&old, bytes).unwrap();
+    let mut expected = artifact("build-migrate");
+    expected.executable = home.path().join("deleted-bundle/yi-agent");
+    expected.sha256 = format!("{:x}", Sha256::digest(bytes));
+
+    let program = pinned_program(home.path(), &expected)
+        .expect("an approved legacy private copy must survive a layout upgrade");
+    assert_ne!(program, old);
+    assert_eq!(std::fs::read(&program).unwrap(), bytes);
+    assert_eq!(std::fs::read(&old).unwrap(), bytes);
+    assert_eq!(verify_pinned(home.path(), &expected).unwrap(), program);
+}
+
 /// A cache that no longer matches its recorded digest is an error.
 ///
 /// Repairing it from the bundle or `PATH` would run bytes the selection never
@@ -740,12 +819,12 @@ fn a_changed_source_during_pinning_is_refused() {
 
     let error = pin_artifact(directory.path(), &source).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    assert!(
-        !directory
-            .path()
-            .join("artifacts/build-changed/yi-agent")
-            .exists(),
-        "a rejected pin must not leave a half-trusted file behind"
+    assert_eq!(
+        std::fs::read_dir(directory.path().join("artifacts/build-changed"))
+            .unwrap()
+            .count(),
+        0,
+        "a rejected pin must not leave staged or temporary files behind"
     );
 }
 
@@ -801,7 +880,9 @@ fn a_first_start_stages_the_pinned_artifact_it_was_never_given() {
         program,
         directory
             .path()
-            .join("artifacts/build-first-start/yi-agent")
+            .join("artifacts/build-first-start")
+            .join(&expected.sha256)
+            .join("yi-agent")
     );
     // The second start reuses the copy instead of staging it again.
     assert_eq!(
@@ -855,12 +936,12 @@ fn a_first_start_refuses_a_source_the_selection_did_not_approve() {
 
     let error = pinned_program(directory.path(), &expected).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    assert!(
-        !directory
-            .path()
-            .join("artifacts/build-unapproved/yi-agent")
-            .exists(),
-        "a refused first start must not stage the unapproved bytes"
+    assert_eq!(
+        std::fs::read_dir(directory.path().join("artifacts/build-unapproved"))
+            .unwrap()
+            .count(),
+        0,
+        "an unapproved source must leave no staged or temporary files"
     );
 }
 
