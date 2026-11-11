@@ -10,9 +10,10 @@
 - [x] Upgrade both rusqlite declarations to a version using libsqlite3-sys >=0.39; upgrade both rmcp declarations to >=3.9; update only the affected lockfile closure.
 - [x] Run MCP, store, supervisors and management regressions with inherited YI_AGENT_* variables removed. Resolve demonstrated compatibility failures only.
 - [x] Run cargo fmt --all, cargo audit, and full just ci including MSRV verification. Update module progress records with actual results.
-- [ ] Request independent review, commit, merge --no-ff, and repeat just ci on the merge result.
-- [ ] Build and verify signed runtime bundle without invoking the process-stopping rebuild wrapper. Deploy with a controlled runtime handover; do not terminate the guardian hosting this active task blindly.
-- [ ] Verify runtime identity and same-version content recovery. Report separately any visual/device verification unavailable in this environment.
+- [x] Request independent review, commit, merge --no-ff, and repeat just ci on the merge result (`994dc2e6`; clean worktree, 6408 + 50 tests passed, online RustSec audit passed).
+- [x] Build and verify signed runtime bundle without invoking the process-stopping rebuild wrapper. Final candidate: `0.1.13-dev+994dc2e6`, build ID `c11f2e01e20a3982c799088cc2298d38`.
+- [x] Verify isolated native App runtime identity, same-version content recovery and stable screenshot (resume 345ms; sameBuild, complete content, no timeout).
+- [ ] Deploy with a controlled runtime handover after the active task has ended; do not terminate its hosting guardian blindly. Verify the installed official App after handover.
 
 Security acceptance: no new advisory ignores; RUSTSEC-2026-0459/0457/0462/0461 must disappear from cargo audit. Existing RED baseline: audit fails with four vulnerabilities; management ingress regressions fail on the original reader.
 

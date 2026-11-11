@@ -15,6 +15,8 @@
 - 前端 App/useRuntimeLease/syncWatchdog：313 项通过。
 - 精准升级 rmcp 3.9、rusqlite 0.41.1 / libsqlite3-sys 0.39.1，清除 RUSTSEC-2026-0457/0462/0461/0459；保留 bundled、启用 fallible_uint 保持无符号整数受检转换。通过本机 7897 代理更新 RustSec 后在线审计无漏洞；没有新增豁免，仅有既有 chacha20 yanked warning。
 - 测试子进程清除继承的 YI_AGENT_* 会话变量，避免无效 managed fd 与真实实例作用域污染测试；不改全局配置。
+- 修复提交 `97e8273a`，合并提交 `994dc2e6`；两次独立复审无阻断。合并结果在干净 worktree 完整 `just ci` exit 0，6408 + 50 项通过，在线 RustSec 审计成功。主目录原有未跟踪的 `probe_guardian.rs` 未修改，其格式问题不混入本次提交。
+- GitHub 访问使用 `http://127.0.0.1:7897`；验证子进程同时设置 `NO_PROXY` / `no_proxy=127.0.0.1,localhost,::1`，防止本地 mock 请求经代理导致连接复用断言失败。补齐回环排除后相关 6 项及完整 CI 均通过。
 
 ## 原生 App 验收
 
@@ -27,3 +29,5 @@ Tauri release build + finalize-runtime-bundle.sh 成功，签名与 sidecar 摘�
 ## 部署边界
 
 正式 `/Applications/yi-agent.app` 尚未替换。旧 guardian 托管本次工具执行，不能在当前任务中盲目杀掉。正式部署必须先完成受控退出，保留完整旧 bundle，再安装并验证新包；新旧 runtime 构建不一致时仍必须走版本确认，不伪造 sameBuild 或绕过授权。
+
+合并后已从干净源码重新构建候选包：`desktop/src-tauri/target/release/bundle/macos/yi-agent.app`，版本 `0.1.13-dev+994dc2e6`，build ID 与上述原生验收一致。`finalize-runtime-bundle.sh` 的签名与摘要复核通过，sidecar SHA-256 为 `6f82367ba71e3b798824716e91cb2fe230e469e5b86fa8899dbc92fa03b4a3ec`。该路径是构建产物，不代表已安装；不要在旧 guardian 仍使用正式 bundle 时删除或覆盖它。
