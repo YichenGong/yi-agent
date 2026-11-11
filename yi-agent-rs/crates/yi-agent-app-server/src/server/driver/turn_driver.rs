@@ -214,33 +214,38 @@ pub(crate) async fn run_thread_driver(
         else {
             break; // prompt_rx 关闭:driver 收尾退出
         };
-        if !activation_attempted {
-            activation_attempted = true;
-            if let Some(binding) = activate {
-                // Kept so every turn after this one can still report activity: the
-                // activation happens once per thread, so later prompts carry `None`.
-                foreground_root = Some(Arc::clone(&binding));
-                let objective = prompt.clone();
-                // 同步调用放到阻塞线程池:driver 是 async 任务,直接调用会占住 executor。
-                // `activate` 先探活、必要时重建 runtime,所以即便 daemon 在这轮之前
-                // 已经死掉(例如承载它的终端被关掉),这里也能自愈后再激活。
-                let outcome =
-                    tokio::task::spawn_blocking(move || binding.activate(&objective)).await;
-                match outcome {
-                    Ok(Ok(())) => {}
-                    Ok(Err(cause)) => tracing::warn!(
-                        stage = "activation",
-                        %cause,
-                        %thread_id,
-                        "subagent delegation unavailable for this thread"
-                    ),
-                    Err(error) => tracing::warn!(
-                        stage = "activation",
-                        %error,
-                        %thread_id,
-                        "subagent delegation unavailable for this thread"
-                    ),
-                }
+        // Activation is attempted once per thread *per success*, not once per thread.
+        //
+        // Marking it attempted before knowing the outcome is how one startup race
+        // became permanent: the desktop shell registers its lease while the sidecar
+        // attaches, so the very first conversation of a fresh launch can lose that
+        // race, and a driver that had recorded "tried" would then keep its `None`
+        // root -- no delegation tools -- for the whole life of the process. Later
+        // turns now re-arm instead, and the bring-up path already knows how to wait
+        // out a peer that is still starting.
+        if !activation_attempted && let Some(binding) = activate {
+            // Kept so every turn after this one can still report activity: the
+            // activation happens once per thread, so later prompts carry `None`.
+            foreground_root = Some(Arc::clone(&binding));
+            let objective = prompt.clone();
+            // 同步调用放到阻塞线程池:driver 是 async 任务,直接调用会占住 executor。
+            // `activate` 先探活、必要时重建 runtime,所以即便 daemon 在这轮之前
+            // 已经死掉(例如承载它的终端被关掉),这里也能自愈后再激活。
+            let outcome = tokio::task::spawn_blocking(move || binding.activate(&objective)).await;
+            match outcome {
+                Ok(Ok(())) => activation_attempted = true,
+                Ok(Err(cause)) => tracing::warn!(
+                    stage = "activation",
+                    %cause,
+                    %thread_id,
+                    "subagent delegation unavailable for this thread; a later turn will retry"
+                ),
+                Err(error) => tracing::warn!(
+                    stage = "activation",
+                    %error,
+                    %thread_id,
+                    "subagent delegation unavailable for this thread; a later turn will retry"
+                ),
             }
         }
         // Foreground activity for this turn. Resolved on the first root the driver sees
@@ -299,9 +304,27 @@ pub(crate) async fn run_thread_driver(
         // be reported as such, not silently replaced by the host's own secret. Asked
         // once per conversation, because it is a property of the host's lease rather
         // than of the turn.
-        let authority_failure = match (delegation.as_mut(), foreground_host.as_ref()) {
-            (Some(driver), Some(manager)) if driver.authority().is_none() => {
-                match manager.authority(&driver.root(), &format!("app-server:{}", turn_id)) {
+        //
+        // The source is chosen by `authority_source`, not by whether a guardian manager
+        // happens to exist. A managed conversation has no manager of its own -- its
+        // authority was brokered by the desktop shell and lives in the root's store --
+        // so keying this off `foreground_host` left every App conversation with no
+        // recorded authority, which the daemon then refused as a self-declared
+        // identity and which removed all five delegation tools.
+        let authority_failure = match delegation.as_mut() {
+            Some(driver) if driver.authority().is_none() => {
+                // Bound first: `authority_source` borrows the root, and asking the
+                // driver inline would hand it a temporary that dies at the end of
+                // the statement.
+                let root = driver.root();
+                let source = crate::server::delegation::authority_source(
+                    Some(&root),
+                    foreground_host.as_deref(),
+                );
+                match crate::server::delegation::resolve_authority(
+                    source,
+                    &format!("app-server:{}", turn_id),
+                ) {
                     Ok(authority) => {
                         driver.set_authority(authority);
                         None
@@ -311,7 +334,7 @@ pub(crate) async fn run_thread_driver(
                     )),
                 }
             }
-            // No guardian manager: an embedded deployment, which is a normal answer.
+            // Already authorized, or no delegation root at all.
             _ => None,
         };
         let prepared = match authority_failure {
