@@ -1175,6 +1175,137 @@ describe("Session", () => {
       expect(s.lastServerItemId).toBe("A");
     });
 
+    const serverIds = (s: Session) =>
+      s.items.filter((i) => !i.id.startsWith("local-") && i.type !== "notice").map((i) => i.id);
+
+    it("puts a batched full replay ahead of a cached tail and keeps the tail until it replays", () => {
+      // Desktop snapshots keep only the tail, so the cache holds [C, D] while the
+      // server replays the whole history [A, B, C, D].
+      const s = new Session();
+      s.upsertItems([
+        { type: "agentMessage", id: "C", text: "c" },
+        { type: "agentMessage", id: "D", text: "d" },
+      ]);
+      s.notice("cached notice");
+      s.beginReplay();
+      s.apply({
+        method: "items/completed",
+        params: {
+          thread_id: "t",
+          items: [
+            { type: "agentMessage", id: "A", text: "a" },
+            { type: "agentMessage", id: "B", text: "b" },
+          ],
+        },
+      } as never);
+      // Older rows arrive first and must read above the not-yet-replayed tail;
+      // the tail itself must stay on screen instead of blanking.
+      expect(serverIds(s)).toEqual(["A", "B", "C", "D"]);
+      s.apply({
+        method: "items/completed",
+        params: {
+          thread_id: "t",
+          items: [
+            { type: "agentMessage", id: "C", text: "c" },
+            { type: "agentMessage", id: "D", text: "d" },
+          ],
+        },
+      } as never);
+      s.endReplay();
+      expect(serverIds(s)).toEqual(["A", "B", "C", "D"]);
+      expect(s.lastServerItemId).toBe("D");
+      expect(s.items.filter((i) => i.type === "notice")).toHaveLength(1);
+    });
+
+    it("puts per-item replay frames ahead of the cached tail without dropStale", () => {
+      const s = new Session();
+      s.upsertItems([
+        { type: "agentMessage", id: "C", text: "c" },
+        { type: "agentMessage", id: "D", text: "d" },
+      ]);
+      s.beginReplay();
+      s.apply(serverItem("A", "a") as never);
+      s.apply(serverItem("B", "b") as never);
+      s.apply(serverItem("C", "c") as never);
+      s.apply(serverItem("D", "d") as never);
+      // `endReplay` alone must leave a correct order: the readItems catch-up path
+      // deliberately skips `dropStale` so in-flight live items survive.
+      s.endReplay();
+      expect(serverIds(s)).toEqual(["A", "B", "C", "D"]);
+      expect(s.lastServerItemId).toBe("D");
+    });
+
+    it("keeps local notices and echoes in their slots while replaying order moves", () => {
+      const s = new Session();
+      s.upsertItems([
+        { type: "agentMessage", id: "C", text: "c" },
+        { type: "agentMessage", id: "D", text: "d" },
+      ]);
+      s.addUserMessage("pending prompt");
+      s.notice("local notice");
+      const isLocal = (id: string) => id.startsWith("local-");
+      const localBefore = s.items.filter((i) => isLocal(i.id)).map((i) => i.id);
+      s.beginReplay();
+      s.apply(serverItem("A", "a") as never);
+      s.apply(serverItem("B", "b") as never);
+      s.apply(serverItem("C", "c") as never);
+      s.endReplay();
+      // Server rows are ordered, and nothing local was dropped or reordered.
+      expect(serverIds(s)).toEqual(["A", "B", "C", "D"]);
+      expect(s.items.filter((i) => isLocal(i.id)).map((i) => i.id)).toEqual(localBefore);
+      expect(s.items.filter((i) => i.type === "notice")).toHaveLength(1);
+    });
+
+    it("leaves unseen server items in their existing relative order during replay", () => {
+      const s = new Session();
+      s.upsertItems([
+        { type: "agentMessage", id: "X", text: "x" },
+        { type: "agentMessage", id: "Y", text: "y" },
+      ]);
+      s.beginReplay();
+      s.apply(serverItem("A", "a") as never);
+      expect(serverIds(s)).toEqual(["A", "X", "Y"]);
+      s.endReplay();
+    });
+
+    it("orders a thinking item that takes over a local reasoning block", () => {
+      const s = new Session();
+      // A local CoT block is already on screen when the replay starts.
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "thinking", kind: "Content" },
+      } as never);
+      s.beginReplay();
+      // The server's own thinking item takes the block over in place…
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "thinking", id: "T", text: "", redacted: false } },
+      } as never);
+      // …and a later batch lands behind it.
+      s.apply({
+        method: "items/completed",
+        params: { thread_id: "t", items: [{ type: "agentMessage", id: "A", text: "a" }] },
+      } as never);
+      s.endReplay();
+      // The takeover is a server item too: it keeps its arrival slot ahead of A.
+      expect(serverIds(s)).toEqual(["T", "A"]);
+    });
+
+    it("keeps the plain upsert append order outside a replay", () => {
+      const s = new Session();
+      s.upsertItems([
+        { type: "agentMessage", id: "C", text: "c" },
+        { type: "agentMessage", id: "D", text: "d" },
+      ]);
+      s.upsertItems([
+        { type: "agentMessage", id: "A", text: "a" },
+        { type: "agentMessage", id: "B", text: "b" },
+      ]);
+      // Catch-up windows are append-only by contract; reordering only exists to
+      // repair a full replay, so a plain upsert must stay byte-identical.
+      expect(serverIds(s)).toEqual(["C", "D", "A", "B"]);
+    });
+
     it("clears lastServerItemId when nothing server-authored survives", () => {
       const s = new Session();
       s.upsertItems([{ type: "agentMessage", id: "B", text: "b" }]);
