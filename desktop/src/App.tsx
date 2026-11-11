@@ -1744,11 +1744,13 @@ export default function App() {
     // 首次新建前先显式准备项目：managed runtime 没就绪时建出的会话永远拿不到
     // 工具，而用户只会看到"子代理用不了"。远端没有本机壳，故不在这条路上。
     //
-    // 只有壳**给了答案**且答案不是 ready 时才拦。壳答不出来（旧壳没有这个命令）
-    // 时按老行为继续：这个能力是叠加的，不能因为它把老环境挡死。
+    // 本地准备答不出来也必须阻塞；远端没有本机壳，不走此闸门。
     if (cwd && !isRemoteClient() && usesLocalPaths(activeSlotRef.current)) {
+      const revision = selectionRevision.current;
+      const slot = activeSlotRef.current;
       const prepared = await prepareRuntimeProject(cwd);
-      if (prepared && prepared.state !== "managedReady") {
+      if (clientRef.current !== c || selectionRevision.current !== revision || activeSlotRef.current !== slot) return;
+      if (!prepared || prepared.state !== "managedReady") {
         setBlockedStartupProject(cwd);
         bumpRuntimeScopeRevision();
         force((v) => v + 1);
@@ -3902,8 +3904,14 @@ export default function App() {
               project={blockedStartupProject ?? leaseActiveProject}
               local={runtimeControl !== null}
               onRetry={(project) => {
-                retryRuntimeProject(project);
-                bumpRuntimeScopeRevision();
+                if (project === blockedStartupProject) {
+                  // This first-create target may not be in the active/busy set.
+                  // Prepare it explicitly, but never replay thread/start or a turn.
+                  void prepareRuntimeProject(project).finally(bumpRuntimeScopeRevision);
+                } else {
+                  retryRuntimeProject(project);
+                  bumpRuntimeScopeRevision();
+                }
                 // 没有 scope 的失败在重试后仍要能说明原因，故不清掉兜底项目。
               }}
             />

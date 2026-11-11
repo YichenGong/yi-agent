@@ -1160,10 +1160,15 @@ async fn a_new_capability_for_the_same_authorized_root_reattaches_it() {
         .apply_authority_update(AuthorizationUpdate::Bind(Box::new(second.clone())))
         .expect("the second binding reaches the daemon");
 
+    coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .expect_err("a capability must not steal a root from its still-open owner");
+    coordinator.close_client_admission("app-run-1");
     let reattached = coordinator
         .attach_application_root(&second.capability, &workspace, &[], None)
         .await
-        .expect("a new capability for the same authorized root must adopt it");
+        .expect("a new capability may adopt an idle root after its old owner closed");
 
     assert_eq!(
         reattached.session_id, attached.session_id,
@@ -1175,13 +1180,180 @@ async fn a_new_capability_for_the_same_authorized_root_reattaches_it() {
         "the reconnecting client must own the root it was authorized for"
     );
 
-    // The old capability is still a capability for this root: it must keep
-    // working for the client it was minted for rather than being revoked by a
-    // reconnect of somebody else.
+    // Reopening the historical root must not reopen the departed client's
+    // admission or let its old capability move ownership back again.
     coordinator
         .attach_application_root(&first.capability, &workspace, &[], None)
         .await
-        .expect("the first client's capability stays valid");
+        .expect_err("the departed client's capability must remain unusable");
+    assert!(coordinator.authorize_work("app-run-2", ROOT_ID).is_ok());
+}
+
+/// Reopening an idle conversation after its previous App client closed must not
+/// leave the stable root permanently unusable within the same daemon generation.
+#[tokio::test]
+async fn a_new_client_reopens_an_idle_root_after_the_previous_client_closed() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    let mut daemon = verifier_for(&directory, &coordinator, guardian.generation_secret());
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator.adopt_managed_authority(daemon).unwrap();
+    let attached = coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .unwrap();
+    // There are no workers or descendants: this is a closed frontend, not an
+    // unsettled tool execution that a new host would be allowed to overwrite.
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::RevokeClient {
+            client_run_id: "app-run-1".into(),
+        })
+        .unwrap();
+    let second = guardian
+        .issue("app-run-2", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::Bind(Box::new(second.clone())))
+        .unwrap();
+    let reopened = coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .expect("a newly authorized client must reopen an idle historical root");
+    assert_eq!(reopened.session_id, attached.session_id);
+    assert!(coordinator.authorize_work("app-run-2", ROOT_ID).is_ok());
+    assert!(coordinator.authorize_work("app-run-1", ROOT_ID).is_err());
+}
+
+/// A spawn paused before its durable commit must not survive client revocation,
+/// and its provisional supervisor entry must not permanently block reconnect.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn a_revoked_precommit_spawn_is_rejected_then_the_root_can_reconnect() {
+    use std::time::Duration;
+
+    let directory = TempDir::new().unwrap();
+    let coordinator = Arc::new(coordinator(&directory));
+    let workspace = workspace(&directory);
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    let mut daemon = verifier_for(&directory, &coordinator, guardian.generation_secret());
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator.adopt_managed_authority(daemon).unwrap();
+    let attached = coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .unwrap();
+    let barrier = Arc::new(yi_agent_store::foreground::TestBarrier::new());
+    coordinator.install_test_barrier("before_admission_commit", barrier.clone());
+    let spawning = {
+        let coordinator = coordinator.clone();
+        let session = attached.session_id.clone();
+        let root = attached.root_task_id.clone();
+        tokio::spawn(async move { coordinator.spawn_child(&session, &root).await })
+    };
+    // Shorter than the barrier's own fallback timeout: timeout cannot masquerade
+    // as an arrival and silently turn this into a sequential test.
+    tokio::time::timeout(Duration::from_secs(2), barrier.wait_arrival())
+        .await
+        .expect("the old spawn must reach the precommit barrier");
+    assert!(!spawning.is_finished());
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::RevokeClient {
+            client_run_id: "app-run-1".into(),
+        })
+        .unwrap();
+    let second = guardian
+        .issue("app-run-2", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::Bind(Box::new(second.clone())))
+        .unwrap();
+    let pending = coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        pending,
+        RuntimeCoordinatorError::StopUnproven { .. }
+    ));
+    barrier.release_shared();
+    let result = tokio::time::timeout(Duration::from_secs(3), spawning)
+        .await
+        .expect("revoked spawn must finish")
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(RuntimeCoordinatorError::AdmissionClosed(_))
+    ));
+    let reopened = coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .expect("the rejected provisional spawn must no longer block reconnect");
+    assert_eq!(reopened.session_id, attached.session_id);
+    assert!(coordinator.authorize_work("app-run-2", ROOT_ID).is_ok());
+    assert!(coordinator.authorize_work("app-run-1", ROOT_ID).is_err());
+}
+
+/// A closed frontend is not itself proof that its registered child execution
+/// settled. Reconnect must leave that tree closed until recovery proves the stop.
+#[tokio::test]
+async fn a_closed_client_with_an_unsettled_child_cannot_be_replaced() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    let mut daemon = verifier_for(&directory, &coordinator, guardian.generation_secret());
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator.adopt_managed_authority(daemon).unwrap();
+    let attached = coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .unwrap();
+    let child = coordinator
+        .spawn_child(&attached.session_id, &attached.root_task_id)
+        .await
+        .unwrap();
+    let release = coordinator.release_owner_and_stop("app-run-1").await;
+    assert!(
+        matches!(release, Err(RuntimeCoordinatorError::StopUnproven { .. })),
+        "cancellation of a parked start is not a stop certificate: {release:?}"
+    );
+    let second = guardian
+        .issue("app-run-2", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::Bind(Box::new(second.clone())))
+        .unwrap();
+    let error = coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, RuntimeCoordinatorError::StopUnproven { .. }),
+        "{error}"
+    );
+    assert!(coordinator.authorize_work("app-run-2", ROOT_ID).is_err());
+    assert!(
+        coordinator
+            .authorize_work("app-run-1", &child.to_string())
+            .is_err()
+    );
 }
 
 /// A daemon restart is a new generation. The App presents a capability minted by
@@ -1291,6 +1463,7 @@ async fn reattaching_an_authorized_root_keeps_its_linked_roots() {
         .attach_application_root(&first.capability, &workspace, &linked_roots, None)
         .await
         .expect("the first attach records its linked roots");
+    coordinator.close_client_admission("app-run-1");
 
     let second = guardian
         .issue("app-run-2", ROOT_ID, LeaseMode::Business)
@@ -1365,6 +1538,7 @@ async fn reattaching_an_authorized_root_restores_its_detached_attachment() {
         "detached"
     );
     drop(repository);
+    coordinator.close_client_admission("app-run-1");
 
     let second = guardian
         .issue("app-run-2", ROOT_ID, LeaseMode::Business)

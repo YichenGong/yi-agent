@@ -2792,6 +2792,73 @@ fn build_usage_agent_for_resume() -> impl Fn(
     |session, cwd, mode| crate::server::tests::build_usage_agent_for_tests(session, cwd, mode)
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_resume_append_without_env_refuses_degraded_delegation() {
+    struct RefusedRoot;
+    impl yi_agent_subagent::managed_binding::ManagedRootAuthority for RefusedRoot {
+        fn authorize(
+            &self,
+            _: &yi_agent_lifecycle::production::RootIntentRequest,
+            _: yi_agent_lifecycle::deadline::Deadline,
+        ) -> Result<yi_agent_lifecycle::production::RootAuthorityEntry, String> {
+            Err("fixture root preparation refused".into())
+        }
+    }
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let tid = "thread-cold-managed";
+    persist_turn(
+        &workdir,
+        tid,
+        &resume_meta(&workdir, tid, None),
+        vec![],
+        vec![yi_agent_core::Message::user("hi")],
+        crate::thread_store::TurnUsage {
+            model: crate::test_support::TEST_MODEL.to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    );
+    let mut store = yi_agent_subagent::managed_binding::RootAuthorityStore::new();
+    store.bind_epoch("fixture-epoch").unwrap();
+    *host.managed.lock().unwrap() = Some(Arc::new(crate::server::ManagedAuthority {
+        store: Arc::new(StdMutex::new(store)),
+        broker: Arc::new(RefusedRoot),
+        client_run_id: "fixture-managed-client".into(),
+    }));
+    host.runtimes.lock().unwrap().insert(
+        super::project_key(&workdir),
+        Err(yi_agent_subagent::attach::AttachFailure::new(
+            "test",
+            "fixture refused",
+        )),
+    );
+    let action = DriverAction {
+        action_id: "act-managed".into(),
+        kind: DriverActionKind::ResumeAppend {
+            thread_id: tid.into(),
+            workdir: workdir.to_string_lossy().into(),
+            objective: "explicit resume".into(),
+            env: vec![],
+        },
+    };
+    let error = SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        "test-plugin",
+        &action,
+    )
+    .await
+    .expect_err("managed recovery must not silently omit delegation");
+    assert_eq!(
+        failure_code(&error),
+        Some(crate::session_driver::DriverErrorCode::RestoreFailed)
+    );
+    assert!(host.threads.is_empty());
+    assert!(!host.thread_roots.lock().unwrap().contains_key(tid));
+}
+
 /// spec §5.1:冷装配**必须**在实际构造 bash 工具时应用 env;装配失败不得降级成
 /// 「遗漏 env 的 BuiltAgent」再宣称成功。
 ///

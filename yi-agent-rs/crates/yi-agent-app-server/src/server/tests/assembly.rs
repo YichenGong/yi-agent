@@ -1437,6 +1437,44 @@ fn a_managed_choice_without_an_instance_home_is_refused() {
     );
 }
 
+#[test]
+fn a_managed_explicit_assembly_rechecks_a_previous_durable_failure() {
+    let repo = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+    let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+    runtimes.lock().unwrap().insert(
+        project_key(&cfg.workdir),
+        Err(yi_agent_subagent::attach::AttachFailure::new(
+            "attach",
+            "stale fixture refusal",
+        )),
+    );
+    let choice = yi_agent_subagent::binding::BringUpChoice {
+        policy: yi_agent_subagent::attach::BringUpPolicy::Managed,
+        expected: None,
+        instance_home: Some(runtime.path().into()),
+    };
+    let error = match attach_cwd_runtime_with(
+        &runtimes,
+        runtime.path(),
+        &cfg,
+        &isolated_models_path(runtime.path()),
+        &choice,
+        None,
+        Some("explicit-client"),
+    ) {
+        Ok(_) => panic!("a managed choice without identity must refuse"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("artifact identity"),
+        "an explicit retry must recheck current readiness: {error}"
+    );
+    assert!(!error.contains("stale fixture refusal"));
+}
+
 /// An embedded choice keeps using the historical path and needs no context.
 ///
 /// This is the pair to the test above: the two policies must differ in *whether*

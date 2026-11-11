@@ -56,6 +56,20 @@ async fn managed_thread_start_refuses_a_silently_degraded_agent() {
 async fn managed_resume_reports_attach_failure_after_read_only_history() {
     let mut h = Harness::new();
     let tid = start_thread(&mut h).await;
+    let binding = yi_agent_subagent::binding::RuntimeBinding::fixed(
+        yi_agent_subagent::binding::RuntimeHandle {
+            socket_path: h.resident_dir.path().join("unused.sock"),
+            workspace_root: h.resident_dir.path().into(),
+            session_id: "old-session".into(),
+            task_id: "old-root".into(),
+            capability: "fixture-message-capability".into(),
+        },
+    );
+    let old_root = ThreadRoot::new(binding, &tid, h.resident_dir.path().into(), vec![]);
+    h.thread_roots
+        .lock()
+        .unwrap()
+        .insert(tid.clone(), Arc::clone(&old_root));
     install_refused_desktop_authority(&h);
     h.send(
         &serde_json::json!({"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{
@@ -83,6 +97,14 @@ async fn managed_resume_reports_attach_failure_after_read_only_history() {
         response.get("error").is_some(),
         "a degraded managed resume must not become warm: {response}"
     );
+    assert!(Arc::ptr_eq(
+        h.thread_roots
+            .lock()
+            .unwrap()
+            .get(&tid)
+            .expect("failed resume must retain the old root"),
+        &old_root,
+    ));
     h.shutdown().await;
 }
 

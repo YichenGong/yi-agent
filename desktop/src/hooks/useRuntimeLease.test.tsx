@@ -422,6 +422,25 @@ describe("useRuntimeLease: preparation failures are reported, not swallowed", ()
     expect(result.current.issues.get("/p/a")?.reason).toContain("准备失败");
   });
 
+  it("still releases a held lease after an explicit retry throws", async () => {
+    let attempts = 0;
+    invokeImpl = async (cmd) => {
+      if (cmd === "runtime_acquire_project") {
+        if (++attempts > 1) throw new Error("fixture IPC failure");
+        return { ...leaseAnswer("/p/a"), held: true };
+      }
+      if (cmd === "runtime_scope_for_project") return "/p/a/.yi-agent/runtime";
+      return undefined;
+    };
+    const { result, rerender } = renderHook((props: LeaseDeps) => useRuntimeLease(props), { initialProps: deps() });
+    await flush();
+    act(() => result.current.retryProject("/p/a"));
+    await flush();
+    rerender(deps({ activeProject: null, revision: "left" }));
+    await flush();
+    expect(calls.some((call) => call.cmd === "runtime_release_project")).toBe(true);
+  });
+
   it("does not spin: a blocked answer is not retried until the user asks", async () => {
     let acquireCount = 0;
     invokeImpl = async (cmd, args) => {

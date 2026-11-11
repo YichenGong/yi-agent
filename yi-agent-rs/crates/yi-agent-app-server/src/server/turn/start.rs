@@ -147,16 +147,7 @@ pub(crate) async fn start_thread_core(
         Some(sandbox_baseline),
         built,
     );
-    let activation = match activation.require_managed(require_managed) {
-        Ok(activation) => activation,
-        Err(error) => {
-            thread_roots
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&thread_id);
-            return Err(error);
-        }
-    };
+    let activation = activation.require_managed(require_managed)?;
     let BuiltAgent {
         agent,
         provider,

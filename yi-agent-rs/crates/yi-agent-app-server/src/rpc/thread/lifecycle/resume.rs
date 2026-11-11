@@ -283,11 +283,6 @@ pub(crate) async fn handle(
             let activation = match activation.require_managed(require_managed) {
                 Ok(activation) => activation,
                 Err(error) => {
-                    state
-                        .thread_roots
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .remove(&thread_id);
                     write_response(
                         state.hub,
                         state.client,

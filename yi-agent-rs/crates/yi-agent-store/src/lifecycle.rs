@@ -95,18 +95,10 @@ impl RuntimeClients {
         self.bind_root_with_parent(client, root, generation, None, false)
     }
 
-    /// Binds a root whose capability the daemon has already verified for this exact
-    /// root, allowing it to move to the client that presented that capability.
-    ///
-    /// A plain [`Self::bind_root`] must keep refusing a takeover: knowing a stable
-    /// root id is not authority, and the guardian's whole point is that only a
-    /// capability it minted is. But a capability *is* that authority, and a client
-    /// reconnect (a new App run id on the same generation) presents exactly that.
-    /// Refusing it would leave the root owned by a process that no longer exists,
-    /// so every later work request from the reconnected client would be denied.
-    ///
-    /// `takeover_authorized` is not a caller's opinion: the only call site reaches
-    /// it after `AuthorizationLedger::verify` accepted the capability for this root.
+    /// Binds an authenticated root after the coordinator proved it quiescent.
+    /// A different owner must already have closed admission. The coordinator
+    /// checks pending execution slots and workers before calling this method;
+    /// a capability alone is never permission to steal a live owner's root.
     pub fn bind_verified_root(
         &mut self,
         client: &str,
@@ -183,6 +175,33 @@ impl RuntimeClients {
         parent: Option<RootId>,
         takeover_authorized: bool,
     ) -> Result<(), String> {
+        if self.closed.contains(client) {
+            return Err(format!("client {client} has closed admission"));
+        }
+        if takeover_authorized {
+            if let Some(existing) = self.roots.get(root) {
+                if existing.generation != generation {
+                    return Err(format!("root {root} belongs to another generation"));
+                }
+                if existing.owner != client && !self.closed.contains(&existing.owner) {
+                    return Err(format!(
+                        "root {root} is still owned by active client {}",
+                        existing.owner
+                    ));
+                }
+            }
+            if self
+                .exited
+                .iter()
+                .any(|entry| entry.root == root && entry.reason == ExitReason::Maintenance)
+            {
+                return Err(format!("root {root} is closed by maintenance"));
+            }
+            // The coordinator only reaches this after checking that the departed
+            // owner's workers and gate slots have settled. This reopens the root,
+            // never the old client's admission, and never an arbitrary task.
+            self.exited.retain(|entry| entry.root != root);
+        }
         if self.is_exited(root) {
             return Err(format!(
                 "root {root} already stopped accepting work; it cannot be rebound"

@@ -250,8 +250,9 @@ export function useRuntimeLease(deps: LeaseDeps): RuntimeLeaseFeedback {
       if (view === null) {
         // A thrown command is a refusal too, but the exception text can carry
         // paths or credential-shaped values, so the page gets a fixed sentence.
-        owned.current.delete(project);
-        held.current.delete(project);
+        // A failed command gives no evidence that a previous lease disappeared.
+        // Preserve its release obligation; only discard a never-held reservation.
+        if (!held.current.has(project)) owned.current.delete(project);
         if (wanted.current.has(project)) {
           noteIssue(project, {
             project,

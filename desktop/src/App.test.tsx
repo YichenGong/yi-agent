@@ -8271,6 +8271,19 @@ describe("App runtime preparation wiring", () => {
     expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(false);
   });
 
+  it("blocks thread/start when local preparation throws", async () => {
+    state.groupWorkspaces = ["/w"];
+    state.workspaceGroups = [];
+    state.dataSources["workspace/list"] = () => ({ workspaces: [{ path: "/w", exists: true }] });
+    runtimeNative.acquire = async () => { throw new Error("fixture IPC failure"); };
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    await clickNewThreadHere();
+    await waitFor(() => expect(runtimeNative.calls.some((c) => c.cmd === "runtime_acquire_project")).toBe(true));
+    expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(false);
+    expect(await screen.findByRole("alert")).toBeTruthy();
+  });
+
   it("creates the thread once the project is managed-ready", async () => {
     state.groupWorkspaces = ["/w"];
     state.workspaceGroups = [];
@@ -8372,6 +8385,14 @@ describe("App runtime preparation wiring", () => {
     const notice = await screen.findByRole("alert");
     expect(notice.textContent).toContain("未能就绪");
     expect(notice.textContent).not.toContain("/Users/secret");
+    expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(false);
+    const before = runtimeNative.calls.filter(
+      (c) => c.cmd === "runtime_acquire_project" && (c.args as { project?: string }).project === "/w2",
+    ).length;
+    fireEvent.click(within(notice).getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(runtimeNative.calls.filter(
+      (c) => c.cmd === "runtime_acquire_project" && (c.args as { project?: string }).project === "/w2",
+    ).length).toBe(before + 1));
     expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(false);
   });
 

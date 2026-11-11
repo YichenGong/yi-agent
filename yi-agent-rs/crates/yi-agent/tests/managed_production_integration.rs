@@ -19,6 +19,14 @@
 //! test registered proves the lease table works; it says nothing about whether an
 //! entry point registers one, which is the whole subject.
 //!
+//! **Every pipe in this file is bounded.** Both the sidecar harness and the model
+//! gateway read through `managed_sidecar_harness`, which caps one frame at
+//! `MAX_FRAME_BYTES`, drains stderr on its own thread, and fails a write or a read on
+//! a real deadline. This is not tidiness: a sidecar that went silent, emitted half a
+//! frame, or filled an undrained stderr pipe used to hang the suite with no
+//! diagnostic, and a hang is indistinguishable from a slow machine. The bounded
+//! versions live in `managed_sidecar_harness` with their own tests.
+//!
 //! Ownership rules, because a leaked child outlives the test and poisons the next:
 //!
 //! * every child is recorded with its *start identity* (pid plus start time), not
@@ -29,10 +37,11 @@
 //! * nothing is killed by name.
 
 mod common;
+mod managed_sidecar_harness;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use yi_agent_lifecycle::deadline::Deadline;
@@ -559,10 +568,10 @@ fn spawn_mock_gateway(listener: std::net::TcpListener) -> std::thread::JoinHandl
 /// driving a channel production never opens.
 struct Sidecar {
     child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    pipes: managed_sidecar_harness::BoundedPipes,
     secret: String,
     epoch: String,
+    scope_key: String,
 }
 
 impl Sidecar {
@@ -579,14 +588,17 @@ impl Sidecar {
             .stderr(Stdio::piped());
         let mut child = command.spawn()?;
         fixture.own(&child, "sidecar")?;
-        let stdin = child.stdin.take().expect("sidecar stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("sidecar stdout"));
+        // Read through bounded pipes, never `read_line` on a blocking descriptor:
+        // a sidecar that goes silent must fail its deadline instead of hanging the
+        // suite, and a sidecar that is chatty on stderr must not block on a pipe
+        // nobody drains. Both were observed as indefinite hangs.
+        let pipes = managed_sidecar_harness::BoundedPipes::attach(&mut child)?;
         let mut sidecar = Self {
             child,
-            stdin,
-            stdout,
+            pipes,
             secret,
             epoch,
+            scope_key: fixture.scope().key,
         };
         // The first frame is the credential, and it has no `id`: it is a session
         // identity, not a request.
@@ -603,25 +615,27 @@ impl Sidecar {
     }
 
     fn write(&mut self, frame: &serde_json::Value) -> anyhow::Result<()> {
-        writeln!(self.stdin, "{frame}")?;
-        self.stdin.flush()?;
+        self.pipes
+            .write_line(&frame.to_string(), Duration::from_secs(30))?;
         Ok(())
     }
 
     fn read_frame(&mut self, budget: Duration) -> anyhow::Result<serde_json::Value> {
+        // The deadline lives in the reader, not in a retry loop: a frame that never
+        // arrives must fail here rather than after a budget of successful no-ops.
         let deadline = Instant::now() + budget;
-        let mut line = String::new();
         loop {
-            line.clear();
-            let read = self.stdout.read_line(&mut line)?;
-            anyhow::ensure!(read > 0, "the sidecar closed its stdout before answering");
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-                return Ok(value);
+            let line = self
+                .pipes
+                .next_frame(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|error| {
+                    anyhow::anyhow!("{error}; sidecar stderr tail: {}", self.pipes.stderr_tail())
+                })?;
+            match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(value) => return Ok(value),
+                // Non-JSON on stdout is the child's own noise; keep reading.
+                Err(_) => continue,
             }
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "the sidecar never produced a JSON frame"
-            );
         }
     }
 
@@ -647,7 +661,7 @@ impl Sidecar {
         }))?;
         let deadline = Instant::now() + budget;
         loop {
-            let frame = self.read_frame(Duration::from_secs(5))?;
+            let frame = self.read_frame(deadline.saturating_duration_since(Instant::now()))?;
             // Business frames and outbound management traffic share this stdout.
             if frame.get("id").and_then(|v| v.as_str()) != Some(id.as_str()) {
                 anyhow::ensure!(
@@ -677,7 +691,7 @@ fn read_until_id(
 ) -> anyhow::Result<serde_json::Value> {
     let deadline = Instant::now() + budget;
     loop {
-        let frame = sidecar.read_frame(Duration::from_secs(5))?;
+        let frame = sidecar.read_frame(deadline.saturating_duration_since(Instant::now()))?;
         if frame.get("id").and_then(|v| v.as_str()) == Some(id) {
             return Ok(frame);
         }
@@ -707,7 +721,7 @@ fn read_until_id_answering_authorize(
             Instant::now() < deadline,
             "no answer to {wanted_id} within {budget:?}"
         );
-        let frame = sidecar.read_frame(Duration::from_secs(5))?;
+        let frame = sidecar.read_frame(deadline.saturating_duration_since(Instant::now()))?;
 
         // An outbound root request, not a response: answer it and keep reading.
         if frame.get("method").and_then(|v| v.as_str()) == Some("_shell/authorizeRoot") {
@@ -899,17 +913,14 @@ fn an_unbootstrapped_management_call_starts_nothing() -> anyhow::Result<()> {
         .env("YI_AGENT_LOCAL_MANAGEMENT", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     fixture.own(&child, "unbootstrapped-sidecar")?;
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut pipes = managed_sidecar_harness::BoundedPipes::attach(&mut child)?;
 
     let id = format!("nope-{}", uuid_like());
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
+    pipes.write_line(
+        &serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "_shell/prepare",
@@ -921,24 +932,19 @@ fn an_unbootstrapped_management_call_starts_nothing() -> anyhow::Result<()> {
                 attempt_id: format!("attempt-{}", uuid_like()),
             })?,
         })
+        .to_string(),
+        Duration::from_secs(20),
     )?;
-    stdin.flush()?;
 
-    let mut line = String::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
     let answer = loop {
-        line.clear();
-        let read = stdout.read_line(&mut line)?;
-        anyhow::ensure!(read > 0, "the sidecar closed before refusing");
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim())
+        let line = pipes.next_frame(Duration::from_secs(20)).map_err(|error| {
+            anyhow::anyhow!("{error}; sidecar stderr tail: {}", pipes.stderr_tail())
+        })?;
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
             && value.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
         {
             break value;
         }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "the sidecar never answered the unauthenticated prepare"
-        );
     };
     assert!(
         answer.get("error").is_some(),
@@ -954,7 +960,7 @@ fn an_unbootstrapped_management_call_starts_nothing() -> anyhow::Result<()> {
     // property. Close the channel instead and wait for the process to be gone -- a
     // sidecar that never reaches its own exit is itself a failure, so the deadline
     // below always resolves to a real observation.
-    drop(stdin);
+    drop(pipes);
     let status = wait_for_exit(&mut child, Duration::from_secs(20))?;
     assert!(
         !status.success() || status.code() == Some(0),
@@ -2381,6 +2387,644 @@ fn journal_generation(runtime_dir: &Path) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// A23: a real model drives spawn -> child bash -> parent wait, end to end.
+// ---------------------------------------------------------------------------
+
+/// How long a turn that delegates may take.
+///
+/// `wait_agent` blocks inside the daemon for up to 120 s (the shipped budget, not a
+/// test knob), and before that returns the child has to be admitted, spawned, run
+/// one provider turn, execute a sandboxed shell and report. The budget is above the
+/// tool's own so a slow machine is not reported as a missing delegation.
+const DELEGATION_BUDGET: Duration = Duration::from_secs(200);
+
+/// The catalog this test installs: two entries plus the subagent pointer.
+///
+/// Two entries are load-bearing. `subagent_model` is how the daemon picks the
+/// child's model, and the scripted gateway keys its behaviour on the resolved
+/// `model` string -- a worker is offered the same delegation tools its parent has,
+/// so "which tools did it see" cannot tell parent from child.
+///
+/// `api_style: "chat"` is equally load-bearing. The `Auto` default POSTs
+/// `/responses` first and falls back only on a missing-route signal; the gateway
+/// answers one path and refuses the rest, so pinning the style keeps the script's
+/// turn accounting exact instead of best-effort.
+fn two_entry_catalog(port: u16, parent: &str, child: &str) -> serde_json::Value {
+    serde_json::json!({
+        "models": [
+            {
+                "name": "parent-entry",
+                "provider": "openai",
+                "api_url": format!("http://127.0.0.1:{port}"),
+                "model": parent,
+                "api_key": "test-key",
+                "api_style": "chat"
+            },
+            {
+                "name": "child-entry",
+                "provider": "openai",
+                "api_url": format!("http://127.0.0.1:{port}"),
+                "model": child,
+                "api_key": "test-key",
+                "api_style": "chat"
+            }
+        ],
+        "default_model": "parent-entry",
+        "subagent_model": "child-entry"
+    })
+}
+
+/// Writes the two-entry catalog into the fixture's instance home.
+///
+/// The daemon resolves `models_path()` from its own environment, and the fixture
+/// passes the same instance home to every child, so this file is the one the
+/// worker factory reads -- including its `subagent_model` pointer.
+fn install_two_entry_catalog(fixture: &IsolatedRuntimeFixture, port: u16) -> anyhow::Result<()> {
+    let path = fixture.instance_home.join(".yi-agent/models.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&two_entry_catalog(port, "parent-model", "child-model"))?,
+    )?;
+    Ok(())
+}
+
+/// One `_shell/authorizeRoot` request, validated before it is answered.
+///
+/// Answering is not the interesting part -- production has to *refuse* a request
+/// that names another generation, another client run, or a workspace nobody asked
+/// for. Checking the frame here is how the test knows the sidecar sent what the
+/// contract says rather than merely sent something answerable.
+struct AuthorizeRequest {
+    id: String,
+    sidecar_epoch: String,
+    secret: String,
+    scope_key: String,
+    client_run_id: String,
+    operation_id: String,
+    thread_key: String,
+    workspace: String,
+}
+
+impl AuthorizeRequest {
+    fn field(value: &serde_json::Value, key: &str) -> anyhow::Result<String> {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("an authorize request has no {key}: {value}"))
+    }
+
+    fn parse(frame: &serde_json::Value) -> anyhow::Result<Self> {
+        let params = frame
+            .get("params")
+            .ok_or_else(|| anyhow::anyhow!("an authorize request without params: {frame}"))?;
+        let intent = params
+            .get("intent")
+            .ok_or_else(|| anyhow::anyhow!("an authorize request without an intent: {frame}"))?;
+        Ok(Self {
+            id: Self::field(frame, "id")?,
+            sidecar_epoch: Self::field(frame, "sidecar_epoch")?,
+            secret: Self::field(frame, "secret")?,
+            scope_key: Self::field(params, "scope_key")?,
+            client_run_id: Self::field(params, "client_run_id")?,
+            operation_id: Self::field(intent, "operation_id")?,
+            thread_key: Self::field(intent, "thread_key")?,
+            workspace: Self::field(intent, "workspace")?,
+        })
+    }
+
+    /// The thread id this request is about, taken from its own thread key.
+    fn thread_id(&self) -> String {
+        self.thread_key
+            .strip_prefix("thread:")
+            .unwrap_or(&self.thread_key)
+            .to_string()
+    }
+
+    /// Why the shell should refuse this request, or `None` when it should answer.
+    ///
+    /// Returns the reason instead of panicking so the failure names the field that
+    /// disagreed with the frame that actually arrived.
+    fn disagreement(
+        &self,
+        sidecar: &Sidecar,
+        client_run_id: &str,
+        thread_id: &str,
+        cwd: &Path,
+    ) -> Option<String> {
+        if self.sidecar_epoch != sidecar.epoch {
+            return Some(format!(
+                "the request names sidecar epoch {:?}, this session is {:?}",
+                self.sidecar_epoch, sidecar.epoch
+            ));
+        }
+        if self.secret != sidecar.secret {
+            return Some("the request carries a secret this session never issued".into());
+        }
+        if self.client_run_id != client_run_id {
+            return Some(format!(
+                "the request names client run {:?}, the lease was registered as {:?}",
+                self.client_run_id, client_run_id
+            ));
+        }
+        let expected_thread = yi_agent_subagent::thread_root::application_root_key(thread_id);
+        if self.thread_key != expected_thread {
+            return Some(format!(
+                "the request names thread key {:?}, expected {:?}",
+                self.thread_key, expected_thread
+            ));
+        }
+        let expected_operation =
+            yi_agent_subagent::thread_root::managed_bind_operation_id(thread_id);
+        if self.operation_id != expected_operation {
+            return Some(format!(
+                "the request names operation {:?}, expected {:?}",
+                self.operation_id, expected_operation
+            ));
+        }
+        let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        if Path::new(&self.workspace) != canonical {
+            return Some(format!(
+                "the request names workspace {:?}, expected {:?}",
+                self.workspace,
+                canonical.display()
+            ));
+        }
+        if self.scope_key != sidecar.scope_key {
+            return Some("the request names another runtime scope".into());
+        }
+        None
+    }
+}
+
+/// Starts a conversation and returns its id, validating the root handshake.
+///
+/// The thread id does not exist until the call answers, and the handshake needs it
+/// to check `thread_key` against the request, so the id is taken from the request's
+/// own thread key and then confirmed against the response.
+fn start_conversation(
+    sidecar: &mut Sidecar,
+    id: &str,
+    cwd: &Path,
+    lease: &yi_agent_lifecycle::client::FrontendLease,
+    client_run_id: &str,
+    budget: Duration,
+) -> anyhow::Result<String> {
+    sidecar.write(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "thread/start",
+        "params": { "cwd": cwd.to_string_lossy() },
+    }))?;
+    let deadline = Instant::now() + budget;
+    loop {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "no answer to thread/start within {budget:?}; sidecar stderr tail: {}",
+            sidecar.pipes.stderr_tail()
+        );
+        let frame = sidecar
+            .read_frame(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{error}; sidecar stderr tail: {}",
+                    sidecar.pipes.stderr_tail()
+                )
+            })?;
+        if frame.get("method").and_then(|v| v.as_str()) == Some("_shell/authorizeRoot") {
+            let request = AuthorizeRequest::parse(&frame)?;
+            if let Some(reason) =
+                request.disagreement(sidecar, client_run_id, &request.thread_id(), cwd)
+            {
+                anyhow::bail!(
+                    "the sidecar asked for authority it should not have: {reason}; frame: {frame}"
+                );
+            }
+            answer_authorize(sidecar, &frame, lease)?;
+            continue;
+        }
+        if frame.get("id").and_then(|v| v.as_str()) == Some(id) {
+            let result = frame
+                .get("result")
+                .ok_or_else(|| anyhow::anyhow!("thread/start was refused: {frame}"))?;
+            return result
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("thread/start returned no thread id: {frame}"));
+        }
+    }
+}
+
+/// Runs one turn to completion, validating roots and rejecting unexpected approvals.
+fn run_turn(
+    sidecar: &mut Sidecar,
+    request_id: &str,
+    thread_id: &str,
+    text: &str,
+    shell: &ShellSession,
+    cwd: &Path,
+    budget: Duration,
+) -> anyhow::Result<(serde_json::Value, Vec<serde_json::Value>)> {
+    sidecar.write(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "turn/start",
+        "params": {
+            "threadId": thread_id,
+            "input": [{ "type": "text", "text": text }],
+        },
+    }))?;
+    let deadline = Instant::now() + budget;
+    let mut seen = Vec::new();
+    let mut accepted = None;
+    loop {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the turn never completed within {budget:?}; frames: {seen:?}; \
+             sidecar stderr tail: {}",
+            sidecar.pipes.stderr_tail()
+        );
+        let frame = sidecar
+            .read_frame(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{error}; sidecar stderr tail: {}",
+                    sidecar.pipes.stderr_tail()
+                )
+            })?;
+
+        match frame.get("method").and_then(|v| v.as_str()) {
+            Some("_shell/authorizeRoot") => {
+                let request = AuthorizeRequest::parse(&frame)?;
+                if let Some(reason) =
+                    request.disagreement(sidecar, &shell.client_run_id, thread_id, cwd)
+                {
+                    anyhow::bail!(
+                        "the sidecar asked for authority it should not have: {reason}; \
+                         frame: {frame}"
+                    );
+                }
+                answer_authorize(sidecar, &frame, &shell.lease)?;
+                continue;
+            }
+            Some("item/toolCall/requestApproval") => {
+                anyhow::bail!("delegation unexpectedly requested approval: {frame}");
+            }
+            Some("turn/completed") => {
+                let completed_thread = frame
+                    .get("params")
+                    .and_then(|params| params.get("thread_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                seen.push(frame);
+                if completed_thread == thread_id {
+                    break;
+                }
+                continue;
+            }
+            Some(_) => {
+                seen.push(frame);
+                continue;
+            }
+            None => {}
+        }
+
+        if frame.get("id").and_then(|v| v.as_str()) == Some(request_id) {
+            anyhow::ensure!(
+                frame.get("result").is_some(),
+                "turn/start was refused: {frame}"
+            );
+            accepted = Some(frame);
+            continue;
+        }
+        seen.push(frame);
+    }
+    let accepted = accepted.ok_or_else(|| {
+        anyhow::anyhow!("the turn completed without an answer to turn/start: {seen:?}")
+    })?;
+    Ok((accepted, seen))
+}
+
+/// The text of every tool result the turn reported, with the tool's name.
+///
+/// The two results this test is about -- `spawn_agent`'s queued task and
+/// `wait_agent`'s completed report -- arrive here. A trace with no error would pass
+/// while the child never ran, so the assertions read these instead.
+fn tool_results_by_name(frames: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for frame in frames {
+        let Some(item) = frame.get("params").and_then(|params| params.get("item")) else {
+            continue;
+        };
+        if item.get("type").and_then(|v| v.as_str()) != Some("toolCall") {
+            continue;
+        }
+        let Some(result) = item.get("result").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        out.push((name, result.to_string()));
+    }
+    out
+}
+
+/// The whole `prepare + lease + initialize` prologue the desktop performs.
+///
+/// Returned as one value so a test cannot register the lease and then forget to
+/// start its heartbeat: a lease that is never renewed is released under a long
+/// turn, and the failure that follows would look like a broken delegation.
+struct ShellSession {
+    lease: yi_agent_lifecycle::client::FrontendLease,
+    client_run_id: String,
+}
+
+fn open_shell_session(
+    fixture: &IsolatedRuntimeFixture,
+    sidecar: &mut Sidecar,
+    client_run_id: String,
+) -> anyhow::Result<ShellSession> {
+    let params = serde_json::to_value(yi_agent_lifecycle::production::PrepareRequest {
+        scope: fixture.scope(),
+        expected: fixture.artifact().clone(),
+        attempt_id: format!("attempt-{}", uuid_like()),
+    })?;
+    let answer = sidecar.call("_shell/prepare", params, START_BUDGET)?;
+    let prepared = answer
+        .get("result")
+        .ok_or_else(|| anyhow::anyhow!("prepare refused: {answer}"))?;
+    anyhow::ensure!(
+        prepared.get("Connected").is_some() || prepared.get("VersionChoiceRequired").is_some(),
+        "prepare did not connect to this build's runtime: {prepared}"
+    );
+
+    // The fixture's own instance home, passed explicitly: `control_path` reads the
+    // *test process's* environment, which points at the developer's real instance.
+    let control_path = yi_agent_lifecycle::scope::guardian_socket(
+        &fixture.runtime_dir,
+        &fixture.instance_home.join(".yi-agent"),
+    );
+    let lease = yi_agent_lifecycle::client::FrontendLease::register_if_served(
+        &control_path,
+        client_run_id.clone(),
+        yi_agent_lifecycle::types::ClientKind::App,
+        yi_agent_lifecycle::types::LeaseMode::Business,
+        &Deadline::after(Duration::from_secs(30)),
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no guardian answered at {}; prepare connected without a control channel",
+            control_path.display()
+        )
+    })?;
+    // Kept alive on purpose for the whole test. A registration without a heartbeat
+    // expires while a delegating turn is still inside `wait_agent`, and the reclaim
+    // that follows would look like a delegation bug.
+    lease.start_heartbeat()?;
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "initialize-1",
+        "method": "initialize",
+        "params": {
+            "shellAuthorization": {
+                "client_run_id": client_run_id,
+                "issued_by_shell": true,
+            }
+        }
+    });
+    sidecar.write(&initialize)?;
+    let ack = read_until_id(sidecar, "initialize-1", Duration::from_secs(60))?;
+    anyhow::ensure!(
+        ack.get("result").is_some(),
+        "the sidecar refused the business handshake: {ack}"
+    );
+    Ok(ShellSession {
+        lease,
+        client_run_id,
+    })
+}
+
+/// The shipped failure this test is the acceptance for: the desktop says it started
+/// a conversation, but the conversation has no delegation runtime, so `spawn_agent`
+/// is missing and a subagent can never start.
+///
+/// Every in-process test missed this by construction -- one can hand the daemon a
+/// pre-registered lease or a pre-bound capability, while the desktop does neither.
+/// This fixture runs the shell's real sequence against the real binary, then does
+/// what a user does: asks the assistant to delegate, and checks that a real child
+/// really ran a real shell and really reported back to the parent.
+///
+/// What would make this pass without proving anything, and how each is excluded:
+///
+/// * a turn that merely finishes -- excluded by requiring the gateway to have seen
+///   the child's model call *and* the child's own shell result, with `exit: 0` and
+///   `hello` in the text the gateway received;
+/// * a parent that never waited -- excluded by requiring `wait_agent`'s result to
+///   carry `"status":"completed"` and a report for the task it actually spawned, in
+///   a terminal state;
+/// * the same model answering both sides -- excluded by two catalog entries and a
+///   `subagent_model` pointer, asserted through the models the gateway actually saw.
+#[test]
+fn managed_sidecar_model_spawns_child_echo_hello_and_waits() -> anyhow::Result<()> {
+    let mut fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+
+    // The gateway has to exist before the catalog names its port.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let script = managed_sidecar_harness::GatewayScript::new("parent-model", "child-model");
+    let mut gateway = managed_sidecar_harness::spawn_scripted_gateway(listener, script.clone());
+    install_two_entry_catalog(&fixture, port)?;
+
+    let mut sidecar = Sidecar::spawn(&mut fixture)?;
+    let shell = open_shell_session(&fixture, &mut sidecar, format!("app-run-{}", uuid_like()))?;
+
+    let thread_id = start_conversation(
+        &mut sidecar,
+        "start-1",
+        &fixture.workdir,
+        &shell.lease,
+        &shell.client_run_id,
+        START_BUDGET,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "the first conversation could not start: {error}; trace: {}",
+            std::fs::read_dir(fixture.instance_home.join(".yi-agent/trace"))
+                .map(|entries| entries
+                    .flatten()
+                    .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+                .unwrap_or_default()
+        )
+    })?;
+
+    let (_accepted, frames) = run_turn(
+        &mut sidecar,
+        "turn-1",
+        &thread_id,
+        "Delegate a greeting to one read-only child.",
+        &shell,
+        &fixture.workdir,
+        DELEGATION_BUDGET,
+    )?;
+
+    // The turn's own verdict first: a failed turn explains every missing piece of
+    // evidence below, and reporting the absence instead would hide the cause.
+    let completed = frames
+        .iter()
+        .rev()
+        .find(|frame| frame.get("method").and_then(|v| v.as_str()) == Some("turn/completed"))
+        .ok_or_else(|| anyhow::anyhow!("the turn produced no completion frame: {frames:?}"))?;
+    let status = completed
+        .get("params")
+        .and_then(|params| params.get("status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let error = completed
+        .get("params")
+        .and_then(|params| params.get("error"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    anyhow::ensure!(
+        status == "completed",
+        "the delegating turn ended {status:?} ({error}); gateway turns: {:#?}; \
+         unexpected paths: {:?}",
+        script.turns(),
+        script.unexpected_paths()
+    );
+
+    // 1. The gateway saw a request on the child's model. Without this the rest of
+    //    the evidence would be about a single-agent turn that happened to quote the
+    //    word "hello".
+    let child_turns = script.child_turns();
+    anyhow::ensure!(
+        !child_turns.is_empty(),
+        "no request ever reached the child model {:?}; the parent turn was {status} but \
+         nothing was delegated. Gateway turns: {:#?}; unexpected paths: {:?}",
+        script.child_model,
+        script.turns(),
+        script.unexpected_paths()
+    );
+
+    // 2. The child's own shell really ran, and the gateway saw its real output. The
+    //    `bash` tool reports `cwd:` then `exit:`; `hello` is the command's stdout.
+    //    Asserting on the *text the gateway received* is what makes this about the
+    //    executed process rather than about a trace line somebody wrote.
+    let child_shell = child_turns
+        .iter()
+        .flat_map(|turn| turn.tool_results.iter())
+        .find(|text| text.contains("exit: 0") && text.contains("hello"));
+    anyhow::ensure!(
+        child_shell.is_some(),
+        "the child model never received a successful shell result carrying `hello`; \
+         child tool results were: {:#?}",
+        child_turns
+            .iter()
+            .map(|turn| turn.tool_results.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // 3. The parent model was offered the delegation tools and used them. Both
+    //    halves matter: a schema without `spawn_agent` is the reported bug, and a
+    //    model that never called it would leave the tool untested.
+    let parent_turns = script.parent_turns();
+    anyhow::ensure!(
+        parent_turns
+            .iter()
+            .any(|turn| turn.tool_names.iter().any(|name| name == "spawn_agent")),
+        "the parent model was never offered `spawn_agent`; its tool list was: {:?}",
+        parent_turns
+            .iter()
+            .map(|turn| turn.tool_names.clone())
+            .collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        parent_turns.iter().any(|turn| turn.last_role == "tool"),
+        "the parent model never received a tool result, so no spawn/wait round trip \
+         reached it: {:#?}",
+        parent_turns
+    );
+
+    // 4. The turn stream carries the two results, so this is not a model-side
+    //    hallucination of completion. `spawn_agent` reports a queued task and
+    //    `wait_agent` reports the child's terminal state.
+    let results = tool_results_by_name(&frames);
+    let spawn_text = results
+        .iter()
+        .find(|(name, text)| name == "spawn_agent" && text.contains("\"status\":\"queued\""))
+        .map(|(_, text)| text.clone())
+        .ok_or_else(|| anyhow::anyhow!("the turn never reported a queued spawn: {results:#?}"))?;
+    let spawned_task = serde_json::from_str::<serde_json::Value>(&spawn_text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| anyhow::anyhow!("spawn_agent's result carried no task id: {spawn_text}"))?;
+
+    let wait_text = results
+        .iter()
+        .find(|(name, text)| name == "wait_agent" && text.contains("\"status\":\"completed\""))
+        .map(|(_, text)| text.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the parent never saw a completed wait; tool results were: {results:#?}; \
+                 gateway turns: {:#?}",
+                script.turns()
+            )
+        })?;
+    let wait: serde_json::Value = serde_json::from_str(&wait_text)?;
+    // The report has to be about the child the parent actually spawned, in a
+    // terminal state: a wait that completed while the child was still running would
+    // not be the end of the delegation.
+    let report = wait
+        .get("reports")
+        .and_then(|v| v.as_array())
+        .and_then(|reports| {
+            reports.iter().find(|report| {
+                report.get("task_id").and_then(|v| v.as_str()) == Some(&spawned_task)
+            })
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "wait_agent's report does not mention the spawned task {spawned_task}: {wait_text}"
+            )
+        })?;
+    let report_state = report
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        matches!(report_state.as_str(), "completed" | "completed_no_changes"),
+        "the child settled in {report_state:?}, not a completed state: {report}"
+    );
+
+    // 5. The lease is still ours. A lease that was lost would have let the guardian
+    //    reclaim this client's work, and "the child finished" would then be a story
+    //    about a run that had already been stopped.
+    assert!(
+        !shell.lease.is_lost(),
+        "the App's lease was lost while the delegation ran; the turn's completion \
+         cannot be trusted"
+    );
+
+    gateway.stop(Duration::from_secs(10));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // A22: the App's first conversation gets its delegation tools.
 // ---------------------------------------------------------------------------
 
@@ -2530,6 +3174,365 @@ fn the_apps_first_conversation_attaches_its_delegation_runtime() -> anyhow::Resu
     );
 
     drop(lease);
+    Ok(())
+}
+
+/// Resumes the same conversation and delegates again, from the recovered history.
+///
+/// The first conversation succeeding says nothing about whether an *old* one can
+/// still delegate. Resuming rebuilds the agent from disk and re-attaches the
+/// delegation runtime, which is a different path: it loads a durable transcript,
+/// resolves the recorded model reference, and asks the shell for a root whose
+/// operation id was minted by a previous turn. This asserts that path, in the same
+/// process, against the same sidecar, with the same lease.
+///
+/// Deliberately not claimed: a resume from a *new* client run, or across a sidecar
+/// restart. Those need a second lease generation and are covered where the
+/// generation logic lives; this test only claims that the recovered conversation
+/// delegates again.
+#[test]
+fn managed_sidecar_resumes_a_delegated_conversation_and_delegates_again() -> anyhow::Result<()> {
+    let mut fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let script = managed_sidecar_harness::GatewayScript::new("parent-model", "child-model");
+    let mut gateway = managed_sidecar_harness::spawn_scripted_gateway(listener, script.clone());
+    install_two_entry_catalog(&fixture, port)?;
+
+    let mut sidecar = Sidecar::spawn(&mut fixture)?;
+    let shell = open_shell_session(&fixture, &mut sidecar, format!("app-run-{}", uuid_like()))?;
+
+    let thread_id = start_conversation(
+        &mut sidecar,
+        "start-1",
+        &fixture.workdir,
+        &shell.lease,
+        &shell.client_run_id,
+        START_BUDGET,
+    )?;
+
+    // Turn one, so there is a durable transcript for the resume to recover.
+    let (_accepted, first_frames) = run_turn(
+        &mut sidecar,
+        "turn-1",
+        &thread_id,
+        "Delegate a greeting to one read-only child.",
+        &shell,
+        &fixture.workdir,
+        DELEGATION_BUDGET,
+    )?;
+    let first_completed = first_frames
+        .iter()
+        .rev()
+        .find(|frame| frame.get("method").and_then(|v| v.as_str()) == Some("turn/completed"))
+        .and_then(|frame| frame.get("params"))
+        .and_then(|params| params.get("status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    anyhow::ensure!(
+        first_completed == "completed",
+        "the conversation did not complete its first delegating turn ({first_completed}), \
+         so there is no history worth resuming"
+    );
+    let child_turns_after_first = script.child_turns().len();
+
+    // The resume itself. `historyFirst` makes the sidecar replay the transcript
+    // before it answers, which is the same ordering the desktop relies on, and the
+    // token is echoed back so the client can tell its replay from another's.
+    let history_token = format!("resume-{}", uuid_like());
+    sidecar.write(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "resume-1",
+        "method": "thread/resume",
+        "params": {
+            "threadId": thread_id,
+            "historyFirst": true,
+            "historyToken": history_token,
+        },
+    }))?;
+    let deadline = Instant::now() + START_BUDGET;
+    let mut history_ready = false;
+    let mut replayed_items = 0usize;
+    let resumed = loop {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "thread/resume never answered; sidecar stderr tail: {}",
+            sidecar.pipes.stderr_tail()
+        );
+        let frame = sidecar
+            .read_frame(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{error}; sidecar stderr tail: {}",
+                    sidecar.pipes.stderr_tail()
+                )
+            })?;
+        match frame.get("method").and_then(|v| v.as_str()) {
+            Some("_shell/authorizeRoot") => {
+                let request = AuthorizeRequest::parse(&frame)?;
+                if let Some(reason) = request.disagreement(
+                    &sidecar,
+                    &shell.client_run_id,
+                    &thread_id,
+                    &fixture.workdir,
+                ) {
+                    anyhow::bail!(
+                        "the sidecar asked for authority it should not have on resume: \
+                         {reason}; frame: {frame}"
+                    );
+                }
+                answer_authorize(&mut sidecar, &frame, &shell.lease)?;
+                continue;
+            }
+            Some("thread/historyReady") => {
+                let token = frame
+                    .get("params")
+                    .and_then(|params| params.get("request_token"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                // The marker must carry *our* token: a replay unlocked by somebody
+                // else's request would let this client read a transcript it did not
+                // ask for.
+                assert_eq!(
+                    token, history_token,
+                    "the resume replay answered a different request token: {frame}"
+                );
+                history_ready = true;
+                continue;
+            }
+            Some("items/completed") => {
+                let items = frame
+                    .get("params")
+                    .and_then(|params| params.get("items"))
+                    .and_then(|v| v.as_array())
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                replayed_items += items;
+                continue;
+            }
+            Some(_) => continue,
+            None => {}
+        }
+        if frame.get("id").and_then(|v| v.as_str()) == Some("resume-1") {
+            break frame;
+        }
+    };
+    anyhow::ensure!(
+        resumed.get("result").is_some(),
+        "thread/resume was refused: {resumed}"
+    );
+    assert!(
+        history_ready,
+        "the resumed conversation never signalled that its history was on the wire"
+    );
+    assert!(
+        replayed_items > 0,
+        "the resume replayed no items, so the recovered conversation would have had to \
+         delegate from an empty transcript"
+    );
+
+    // Turn two: the same conversation, the same lease, a second real delegation.
+    let (_accepted, second_frames) = run_turn(
+        &mut sidecar,
+        "turn-2",
+        &thread_id,
+        "Delegate another greeting to one read-only child.",
+        &shell,
+        &fixture.workdir,
+        DELEGATION_BUDGET,
+    )?;
+    let second_completed = second_frames
+        .iter()
+        .rev()
+        .find(|frame| frame.get("method").and_then(|v| v.as_str()) == Some("turn/completed"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("the resumed turn produced no completion: {second_frames:?}")
+        })?;
+    let second_status = second_completed
+        .get("params")
+        .and_then(|params| params.get("status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let second_error = second_completed
+        .get("params")
+        .and_then(|params| params.get("error"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    anyhow::ensure!(
+        second_status == "completed",
+        "the resumed conversation ended {second_status:?} ({second_error}); gateway turns: {:#?}",
+        script.turns()
+    );
+
+    // A second child really ran: the gateway must have seen another child request
+    // and its shell output, not just another parent turn that mentioned `hello`.
+    let child_turns = script.child_turns();
+    assert!(
+        child_turns.len() > child_turns_after_first,
+        "the resumed turn delegated nothing: the child model saw {child_turns_after_first} \
+         request(s) before the resume and {} after",
+        child_turns.len()
+    );
+    let saw_second_shell = child_turns
+        .iter()
+        .skip(child_turns_after_first)
+        .flat_map(|turn| turn.tool_results.iter())
+        .any(|text| text.contains("exit: 0") && text.contains("hello"));
+    assert!(
+        saw_second_shell,
+        "the resumed conversation's child never ran its shell successfully; child results \
+         after the resume: {:#?}",
+        child_turns
+            .iter()
+            .skip(child_turns_after_first)
+            .map(|turn| turn.tool_results.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let results = tool_results_by_name(&second_frames);
+    assert!(
+        results
+            .iter()
+            .any(|(name, text)| name == "wait_agent" && text.contains("\"status\":\"completed\"")),
+        "the resumed turn never waited on its child to completion: {results:#?}"
+    );
+    assert!(
+        !shell.lease.is_lost(),
+        "the App's lease was lost during the resume; the second delegation cannot be trusted"
+    );
+
+    gateway.stop(Duration::from_secs(10));
+    Ok(())
+}
+
+/// A root authorization whose epoch is not this session's must be refused.
+///
+/// This is the negative half of the handshake `managed_sidecar_model_spawns_child_hello`
+/// exercises. A sidecar that accepted a reply from a replaced generation would
+/// install a capability naming a root that generation owned, which is precisely how
+/// an old conversation would keep writing after it should have stopped. The check
+/// lives in the client, so only a real sidecar can show it fires.
+#[test]
+fn a_root_authorization_carrying_a_foreign_epoch_is_refused() -> anyhow::Result<()> {
+    let mut fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let script = managed_sidecar_harness::GatewayScript::new("parent-model", "child-model");
+    let mut gateway = managed_sidecar_harness::spawn_scripted_gateway(listener, script);
+    install_two_entry_catalog(&fixture, port)?;
+
+    let mut sidecar = Sidecar::spawn(&mut fixture)?;
+    let shell = open_shell_session(&fixture, &mut sidecar, format!("app-run-{}", uuid_like()))?;
+
+    sidecar.write(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "start-stale",
+        "method": "thread/start",
+        "params": { "cwd": fixture.workdir.to_string_lossy() },
+    }))?;
+
+    let deadline = Instant::now() + START_BUDGET;
+    let answer = loop {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "thread/start never answered the stale-epoch reply; sidecar stderr tail: {}",
+            sidecar.pipes.stderr_tail()
+        );
+        let frame = sidecar
+            .read_frame(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{error}; sidecar stderr tail: {}",
+                    sidecar.pipes.stderr_tail()
+                )
+            })?;
+        if frame.get("method").and_then(|v| v.as_str()) == Some("_shell/authorizeRoot") {
+            let request = AuthorizeRequest::parse(&frame)?;
+            let mut foreign_scope = AuthorizeRequest::parse(&frame)?;
+            foreign_scope.scope_key = "another-runtime-scope".into();
+            anyhow::ensure!(
+                foreign_scope
+                    .disagreement(
+                        &sidecar,
+                        &shell.client_run_id,
+                        &request.thread_id(),
+                        &fixture.workdir
+                    )
+                    .is_some(),
+                "the shell must reject a nonempty scope belonging to another runtime"
+            );
+            // Sanity: the genuine request is valid, so the refusal below is about
+            // the forged *reply* rather than about a malformed request.
+            anyhow::ensure!(
+                request
+                    .disagreement(
+                        &sidecar,
+                        &shell.client_run_id,
+                        &request.thread_id(),
+                        &fixture.workdir
+                    )
+                    .is_none(),
+                "the request under test was already invalid: {frame}"
+            );
+            let intent: yi_agent_lifecycle::foreground::RootBindIntent = serde_json::from_value(
+                frame
+                    .get("params")
+                    .and_then(|params| params.get("intent"))
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("no intent in {frame}"))?,
+            )?;
+            let authorization = shell
+                .lease
+                .authorize_root(&intent, &Deadline::after(Duration::from_secs(30)))?;
+            let entry = yi_agent_lifecycle::production::RootAuthorityEntry {
+                key: yi_agent_lifecycle::production::RootAuthorityKey {
+                    scope_key: authorization.scope_key.clone(),
+                    generation: authorization.daemon_instance_id.clone(),
+                    client_run_id: authorization.client_run_id.clone(),
+                    thread_key: intent.thread_key.clone(),
+                    root_id: authorization.root_id.clone(),
+                },
+                capability: yi_agent_lifecycle::foreground::SecretCapability::new(
+                    authorization.capability,
+                ),
+            };
+            // The forgery: a real capability, labelled with a generation that is not
+            // this session's.
+            sidecar.write(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "sidecar_epoch": format!("{}-stale", sidecar.epoch),
+                "result": serde_json::to_value(entry)?,
+            }))?;
+            continue;
+        }
+        if frame.get("id").and_then(|v| v.as_str()) == Some("start-stale") {
+            break frame;
+        }
+    };
+
+    // The refusal has to be an RPC error, not a success that quietly ran without
+    // delegation: a "started" answer here is the bug this whole file exists for.
+    assert!(
+        answer.get("error").is_some(),
+        "a root authorization from a foreign generation was accepted: {answer}"
+    );
+    assert!(
+        answer.get("result").is_none(),
+        "a refused authorization still produced a ready session: {answer}"
+    );
+    assert!(
+        !shell.lease.is_lost(),
+        "refusing a forged reply must not cost the caller its own lease"
+    );
+
+    gateway.stop(Duration::from_secs(10));
     Ok(())
 }
 

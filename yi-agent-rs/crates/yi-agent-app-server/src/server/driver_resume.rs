@@ -245,11 +245,13 @@ where
             tracing::warn!(thread_id, %error, "could not persist the resolved sandbox baseline");
         }
         let sandbox_baseline = Some(resolved_baseline.baseline);
+        let managed_authority = crate::server::managed_snapshot(self.managed);
+        let require_managed = managed_authority.is_some();
         let activation = attach_delegation(
             self.runtimes,
             self.thread_roots,
             &runtime_dir,
-            crate::server::managed_snapshot(self.managed),
+            managed_authority,
             self.models_path,
             self.bringup,
             self.cfg,
@@ -271,20 +273,17 @@ where
             sandbox_baseline,
             built,
         );
+        let activation = activation
+            .require_managed(require_managed)
+            .map_err(|error| failed(DriverErrorCode::RestoreFailed, error.to_string()))?;
         // spec §5.1:冷装配必须在**实际构造 bash 工具**时应用 env;装配失败就
         // 不得降级成「遗漏 env 的 BuiltAgent」再宣称成功。调用方带了 env 时,
         // 降级等于让合并命令落在一个拿不到卡片句柄的 shell 里,必须报错。
         if !env.is_empty()
             && let Some(reason) = &activation.tooling_error
         {
-            // `attach_delegation` 可能已经为**本次** thread 建好并登记了一个 root
-            // (tooling 失败时 root 本身是成功的)。不回滚它,这个 thread id 会在
-            // `thread_roots` 里留一条无人持有的记录。只删本次这一个键——项目共享的
-            // runtime binding 归别的会话一起用,绝不能动。
-            self.thread_roots
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(thread_id);
+            // Root publication/rollback belongs to attach_delegation; do not
+            // remove a previous session's registered root on failed reassembly.
             return Err(failed(
                 DriverErrorCode::RestoreFailed,
                 format!(
