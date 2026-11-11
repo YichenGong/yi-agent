@@ -2475,3 +2475,673 @@ async fn thread_compact_uses_the_live_entry_point() {
     );
     h.shutdown().await;
 }
+
+/// A factory that optionally parks the caller on a condvar.
+///
+/// `historyFirst` exists because the agent build (model resolution, tool registry,
+/// MCP probing) and the delegation attach can take seconds, while the transcript
+/// is already on disk. The gate makes that window observable: while the factory is
+/// parked, the client must already hold the history and the ready marker, and must
+/// not hold the resume response. A plain `std` condvar (not tokio time) is used on
+/// purpose -- the parked thread must stay parked for as long as the assertion
+/// needs, not until a timer fires.
+struct BuildGate {
+    open: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl BuildGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            open: std::sync::Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::SeqCst)
+    }
+
+    fn release(&self) {
+        *self.open.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.cv.notify_all();
+    }
+
+    /// Blocks while armed and unopened. Called from the factory.
+    fn wait_if_armed(&self) {
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        while !*open {
+            open = self.cv.wait(open).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+struct ReleaseBuildGate(Arc<BuildGate>);
+impl Drop for ReleaseBuildGate {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// One gated harness plus its history, for the ordering tests.
+async fn gated_resume_fixture(
+    gate: Arc<BuildGate>,
+) -> (Harness, String, Vec<crate::protocol::Item>) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let factory_gate = Arc::clone(&gate);
+    let factory = move |session: Option<yi_agent_core::Session>,
+                        cwd: &std::path::Path,
+                        mode: crate::thread_store::ThreadMode| {
+        factory_gate.wait_if_armed();
+        build_test_agent(session, cwd, mode)
+    };
+    let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    // 600 items spans multiple bounded frames, exercising the same reliable
+    // replay path as large histories (the existing long-history test stresses backpressure).
+    let items: Vec<crate::protocol::Item> = (0..600)
+        .map(|i| crate::protocol::Item::AgentMessage {
+            id: format!("early-item-{i}"),
+            text: format!("m{i}"),
+        })
+        .collect();
+    let store = crate::thread_store::ThreadStore::new(dir.path());
+    store
+        .append_turn(
+            &tid,
+            &crate::thread_store::TurnLine::Turn {
+                items: items.clone(),
+                usage: None,
+                usage_total: None,
+                messages: Vec::new(),
+            },
+        )
+        .unwrap();
+    // Harness owns the directory until shutdown; no leaked fixture on failures.
+    h._fallback_workdir = Some(dir);
+    gate.arm();
+    (h, tid, items)
+}
+
+/// `historyFirst` must put the transcript on the wire before the agent is built.
+///
+/// The user-visible bug: opening an idle history showed "正在同步" for seconds while
+/// nothing was on screen. The transcript is on disk and cheap to read; the wait was
+/// the agent build plus the managed runtime attach that preceded the replay. The
+/// fix replays first, under a request token the caller can match, and keeps the
+/// full activation afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn history_first_replays_the_transcript_before_the_agent_is_built() {
+    let gate = BuildGate::new();
+    let _release_on_failure = ReleaseBuildGate(Arc::clone(&gate));
+    let (mut h, tid, items) = gated_resume_fixture(Arc::clone(&gate)).await;
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}","historyFirst":true,"historyToken":"tok-1"}}}}"#
+    ))
+    .await;
+
+    // Collect whatever arrives while the factory is parked. The ready marker ends
+    // the early phase, so we stop at it.
+    let mut replayed: Vec<crate::protocol::Item> = Vec::new();
+    let mut ready = None;
+    let deadline = Duration::from_secs(10);
+    for _ in 0..4096 {
+        let Some(v) = h.try_read_value(deadline).await else {
+            break;
+        };
+        replayed.extend(replayed_items_of(&v));
+        if v.get("method").and_then(|m| m.as_str()) == Some("thread/historyReady") {
+            ready = Some(v);
+            break;
+        }
+        // Any response before the marker means the early phase never happened.
+        assert!(
+            v.get("id") != Some(&serde_json::json!(4)),
+            "the resume response must not arrive before the ready marker: {v}"
+        );
+    }
+
+    let ready = ready.expect("historyFirst must emit thread/historyReady");
+    assert_eq!(
+        ready["params"]["thread_id"],
+        serde_json::json!(tid),
+        "the marker must name the thread: {ready}"
+    );
+    // The token is echoed verbatim: the client uses it to discard a marker that
+    // belongs to an older resume of the same thread.
+    assert_eq!(
+        ready["params"]["request_token"],
+        serde_json::json!("tok-1"),
+        "the marker must echo the caller's token: {ready}"
+    );
+    let got: std::collections::HashSet<&str> = replayed.iter().filter_map(item_id).collect();
+    let want: std::collections::HashSet<String> = items.iter().filter_map(item_id_owned).collect();
+    let missing: Vec<&String> = want
+        .iter()
+        .filter(|id| !got.contains(id.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every item must be replayed before the agent exists: {} missing (e.g. {:?})",
+        missing.len(),
+        missing.iter().take(5).collect::<Vec<_>>()
+    );
+    // No response yet: the factory is still parked, so activation cannot have
+    // finished. This is the assert that fails on the unfixed ordering.
+    assert!(
+        h.try_read_value(Duration::from_millis(300)).await.is_none(),
+        "nothing may follow the marker while the agent is still being built"
+    );
+
+    gate.release();
+
+    // Activation then completes normally, reporting what it actually built.
+    let response = h
+        .read_matching(4096, |v| v.get("id") == Some(&serde_json::json!(4)))
+        .await;
+    assert!(response.get("error").is_none(), "resume failed: {response}");
+    assert_eq!(
+        response["result"]["model"],
+        serde_json::json!(crate::test_support::TEST_MODEL),
+        "the response must report the built agent's model, not the meta's: {response}"
+    );
+    assert_eq!(response["result"]["thread_id"], serde_json::json!(tid));
+
+    // The late phase must not replay the transcript again: duplicate items would
+    // make the client append the whole history twice.
+    let after = h.try_read_value(Duration::from_millis(300)).await;
+    if let Some(v) = after {
+        assert!(
+            replayed_items_of(&v).is_empty(),
+            "the transcript must not be replayed twice: {v}"
+        );
+    }
+    h.shutdown().await;
+}
+
+/// Without `historyFirst` the wire order is exactly what it always was: nothing
+/// (no items, no marker) until activation finishes. Old clients keep their
+/// contract, including the `thread/started` preamble.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_without_history_first_keeps_the_legacy_order() {
+    let gate = BuildGate::new();
+    let _release_on_failure = ReleaseBuildGate(Arc::clone(&gate));
+    let (mut h, tid, items) = gated_resume_fixture(Arc::clone(&gate)).await;
+
+    // A token alone must not enable the early phase: opt-in is the boolean.
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}","historyToken":"tok-1"}}}}"#
+    ))
+    .await;
+
+    assert!(
+        h.try_read_value(Duration::from_millis(500)).await.is_none(),
+        "the legacy path must not emit anything before activation finishes"
+    );
+
+    gate.release();
+
+    let mut replayed: Vec<crate::protocol::Item> = Vec::new();
+    let mut saw_marker = false;
+    let mut started_first = false;
+    let mut saw_started = false;
+    for _ in 0..4096 {
+        let v = h.read_value().await;
+        if v.get("method").and_then(|m| m.as_str()) == Some("thread/started") && !saw_started {
+            saw_started = true;
+            started_first = replayed.is_empty();
+        }
+        if v.get("method").and_then(|m| m.as_str()) == Some("thread/historyReady") {
+            saw_marker = true;
+        }
+        replayed.extend(replayed_items_of(&v));
+        if v.get("id") == Some(&serde_json::json!(4)) {
+            break;
+        }
+    }
+    assert!(
+        saw_started,
+        "the legacy path still announces thread/started"
+    );
+    assert!(
+        started_first,
+        "thread/started must precede the replay on the legacy path"
+    );
+    assert!(!saw_marker, "the legacy path must not emit the marker");
+    let got: std::collections::HashSet<&str> = replayed.iter().filter_map(item_id).collect();
+    let want: std::collections::HashSet<String> = items.iter().filter_map(item_id_owned).collect();
+    let missing: Vec<&String> = want
+        .iter()
+        .filter(|id| !got.contains(id.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the legacy path must still replay every item: {} missing",
+        missing.len()
+    );
+    h.shutdown().await;
+}
+
+/// `historyFirst: true` with no usable token is refused the early phase: without a
+/// token the client cannot tell its own marker from a concurrent resume's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn history_first_without_a_token_stays_on_the_legacy_path() {
+    let gate = BuildGate::new();
+    let _release_on_failure = ReleaseBuildGate(Arc::clone(&gate));
+    let (mut h, tid, _items) = gated_resume_fixture(Arc::clone(&gate)).await;
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}","historyFirst":true}}}}"#
+    ))
+    .await;
+
+    assert!(
+        h.try_read_value(Duration::from_millis(500)).await.is_none(),
+        "an empty token must not start the early phase"
+    );
+    gate.release();
+    let response = h
+        .read_matching(4096, |v| v.get("id") == Some(&serde_json::json!(4)))
+        .await;
+    assert!(response.get("error").is_none(), "resume failed: {response}");
+    h.shutdown().await;
+}
+
+/// A resume fixture whose history carries both a recorded usage sample and a
+/// crashed, uncommitted partial turn.
+///
+/// The early replay must deliver *all* of it (chunks, usage, interrupted marker)
+/// before the ready marker, exactly once, and must not promote the partial before
+/// activation either succeeds or fails.
+async fn history_first_fixture_with_usage_and_partial(
+    gate: Arc<BuildGate>,
+) -> (
+    Harness,
+    String,
+    std::path::PathBuf,
+    Vec<crate::protocol::Item>,
+    Vec<crate::protocol::Item>,
+) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let mut cfg = test_config();
+    cfg.workdir = root.clone();
+    let factory_gate = Arc::clone(&gate);
+    let factory = move |session: Option<yi_agent_core::Session>,
+                        cwd: &std::path::Path,
+                        mode: crate::thread_store::ThreadMode| {
+        factory_gate.wait_if_armed();
+        build_test_agent(session, cwd, mode)
+    };
+    let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let log_items: Vec<crate::protocol::Item> = (0..3)
+        .map(|i| crate::protocol::Item::AgentMessage {
+            id: format!("logged-{i}"),
+            text: format!("l{i}"),
+        })
+        .collect();
+    let partial_items: Vec<crate::protocol::Item> = vec![
+        crate::protocol::Item::UserMessage {
+            id: "recovered-user".into(),
+            text: "crash question".into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        },
+        crate::protocol::Item::AgentMessage {
+            id: "recovered-reply".into(),
+            text: "crash answer".into(),
+        },
+    ];
+    let usage = crate::thread_store::TurnUsage {
+        model: "m".into(),
+        input_tokens: 10,
+        output_tokens: 2,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    let store = crate::thread_store::ThreadStore::new(&root);
+    store
+        .append_turn(
+            &tid,
+            &crate::thread_store::TurnLine::Turn {
+                items: log_items.clone(),
+                usage: Some(usage.clone()),
+                usage_total: Some(usage.clone()),
+                messages: Vec::new(),
+            },
+        )
+        .unwrap();
+    store
+        .write_partial(
+            &tid,
+            &crate::thread_store::PartialTurn {
+                turn_id: "turn-crashed".into(),
+                items: partial_items.clone(),
+                messages: Vec::new(),
+                usage: Some(usage.clone()),
+                usage_total: Some(usage),
+            },
+        )
+        .unwrap();
+
+    h._fallback_workdir = Some(dir);
+    gate.arm();
+    (h, tid, root, log_items, partial_items)
+}
+
+fn count_method(frames: &[serde_json::Value], method: &str) -> usize {
+    frames
+        .iter()
+        .filter(|v| v.get("method").and_then(|m| m.as_str()) == Some(method))
+        .count()
+}
+
+/// The early replay goes only to the client that asked for it, even when that
+/// client's feed excludes this thread, and it is complete before the marker.
+///
+/// This is the invariant the desktop relies on: `thread/historyReady` is what
+/// lets the UI stop saying "syncing", so it must never overtake the transcript.
+/// A subscription-based broadcast would deliver the marker (directed) but drop
+/// the items (filtered), leaving a `ready` with an empty history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn history_first_replays_the_whole_transcript_to_the_caller_before_ready() {
+    let gate = BuildGate::new();
+    let _release_on_failure = ReleaseBuildGate(Arc::clone(&gate));
+    let (mut h, tid, root, log_items, partial_items) =
+        history_first_fixture_with_usage_and_partial(Arc::clone(&gate)).await;
+
+    // Narrow this client's feed to an unrelated thread. Directed delivery must
+    // still work; a broadcast would silently drop every content frame.
+    h.send(r#"{"jsonrpc":"2.0","id":7,"method":"thread/subscribe","params":{"threadIds":["some-other-thread"]}}"#)
+        .await;
+    let subscribed = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(7)))
+        .await;
+    assert!(
+        subscribed.get("error").is_none(),
+        "subscribe failed: {subscribed}"
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}","historyFirst":true,"historyToken":"tok-1"}}}}"#
+    ))
+    .await;
+
+    let mut early: Vec<serde_json::Value> = Vec::new();
+    let mut replayed: Vec<crate::protocol::Item> = Vec::new();
+    let mut ready = None;
+    for _ in 0..4096 {
+        let Some(v) = h.try_read_value(Duration::from_secs(10)).await else {
+            break;
+        };
+        replayed.extend(replayed_items_of(&v));
+        if v.get("method").and_then(|m| m.as_str()) == Some("thread/historyReady") {
+            ready = Some(v.clone());
+            early.push(v);
+            break;
+        }
+        assert!(
+            v.get("id") != Some(&serde_json::json!(4)),
+            "the resume response must not arrive before the ready marker: {v}"
+        );
+        early.push(v);
+    }
+
+    let ready = ready.expect("historyFirst must emit thread/historyReady");
+    assert_eq!(ready["params"]["request_token"], serde_json::json!("tok-1"));
+
+    let got: std::collections::HashSet<String> =
+        replayed.iter().filter_map(item_id_owned).collect();
+    let want: std::collections::HashSet<String> = log_items
+        .iter()
+        .chain(partial_items.iter())
+        .filter_map(item_id_owned)
+        .collect();
+    let missing: Vec<&String> = want.iter().filter(|id| !got.contains(*id)).collect();
+    assert!(
+        missing.is_empty(),
+        "the early replay must contain the whole transcript (logged + recovered), {} missing: {:?}",
+        missing.len(),
+        missing.iter().take(5).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        count_method(&early, "thread/tokenUsage/updated"),
+        1,
+        "the recorded usage must be replayed once before ready: {early:?}"
+    );
+    assert_eq!(
+        count_method(&early, "turn/completed"),
+        1,
+        "the crashed partial must be marked interrupted once before ready: {early:?}"
+    );
+
+    gate.release();
+
+    let response = h
+        .read_matching(4096, |v| v.get("id") == Some(&serde_json::json!(4)))
+        .await;
+    assert!(response.get("error").is_none(), "resume failed: {response}");
+    // The late phase must not replay anything a second time.
+    assert!(
+        h.try_read_value(Duration::from_millis(300)).await.is_none(),
+        "nothing may follow the resume response"
+    );
+    // Activation succeeded, so the recovered partial is now durable history and
+    // the checkpoint is gone.
+    assert!(
+        !crate::thread_store::ThreadStore::new(&root)
+            .partial_path(&tid)
+            .exists(),
+        "a successful activation must promote the recovered partial"
+    );
+    h.shutdown().await;
+}
+
+/// A failed activation must not lose the recovered turn: the early phase is a
+/// read-only preview, so the checkpoint stays on disk for the next resume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_activation_keeps_the_recovered_partial_on_disk() {
+    let gate = BuildGate::new();
+    let _release_on_failure = ReleaseBuildGate(Arc::clone(&gate));
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let mut cfg = test_config();
+    cfg.workdir = root.clone();
+    let factory_gate = Arc::clone(&gate);
+    let factory = move |session: Option<yi_agent_core::Session>,
+                        cwd: &std::path::Path,
+                        mode: crate::thread_store::ThreadMode| {
+        if !factory_gate.is_armed() {
+            // `thread/start` must succeed: the fixture needs a real thread id.
+            return build_test_agent(session, cwd, mode);
+        }
+        factory_gate.wait_if_armed();
+        let _ = (session, cwd, mode);
+        Err(anyhow::anyhow!("activation boom"))
+    };
+    let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let store = crate::thread_store::ThreadStore::new(&root);
+    store
+        .append_turn(
+            &tid,
+            &crate::thread_store::TurnLine::Turn {
+                items: vec![crate::protocol::Item::AgentMessage {
+                    id: "logged-0".into(),
+                    text: "l0".into(),
+                }],
+                usage: None,
+                usage_total: None,
+                messages: Vec::new(),
+            },
+        )
+        .unwrap();
+    let partial_items = vec![
+        crate::protocol::Item::UserMessage {
+            id: "recovered-user".into(),
+            text: "crash question".into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        },
+        crate::protocol::Item::AgentMessage {
+            id: "recovered-reply".into(),
+            text: "crash answer".into(),
+        },
+    ];
+    store
+        .write_partial(
+            &tid,
+            &crate::thread_store::PartialTurn {
+                turn_id: "turn-crashed".into(),
+                items: partial_items.clone(),
+                messages: Vec::new(),
+                usage: None,
+                usage_total: None,
+            },
+        )
+        .unwrap();
+    let partial_bytes = std::fs::read(store.partial_path(&tid)).unwrap();
+    h._fallback_workdir = Some(dir);
+    gate.arm();
+
+    // Same feed narrowing as the success case: delivery must not depend on it.
+    h.send(r#"{"jsonrpc":"2.0","id":7,"method":"thread/subscribe","params":{"threadIds":["some-other-thread"]}}"#)
+        .await;
+    let _ = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(7)))
+        .await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}","historyFirst":true,"historyToken":"tok-1"}}}}"#
+    ))
+    .await;
+
+    let mut early: Vec<serde_json::Value> = Vec::new();
+    let mut replayed: Vec<crate::protocol::Item> = Vec::new();
+    let mut ready = false;
+    for _ in 0..4096 {
+        let Some(v) = h.try_read_value(Duration::from_secs(10)).await else {
+            break;
+        };
+        replayed.extend(replayed_items_of(&v));
+        if v.get("method").and_then(|m| m.as_str()) == Some("thread/historyReady") {
+            ready = true;
+            break;
+        }
+        early.push(v);
+    }
+    assert!(ready, "historyFirst must emit thread/historyReady");
+    let got: std::collections::HashSet<String> =
+        replayed.iter().filter_map(item_id_owned).collect();
+    for want in ["logged-0", "recovered-user", "recovered-reply"] {
+        assert!(got.contains(want), "early replay missing {want}");
+    }
+
+    gate.release();
+
+    let response = h
+        .read_matching(4096, |v| v.get("id") == Some(&serde_json::json!(4)))
+        .await;
+    assert!(
+        response.get("error").is_some(),
+        "a failing factory must answer with an error: {response}"
+    );
+    // The early preview must not have promoted (or otherwise consumed) the only
+    // durable copy of the crashed turn.
+    assert_eq!(
+        std::fs::read(store.partial_path(&tid)).ok(),
+        Some(partial_bytes),
+        "a failed activation must leave the recovered partial byte-identical"
+    );
+    h.shutdown().await;
+}
+
+/// A remote (WS) client that sends `historyFirst` must stay on the legacy path.
+///
+/// The early path writes `thread/historyReady` as a directed, load-bearing frame.
+/// For a shared sidecar a remote disconnect must not be able to turn that into a
+/// fatal error for the local session, and remote clients have their own
+/// catch-up protocol (`thread/readItems` + sync plan). So the flag is local-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_client_asking_for_history_first_gets_the_legacy_order() {
+    let mut h = MergedHarness::new().await;
+    let mut ws = h.connect_ws().await;
+    crate::test_support::initialize(&mut ws).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    for _ in 0..16 {
+        let v = h.read_value().await;
+        if v.get("id") == Some(&serde_json::json!(1)) {
+            break;
+        }
+    }
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let mut tid = None;
+    for _ in 0..16 {
+        let v = h.read_value().await;
+        if v.get("id") == Some(&serde_json::json!(2)) {
+            tid = v["result"]["thread_id"].as_str().map(str::to_string);
+            break;
+        }
+    }
+    let tid = tid.expect("thread/start response");
+
+    // The thread is already in memory; narrowing the ws feed proves that neither
+    // a marker nor an early replay is delivered to it.
+    ws_send_json(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":3,"method":"thread/subscribe","params":{"threadIds":["some-other-thread"]}}"#,
+    )
+    .await;
+    let _ = ws_read_response(&mut ws, 3).await;
+
+    ws_send_json(
+        &mut ws,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}","historyFirst":true,"historyToken":"tok-ws"}}}}"#
+        ),
+    )
+    .await;
+
+    // Read until the response; neither a ready marker nor a history chunk may
+    // appear on this remote connection.
+    let mut methods: Vec<String> = Vec::new();
+    let mut items = 0usize;
+    for _ in 0..64 {
+        let v = ws_recv_json(&mut ws).await;
+        if v.get("id") == Some(&serde_json::json!(4)) {
+            assert!(v.get("error").is_none(), "remote resume failed: {v}");
+            break;
+        }
+        if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
+            methods.push(m.to_string());
+        }
+        items += replayed_items_of(&v).len();
+    }
+    assert!(
+        !methods.iter().any(|m| m == "thread/historyReady"),
+        "the remote client must not receive a historyReady marker: {methods:?}"
+    );
+    assert_eq!(
+        items, 0,
+        "the remote client must not receive an early transcript replay: {methods:?}"
+    );
+    h.shutdown().await;
+}

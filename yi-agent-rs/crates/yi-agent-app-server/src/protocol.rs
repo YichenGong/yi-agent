@@ -344,6 +344,13 @@ pub enum Notification {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_ref: Option<String>,
     },
+    /// The requesting client's correlated transcript replay is complete.
+    /// Runtime activation can still be in progress; this grants no tool authority.
+    #[serde(rename = "thread/historyReady")]
+    ThreadHistoryReady {
+        thread_id: String,
+        request_token: String,
+    },
     #[serde(rename = "turn/started")]
     TurnStarted { thread_id: String, turn_id: String },
     #[serde(rename = "thread/status/updated")]
@@ -750,6 +757,7 @@ impl Notification {
     pub(crate) fn thread_key(&self) -> Option<&str> {
         match self {
             Notification::ThreadStarted { thread_id, .. }
+            | Notification::ThreadHistoryReady { thread_id, .. }
             | Notification::TurnStarted { thread_id, .. }
             | Notification::ThreadStatusUpdated { thread_id, .. }
             | Notification::DelegationStatusUpdated { thread_id, .. }
@@ -2267,6 +2275,23 @@ mod tests {
             v["params"]["items"][0]["type"],
             serde_json::json!("userMessage")
         );
+        assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    /// The marker that ends the early replay phase: content delivery (so a
+    /// subscription filter applies to it like any other thread frame), keyed by
+    /// the thread, with the caller's token echoed verbatim.
+    #[test]
+    fn history_ready_notification_is_content_scoped_and_correlates() {
+        let n = Notification::ThreadHistoryReady {
+            thread_id: "t1".to_string(),
+            request_token: "tok-9".to_string(),
+        };
+        let v = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], serde_json::json!("thread/historyReady"));
+        assert_eq!(v["params"]["thread_id"], serde_json::json!("t1"));
+        assert_eq!(v["params"]["request_token"], serde_json::json!("tok-9"));
+        assert_eq!(n.delivery(), Delivery::Content);
         assert_eq!(n.thread_key(), Some("t1"));
     }
 }

@@ -70,7 +70,7 @@ pub(crate) async fn handle(
             // must refuse to run tools, not silently rebuild into a conversation
             // whose sandbox record is gone. Listing still uses the tolerant
             // `load`; this path is the one that grants tool access.
-            let loaded = match thread_store.load_for_activation(&thread_id) {
+            let mut loaded = match thread_store.load_for_activation(&thread_id) {
                 Ok(Some(l)) => l,
                 Ok(None) => {
                     write_response(
@@ -111,7 +111,7 @@ pub(crate) async fn handle(
             if let Some(u) = &loaded.usage {
                 session.set_last_input_tokens(Some(u.input_tokens));
             }
-            session.replace_messages(loaded.messages);
+            session.replace_messages(std::mem::take(&mut loaded.messages));
 
             // 按 cwd(`meta.cwd`,损坏时用 cfg.workdir 兜底)重建本 thread
             // 的 store,让 agent 与 driver 都跑在对话真实目录,而非全局
@@ -136,6 +136,49 @@ pub(crate) async fn handle(
             {
                 write_response(state.hub, state.client, err_response(id, error)).await?;
                 return Ok(Flow::Continue);
+            }
+
+            // Early replay is a desktop-only optimization. The marker is a
+            // directed, load-bearing frame: a remote WS client can ask for
+            // `historyFirst` on a shared sidecar, and its disconnect must not be
+            // able to tear the local session down. Remote clients also have their
+            // own catch-up protocol (`thread/readItems` + sync plan), so they stay
+            // on the legacy ordering.
+            let history_token = req
+                .params
+                .get("historyToken")
+                .and_then(serde_json::Value::as_str)
+                .filter(|token| !token.is_empty());
+            let history_first = *state.client == crate::broadcast::ClientId::local()
+                && req
+                    .params
+                    .get("historyFirst")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                && history_token.is_some();
+            if history_first {
+                // Directed delivery, not a broadcast: `historyReady` promises the
+                // caller that the transcript is already on its wire, so the
+                // requestor must receive every frame regardless of its
+                // `thread/subscribe` feed. Same for the partial/interrupted and
+                // usage frames, which otherwise could be filtered out while the
+                // marker still arrived.
+                replay_history(state, &thread_id, &mut loaded, Some(state.client)).await?;
+                // Reliable and targeted: another client or replay must not be unlocked.
+                let ready = Notification::ThreadHistoryReady {
+                    thread_id: thread_id.clone(),
+                    request_token: history_token.unwrap_or_default().to_string(),
+                };
+                let frame =
+                    serde_json::to_value(crate::protocol::NotificationEnvelope::new(&ready))?;
+                state
+                    .hub
+                    .reply(state.client, frame)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("history client disconnected"))?;
+                // The next phase is synchronous. Let the independent output pump
+                // run before it can park this worker during agent construction.
+                tokio::task::yield_now().await;
             }
 
             let built = match with_session_model_ref(loaded.meta.model_ref.clone(), || {
@@ -389,52 +432,12 @@ pub(crate) async fn handle(
                 },
             )
             .await?;
-            // 回放：分块批量下发（每块一条 `items/completed`），经带背压的
-            // 投递——本地 reliable 客户端队列满时等待而非丢帧。旧实现逐条
-            // try_send,超过 256 格队列即静默丢帧,长会话尾部就此消失。
-            for chunk in chunk_items_for_replay(loaded.items) {
-                if let Err(e) = write_notification_await(
-                    state.hub,
-                    &Notification::ItemsCompleted {
-                        thread_id: thread_id.clone(),
-                        items: chunk,
-                    },
-                )
-                .await
-                {
-                    eprintln!("[app-server] replay aborted for {thread_id}: {e}");
-                    break;
-                }
+            if !history_first {
+                // Legacy broadcast path: unchanged wire ordering and filtering.
+                replay_history(state, &thread_id, &mut loaded, None).await?;
             }
-            // 回放的既要有「最后一轮快照」（上下文占用），也要有该 thread 的累计值
-            // （`/usage` 与状态栏）——后者若不带，客户端 resume 后累计会从 0 重来。
-            if let Some(u) = loaded.usage {
-                let totals = loaded.totals;
-                write_notification(
-                    state.hub,
-                    &Notification::TokenUsage {
-                        thread_id: thread_id.clone(),
-                        model: u.model,
-                        input_tokens: u.input_tokens,
-                        output_tokens: u.output_tokens,
-                        cache_creation_input_tokens: u.cache_creation_input_tokens,
-                        cache_read_input_tokens: u.cache_read_input_tokens,
-                        total_input_tokens: totals.input_tokens,
-                        total_output_tokens: totals.output_tokens,
-                        total_cache_creation_input_tokens: totals.cache_creation_input_tokens,
-                        total_cache_read_input_tokens: totals.cache_read_input_tokens,
-                        // 回放不带 subagent 汇总：它由 children watch 在会话恢复后
-                        // 推送（Task 5）。这里给 0 而不是省略字段，客户端因此不必
-                        // 处理「缺失」这一种额外状态。
-                        subagent_input_tokens: 0,
-                        subagent_output_tokens: 0,
-                        subagent_cache_read_tokens: 0,
-                    },
-                )
-                .await?;
-            }
-            // 末尾若是崩溃残留的未收尾 turn，补一条 interrupted 标记，
-            // 让客户端把它显示为"这一轮被中断"，而不是当成正常轮次。
+            // Promote only after acquiring the writer lock, as on the legacy path.
+            // Early replay is read-only: a failed activation must leave the partial intact.
             if loaded.pending_turn {
                 // 采纳的 partial 必须在这一刻**升格**进主 jsonl：它是这一轮
                 // 唯一的持久副本，若不 append 就返回，用户下一条消息的 turn-start
@@ -445,19 +448,6 @@ pub(crate) async fn handle(
                 if let Err(e) = thread_store.promote_partial(&thread_id) {
                     eprintln!("[app-server] failed to promote recovered turn ({thread_id}): {e}");
                 }
-                write_notification(
-                    state.hub,
-                    &Notification::TurnCompleted {
-                        thread_id: thread_id.clone(),
-                        turn_id: "crashed".to_string(),
-                        status: TurnStatus::Interrupted,
-                        error: None,
-                        // 崩溃那轮从未走到收尾，meta 里没有它的完成时间；
-                        // 回放这一刻即客户端「得知它结束」的时刻。
-                        completed_at: Some(crate::thread_store::now_millis()),
-                    },
-                )
-                .await?;
             }
             write_response(
                 state.hub,
@@ -480,4 +470,109 @@ pub(crate) async fn handle(
         _ => return Ok(Flow::Unknown),
     }
     Ok(Flow::Continue)
+}
+
+/// Replay durable transcript data without creating an agent or granting tool authority.
+///
+/// `targeted` is `Some(client)` only for the local early phase, where every frame
+/// must reach the requestor directly (a subscription filter must not be able to
+/// strand a `historyReady` without its history). `None` keeps the legacy
+/// thread-keyed broadcast, frame-for-frame identical to the old implementation:
+/// item chunks wait for backpressure, the usage and interrupted markers do not.
+async fn replay_history(
+    state: &AppState<'_>,
+    thread_id: &str,
+    loaded: &mut crate::thread_store::LoadedThread,
+    targeted: Option<&crate::broadcast::ClientId>,
+) -> anyhow::Result<()> {
+    /// `blocking` selects the legacy delivery shim: chunks use the awaited
+    /// backpressured send; usage/interrupted use the fire-and-forget broadcast
+    /// (which deliberately ignores a closed client). A targeted frame always
+    /// awaits enqueue so `historyReady` cannot overtake it.
+    async fn send(
+        state: &AppState<'_>,
+        targeted: Option<&crate::broadcast::ClientId>,
+        notification: &Notification,
+        blocking: bool,
+    ) -> anyhow::Result<()> {
+        if let Some(client) = targeted {
+            let frame =
+                serde_json::to_value(crate::protocol::NotificationEnvelope::new(notification))?;
+            return state
+                .hub
+                .reply(client, frame)
+                .await
+                .map_err(|_| anyhow::anyhow!("history client disconnected"));
+        }
+        if blocking {
+            write_notification_await(state.hub, notification).await
+        } else {
+            write_notification(state.hub, notification).await
+        }
+    }
+
+    // 回放：分块批量下发（每块一条 `items/completed`），经带背压的
+    // 投递——本地 reliable 客户端队列满时等待而非丢帧。旧实现逐条
+    // try_send,超过 256 格队列即静默丢帧,长会话尾部就此消失。
+    for chunk in chunk_items_for_replay(std::mem::take(&mut loaded.items)) {
+        send(
+            state,
+            targeted,
+            &Notification::ItemsCompleted {
+                thread_id: thread_id.to_string(),
+                items: chunk,
+            },
+            true,
+        )
+        .await?;
+    }
+    // 回放的既要有「最后一轮快照」（上下文占用），也要有该 thread 的累计值
+    // （`/usage` 与状态栏）——后者若不带，客户端 resume 后累计会从 0 重来。
+    if let Some(u) = loaded.usage.take() {
+        let totals = &loaded.totals;
+        send(
+            state,
+            targeted,
+            &Notification::TokenUsage {
+                thread_id: thread_id.to_string(),
+                model: u.model,
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cache_creation_input_tokens: u.cache_creation_input_tokens,
+                cache_read_input_tokens: u.cache_read_input_tokens,
+                total_input_tokens: totals.input_tokens,
+                total_output_tokens: totals.output_tokens,
+                total_cache_creation_input_tokens: totals.cache_creation_input_tokens,
+                total_cache_read_input_tokens: totals.cache_read_input_tokens,
+                // 回放不带 subagent 汇总：它由 children watch 在会话恢复后
+                // 推送（Task 5）。这里给 0 而不是省略字段，客户端因此不必
+                // 处理「缺失」这一种额外状态。
+                subagent_input_tokens: 0,
+                subagent_output_tokens: 0,
+                subagent_cache_read_tokens: 0,
+            },
+            false,
+        )
+        .await?;
+    }
+    // 末尾若是崩溃残留的未收尾 turn，补一条 interrupted 标记，
+    // 让客户端把它显示为"这一轮被中断"，而不是当成正常轮次。
+    if loaded.pending_turn {
+        send(
+            state,
+            targeted,
+            &Notification::TurnCompleted {
+                thread_id: thread_id.to_string(),
+                turn_id: "crashed".to_string(),
+                status: TurnStatus::Interrupted,
+                error: None,
+                // 崩溃那轮从未走到收尾，meta 里没有它的完成时间；
+                // 回放这一刻即客户端「得知它结束」的时刻。
+                completed_at: Some(crate::thread_store::now_millis()),
+            },
+            false,
+        )
+        .await?;
+    }
+    Ok(())
 }
