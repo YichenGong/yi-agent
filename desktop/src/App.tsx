@@ -111,7 +111,8 @@ import { buildUsageReport } from "./lib/usageCommand";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
 import { OnboardingWizard } from "./components/OnboardingWizard";
-import { readListCache } from "./lib/sessionCache";
+import { readListCache, DESKTOP_THREAD_LIST_CACHE_KEY } from "./lib/sessionCache";
+import type { Session } from "./lib/session";
 import { resetCacheScope } from "./lib/cacheScope";
 import {
   contentFingerprintOf,
@@ -382,6 +383,16 @@ export default function App() {
   // Resume requests currently on the wire, so a rapid second click cannot
   // interleave two histories into one session.
   const inFlightResume = useRef(new Set<string>());
+  // Transcript readiness is independent of tool/runtime readiness. Keep the
+  // activation barrier even after historyReady allows reading and navigation.
+  const selectionRevision = useRef(0);
+  const pendingResumes = useRef(new Map<string, {
+    token: string;
+    client: RpcClient;
+    historyReady: () => void;
+    activation: Promise<boolean>;
+  }>());
+  const notifyHistoryReady = useRef<(client: RpcClient, id: string, token: string) => void>(() => {});
   // Remote-only (S2): the LRU of threads we keep warm via `thread/subscribe`.
   // Content notifications are only delivered for subscribed threads, so the
   // window bounds how many histories stream live; the rest stay cold and are
@@ -407,11 +418,9 @@ export default function App() {
     {},
   );
   const [status, setStatus] = useState<string>("connecting");
-  // 手机端首屏缓存：权威列表在服务端，这里只放一份同步快照，让侧栏在
-  // `thread/listAll` 回来之前就能画出来。桌面端不读（`null`），初值保持 []，
-  // 行为与从前逐字节一致。
+  // 首屏先画快照。Desktop local 使用独立键，绝不读配对远端的列表。
   const initialListCache = useRef(
-    isRemoteClient() ? readListCache() : null,
+    isRemoteClient() ? readListCache() : readListCache(localStorage, DESKTOP_THREAD_LIST_CACHE_KEY),
   ).current;
   /** 标签显示名（6 键齐全）。默认名来自 threadTags.ts，服务端只给覆盖项。 */
   const [tagNames, setTagNames] =
@@ -444,16 +453,23 @@ export default function App() {
   const isMobile = useIsMobile();
   // 手机端离线 = 尚未握手成功。桌面端恒为 false（不显示缓存相关 UI）。
   const offline = isRemoteClient() && status !== "connected";
-  // 内容缓存（IndexedDB）：仅手机端。懒建，桌面端永不构造（`null`）。
+  // 正文快照：本地 desktop 与配对 remote 分库。非 local 槽位不缓存。
   const contentStoreRef = useRef<AsyncContentStore | null>(null);
   const getContentStore = (): AsyncContentStore =>
-    (contentStoreRef.current ??= createContentStore());
+    (contentStoreRef.current ??= createContentStore({ desktop: !isRemoteClient() }));
+  const canCacheContent = useCallback(
+    () => isRemoteClient() || activeSlotRef.current === LOCAL_SLOT,
+    [],
+  );
+  const cacheLocal = useCallback(() => activeSlotRef.current === LOCAL_SLOT, []);
   // 防抖落盘定时器，按 thread 隔离：一个会话的写入不能被另一个的盖掉。
   const persistTimers = useRef(new Map<string, number>());
   // 内容来自缓存、尚未被服务端覆盖的会话 → 其 `savedAt`（供离线提示）。
   const cachedAt = useRef(new Map<string, number>());
   /** 每个会话的缓存元数据（epoch / 游标 / 是否被裁剪），用于组装 hints 与裁决。 */
   const cacheMetaRef = useRef(new Map<string, ContentEntry>());
+  // Once authority has spoken, even an empty transcript beats a late disk read.
+  const confirmedHistory = useRef(new WeakSet<Session>());
   /**
    * 「盘上是什么」的内存镜像：threadId → 内容指纹。
    *
@@ -468,19 +484,23 @@ export default function App() {
   );
 
   /**
-   * 从内容缓存预填某会话的对话（手机端）。服务端 item 到达后按 id 就地替换，
+   * 从内容缓存预填某会话的对话。服务端 item 到达后按 id 就地替换，
    * 所以这里的旧内容只会短暂停留；若服务端已先填好了内容则整段跳过。
    *
    * 预填**不**置 warm：那会让连上后的 `thread/resume` 被跳过，服务端历史
    * 永远合不进来。缓存（cachedAt）与 warm 是两套东西，必须分开。
    */
   const prefillFromCache = (id: string) => {
-    if (!isRemoteClient()) return;
+    if (!canCacheContent()) return;
+    const slot = activeSlotRef.current;
+    const session = store.peek(id)?.session;
     const store0 = getContentStore();
     void store0
       .read(id)
       .then((entry) => {
-        if (!entry || entry.items.length === 0) return;
+        if (!entry || entry.items.length === 0 || slot !== activeSlotRef.current ||
+            store.peek(id)?.session !== session ||
+            (session && confirmedHistory.current.has(session))) return;
         // 记下元数据供 hints 与裁决使用（即使本次不注入内容）。
         cacheMetaRef.current.set(entry.threadId, entry);
         const v = store.peek(id);
@@ -519,7 +539,7 @@ export default function App() {
   // 冷启首帧：把缓存里已有的条目读进内存元数据，供首次 initialize 的 hints 使用。
   // `contentStore.keys()` 已存在；读失败静默跳过（hints 是优化，不能挡住握手）。
   useEffect(() => {
-    if (!isRemoteClient()) return;
+    if (!canCacheContent()) return;
     const cs = getContentStore();
     void (async () => {
       try {
@@ -563,13 +583,14 @@ export default function App() {
   /** 节流：内容变更后延迟落盘，避免逐字 delta 每次都写 IndexedDB。 */
   const CONTENT_PERSIST_DEBOUNCE_MS = 800;
   const schedulePersist = (id: string) => {
-    if (!isRemoteClient()) return;
+    if (!canCacheContent()) return;
     const timers = persistTimers.current;
     const existing = timers.get(id);
     if (existing !== undefined) window.clearTimeout(existing);
+    const slot = activeSlotRef.current;
     const timer = window.setTimeout(() => {
       timers.delete(id);
-      void flushContent(id);
+      if (slot === activeSlotRef.current) void flushContent(id);
     }, CONTENT_PERSIST_DEBOUNCE_MS);
     timers.set(id, timer);
   };
@@ -584,7 +605,7 @@ export default function App() {
     id: string,
     options?: PersistOptions,
   ): Promise<PersistOutcome | null> => {
-    if (!isRemoteClient()) return null;       // 桌面端：本就没有缓存
+    if (!canCacheContent()) return null;
     const v = store.peek(id);
     if (!v) return null;                      // 会话已不存在（如刚被 drop）
     try {
@@ -604,9 +625,9 @@ export default function App() {
       return null;                            // 写失败：不抛给调用方，也不记指纹
     }
   };
-  /** 删除某会话的内容缓存（仅手机端）。桌面端不构造内容缓存，故此处也必须门控。 */
+  /** 删除当前缓存域中某会话的正文。 */
   const deleteCachedContent = (id: string) => {
-    if (!isRemoteClient()) return;
+    if (!canCacheContent()) return;
     cacheMetaRef.current.delete(id);
     cachedAt.current.delete(id);
     persistedFp.current.delete(id);      // 新增：否则指纹会永久偏旧
@@ -650,6 +671,7 @@ export default function App() {
     setCurrentError,
     railStore,
     initialListCache,
+    cacheLocal,
     pairingVersion: prefs.pairingVersion,
   });
   /**
@@ -1140,7 +1162,8 @@ export default function App() {
     store.seed([...c.pinned, ...c.groups.flatMap((g) => g.threads)]);
     if (
       c.selectedId &&
-      c.groups.some((g) => g.threads.some((t) => t.thread_id === c.selectedId))
+      (c.pinned.some((t) => t.thread_id === c.selectedId) ||
+       c.groups.some((g) => g.threads.some((t) => t.thread_id === c.selectedId)))
     ) {
       store.select(c.selectedId);
       sess.setCurrentId(c.selectedId);
@@ -1157,8 +1180,8 @@ export default function App() {
   // 页面隐藏 / 卸载时把在途的会话内容立刻写盘：手机切后台后可能很久不再执行
   // 定时器，等着防抖会把最后一段内容丢掉。
   useEffect(() => {
-    if (!isRemoteClient()) return;
     const flushAll = () => {
+      if (!canCacheContent()) return;
       for (const id of persistTimers.current.keys()) {
         window.clearTimeout(persistTimers.current.get(id));
       }
@@ -1271,11 +1294,19 @@ export default function App() {
    * resumed once; per-thread isolation means the base session list/sidebar can
    * keep serving other threads in parallel.
    */
+  notifyHistoryReady.current = (client, id, token) => {
+    const pending = pendingResumes.current.get(id);
+    if (pending?.client === client && pending.token === token && clientRef.current === client) {
+      pending.historyReady();
+    }
+  };
+
   const selectThread = async (
     id: string,
     opts?: { forceResume?: boolean },
   ) => {
     const prevId = store.currentId;
+    if (prevId !== id) selectionRevision.current += 1;
     if (prevId !== id) captureTranscriptRef.current?.();
     // 只有**换了会话**才清附属视图：清空是为了「别把 A 的数据画在 B 上」，
     // 会话没变时（重连重放、点已选中的那一行）不存在错配，清掉纯属打断用户。
@@ -1494,14 +1525,22 @@ export default function App() {
       if ((inWindow || running) && !opts?.forceResume) return;
     }
     if (running && !isRemoteClient()) {
+      // A concurrent full read must not reset the resume's replay-id collector.
+      if (inFlightResume.current.has(id)) return;
       // 桌面端同样成立：**看**一个运行中的会话绝不走 `thread/resume`（resume 会先
-      // 中断在跑的 turn），改用只读的 `thread/readItems` 补齐内容。这不设 `syncing`
-      // 也不挂提示条：桌面端没有缓存，内容恒来自服务端。
+      // 中断在跑的 turn），改用只读的 `thread/readItems` 补齐内容。
+      // 快照仅是提示；首次确认必须取全量，不能把先到的 live tail 当成完整历史。
       // （远端 running 已在上面的远端分支内处理并早退；唯一走到这里的远端情形是
       // `forceResume`——那是 stale_context 触发的全量重放，必须落到 resume。）
       const c0 = clientRef.current;
       if (c0) {
-        const after = store.peek(id)?.session.lastServerItemId ?? null;
+        // A bounded snapshot may contain only the tail: an incremental cursor
+        // would permanently skip its missing head. Keep this read-only (no resume).
+        const target = store.peek(id)?.session;
+        const slot = activeSlotRef.current;
+        const fullSnapshot = !target || !confirmedHistory.current.has(target) ||
+          cacheMetaRef.current.get(id)?.trimmed === true;
+        const after = fullSnapshot ? null : target?.lastServerItemId ?? null;
         void (async () => {
           try {
             const r = await c0.request<{
@@ -1513,8 +1552,16 @@ export default function App() {
               after ? { threadId: id, afterItemId: after } : { threadId: id },
             );
             const v = store.peek(id);
-            if (v) {
-              v.session.upsertItems(r.items);
+            if (v && v.session === target && clientRef.current === c0 && activeSlotRef.current === slot &&
+                !inFlightResume.current.has(id)) {
+              confirmedHistory.current.add(v.session);
+              if (fullSnapshot) {
+                // Re-establish server order without deleting live items that
+                // arrived while the read-only snapshot was in flight.
+                v.session.beginReplay();
+                v.session.apply({ method: "items/completed", params: { thread_id: id, items: r.items } });
+                v.session.endReplay();
+              } else v.session.upsertItems(r.items);
               // 同远端分支：这是运行中会话唯一的数据来源。
               v.session.adoptPersistedUsage(wireUsageToUsage(r.usage));
               v.session.adoptPersistedTotals(wireTotalsToTotals(r.totals));
@@ -1537,7 +1584,10 @@ export default function App() {
     if (!c) return;
     // 对账开始：全量回放在途，内容随时可能是旧的，UI 与发送门槛据此收紧（spec §5.1）。
     const coldView = store.peek(id);
-    if (coldView) coldView.syncState = "syncing";
+    if (coldView) {
+      coldView.syncState = "syncing";
+      coldView.activationError = null;
+    }
     inFlightResume.current.add(id);
     // 停滞检测：健康的回放每收一帧就续命，只有真的断了才会触发。
     const watchdog = createWatchdog(SYNC_IDLE_TIMEOUT_MS, () =>
@@ -1548,82 +1598,114 @@ export default function App() {
     // （clear / compact / 裁剪造成的幽灵内容）。readItems 只补尾部，不走这条路径。
     const replaySession = store.view(id).session;
     replaySession.beginReplay();
-    try {
-      const resumed = await c.request<{
-        permission_mode?: ThreadMode;
-        reasoning_effort?: string | null;
-      }>("thread/resume", {
-        threadId: id,
-      });
-      // resume 回包意味着历史回放已结束；附属列表刷新不属于内容加载，
-      // 必须在等待它之前停机，否则慢 listAll 会把已加载的内容反向判失败。
+    // A correlation token is not a credential. Older WebViews may lack randomUUID.
+    let token: string;
+    try { token = globalThis.crypto?.randomUUID?.() ?? ""; } catch { token = ""; }
+    if (!token) token = `history-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    let releaseHistory: () => void = () => {};
+    const historyReady = new Promise<void>((resolve) => { releaseHistory = resolve; });
+    let reconciled = false;
+    let authoritative = false;
+    const finishHistory = (confirmed = false) => {
+      if (reconciled || clientRef.current !== c || store.peek(id)?.session !== replaySession ||
+          pendingResumes.current.get(id)?.token !== token) return;
+      reconciled = true;
+      confirmedHistory.current.add(replaySession);
       watchdog.stop();
       const replayed = replaySession.endReplay();
-      // 只有真收到过回放帧才允许删项。空集是不能下「服务端没有这些 item」结论的：
-      // 它既可能是「服务端历史本来就空」，也可能是「这趟 resume 压根没投递帧」。
-      // 而后者的代价是把刚预填的缓存整段抹掉——spec §5 的三段式第一步（先显示
-      // 缓存）就此消失。生产 ws 路径上全量回放必然携带帧(thread/started +
-      // items/completed),所以这一守卫只在「无帧可对账」时跳过,不影响幽灵项清理。
-      // 只有在真的收到过回放帧并做过 dropStale 时才「权威」：replayed 为空意味着
-      // 这趟 resume 压根没投递帧，此时 items 仍可能是刚预填的缓存内容，
-      // 不能据此判定「服务端确认无内容」而删盘上条目。
-      const authoritative = replayed !== null && replayed.size > 0;
-      if (authoritative) replaySession.dropStale(replayed);
-      // 删除竞态:resume 在途时用户可能已删掉该冷 thread,此时不能再把它
-      // 加回 warm(会复活已删 id)。peek 不创建视图,仅判断是否仍存在。
-      const view = store.peek(id);
-      if (!view) return;
-      warm.current.add(id);
-      // 对账完成：内容已是服务端权威，解禁发送并去掉"这是缓存"的标注（spec §5.1/§5.3）。
-      view.syncState = "synced";
+      // A correlated completion explicitly confirms even an empty transcript.
+      // Legacy servers without that signal keep the no-frames safety guard.
+      authoritative = replayed !== null && (confirmed || replayed.size > 0);
+      if (authoritative && replayed !== null) replaySession.dropStale(replayed);
+      store.view(id).syncState = "synced";
       cachedAt.current.delete(id);
-      // 不要挪进 `if (authoritative)`：false 时仍然要落盘（那是预填内容），
-      // 只是不授权删除。
       void flushContent(id, { authoritative });
-      // 响应直接带权威 mode：一次请求即定,不受 listAll 快照的竞态/失败影响
-      // （「手机上打开会话时 YOLO 概率性没同步过来」的修复点）。
-      const fromResponse = permissionModeFromResponse(resumed);
-      if (fromResponse !== null) view.mode = fromResponse;
-      // effort 同样以 resume 回包为权威：服务端报的是**实际建出**的 agent 的生效
-      // **值**（清过覆盖时 meta 是 null，但工厂已回落条目默认，故回包仍是实际值）。
-      // 这个值是「生效值」而非「覆盖值」——无覆盖时它就等于条目默认，本字段便
-      // 无法自己区分两者。控件（ModelPicker）拿清单里的条目默认与之比对折回覆盖：
-      // 相等即当「无覆盖」，显示「未设置（继承 X）」，不会把默认档错误打勾。故这里
-      // 如实记下服务端报告的值即可（旧服务端不带该字段时记 null）。
-      view.reasoningEffort =
-        typeof resumed.reasoning_effort === "string"
-          ? resumed.reasoning_effort
-          : null;
-      // listAll 只是附属兜底，不能阻塞内容同步收尾或连接握手。
-      // 重连/删除后晚到的列表也不能再修改旧视图。
       force((v) => v + 1);
-      void sess.refreshThreads().then((gs) => {
-        if (gs !== null && clientRef.current === c && store.peek(id) === view) {
-          view.mode = modeForThread(gs, sess.pinned, id) ?? view.mode;
-          force((v) => v + 1);
+      releaseHistory();
+    };
+    // Defer execution one microtask so even a synchronous transport reply sees
+    // its barrier registered. The promise always resolves: background failures
+    // are rendered below, never left as unhandled rejections.
+    const activation = Promise.resolve().then(async (): Promise<boolean> => {
+      try {
+        const resumed = await c.request<{
+          permission_mode?: ThreadMode;
+          reasoning_effort?: string | null;
+        }>("thread/resume", {
+          threadId: id,
+          ...(!isRemoteClient() ? { historyFirst: true, historyToken: token } : {}),
+        });
+        finishHistory();
+        if (clientRef.current !== c || pendingResumes.current.get(id)?.token !== token) return false;
+        // 删除竞态:resume 在途时用户可能已删掉该冷 thread,此时不能再把它
+        // 加回 warm(会复活已删 id)。peek 不创建视图,仅判断是否仍存在。
+        const view = store.peek(id);
+        if (!view || view.session !== replaySession) return false;
+        warm.current.add(id);
+        // 对账完成：内容已是服务端权威，解禁发送并去掉"这是缓存"的标注（spec §5.1/§5.3）。
+        view.syncState = "synced";
+        cachedAt.current.delete(id);
+        // 不要挪进 `if (authoritative)`：false 时仍然要落盘（那是预填内容），
+        // 只是不授权删除。
+        void flushContent(id, { authoritative });
+        // 响应直接带权威 mode：一次请求即定,不受 listAll 快照的竞态/失败影响
+        // （「手机上打开会话时 YOLO 概率性没同步过来」的修复点）。
+        const fromResponse = permissionModeFromResponse(resumed);
+        if (fromResponse !== null) view.mode = fromResponse;
+        // effort 同样以 resume 回包为权威：服务端报的是**实际建出**的 agent 的生效
+        // **值**（清过覆盖时 meta 是 null，但工厂已回落条目默认，故回包仍是实际值）。
+        // 这个值是「生效值」而非「覆盖值」——无覆盖时它就等于条目默认，本字段便
+        // 无法自己区分两者。控件（ModelPicker）拿清单里的条目默认与之比对折回覆盖：
+        // 相等即当「无覆盖」，显示「未设置（继承 X）」，不会把默认档错误打勾。故这里
+        // 如实记下服务端报告的值即可（旧服务端不带该字段时记 null）。
+        view.reasoningEffort =
+          typeof resumed.reasoning_effort === "string"
+            ? resumed.reasoning_effort
+            : null;
+        // listAll 只是附属兜底，不能阻塞内容同步收尾或连接握手。
+        // 重连/删除后晚到的列表也不能再修改旧视图。
+        force((v) => v + 1);
+        void sess.refreshThreads().then((gs) => {
+          if (gs !== null && clientRef.current === c && store.peek(id) === view) {
+            view.mode = modeForThread(gs, sess.pinned, id) ?? view.mode;
+            force((v) => v + 1);
+          }
+        }).catch(() => {
+          // 内容已成功加载；附属刷新失败不能将其标为同步失败。
+        });
+        return true;
+      } catch (e) {
+        if (clientRef.current !== c || pendingResumes.current.get(id)?.token !== token) return false;
+        replaySession.endReplay();
+        // A runtime failure is not a transcript failure once replay is confirmed.
+        const view = store.peek(id);
+        if (view?.session === replaySession) {
+          if (reconciled) {
+            view.activationError = formatError(e);
+            view.session.lastError = `运行环境未就绪：${view.activationError}；请重新选择此会话重试`;
+            warm.current.delete(id);
+            force((v) => v + 1);
+          } else failSync(id, formatError(e));
         }
-      }).catch(() => {
-        // 内容已成功加载；附属刷新失败不能将其标为同步失败。
-      });
-    } catch (e) {
-      replaySession.endReplay();
-      // 失败路径只在视图仍存在时构造文案，避免 re-create 一个已被 drop 的
-      // ThreadView（无界泄漏 + 残留 warm 条目）。
-      //
-      // failSync 内部已经 force 过一次，故这里不再单独 force。
-      if (store.peek(id)) failSync(id, formatError(e));
-    } finally {
-      // 停机是硬要求：不停的话，一次成功的加载会被这个定时器在 15s 后
-      // 反向判成失败。
-      watchdog.stop();
-      // 只摘**自己这条**条目。重试路径允许「上一趟仍在途」时再发一趟
-      // （`forceResume` 跳过全部早退），若无条件 `delete(id)`，先落定那趟会
-      // 把后起那趟的条目删掉，后者的续命信号就此丢失、健康回放被 15s 判死。
-      if (syncWatchdogs.current.get(id) === watchdog) {
-        syncWatchdogs.current.delete(id);
+        return false;
+      } finally {
+        // 停机是硬要求：不停的话，一次成功的加载会被这个定时器在 15s 后
+        // 反向判成失败。
+        watchdog.stop();
+        // 只摘**自己这条**条目。重试路径允许「上一趟仍在途」时再发一趟
+        // （`forceResume` 跳过全部早退），若无条件 `delete(id)`，先落定那趟会
+        // 把后起那趟的条目删掉，后者的续命信号就此丢失、健康回放被 15s 判死。
+        if (syncWatchdogs.current.get(id) === watchdog) {
+          syncWatchdogs.current.delete(id);
+        }
+        if (pendingResumes.current.get(id)?.token === token) {
+          pendingResumes.current.delete(id);
+          inFlightResume.current.delete(id);
+        }
       }
-      inFlightResume.current.delete(id);
-    }
+    });
+    pendingResumes.current.set(id, { token, client: c, historyReady: () => finishHistory(true), activation });
+    await Promise.race([activation, historyReady]);
   };
 
   /**
@@ -2104,6 +2186,7 @@ export default function App() {
       force,
       markThreadRead,
       notifySyncActivity: (id) => notifySyncActivity.current(id),
+      onHistoryReady: (client, id, token) => notifyHistoryReady.current(client, id, token),
       schedulePersist,
       selectThread,
       disposed,
@@ -2385,14 +2468,52 @@ export default function App() {
     // **失败态（failed）同样要拦**：它比 syncing 更危险——用户以为自己已经看到了
     // 完整上下文，其实一条都没到。这是加 failed 时最容易漏的一处。
     const syncState = store.peek(id)?.syncState;
-    if (offline || syncState === "syncing" || syncState === "failed") {
-      store.view(id).session.lastError = offline
+    const connecting = !isRemoteClient() && status !== "connected";
+    if (offline || connecting || syncState === "syncing" || syncState === "failed") {
+      store.view(id).session.lastError = offline || connecting
         ? "正在连接，请稍候"
         : syncState === "failed"
           ? "内容尚未加载完成，请先重试"
           : "正在同步，请稍候";
       force((v) => v + 1);
       return false;
+    }
+    const activationError = store.peek(id)?.activationError;
+    if (activationError) {
+      store.view(id).session.lastError = `运行环境未就绪：${activationError}；请重新选择此会话重试`;
+      force((v) => v + 1);
+      return false;
+    }
+    const activating = pendingResumes.current.get(id);
+    if (activating) {
+      const target = store.peek(id);
+      const revision = selectionRevision.current;
+      const submittedDraft = target?.draft;
+      const preparing = "运行环境正在准备，完成后发送；切换会话或修改草稿将取消本次发送";
+      if (target) target.session.lastError = preparing;
+      force((v) => v + 1);
+      let waitTimer: number | undefined;
+      const activated = await Promise.race([
+        activating.activation,
+        new Promise<"timeout">((resolve) => {
+          waitTimer = window.setTimeout(() => resolve("timeout"), SYNC_IDLE_TIMEOUT_MS);
+        }),
+      ]);
+      window.clearTimeout(waitTimer);
+      if (activated === "timeout") {
+        if (store.peek(id) === target && target?.session.lastError === preparing) {
+          target.session.lastError = "运行环境仍未就绪，本次发送已取消；草稿已保留，请稍后重新发送";
+          force((v) => v + 1);
+        }
+        return false;
+      }
+      if (target?.session.lastError === preparing) {
+        target.session.lastError = null;
+        force((v) => v + 1);
+      }
+      if (!activated || clientRef.current !== c || selectionRevision.current !== revision ||
+          store.currentId !== id || store.peek(id) !== target || target?.draft !== submittedDraft ||
+          sideConversationRef.current.active?.kind === "side" || pendingResumes.current.has(id)) return false;
     }
     // 这个会话待发送的附件。发送前先取快照：成功要清空它，失败要**留着**重试。
     const files = pending[id] ?? [];
@@ -2883,6 +3004,8 @@ export default function App() {
           store.reset();
           warm.current.clear();
           inFlightResume.current.clear();
+          pendingResumes.current.clear();
+          selectionRevision.current += 1;
           cacheMetaRef.current.clear();
           cachedAt.current.clear();
           syncPlanRef.current.clear();

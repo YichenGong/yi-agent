@@ -1,5 +1,9 @@
 # desktop（Tauri GUI）
 
+## 历史会话先显示、后台刷新
+
+- [x] Desktop 重启与打开历史会话优先显示本地快照，后续分块回放不等待运行环境激活 — `desktop/src/App.tsx`（独立缓存预填、请求 token、historyReady / activation 两道门禁、迟到缓存与回包身份守卫）、`lib/contentStore.ts` / `lib/sessionCache.ts`（本地与配对远端分库分键）、`lib/session.ts`（cached tail 与完整 replay 按服务端顺序合并）。运行中会话只读全量确认，不 resume/interrupt；发送前仍须握手、正文对账和真实激活成功。判据：`cd desktop && npm test && npm run build`，194 文件 / 2879 测试通过；`cd yi-agent-rs && just ci` 全绿（6415 + 50 测试）；隔离原生 WKWebView 双启动：真实 IDB 快照 2 项，重启正文 133ms 可见，启动 RPC 延至 5006ms 放行，5044ms 完成对账、无超时；34.3MiB / 3251 项长历史完整分块回放，574ms 可读，快照线性裁剪后 1040275 bytes，正式 App 未替换。详见 [设计](../superpowers/specs/2026-11-11-desktop-history-first-design.md) / [回归记录](../testing/desktop-history-first-regression.md)。同时以卸载测试修复 `usePluginDemand` 重试定时器及异步续体在卸载后排队更新。
+
 ## 一次性对话快照旁问（自动检查通过，真实设备验收未执行）
 
 - [ ] 桌面/手机离开销毁与全新重入 — [plan](../superpowers/plans/2026-11-09-side-snapshot-lifecycle-impl.md) · [复核](../superpowers/reviews/2026-11-09-side-snapshot-lifecycle-spec-review.md) · [spec](../superpowers/specs/2026-11-09-side-snapshot-lifecycle-design.md) §4、§6–§9。自动部分已完成：`src/hooks/useSideConversationController.ts` 的 `leaveSide(reason)` 统一返回、导航、卸载三条出口，退出即撤本地正文与首问意图；退出票据协调器记录精确票据，握手就绪后先 flush，迟到 open 补 `side/exit` 而不提问。判据：`cd desktop && npx tsc --noEmit` exit 0；`npx vitest run` 194 文件 / 2850 测试全通过（含 `useSideConversationController.test.tsx` 42 例与 `App.test.tsx` 293 例）；`npm run build` exit 0。Rust 侧 `just ci` exit 0（6325 passed + 50 passed）。仍阻塞：spec §9 的桌面真机 + 手机同宿主 relay 联合验收未执行（手机后台/短断线与断网重连时序依赖真实网络），本项保持未完成，不以 jsdom 代替。

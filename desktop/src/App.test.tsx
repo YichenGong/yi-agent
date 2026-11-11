@@ -127,18 +127,23 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
   dragDrop: { fn: null as null | ((event: unknown) => void) },
 }));
 
-// 内容缓存模块级替换：每个用例一份内存实现。App 在首次远端渲染时才懒建，故用
+// 内容缓存模块级替换：每个用例本地/远端各一份内存实现。App 懒建，故用
 // `??=` 记录「本次用例创建的那个」，用例既可读它、也可在 `beforeEach` 里清空
 // 后由用例自己塞一份预置内容（见 "App mobile local cache"）。
 const { contentStore } = vi.hoisted(() => ({
-  contentStore: { current: null as null | import("./lib/contentStore").AsyncContentStore },
+  contentStore: {
+    current: null as null | import("./lib/contentStore").AsyncContentStore,
+    desktop: null as null | import("./lib/contentStore").AsyncContentStore,
+  },
 }));
 vi.mock("./lib/contentStore", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lib/contentStore")>();
   return {
     ...actual,
-    // One instance per test: the App grabs it lazily on first remote render.
-    createContentStore: () => (contentStore.current ??= new actual.MemoryContentStore()),
+    // Distinct local/remote stores per test, matching the production DB boundary.
+    createContentStore: (options?: { desktop?: boolean }) => options?.desktop
+      ? (contentStore.desktop ??= new actual.MemoryContentStore())
+      : (contentStore.current ??= new actual.MemoryContentStore()),
   };
 });
 
@@ -613,6 +618,7 @@ beforeEach(() => {
   state.sideConversationFlagEnabled = true;
   dragDrop.fn = null;
   contentStore.current = null;
+  contentStore.desktop = null;
   Element.prototype.scrollIntoView = vi.fn();
   // 主题是全局 DOM 状态，用例间必须清掉，否则首例会污染后续。
   delete document.documentElement.dataset.theme;
@@ -708,7 +714,7 @@ describe("App YOLO wiring", () => {
     await waitFor(() =>
       expect(clients[0].requests).toContainEqual({
         method: "thread/resume",
-        params: { threadId: "t2" },
+        params: expect.objectContaining({ threadId: "t2", historyFirst: true, historyToken: expect.any(String) }),
       }),
     );
   });
@@ -1998,7 +2004,7 @@ describe("App session pinning", () => {
     await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
     expect(clients[0].requests).toContainEqual({
       method: "thread/resume",
-      params: { threadId: "t2" },
+      params: expect.objectContaining({ threadId: "t2", historyFirst: true, historyToken: expect.any(String) }),
     });
   });
 
@@ -4489,7 +4495,7 @@ describe("App 会话详情栏的开合", () => {
     await waitFor(() =>
       expect(clients[0].requests).toContainEqual({
         method: "thread/resume",
-        params: { threadId: "t2" },
+        params: expect.objectContaining({ threadId: "t2", historyFirst: true, historyToken: expect.any(String) }),
       }),
     );
     expect(screen.queryByLabelText("会话详情")).toBeNull();
@@ -5395,7 +5401,7 @@ describe("App mobile local cache", () => {
     expect(screen.getByText("keep me")).toBeTruthy();
   });
 
-  it("never touches the list/content caches on the desktop build", async () => {
+  it("keeps remote list snapshots out of the desktop first paint", async () => {
     localStorage.setItem("yi-agent.threadListCache", JSON.stringify({
       version: 1, savedAt: 1, selectedId: "t1", pinned: [],
       groups: [{ workspace: "/w", exists: true, threads: [{ thread_id: "t1", cwd: "/w", model: "m", created_at: 0, updated_at: 0, title: "cached-one", permission_mode: "normal", status: "idle" }] }],
@@ -5405,12 +5411,12 @@ describe("App mobile local cache", () => {
     // The desktop build must not have painted from the cache…
     expect(screen.queryByText("cached-one")).toBeNull();
     await waitFor(() => expect(screen.getByText("one")).toBeTruthy()); // server list
-    // …and must not have constructed a content store.
+    // …and must not have constructed the remote content store.
     expect(contentStore.current).toBeNull();
 
     // Deleting a thread is reachable on the desktop build too — it is the
     // sidebar row's onDelete. Routing the cache eviction through the gated
-    // helper must keep the desktop path free of any store construction;
+    // helper must keep the desktop path free of any remote store construction;
     // otherwise `thread/delete` builds an IndexedDB-backed store here.
     // The server answers the post-delete refresh with an empty list, so the row
     // disappearing proves the eviction (before `refreshThreads`) has run.
@@ -6541,6 +6547,179 @@ describe("App 同步状态机（手机端黑屏）", () => {
     fireEvent.keyDown(box, { key: "Enter" });
   };
 
+  it("desktop history becomes readable before runtime activation finishes, but send waits", async () => {
+    let finish: (value: unknown) => void = () => {};
+    state.dataSources["thread/resume"] = (params) => {
+      const p = params as { threadId: string; historyFirst?: boolean; historyToken?: string };
+      expect(p.historyFirst).toBe(true);
+      state.notifHandlers[0]({
+        method: "items/completed",
+        params: { thread_id: p.threadId, items: [{ type: "agentMessage", id: "h1", text: "历史已经完整到达" }] },
+      });
+      state.notifHandlers[0]({
+        method: "thread/historyReady",
+        params: { thread_id: p.threadId, request_token: p.historyToken },
+      });
+      return new Promise((resolve) => { finish = resolve; });
+    };
+    render(<App />);
+    await waitFor(() => expect(document.body.textContent).toContain("历史已经完整到达"));
+    await waitFor(() => expect(document.querySelector(".app-statusbar")?.textContent).toContain("已连接"));
+    expect(document.body.textContent).not.toContain("正在同步");
+    typeAndSendOnDesktop("after activation");
+    await act(async () => { await Promise.resolve(); });
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+    await act(async () => { finish(resumeOk("t1")); });
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true));
+  });
+
+  it("desktop cancels a send waiting too long for activation without auto-sending later", async () => {
+    vi.useFakeTimers();
+    try {
+      let finish: (value: unknown) => void = () => {};
+      state.dataSources["thread/resume"] = (params) => {
+        const p = params as { threadId: string; historyToken: string };
+        state.notifHandlers[0]({ method: "thread/historyReady", params: { thread_id: p.threadId, request_token: p.historyToken } });
+        return new Promise((resolve) => { finish = resolve; });
+      };
+      render(<App />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      typeAndSendOnDesktop("keep timed out draft");
+      await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+      expect(document.body.textContent).toContain("本次发送已取消");
+      expect((document.querySelector("textarea") as HTMLTextAreaElement).value).toBe("keep timed out draft");
+      await act(async () => { finish(resumeOk("t1")); });
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("desktop activation failure after historyReady preserves the draft and never starts a turn", async () => {
+    let fail: (error: unknown) => void = () => {};
+    state.dataSources["thread/resume"] = (params) => {
+      const p = params as { threadId: string; historyToken?: string };
+      state.notifHandlers[0]({
+        method: "items/completed",
+        params: { thread_id: p.threadId, items: [{ type: "agentMessage", id: "h1", text: "可阅读的历史" }] },
+      });
+      state.notifHandlers[0]({ method: "thread/historyReady", params: { thread_id: p.threadId, request_token: p.historyToken } });
+      return new Promise((_resolve, reject) => { fail = reject; });
+    };
+    render(<App />);
+    await waitFor(() => expect(document.querySelector(".app-statusbar")?.textContent).toContain("已连接"));
+    typeAndSendOnDesktop("保留我的草稿");
+    await act(async () => { fail({ code: -1, message: "activation refused" }); });
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+    expect((document.querySelector("textarea") as HTMLTextAreaElement).value).toBe("保留我的草稿");
+    expect(document.body.textContent).toContain("可阅读的历史");
+    expect(document.body.textContent).toContain("activation refused");
+  });
+
+  it("desktop ignores another replay's historyReady and keeps sync guarded", async () => {
+    state.dataSources["thread/resume"] = (params) => {
+      const p = params as { threadId: string; historyToken?: string };
+      state.notifHandlers[0]({ method: "thread/historyReady", params: { thread_id: p.threadId, request_token: "not-this-request" } });
+      return new Promise(() => {});
+    };
+    render(<App />);
+    await waitFor(() => expect(resumeCount()).toBe(1));
+    expect(document.body.textContent).toContain("正在同步");
+    expect(document.querySelector(".app-statusbar")?.textContent).not.toContain("已连接");
+    typeAndSendOnDesktop("not ready");
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+  });
+
+  it("desktop does not time out already-loaded history while runtime preparation continues", async () => {
+    vi.useFakeTimers();
+    try {
+      state.dataSources["thread/resume"] = (params) => {
+        const p = params as { threadId: string; historyToken?: string };
+        state.notifHandlers[0]({ method: "thread/historyReady", params: { thread_id: p.threadId, request_token: p.historyToken } });
+        return new Promise(() => {});
+      };
+      render(<App />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(document.querySelector(".app-statusbar")?.textContent).toContain("已连接");
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(document.body.textContent).not.toContain("正在同步");
+      expect(document.body.textContent).not.toContain("内容加载超时");
+      expect(document.querySelector('[data-testid="sync-failed"]')).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("desktop does not send a waiting draft after the user switches threads", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    let finish: (value: unknown) => void = () => {};
+    state.dataSources["thread/resume"] = (params) => {
+      const p = params as { threadId: string; historyToken?: string };
+      if (p.threadId === "t2") return resumeOk("t2");
+      state.notifHandlers[0]({ method: "thread/historyReady", params: { thread_id: p.threadId, request_token: p.historyToken } });
+      return new Promise((resolve) => { finish = resolve; });
+    };
+    render(<App />);
+    await waitFor(() => expect(document.querySelector(".app-statusbar")?.textContent).toContain("已连接"));
+    typeAndSendOnDesktop("不要切走后自动发送");
+    fireEvent.click(screen.getByText("two"));
+    await act(async () => { finish(resumeOk("t1")); });
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+    fireEvent.click(screen.getByText("one"));
+    expect((document.querySelector("textarea") as HTMLTextAreaElement).value).toBe("不要切走后自动发送");
+  });
+
+  it("desktop history remains synced when only runtime activation fails", async () => {
+    let fail: (error: unknown) => void = () => {};
+    state.dataSources["thread/resume"] = (params) => {
+      const p = params as { threadId: string; historyToken?: string };
+      state.notifHandlers[0]({ method: "thread/historyReady", params: { thread_id: p.threadId, request_token: p.historyToken } });
+      return new Promise((_resolve, reject) => { fail = reject; });
+    };
+    render(<App />);
+    await waitFor(() => expect(document.querySelector(".app-statusbar")?.textContent).toContain("已连接"));
+    await act(async () => { fail({ code: -1, message: "runtime unavailable" }); });
+    expect(document.body.textContent).not.toContain("内容加载失败");
+    typeAndSendOnDesktop("keep this");
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+    expect(document.body.textContent).toContain("运行环境未就绪");
+  });
+
+  it("desktop does not auto-send after navigating away and back during activation", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    let finish: (value: unknown) => void = () => {};
+    state.dataSources["thread/resume"] = (params) => {
+      const p = params as { threadId: string; historyToken?: string };
+      if (p.threadId === "t2") return resumeOk("t2");
+      state.notifHandlers[0]({ method: "thread/historyReady", params: { thread_id: p.threadId, request_token: p.historyToken } });
+      return new Promise((resolve) => { finish = resolve; });
+    };
+    render(<App />);
+    await waitFor(() => expect(document.querySelector(".app-statusbar")?.textContent).toContain("已连接"));
+    typeAndSendOnDesktop("wait for explicit send again");
+    expect(document.body.textContent).toContain("运行环境正在准备");
+    fireEvent.click(screen.getByText("two"));
+    fireEvent.click(screen.getByText("one"));
+    await act(async () => { finish(resumeOk("t1")); });
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+    expect((document.querySelector("textarea") as HTMLTextAreaElement).value).toBe("wait for explicit send again");
+  });
+
+  it("desktop opens history even without crypto.randomUUID", async () => {
+    const uuid = vi.spyOn(globalThis.crypto, "randomUUID").mockImplementation(() => { throw Error("uuid unavailable"); });
+    try {
+      state.dataSources["thread/resume"] = (params) => {
+        const p = params as { threadId: string; historyToken?: string };
+        expect(p.historyToken).toBeTruthy();
+        return resumeOk(p.threadId);
+      };
+      render(<App />);
+      await waitFor(() => expect(document.querySelector(".app-statusbar")?.textContent).toContain("已连接"));
+    } finally { uuid.mockRestore(); }
+  });
+
   it("a failing resume is not reported as synced", async () => {
     asRemote();
     state.dataSources["thread/resume"] = () => {
@@ -6924,7 +7103,7 @@ describe("App desktop mid-turn submissions", () => {
     await ready();
     // Prepare the destination draft before the source request goes in flight.
     fireEvent.click(screen.getByText("two"));
-    await waitFor(() => expect(clients[0].requests).toContainEqual({ method: "thread/resume", params: { threadId: "t2" } }));
+    await waitFor(() => expect(clients[0].requests).toContainEqual({ method: "thread/resume", params: expect.objectContaining({ threadId: "t2", historyFirst: true, historyToken: expect.any(String) }) }));
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "other draft" } });
     fireEvent.click(screen.getByText("one"));
     let accept!: (value: object) => void;
@@ -6967,7 +7146,7 @@ describe("App desktop mid-turn submissions", () => {
     ];
     await ready();
     fireEvent.click(screen.getByText("two"));
-    await waitFor(() => expect(clients[0].requests).toContainEqual({ method: "thread/resume", params: { threadId: "t2" } }));
+    await waitFor(() => expect(clients[0].requests).toContainEqual({ method: "thread/resume", params: expect.objectContaining({ threadId: "t2", historyFirst: true, historyToken: expect.any(String) }) }));
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "destination draft" } });
     fireEvent.click(screen.getByText("one"));
     let accept!: (value: object) => void;
@@ -7840,6 +8019,172 @@ describe("App 旁支视图", () => {
     expect(await screen.findByText("已经在主会话了")).toBeTruthy();
     expect(methods()).not.toContain("side/open");
     expect(methods()).not.toContain("turn/start");
+  });
+});
+
+describe("App desktop history snapshot", () => {
+  const seed = async () => {
+    localStorage.setItem("yi-agent.desktop.threadListCache", JSON.stringify({
+      version: 1, savedAt: 1, selectedId: "t1", pinned: [],
+      groups: [{ workspace: "/w", exists: true, threads: [{
+        thread_id: "t1", cwd: "/w", model: "m", created_at: 0, updated_at: 0,
+        title: "desktop cached thread", permission_mode: "normal", status: "idle",
+      }] }],
+    }));
+    contentStore.desktop = new MemoryContentStore();
+    await contentStore.desktop.write({
+      threadId: "t1", savedAt: 1, lastServerItemId: "ghost", trimmed: false, bytes: 100,
+      items: [
+        { type: "agentMessage", id: "A", text: "desktop cached text" },
+        { type: "agentMessage", id: "ghost", text: "desktop stale tail" },
+      ],
+    });
+  };
+
+  it("shows cached content even before initialize and listAll resolve", async () => {
+    await seed();
+    state.dataSources.initialize = () => new Promise(() => {});
+    render(<App />);
+    expect(screen.getByText("desktop cached thread")).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("desktop cached text")).toBeTruthy());
+    expect(clients[0].requests.some((r) => r.method === "thread/listAll")).toBe(false);
+    expect(contentStore.current).toBeNull();
+  });
+
+  it("never sends against a first-paint snapshot before the desktop handshake", async () => {
+    await seed();
+    state.dataSources.initialize = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("desktop stale tail")).toBeTruthy());
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "keep before handshake" } });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await act(async () => { await Promise.resolve(); });
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+    expect(box.value).toBe("keep before handshake");
+  });
+
+  it("refreshes each replay batch while activation is pending and only reconciles at historyReady", async () => {
+    await seed();
+    state.dataSources["thread/resume"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("desktop stale tail")).toBeTruthy());
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true));
+    const emit = (n: unknown) => act(() => state.notifHandlers.forEach((h) => h(n)));
+    emit({ method: "items/completed", params: { thread_id: "t1", items: [{ type: "agentMessage", id: "A", text: "desktop fresh first batch" }] } });
+    await waitFor(() => expect(screen.getByText("desktop fresh first batch")).toBeTruthy());
+    expect(screen.queryByText("desktop cached text")).toBeNull();
+    expect(screen.getByText("desktop stale tail")).toBeTruthy();
+    emit({ method: "items/completed", params: { thread_id: "t1", items: [{ type: "agentMessage", id: "B", text: "desktop fresh second batch" }] } });
+    await waitFor(() => expect(screen.getByText("desktop fresh second batch")).toBeTruthy());
+    const params = clients[0].requests.find((r) => r.method === "thread/resume")!.params as { historyToken: string };
+    emit({ method: "thread/historyReady", params: { thread_id: "t1", request_token: params.historyToken } });
+    await waitFor(() => expect(screen.queryByText("desktop stale tail")).toBeNull());
+    expect(screen.getByText("desktop fresh first batch")).toBeTruthy();
+    await waitFor(async () => expect((await contentStore.desktop!.read("t1"))?.items.map((i) => i.id)).toEqual(["A", "B"]));
+  });
+
+  it("does not resurrect cached content when an empty authoritative history finishes before the cache read", async () => {
+    await seed();
+    const entry = (await contentStore.desktop!.read("t1"))!;
+    const real = contentStore.desktop!;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    contentStore.desktop = {
+      read: async () => { await gate; return entry; },
+      write: (e) => real.write(e), delete: (id) => real.delete(id), keys: () => real.keys(),
+    };
+    state.dataSources["thread/resume"] = (params) => {
+      const p = params as { historyToken: string };
+      state.notifHandlers.forEach((h) => h({ method: "thread/historyReady", params: { thread_id: "t1", request_token: p.historyToken } }));
+      return new Promise(() => {});
+    };
+    render(<App />);
+    await waitFor(() => expect(document.querySelector(".app-statusbar")?.textContent).toContain("已连接"));
+    await act(async () => { release(); await gate; });
+    expect(screen.queryByText("desktop cached text")).toBeNull();
+    expect(screen.queryByText("desktop stale tail")).toBeNull();
+  });
+
+  it("loads the missing head of a trimmed snapshot for a running desktop thread without resuming it", async () => {
+    await seed();
+    const entry = (await contentStore.desktop!.read("t1"))!;
+    await contentStore.desktop!.write({ ...entry, trimmed: true });
+    state.listStatus = "running";
+    state.dataSources["thread/readItems"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("desktop cached text")).toBeTruthy());
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true));
+    expect(clients[0].requests.find((r) => r.method === "thread/readItems")?.params).toEqual({ threadId: "t1" });
+    expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(false);
+  });
+
+  it("fetches the full running history even when cache metadata arrives late", async () => {
+    await seed();
+    const real = contentStore.desktop!;
+    contentStore.desktop = {
+      read: () => new Promise(() => {}),
+      write: (e) => real.write(e), delete: (id) => real.delete(id), keys: async () => [],
+    };
+    let release!: () => void;
+    state.dataSources.initialize = () => new Promise((resolve) => { release = () => resolve({}); });
+    state.listStatus = "running";
+    state.dataSources["thread/readItems"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(release).toBeTypeOf("function"));
+    act(() => state.notifHandlers.forEach((h) => h({ method: "item/completed", params: {
+      thread_id: "t1", item: { type: "agentMessage", id: "live-tail", text: "live tail before metadata" },
+    } })));
+    await act(async () => { release(); });
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true));
+    expect(clients[0].requests.find((r) => r.method === "thread/readItems")?.params).toEqual({ threadId: "t1" });
+    expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(false);
+  });
+
+  it("does not start a competing full read while resume is collecting replay ids", async () => {
+    await seed();
+    state.dataSources["thread/resume"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true));
+    act(() => state.notifHandlers.forEach((h) => h({ method: "thread/status/updated", params: {
+      thread_id: "t1", status: "running",
+    } })));
+    fireEvent.click(screen.getByText("one"));
+    await act(async () => { await Promise.resolve(); });
+    expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(false);
+  });
+
+  it("does not rewrite the sidebar snapshot on every transcript frame", async () => {
+    state.dataSources["thread/resume"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true));
+    const writes = vi.spyOn(Storage.prototype, "setItem");
+    act(() => state.notifHandlers.forEach((h) => h({ method: "item/completed", params: {
+      thread_id: "t1", item: { type: "agentMessage", id: "live", text: "new frame" },
+    } })));
+    await waitFor(() => expect(screen.getByText("new frame")).toBeTruthy());
+    expect(writes.mock.calls.filter(([key]) => key === "yi-agent.desktop.threadListCache")).toHaveLength(0);
+    writes.mockRestore();
+  });
+
+  it("restores a persisted desktop transcript after remount without reading remote caches", async () => {
+    state.dataSources["thread/resume"] = () => new Promise(() => {});
+    const app = render(<App />);
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true));
+    act(() => state.notifHandlers.forEach((h) => h({ method: "item/completed", params: {
+      thread_id: "t1", item: { type: "agentMessage", id: "saved", text: "saved desktop reply" },
+    } })));
+    await waitFor(() => expect(screen.getByText("saved desktop reply")).toBeTruthy());
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    await waitFor(async () => expect((await contentStore.desktop?.read("t1"))?.items).toHaveLength(1));
+    app.unmount();
+    state.dataSources.initialize = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("saved desktop reply")).toBeTruthy());
+    expect(localStorage.getItem("yi-agent.threadListCache")).toBeNull();
+    expect(contentStore.current).toBeNull();
   });
 });
 

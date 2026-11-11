@@ -1,5 +1,9 @@
 # yi-agent-app-server（GUI app-server）
 
+## 本地历史回放与激活解耦
+
+- [x] 本地 `thread/resume` opt-in `historyFirst` + `historyToken` 在建 agent / 等 managed runtime 前可靠定向回放正文、usage、崩溃 partial 并发送对应 `thread/historyReady` — `src/rpc/thread/lifecycle/resume.rs`、`src/protocol.rs`。仅 stdio local 生效；远端保持旧时序，订阅过滤不会吞正文却留下 ready；严格载入 / 模型检查仍前置，partial 只在激活成功及 writer lock 后 promote，`ThreadStarted` 与最终回包仍代表真实激活成功。判据：`cd yi-agent-rs && just ci`（6415 测试 + 50 绑定通过），`server/tests/thread_lifecycle.rs` 包含工厂阻塞前可读、legacy / remote 时序、订阅隔离、usage / partial 单次回放和激活失败保留 partial 回归。原生长历史 3251 项 / 142 批先于激活可读，当前隔离候选双启动缓存验收通过；[回归记录](../testing/desktop-history-first-regression.md)。
+
 ## Desktop 冷恢复管理通道饥饿修复
 
 - [x] 私有管理帧不再等待业务会话恢复 — `src/server/transport/stdio.rs::read_lines` 在独立读取任务中处理本地 bootstrap/管理请求，复用 `transport::handle_local_management` 的认证、epoch、帧上限与定向回包规则；业务准入在入站时检查，避免后到 bootstrap 放行先到业务帧；业务接收端关闭即终止读取任务，禁止关闭后再启动 runtime。根因：`thread/resume` 等待 `ClientLeased`，壳却必须先收到同一业务循环排队的 `_shell/prepare` 响应才能登记租约，30 秒等待超过前端 15 秒同步看门狗。完成判据：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib server::tests::management::`，其中 `prepare_completes_while_the_business_loop_is_blocked` 与 `closing_business_dispatch_stops_the_management_reader` 均已先在旧实现失败，再由修复通过。同步将 `delegation.rs` 测试模块移至文件末尾，恢复既有 Clippy 门禁，不改生产逻辑。验证：管理通道 17 项、后端全量 6408 项及附加门禁 50 项通过；前端 App/lease/watchdog 313 项通过。完整 `just ci` exit 0，Rust 1.89 MSRV 真编译通过。为解除原审计阻塞，将 `rmcp` 升至 3.9、`rusqlite` 升至 0.41.1（`libsqlite3-sys 0.39.1`，保留 bundled 并启用 `fallible_uint` 保持既有无符号整数范围检查）；相关 MCP/store/supervisors/管理通道 1285 项通过。经 7897 代理更新 RustSec 后在线 `cargo audit` 无漏洞，未新增豁免，仅有既有 chacha20 yanked warning。实际隔离原生 App 已通过 WKWebView/React/Tauri/sidecar/guardian 全链路验收：真实 `thread/resume` 345ms 成功，同版本 business lease 已建立，状态栏稳定后正文完整可见、无加载超时，App 正常退出；详见 [回归记录](../testing/desktop-content-timeout-regression.md)。正式旧 runtime 仍托管当前工具执行，未盲目杀进程或覆盖其 bundle；正式换代待受控退出后部署。

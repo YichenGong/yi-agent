@@ -34,13 +34,21 @@ export function applyTrim(
   items: Item[],
   maxBytes: number,
 ): { items: Item[]; trimmed: boolean } {
-  let working = items;
-  let trimmed = false;
-  while (working.length > 1 && estimateItemsBytes(working) > maxBytes) {
-    working = working.slice(1);
-    trimmed = true;
+  // Measure only the suffix that can survive. Repeatedly serializing/slicing
+  // the shrinking full list is quadratic and blocks desktop's main thread for
+  // seconds on multi-MiB histories. UTF-8 bytes are additive across JSON array
+  // elements, with two brackets and one comma between adjacent elements.
+  const encoder = new TextEncoder();
+  let start = items.length;
+  let bytes = 2;
+  while (start > 0) {
+    const itemBytes = encoder.encode(JSON.stringify(items[start - 1])).length;
+    const nextBytes = bytes + itemBytes + (start < items.length ? 1 : 0);
+    if (start < items.length && nextBytes > maxBytes) break;
+    bytes = nextBytes;
+    start -= 1;
   }
-  return { items: working, trimmed };
+  return { items: start === 0 ? items : items.slice(start), trimmed: start > 0 };
 }
 
 /**
@@ -137,12 +145,15 @@ export class MemoryContentStore implements AsyncContentStore {
 export { DB_NAME, DB_VERSION, STORE_NAME };
 
 /** IndexedDB-backed store. Opens lazily on first use. */
-export function createIndexedDbStore(): AsyncContentStore {
+export function createIndexedDbStore(options?: { desktop?: boolean }): AsyncContentStore {
+  // Separate DB: remote pairing cleanup must not erase local desktop snapshots.
+  const desktop = options?.desktop === true;
+  const dbName = desktop ? "yi-agent-desktop-cache" : DB_NAME;
   let dbPromise: Promise<IDBDatabase> | null = null;
 
   const open = (): Promise<IDBDatabase> =>
     new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      const req = indexedDB.open(dbName, DB_VERSION);
       req.onupgradeneeded = () => {
         const db = req.result;
         if (!db.objectStoreNames.contains(STORE_NAME)) {
@@ -159,7 +170,8 @@ export function createIndexedDbStore(): AsyncContentStore {
   //
   // 不能写成 `const d = await ensureCacheScopeClean(); dbPromise ??= open()`：
   // 那样两个并发调用都会走到 open()。
-  const db = (): Promise<IDBDatabase> => (dbPromise ??= ensureCacheScopeClean().then(open));
+  const db = (): Promise<IDBDatabase> =>
+    (dbPromise ??= (desktop ? Promise.resolve() : ensureCacheScopeClean()).then(open));
 
   const run = async <T>(
     mode: IDBTransactionMode,
@@ -185,9 +197,9 @@ export function createIndexedDbStore(): AsyncContentStore {
 }
 
 /** The store for this environment: IndexedDB when present, else in-memory. */
-export function createContentStore(): AsyncContentStore {
+export function createContentStore(options?: { desktop?: boolean }): AsyncContentStore {
   try {
-    if (typeof indexedDB !== "undefined") return createIndexedDbStore();
+    if (typeof indexedDB !== "undefined") return createIndexedDbStore(options);
   } catch {
     // Accessing `indexedDB` can throw in locked-down webviews.
   }

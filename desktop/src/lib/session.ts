@@ -222,19 +222,98 @@ export class Session {
    */
   private replayIds: Set<string> | null = null;
 
+  /**
+   * Server ids in the order the replay delivered them, or `null` outside a
+   * replay. A desktop snapshot may hold only the tail (`[C, D]`) while a full
+   * replay resends everything (`[A, B, C, D]`). Upserting would append the new
+   * head behind the cached tail (`[C, D, A, B]`), so during a replay the
+   * server-authored slots are re-ordered to match this list; unreplayed cached
+   * rows stay behind it so the transcript never blanks mid-replay.
+   */
+  private replayOrder: string[] | null = null;
+
+  /** Membership mirror of `replayOrder`, so dedupe is O(1) on long histories. */
+  private replaySeen: Set<string> | null = null;
+
   /** Start collecting server item ids (called before `thread/resume`). */
   beginReplay(): void {
     this.replayIds = new Set();
+    this.replayOrder = [];
+    this.replaySeen = new Set();
   }
 
   /**
    * Stop collecting and hand back the ids seen. Returns `null` when no replay
    * was in flight, so a caller cannot accidentally reconcile with an empty set.
+   *
+   * Ordering is already final here: it is applied incrementally as frames land,
+   * so callers that skip `dropStale` (the readItems catch-up path deliberately
+   * does, to keep in-flight live items) still get a correctly ordered
+   * transcript.
    */
   endReplay(): Set<string> | null {
     const ids = this.replayIds;
     this.replayIds = null;
+    this.replayOrder = null;
+    this.replaySeen = null;
     return ids;
+  }
+
+  /** Record ids the replay delivered, then keep server slots in order once. */
+  private noteReplayed(ids: readonly string[]): void {
+    const order = this.replayOrder;
+    const seen = this.replaySeen;
+    if (order === null || seen === null || ids.length === 0) return;
+    for (const id of ids) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      order.push(id);
+    }
+    this.reorderReplayedServers();
+  }
+
+  /**
+   * Put replayed server items in arrival order ahead of rows not yet replayed,
+   * leaving local items (echoes, notices, reasoning blocks) in their slots.
+   *
+   * Incremental and O(items + replayed): every replay batch is already mostly
+   * ordered, so this only ever moves the not-yet-replayed cached tail behind the
+   * newly arrived head.
+   */
+  private reorderReplayedServers(): void {
+    const order = this.replayOrder;
+    if (order === null || order.length === 0) return;
+    type AnyItem = (typeof this.items)[number];
+    const byId = new Map<string, AnyItem>();
+    for (const item of this.items) {
+      if (!Session.isLocalId(item.id)) byId.set(item.id, item);
+    }
+    if (byId.size < 2) return;
+    const ordered: AnyItem[] = [];
+    const placed = new Set<string>();
+    for (const id of order) {
+      const item = byId.get(id);
+      if (item !== undefined && !placed.has(id)) {
+        ordered.push(item);
+        placed.add(id);
+      }
+    }
+    for (const item of this.items) {
+      if (!Session.isLocalId(item.id) && !placed.has(item.id)) ordered.push(item);
+    }
+    // Defensive: a duplicate id would make `ordered` shorter than the server
+    // slots. Leaving the transcript untouched is always safe; writing
+    // `undefined` into it is not.
+    if (ordered.length !== byId.size) return;
+    let changed = false;
+    let next = 0;
+    for (let i = 0; i < this.items.length; i += 1) {
+      if (Session.isLocalId(this.items[i].id)) continue;
+      if (this.items[i] !== ordered[next]) changed = true;
+      this.items[i] = ordered[next];
+      next += 1;
+    }
+    if (changed) this.structuralVersion += 1;
   }
 
   /**
@@ -325,6 +404,9 @@ export class Session {
     this.lastServerItemId = null;
     this.openReasoning = null;
     this.epochInvalidated = false;
+    this.replayIds = null;
+    this.replayOrder = null;
+    this.replaySeen = null;
   }
 
   /**
@@ -629,6 +711,9 @@ export class Session {
           if (held >= 0) {
             this.items[held] = Session.mergeThinkingText(this.items[held], item);
             this.structuralVersion += 1;
+            // The takeover replaces a local block, but the resulting item is the
+            // server's: its replay arrival order still applies.
+            this.noteReplayed([item.id]);
             this.lastServerItemId = item.id;
             this.breakReasoningRun();
             break;
@@ -661,6 +746,8 @@ export class Session {
         } else {
           this.items.push(item);
         }
+        // 插入之后再按回放到达顺序重排：重排只动服务端槽位，本地项原地不动。
+        this.noteReplayed([item.id]);
         this.lastServerItemId = item.id;
         break;
       }
@@ -671,7 +758,11 @@ export class Session {
           for (const it of notification.params.items) this.replayIds.add(it.id);
         }
         this.upsertItems(notification.params.items);
-        if (notification.params.items.length > 0) visible = true;
+        const replayed = notification.params.items;
+        if (replayed.length > 0) {
+          this.noteReplayed(replayed.map((it) => it.id));
+          visible = true;
+        }
         break;
       }
       case "item/delta": {
@@ -686,6 +777,9 @@ export class Session {
         const index = this.indexOfItem(item_id);
         if (index < 0) {
           this.insertAfterLastServerItem({ type: "agentMessage", id: item_id, text: delta });
+          // A new server id during a replay joins the replay region in arrival
+          // order; later deltas for the same id only grow text in place.
+          this.noteReplayed([item_id]);
           visible = true;
           this.textVersion += 1;
         } else if (this.items[index].type === "agentMessage") {

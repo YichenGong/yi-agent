@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { isRemoteClient } from "../lib/platform";
-import { writeListCache, type ThreadListCache } from "../lib/sessionCache";
+import { DESKTOP_THREAD_LIST_CACHE_KEY, writeListCache, type ThreadListCache } from "../lib/sessionCache";
 import { formatError } from "../lib/errorMessage";
 import type {
   AgentChildrenListResult,
@@ -36,7 +36,7 @@ import type { ViewAnchor } from "../lib/viewAnchor";
  * `setCurrentError`/`railStore`/`force` 都不是本关注点的状态，而是
  * `refreshSubagents` 落回 App 层的那几笔写入（对话里的红字、子 agent 暂留区、
  * 强制重渲染 tick），故由调用方注入，不在这里另起影子。`initialListCache` 同理：
- * 它是手机端首屏缓存，本 hook 只拿它给 `groups`/`pinned` 播种（`useRef(...).current`
+ * 它是首屏缓存，本 hook 只拿它给 `groups`/`pinned` 播种（`useRef(...).current`
  * 仍在 App，因为它同时喂给那个跨关注点的预填 effect）。
  *
  * 跨关注点的编排留在 App（R6''）：`selectThread`/`newThread`/`deleteThread`/`send`/
@@ -51,6 +51,7 @@ export function useSessionState({
   setCurrentError,
   railStore,
   initialListCache,
+  cacheLocal,
   pairingVersion,
 }: {
   /** 取当前的 RPC 客户端；未连接即 null（各动作据此静默返回）。 */
@@ -63,8 +64,10 @@ export function useSessionState({
   setCurrentError: (msg: string) => void;
   /** App 的子 agent 暂留区（`refreshSubagents` 的回包落盘处），也是 `railRows` 的数据源。 */
   railStore: SubagentRailStore;
-  /** 手机端首屏列表缓存；桌面端为 null（初值保持空，行为与从前逐字节一致）。 */
+  /** 首屏列表快照；本地 desktop 与 paired remote 分键存储。 */
   initialListCache: ThreadListCache | null;
+  /** Whether the active desktop host is local (remote slots must not persist). */
+  cacheLocal?: () => boolean;
   /** 配对版本号；每次成功配对/重配自增。用于丢弃上一个服务端的会话列表。 */
   pairingVersion: number;
 }) {
@@ -136,6 +139,12 @@ export function useSessionState({
     viewAnchors.current.clear();
   }, [pairingVersion]);
 
+  // Keep the last actual selection, not just the selection at list refresh time.
+  useEffect(() => {
+    if (isRemoteClient() || !cacheLocal?.() || (!groups.length && !pinned.length)) return;
+    writeListCache(localStorage, groups, pinned, currentId, DESKTOP_THREAD_LIST_CACHE_KEY);
+  }, [groups, pinned, currentId, cacheLocal]);
+
   const refreshThreads = async (): Promise<WorkspaceGroup[] | null> => {
     const c = rpc();
     if (!c) return null;
@@ -144,12 +153,16 @@ export function useSessionState({
         "thread/listAll",
         {},
       );
+      // A late list belongs to the connection that requested it, not whichever
+      // host is active now. Never render or persist another host's response.
+      if (rpc() !== c) return null;
       setGroups(r.groups);
       setPinned(r.pinned ?? []);
       // seed 喂全集：置顶项仍在分组里，所以不会漏；store 的视图与侧栏的分区
       // 划分无关（状态徽章、未读点都按 thread_id 查 store）。
       store.seed(r.groups.flatMap((g) => g.threads));
       if (isRemoteClient()) writeListCache(localStorage, r.groups, r.pinned ?? [], store.currentId);
+      else if (cacheLocal?.()) writeListCache(localStorage, r.groups, r.pinned ?? [], store.currentId, DESKTOP_THREAD_LIST_CACHE_KEY);
       return r.groups;
     } catch {
       // 列表刷新失败不打断对话。返回 null 表示"未知":调用方必须把 null
