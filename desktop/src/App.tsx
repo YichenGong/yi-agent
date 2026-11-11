@@ -131,6 +131,7 @@ import { usePluginDemand } from "./hooks/usePluginDemand";
 import { localRuntimeControl } from "./lib/runtimeLifecycle";
 import { useRuntimeScopeKey } from "./hooks/useRuntimeLifecycle";
 import { RuntimeVersionBanner } from "./components/RuntimeVersionBanner";
+import { RuntimeStartupNotice } from "./components/RuntimeStartupNotice";
 import { wantedProjects } from "./lib/runtimeLease";
 import { subscribeDragDrop } from "./lib/dragDropSubscribe";
 import { insertDroppedPaths } from "./lib/droppedPaths";
@@ -814,7 +815,7 @@ export default function App() {
   // 它的项目申请 runtime。消费者聚合在 native 侧（按「最后一个离开才停」），
   // 这里只负责把「谁在看」交给壳。
   const pluginProjects = usePluginDemand();
-  useRuntimeLease({
+  const runtimeLease = useRuntimeLease({
     activeProject: leaseActiveProject,
     threads: leaseThreads,
     pluginProjects,
@@ -824,6 +825,27 @@ export default function App() {
       pluginProjects,
     }).join("\n"),
   });
+  // 准备反馈是"按项目"的：没有 scope（壳还没解析出来）时也要能显示原因与重试，
+  // 否则最需要解释的那一步恰好是最安静的一步。
+  const runtimeLeaseIssues = runtimeLease.issues;
+  const retryRuntimeProject = runtimeLease.retryProject;
+  const prepareRuntimeProject = runtimeLease.prepareProject;
+  // 壳解析出的 scope 可能晚于第一次询问（准备完成前它还是 null）。准备或重试
+  // 之后重问一次，版本横幅才能在项目真正就绪时出现。
+  const [runtimeScopeRevision, setRuntimeScopeRevision] = useState(0);
+  const bumpRuntimeScopeRevision = useCallback(() => {
+    setRuntimeScopeRevision((value) => value + 1);
+  }, []);
+  // 从侧栏在**别的**目录新建、却被准备闸门拦下时，那个项目并不是屏上的项目。
+  // 只按当前会话的项目渲染提示，用户会看到"点了没反应"，所以闸门记住它拦的是谁。
+  const [blockedStartupProject, setBlockedStartupProject] = useState<string | null>(null);
+  // 用户已经切到那个项目上（或打开线程）时，这层兜底就多余了。
+  useEffect(() => {
+    setBlockedStartupProject((prev) => (prev !== null && prev === leaseActiveProject ? null : prev));
+  }, [leaseActiveProject]);
+  useEffect(() => {
+    setBlockedStartupProject(null);
+  }, [sess.currentId]);
 
   // 运行时版本生命周期（状态横幅 / 预览 / 确认 / 轮询）整体在 hook 与
   // `lib/runtimeLifecycle.ts` 里，见那两处注释：控制面刻意不走 `RpcClient`，
@@ -836,7 +858,11 @@ export default function App() {
   );
   // scope key 只由壳解析（见 `useRuntimeScopeKey`）：WebView 自己拼 canonical
   // 路径可能与壳不一致，从而指向一个壳从未打开过的 scope。
-  const runtimeScopeKey = useRuntimeScopeKey(leaseActiveProject, runtimeControl !== null);
+  const runtimeScopeKey = useRuntimeScopeKey(
+    leaseActiveProject,
+    runtimeControl !== null,
+    runtimeScopeRevision,
+  );
 
   // 操作 id 记在壳里（确认请求的发起方），所以重载页面恢复的是同一次操作，
   // 也不会把上一次运行留下的 id 误当成本次的。
@@ -1715,6 +1741,22 @@ export default function App() {
   const newThread = async (cwd?: string) => {
     const c = clientRef.current;
     if (!c) return;
+    // 首次新建前先显式准备项目：managed runtime 没就绪时建出的会话永远拿不到
+    // 工具，而用户只会看到"子代理用不了"。远端没有本机壳，故不在这条路上。
+    //
+    // 只有壳**给了答案**且答案不是 ready 时才拦。壳答不出来（旧壳没有这个命令）
+    // 时按老行为继续：这个能力是叠加的，不能因为它把老环境挡死。
+    if (cwd && !isRemoteClient() && usesLocalPaths(activeSlotRef.current)) {
+      const prepared = await prepareRuntimeProject(cwd);
+      if (prepared && prepared.state !== "managedReady") {
+        setBlockedStartupProject(cwd);
+        bumpRuntimeScopeRevision();
+        force((v) => v + 1);
+        return;
+      }
+      // 准备期间停留在别的项目上时，让壳重新解析当前 scope。
+      if (prepared) bumpRuntimeScopeRevision();
+    }
     try {
       const t = await c.request<{
         thread_id: string;
@@ -3854,6 +3896,17 @@ export default function App() {
                   }
                 />
             </>
+            {/* 准备失败/未就绪：只显示固定文案；重试按钮仅本机壳有。 */}
+            <RuntimeStartupNotice
+              issues={runtimeLeaseIssues}
+              project={blockedStartupProject ?? leaseActiveProject}
+              local={runtimeControl !== null}
+              onRetry={(project) => {
+                retryRuntimeProject(project);
+                bumpRuntimeScopeRevision();
+                // 没有 scope 的失败在重试后仍要能说明原因，故不清掉兜底项目。
+              }}
+            />
             {/* 运行时版本横幅：与本功能无关，来自 main 的 daemon 生命周期计划。 */}
             {runtimeScopeKey !== null && runtimeControl !== null && (
               <RuntimeVersionBanner

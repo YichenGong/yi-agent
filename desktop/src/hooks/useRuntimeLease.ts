@@ -11,6 +11,8 @@ import {
 import {
   ACQUIRE_FAILED_REASON,
   acceptsStartupReply,
+  isStartupProblem,
+  startupIssueReason,
   type RuntimeStartupIssue,
 } from "../lib/runtimeStartupIssue";
 
@@ -25,8 +27,8 @@ import {
  *   acquire and a release of the same project),
  * * it reports a preparation failure against its project, so the user can see it
  *   and retry deliberately, and
- * * it swallows nothing that matters: a failure does not break the conversation,
- *   but it is no longer invisible either.
+ * * it can prepare one project on demand, which is what keeps a first
+ *   `thread/start` from creating a conversation with no tools.
  *
  * It is a no-op for the remote web client, which has no Tauri shell and no
  * sidecar of its own.
@@ -59,6 +61,19 @@ export interface RuntimeLeaseFeedback {
    * re-runs the acquire command; it never sends a turn or replays a message.
    */
   retryProject(project: string): void;
+  /**
+   * Prepares one project and answers what the shell said.
+   *
+   * The caller is the "create a conversation" path: it must know whether the
+   * runtime is `managedReady` *before* `thread/start`, or the conversation is
+   * created against a project that can never run a tool. Returns `null` when this
+   * client cannot prepare locally (remote) or the shell threw; the issue map
+   * explains a refusal.
+   *
+   * It records everything the decision needs, so the project is not acquired a
+   * second time when it becomes the active one.
+   */
+  prepareProject(project: string): Promise<AcquireView | null>;
 }
 
 export function useRuntimeLease(deps: LeaseDeps): RuntimeLeaseFeedback {
@@ -69,6 +84,11 @@ export function useRuntimeLease(deps: LeaseDeps): RuntimeLeaseFeedback {
   // this set only decides *when to ask*, so a stale entry costs one refused
   // release, never a wrong "this project is ready".
   const owned = useRef<Set<string>>(new Set());
+  // Projects whose acquire actually reported a held lease. A project whose
+  // acquire is still in flight is in `owned` as a reservation only: releasing it
+  // now would act on a lease that does not exist yet, and the late answer is what
+  // releases it if the user has since left.
+  const held = useRef<Set<string>>(new Set());
   // The wanted set as of the latest decision. A preparation that finishes later
   // compares against this: a project the user has since left must not be recorded
   // as held, or it would never be released.
@@ -97,6 +117,185 @@ export function useRuntimeLease(deps: LeaseDeps): RuntimeLeaseFeedback {
     setRetryTick((tick) => tick + 1);
   }, []);
 
+  // Only fixed wording reaches the page. A native reason is diagnostic and can
+  // carry paths or error text, so it is never rendered.
+  const noteIssue = useCallback((project: string, issue: RuntimeStartupIssue) => {
+    // A reply without a state is a failed command, not a healthy runtime; the
+    // fixed table has no entry for it, so it falls back to the generic sentence.
+    const reason =
+      startupIssueReason(issue.state) ??
+      (issue.state === undefined
+        ? ACQUIRE_FAILED_REASON
+        : issue.reason || ACQUIRE_FAILED_REASON);
+    setIssues((previous) => {
+      const current = requestSeq.current.get(project) ?? 0;
+      // Only the newest request may speak for its project.
+      if (!acceptsStartupReply(current, issue.requestSeq)) return previous;
+      const next = new Map(previous);
+      if (!isStartupProblem(issue.state)) {
+        next.delete(project);
+        return next;
+      }
+      next.set(project, { ...issue, reason });
+      return next;
+    });
+  }, []);
+
+  const clearIssue = useCallback((project: string) => {
+    setIssues((previous) => {
+      if (!previous.has(project)) return previous;
+      const next = new Map(previous);
+      next.delete(project);
+      return next;
+    });
+  }, []);
+
+  /**
+   * Applies one acquire answer: what is held, what the page is told, and what a
+   * project the user has since left still owes back.
+   */
+  const settleAcquire = useCallback(
+    async (project: string, seq: number, view: AcquireView) => {
+      // Asked for again while this answer was in flight? Then it belongs to an
+      // older request and must not decide anything.
+      if (!acceptsStartupReply(requestSeq.current.get(project) ?? 0, seq)) {
+        return;
+      }
+
+      const leasesHeld = isHeldLease(view);
+      const ready = view.state === "managedReady";
+      if (!leasesHeld) {
+        owned.current.delete(project);
+        held.current.delete(project);
+      } else {
+        held.current.add(project);
+      }
+
+      // A late answer for a project the decision has since dropped must not
+      // resurrect it: release a lease it did bring, and keep no failure for a
+      // project nobody is looking at.
+      if (!wanted.current.has(project)) {
+        owned.current.delete(project);
+        held.current.delete(project);
+        const lateScope = scopes.current.get(project) ?? view.scopeKey ?? null;
+        if (leasesHeld && lateScope) {
+          await invoke("runtime_release_project", { scopeKey: lateScope }).catch(
+            () => {},
+          );
+          scopes.current.delete(project);
+        }
+        return;
+      }
+
+      if (!ready) {
+        noteIssue(project, {
+          project,
+          requestSeq: seq,
+          attemptId: view.attemptId,
+          scopeKey: view.scopeKey || undefined,
+          stage: "acquire",
+          state: view.state,
+          // Placeholder only: `noteIssue` replaces it from the fixed table.
+          reason: "",
+        });
+      } else {
+        clearIssue(project);
+      }
+
+      if (!leasesHeld) return;
+
+      // Recorded only after the shell reported a held lease: the shell holds the
+      // resolved scope from this point on, so it can answer status reads for a
+      // runtime that refused a lease (embedded or legacy) as well.
+      //
+      // Always ask the shell: it owns the one canonicalisation of a project path,
+      // and a release must speak the key it resolved, not one echoed in an
+      // acquire reply. A failed lookup is *not* fatal: the chain is shared by
+      // every later acquire and release, so letting the rejection through would
+      // stop them all and strand the lease. The key is asked for again when a
+      // release is actually needed.
+      const scopeKey = await invoke<string | null>("runtime_scope_for_project", {
+        project,
+      }).catch((): string | null => null);
+      if (scopeKey) scopes.current.set(project, scopeKey);
+      // A late answer for a project the decision has since dropped must not
+      // resurrect it: release it now instead of leaving a lease with no owner.
+      if (!wanted.current.has(project)) {
+        owned.current.delete(project);
+        held.current.delete(project);
+        if (scopeKey) {
+          await invoke("runtime_release_project", { scopeKey }).catch(() => {});
+          scopes.current.delete(project);
+        }
+      }
+    },
+    [clearIssue, noteIssue],
+  );
+
+  const acquireOnce = useCallback(
+    async (project: string, seq: number): Promise<AcquireView | null> => {
+      let view: AcquireView | null = null;
+      try {
+        const answer = await invoke("runtime_acquire_project", { project });
+        // A shell that has no such command (or one that answers nothing) is not
+        // evidence of a lease. Treat it as a refusal rather than dereferencing
+        // whatever came back.
+        view =
+          answer && typeof (answer as AcquireView).state === "string"
+            ? (answer as AcquireView)
+            : null;
+      } catch {
+        view = null;
+      }
+      if (view === null) {
+        // A thrown command is a refusal too, but the exception text can carry
+        // paths or credential-shaped values, so the page gets a fixed sentence.
+        owned.current.delete(project);
+        held.current.delete(project);
+        if (wanted.current.has(project)) {
+          noteIssue(project, {
+            project,
+            requestSeq: seq,
+            stage: "acquire",
+            reason: ACQUIRE_FAILED_REASON,
+          });
+        }
+        return null;
+      }
+      await settleAcquire(project, seq, view);
+      return view;
+    },
+    [noteIssue, settleAcquire],
+  );
+
+  /** Queues work on the one chain, so no two decisions interleave. */
+  const enqueue = useCallback(<T,>(work: () => Promise<T>): Promise<T> => {
+    const run = chain.current.then(work);
+    // The chain is the only path every later decision takes, so one unexpected
+    // rejection must not end it for the life of the app.
+    chain.current = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }, []);
+
+  const prepareProject = useCallback(
+    async (project: string): Promise<AcquireView | null> => {
+      if (remote.current) return null;
+      // The user is creating a conversation here, so the project is wanted now.
+      // Recording it before the answer keeps a late failure reportable and stops
+      // the next decision from acquiring it a second time.
+      wanted.current.add(project);
+      owned.current.add(project);
+      // Supersede any earlier request, exactly as an explicit retry does.
+      const seq = (requestSeq.current.get(project) ?? 0) + 1;
+      requestSeq.current.set(project, seq);
+      return enqueue(() => acquireOnce(project, seq)).catch(() => null);
+    },
+    [acquireOnce, enqueue],
+  );
+
   useEffect(() => {
     if (remote.current) return;
     const wantedNow = new Set(
@@ -124,124 +323,57 @@ export function useRuntimeLease(deps: LeaseDeps): RuntimeLeaseFeedback {
 
     if (decision.acquire.length === 0 && decision.release.length === 0) return;
 
+    // Supersede before queueing, not when the chain reaches this decision: a
+    // retry must invalidate the answer already on the wire, or a late reply from
+    // the previous attempt lands after the retry and describes a request the user
+    // has replaced.
+    const queuedSeq = new Map<string, number>();
+    for (const project of decision.acquire) {
+      const seq = (requestSeq.current.get(project) ?? 0) + 1;
+      requestSeq.current.set(project, seq);
+      queuedSeq.set(project, seq);
+    }
+
     // Reserve the *intent*, not a lease: a second run before the first finishes
     // must not decide to release a project whose acquire is still in flight. The
     // reservation is released again if the answer is not a held lease.
     for (const project of decision.acquire) owned.current.add(project);
     for (const project of decision.release) owned.current.delete(project);
 
-    const noteIssue = (project: string, issue: RuntimeStartupIssue) => {
-      setIssues((previous) => {
-        const next = new Map(previous);
-        const current = requestSeq.current.get(project) ?? 0;
-        // Only the newest request may speak for its project.
-        if (!acceptsStartupReply(current, issue.requestSeq)) return previous;
-        next.set(project, issue);
-        return next;
-      });
-    };
-    const clearIssue = (project: string) => {
-      setIssues((previous) => {
-        if (!previous.has(project)) return previous;
-        const next = new Map(previous);
-        next.delete(project);
-        return next;
-      });
-    };
-
-    chain.current = chain.current.then(async () => {
+    void enqueue(async () => {
       for (const project of decision.acquire) {
-        const seq = (requestSeq.current.get(project) ?? 0) + 1;
-        requestSeq.current.set(project, seq);
-        let view: AcquireView;
-        try {
-          view = (await invoke("runtime_acquire_project", { project })) as AcquireView;
-        } catch {
-          // A thrown command is a refusal too, but the exception text can carry
-          // paths or credential-shaped values, so the page gets a fixed sentence.
-          owned.current.delete(project);
-          if (wanted.current.has(project)) {
-            noteIssue(project, {
-              project,
-              requestSeq: seq,
-              stage: "acquire",
-              reason: retried.has(project)
-                ? `${ACQUIRE_FAILED_REASON}（已重试仍失败）`
-                : ACQUIRE_FAILED_REASON,
-            });
-          }
-          continue;
-        }
-
-        // Asked for again while this answer was in flight? Then it belongs to an
-        // older request and must not decide anything.
-        if (!acceptsStartupReply(requestSeq.current.get(project) ?? 0, seq)) {
-          continue;
-        }
-
-        const held = isHeldLease(view);
-        const ready = view.state === "managedReady";
-        if (!held) owned.current.delete(project);
-
-        // A late answer for a project the decision has since dropped must not
-        // resurrect it: release a lease it did bring, and keep no failure for a
-        // project nobody is looking at.
-        if (!wanted.current.has(project)) {
-          owned.current.delete(project);
-          const lateScope = scopes.current.get(project) ?? view.scopeKey ?? null;
-          if (held && lateScope) {
-            await invoke("runtime_release_project", { scopeKey: lateScope }).catch(
-              () => {},
-            );
-            scopes.current.delete(project);
-          }
-          continue;
-        }
-
-        if (!ready) {
+        const seq = queuedSeq.get(project) ?? 0;
+        const view = await acquireOnce(project, seq);
+        // The retry marker is per-decision, but the sentence is chosen from the
+        // state table; a second failure after a retry says so.
+        if (!view && retried.has(project)) {
           noteIssue(project, {
             project,
             requestSeq: seq,
-            attemptId: view.attemptId,
-            scopeKey: view.scopeKey || undefined,
             stage: "acquire",
-            state: view.state,
-            reason: view.reason ?? view.state,
+            reason: `${ACQUIRE_FAILED_REASON}（已重试仍失败）`,
           });
-        } else {
-          clearIssue(project);
-        }
-
-        if (!held) continue;
-
-        // Recorded only after the shell reported a held lease: the shell holds
-        // the resolved scope from this point on, so it can answer status reads
-        // for a runtime that refused a lease (embedded or legacy) as well.
-        // Always ask the shell: it owns the one canonicalisation of a project
-        // path, and a release must speak the key it resolved, not one echoed in
-        // an acquire reply.
-        const scopeKey = await invoke<string | null>("runtime_scope_for_project", {
-          project,
-        });
-        if (scopeKey) scopes.current.set(project, scopeKey);
-        // A late answer for a project the decision has since dropped must not
-        // resurrect it: release it now instead of leaving a lease with no owner.
-        if (!wanted.current.has(project)) {
-          owned.current.delete(project);
-          if (scopeKey) {
-            await invoke("runtime_release_project", { scopeKey }).catch(() => {});
-            scopes.current.delete(project);
-          }
         }
       }
       for (const project of decision.release) {
-        const scopeKey = scopes.current.get(project);
-        // Without a resolved key the shell has nothing to release; inventing one
-        // from the path would ask it to act on a scope it never resolved.
+        // Only a project whose acquire reported a lease can be released. One whose
+        // acquire is still in flight is handled when its answer arrives: releasing
+        // now would either fail or race a lease that is about to be granted.
+        if (!held.current.has(project) && !scopes.current.has(project)) continue;
+        // A key may be missing because the acquire's lookup failed. Ask the shell
+        // now rather than leaving a real lease unreleased; inventing one from the
+        // path would ask it to act on a scope it never resolved.
+        let scopeKey = scopes.current.get(project) ?? null;
+        if (!scopeKey) {
+          scopeKey = await invoke<string | null>("runtime_scope_for_project", {
+            project,
+          }).catch((): string | null => null);
+        }
         if (!scopeKey) continue;
         try {
           await invoke("runtime_release_project", { scopeKey });
           scopes.current.delete(project);
+          held.current.delete(project);
         } catch {
           // Releasing is best-effort here; the quit drain is the authoritative
           // path and reports its own failures.
@@ -251,5 +383,5 @@ export function useRuntimeLease(deps: LeaseDeps): RuntimeLeaseFeedback {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deps.activeProject, deps.revision, retryTick]);
 
-  return { issues, retryProject };
+  return { issues, retryProject, prepareProject };
 }

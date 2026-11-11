@@ -47,7 +47,17 @@ export interface UseRuntimeLifecycleOptions {
  * A failed resolution is not an error to show: the version feature is additive, so
  * the app must behave exactly as it did before when the shell cannot answer.
  */
-export function useRuntimeScopeKey(project: string | null, enabled: boolean): string | null {
+export function useRuntimeScopeKey(
+  project: string | null,
+  enabled: boolean,
+  /**
+   * Bumped by the caller when the scope may have become resolvable since the
+   * last answer: a preparation settled, or the user asked for a retry. Without
+   * it a first `null` (the runtime was still starting) is final for the session,
+   * and the version banner never appears even after the project becomes ready.
+   */
+  revision: number = 0,
+): string | null {
   const [scopeKey, setScopeKey] = useState<string | null>(null);
   useEffect(() => {
     if (project === null || !enabled) {
@@ -69,7 +79,7 @@ export function useRuntimeScopeKey(project: string | null, enabled: boolean): st
     return () => {
       cancelled = true;
     };
-  }, [project, enabled]);
+  }, [project, enabled, revision]);
   return scopeKey;
 }
 
