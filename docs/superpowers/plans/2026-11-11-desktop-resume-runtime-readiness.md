@@ -21,7 +21,9 @@
 - native/hook/恢复组件评审：无 Critical/Important，允许合并。诊断的成功路径字段分配、stderr 限流和 live-region 交互语义均为非阻断后续建议，本轮不扩大范围。
 - superseded `null` 保持 fail-closed：同会话新 activation 使用新 token；当前尝试没有有效 `managedReady` 时必须保留发送屏障和显式重试，不能静默忽略后放行发送。`settleAcquire` 的陈旧结果不盲目释放同 scope 租约，避免影响 native 去重后的新尝试。
 - App 初评无 Critical，I1（重连 retire 无可见兜底）已用失败握手红测确认并修复；收窄复核确认两种断开时序、普通历史失败语义及正常重连均有正确路径，无 Critical/Important，允许合并。其余关于固定失败文案、恢复等待完整 activation、普通发送有限等待预算及 phase 注释均为非阻断建议。复核新增的失败提示重复/运行中会话残留红条、未来远端复用时的 subWindow 注意点也保留为展示与演进建议，不在本轮扩大改动。
-- 集成仍待用户选择：先提交经过本地完整验证的修复；不将此前“2（当前会话实施）”解释成推送/PR 或合并授权。合并后 CI 未跑前，模块条目继续保持 `[ ]`，不提前增加索引完成数。
+- 用户已选择本地合并到 `main`，代码以 `--no-ff` 合并为 `b1210923`（实现提交 `4e623e54`）。合并后前端 197 文件 / 2,945 项、构建、native lib 294 项、完整 `NEXTEST_TEST_THREADS=2 just ci` 均通过（exit 0；Rust 6,442 passed / 41 skipped，bindings 50 passed）。模块条目改为 `[x]`，索引完成数 69 → 70。
+- 合并后 CI 的环境处理如实记录：首次 `fmt-check` 包含主工作区原有未跟踪 `probe_guardian.rs`，因此失败；未改写该文件，重跑时暂移到 ignored 目录，结束后自动原样还原并验证 SHA256 `1514599bb01c07fd45ca58c7ddd2c944dc0d70eab62cfcdcd0b3cc8eef3cbcde`。随后插件测试缓存二进制嵌入已不存在的 `desktop-startup-content` / `desktop-content-timeout` worktree 路径，造成 fixture/src 缺失；`cargo clean -p yi-agent-plugins --profile dev` 定点重建后插件 247 passed / 7 skipped，再完整重跑所有 CI 门禁通过。未跳过测试、修改断言或增加审计豁免。
+- 已归档日志到主仓库 ignored `.artifacts/resume-readiness/`：`main-ci-final.log`、`main-frontend.log`、`main-build.log`、`main-native.log`、`main-plugins-rebuilt.log`；原 worktree 红绿与 CI 日志保存在 `worktree/`。清理前确认无 Cargo/rustc 进程，`just reclaim --target ../.worktrees/resume-runtime-readiness/yi-agent-rs/target` 仅预演；已移除实现 worktree 和已合并的修复分支，其他 worktree、主仓库产物与正式 App 未动。完成记录在独立纯文档 worktree 提交并合并；纯文档合并按项目规则免跑 CI/单测。
 
 ### 验收证据索引
 
@@ -36,7 +38,7 @@
 | 7 | 两个 `activation recovery` 测试：成功/失败保留草稿和 PDF 附件，不发 turn/start 或 thread/start；切走后仅恢复新选择 |
 | 8 | 既有本地 running 只读与远端测试；新增 `does not interrupt a thread that becomes running/awaiting_approval during preparation`，准备返回时状态变忙则重入只读分支 |
 | 9 | 两个 `readiness_diagnostic_*` 覆盖三类原因与严格 JSON 字段集合，完整 native lib 294 项包含正常 root 授权与失效租约拒绝 |
-| 10 | 前端全量 2,945 项及构建、native lib 294 项、最终 worktree `NEXTEST_TEST_THREADS=2 just ci` 已通过（exit 0）：Rust 6,442 项（41 skipped），bindings 50 项；允许的 rustix/chacha20 审计警告未新增豁免。评审及复核无 Critical/Important，允许合并；本地实现合成一个提交，用户集成选择与 main CI 待完成 |
+| 10 | 前端全量 2,945 项及构建、native lib 294 项、最终 worktree `NEXTEST_TEST_THREADS=2 just ci` 已通过（exit 0）：Rust 6,442 项（41 skipped），bindings 50 项；允许的 rustix/chacha20 审计警告未新增豁免。评审及复核无 Critical/Important，允许合并；实现已合并为 `b1210923`，合并后完整 CI（Rust 6,442 passed / 41 skipped，bindings 50 passed）、前端 2,945 项及构建、native 294 项均通过；环境处理与归档日志见 Execution Notes |
 
 ## Global Constraints
 
@@ -303,9 +305,9 @@ NEXTEST_TEST_THREADS=2 just ci
 CI 默认并发导致超时则独占复跑，记录真实差异，不跳过失败。原生/前端构建不得运行时修改正式 App。
 
 - [x] Step 2: 使用 requesting-code-review / receiving-code-review 完成评审与意见核对，I1 经红绿验证和独立复核关闭；pendingResumes、watchdog、陈旧租约结果与草稿发送边界均已审查。无 Critical/Important，允许合并。
-- [ ] Step 3: 完成全部验收后更新 feature 为 `[x]`、索引完成数和计划清单；未做安装版 GUI 验收明确写成限制，不改已有其他 feature 的状态。按项目要求再次跑 fmt/ci 后提交验证记录。
-- [ ] Step 4: 使用 finishing-a-development-branch，回主仓库前检查本轮分支干净和用户原有未跟踪文件仍原样；以 `git merge --no-ff fix/resume-runtime-readiness` 合并，再在 main 的 yi-agent-rs 运行 `NEXTEST_TEST_THREADS=2 just ci`。不得在 main 直接修代码；有问题回 worktree 修。
-- [ ] Step 5: 合并验证通过后移除本 worktree 和已合并分支；先看构建进程及磁盘，只用 `just reclaim` 预演确认垃圾，确认无本轮编译再按项目规则清理。打开本轮 diff 并向用户报告测试、合并 commit 和未部署状态。
+- [x] Step 3: 全部代码验收通过后，模块 feature 更新为 `[x]`、索引 70 / 83；安装版 GUI 未验收/未部署明确保留为边界，不改变其他 feature 状态。验证记录在独立纯文档 worktree 提交，按项目纯文档例外免跑 CI/单测。
+- [x] Step 4: 使用 finishing-a-development-branch，确认分支干净和原有探针内容未变；用户选择后以 `--no-ff` 合并代码为 `b1210923`，在 main 重跑完整 CI（见环境处理记录）通过。没有在 main 直接改代码。
+- [x] Step 5: 合并验证通过，日志归档并确认无 Cargo/rustc 进程；本轮 `just reclaim` 预演完成，原实现 worktree 和已合并修复分支已移除（回收约 35 GiB 产物，不动其他 worktree）。本轮 diff 已打开；报告代码合并 `b1210923`、测试结果及未部署状态。
 
 ## Self-Review / Spec Coverage
 
