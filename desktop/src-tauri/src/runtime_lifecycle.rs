@@ -631,6 +631,15 @@ pub struct ProjectAcquireView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub retry: RetryClass,
+    /// Whether a real lease is registered for this project right now.
+    ///
+    /// Separate from `state`: a blocked project may still hold a lease (for
+    /// example a compatible version mismatch that needs its own lease to switch),
+    /// and that lease must be released when the user leaves. `None` only appears
+    /// on replies from shells predating this field; the page then falls back to
+    /// `managedReady` as the only positive evidence it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<bool>,
 }
 
 /// What one project's preparation actually produced, kept apart from the view.
@@ -1606,6 +1615,7 @@ impl DesktopRuntimeManager {
                 state: AcquireState::LegacyChoiceRequired,
                 reason: Some(reason.clone()),
                 retry: RetryClass::UserAction,
+                held: None,
             }),
             PrepareOutcome::Blocked { reason } => Some(blocked_view(
                 &scope.key,
@@ -1713,6 +1723,7 @@ impl DesktopRuntimeManager {
                 state: AcquireState::ManagedReady,
                 reason: None,
                 retry: RetryClass::DoNotRetry,
+                held: None,
             },
         ))
     }
@@ -1749,20 +1760,25 @@ impl DesktopRuntimeManager {
         attempt_id: &str,
         held: bool,
         ready: bool,
-        view: ProjectAcquireView,
-    ) {
+        mut view: ProjectAcquireView,
+    ) -> ProjectAcquireView {
+        // The page must be able to release a lease it cannot otherwise infer, so
+        // every recorded view carries the one authoritative `held` fact rather
+        // than letting each construction site guess.
+        view.held = Some(held);
         if let Ok(mut guard) = self.states.lock() {
             guard.insert(
                 scope.key.clone(),
                 ProjectState {
                     scope: scope.clone(),
                     attempt_id: attempt_id.to_string(),
-                    view,
+                    view: view.clone(),
                     held,
                     ready,
                 },
             );
         }
+        view
     }
 
     /// Settles an attempt that holds nothing.
@@ -1778,8 +1794,7 @@ impl DesktopRuntimeManager {
             .state_for(&scope.key)
             .map(|state| (state.held, state.ready))
             .unwrap_or((false, false));
-        self.record_view(scope, attempt_id, held, ready, view.clone());
-        view
+        self.record_view(scope, attempt_id, held, ready, view)
     }
 
     /// Settles an attempt whose own outcome decides what is held.
@@ -1791,8 +1806,7 @@ impl DesktopRuntimeManager {
         view: ProjectAcquireView,
     ) -> ProjectAcquireView {
         let ready = view.state == AcquireState::ManagedReady;
-        self.record_view(scope, attempt_id, held, ready, view.clone());
-        view
+        self.record_view(scope, attempt_id, held, ready, view)
     }
 
     /// Records that this scope no longer holds a lease.
@@ -2063,6 +2077,7 @@ fn starting_view(scope_key: &str, attempt_id: &str) -> ProjectAcquireView {
         state: AcquireState::Starting,
         reason: None,
         retry: RetryClass::WhenIdle,
+        held: None,
     }
 }
 
@@ -2079,6 +2094,7 @@ fn blocked_view(
         state: AcquireState::Blocked,
         reason: Some(reason.into()),
         retry,
+        held: None,
     }
 }
 
@@ -2094,6 +2110,7 @@ fn unknown_view(
         state: AcquireState::Unknown,
         reason: Some(reason.into()),
         retry: RetryClass::Backoff,
+        held: None,
     }
 }
 
@@ -4471,6 +4488,11 @@ mod tests {
         fn start(scope: &RuntimeScope) -> Self {
             std::fs::create_dir_all(&scope.runtime_dir).unwrap();
             let path = yi_agent_lifecycle::scope::control_path(&scope.runtime_dir);
+            // The socket lives under the instance home, not the runtime directory,
+            // so its own directory must exist before bind.
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
             let _ = std::fs::remove_file(&path);
             let table = Arc::new(Mutex::new(yi_agent_lifecycle::leases::LeaseTable::new()));
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4844,6 +4866,41 @@ mod tests {
             guardian.live_clients(),
             Vec::<String>::new(),
             "a blocked project still owed its lease back on quit"
+        );
+    }
+
+    /// A blocked project's view must say whether a lease is held, separately from
+    /// whether the runtime is ready.
+    ///
+    /// The page needs both: a blocked-but-held project still has to be released
+    /// when the user leaves, while only `managedReady` may build a delegating
+    /// session. Reporting a single boolean is how a held lease was forgotten.
+    #[tokio::test]
+    async fn blocked_acquire_view_reports_held_separately_from_ready() {
+        let dir = short_dir();
+        let project = real_scope(dir.path(), "alpha");
+        let guardian = LeaseGuardian::start(&project);
+        let manager = real_socket_manager(
+            &guardian,
+            PrepareOutcome::VersionChoiceRequired(managed_identity(&project.key, "gen-1")),
+        );
+
+        let view = manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(view.state, AcquireState::Blocked);
+        assert_eq!(
+            view.held,
+            Some(true),
+            "the lease taken for the switch must be reported: {view:?}"
+        );
+        assert!(!manager.is_lifecycle_ready(&project));
+        let serialized = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            serialized.get("held"),
+            Some(&serde_json::Value::Bool(true)),
+            "the page can only release a lease it is told about: {serialized}"
         );
     }
 

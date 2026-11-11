@@ -42,18 +42,38 @@ export interface AcquireView {
   state: string;
   retry?: string;
   reason?: string | null;
+  /**
+   * Whether the shell holds a live lease, reported by the shell itself.
+   *
+   * Missing on older shells, where `managedReady` is the only observed held
+   * state. Held is not ready: a compatible version mismatch may keep its lease
+   * while blocked for business work, and that lease still has to be released
+   * when the user leaves.
+   */
+  held?: boolean;
 }
 
 /**
- * Whether an acquisition result is an actual lease.
+ * Whether the shell holds a lease for the project.
  *
- * Only `managedReady` is: the shell holds a live, renewing lease and the runtime
- * identity matches this build. `starting` means a preparation is in flight — the
- * command returned, nothing is held — and the other three are refusals or
- * unknowns. Recording any of them as "owned" is how a blocked project silently
- * looked like a working runtime.
+ * A lease is not a runtime: only [`isReadyLease`] permits work. The two are
+ * separate because a blocked project can still hold a lease -- the switch flow
+ * needs it -- and forgetting it on the way out leaks a registration the quit
+ * barrier would otherwise release.
  */
 export function isHeldLease(view: AcquireView): boolean {
+  // Unknown on older shells: `managedReady` is the only state those could hold.
+  return view.held === true || (view.held === undefined && view.state === "managedReady");
+}
+
+/**
+ * Whether the runtime for this project may actually run work.
+ *
+ * This is the gate a session needs before it may delegate. `held` alone is not
+ * enough: the runtime identity must match this build and its heartbeat must be
+ * live, which is exactly what `managedReady` reports.
+ */
+export function isReadyLease(view: AcquireView): boolean {
   return view.state === "managedReady";
 }
 

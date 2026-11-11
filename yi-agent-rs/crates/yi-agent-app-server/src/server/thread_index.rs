@@ -40,6 +40,21 @@ pub(crate) struct Activation {
     /// 决定是报 `RestoreFailed` 还是接受无委派(见 `server/driver_resume.rs`)。
     pub(crate) tooling_error: Option<String>,
 }
+
+impl Activation {
+    /// A desktop that promised managed delegation must not publish a successful
+    /// session with the base (no-delegation) registry. Keep the optional fallback
+    /// for embedded callers, but make managed failure retryable at the RPC edge.
+    /// The diagnostic stays in the trace; do not send raw authority errors to UI.
+    pub(crate) fn require_managed(self, required: bool) -> anyhow::Result<Self> {
+        if required && self.tooling_error.is_some() {
+            anyhow::bail!(
+                "managed subagent runtime is not ready; prepare this project and retry opening the conversation"
+            );
+        }
+        Ok(self)
+    }
+}
 /// The scope key a conversation in `cwd` belongs to.
 ///
 /// The same resolution the guardian, the shell and the runtime status all use: one

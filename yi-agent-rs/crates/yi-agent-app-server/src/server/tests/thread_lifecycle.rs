@@ -1,5 +1,91 @@
 use super::*;
 
+struct RefusedDesktopRoot;
+
+impl yi_agent_subagent::managed_binding::ManagedRootAuthority for RefusedDesktopRoot {
+    fn authorize(
+        &self,
+        _intent: &yi_agent_lifecycle::production::RootIntentRequest,
+        _deadline: yi_agent_lifecycle::deadline::Deadline,
+    ) -> Result<yi_agent_lifecycle::production::RootAuthorityEntry, String> {
+        Err("fixture root preparation refused".into())
+    }
+}
+
+fn install_refused_desktop_authority(h: &Harness) {
+    let mut store = yi_agent_subagent::managed_binding::RootAuthorityStore::new();
+    store.bind_epoch("fixture-epoch").unwrap();
+    *h.managed.lock().unwrap() = Some(Arc::new(crate::server::ManagedAuthority {
+        store: Arc::new(StdMutex::new(store)),
+        broker: Arc::new(RefusedDesktopRoot),
+        client_run_id: "fixture-app-run".into(),
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_thread_start_refuses_a_silently_degraded_agent() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    install_refused_desktop_authority(&h);
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let response = loop {
+        let frame = h.read_value().await;
+        assert_ne!(
+            frame["method"], "thread/started",
+            "a failed managed attach must not publish a ready session"
+        );
+        if frame["id"] == 2 {
+            break frame;
+        }
+    };
+    assert!(
+        response.get("error").is_some(),
+        "managed tooling is mandatory, not a successful no-tools session: {response}"
+    );
+    // The failure is an RPC result, not a connection failure.
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/list","params":{}}"#)
+        .await;
+    let response = h.read_value().await;
+    assert_eq!(response["id"], 3);
+    assert_eq!(response["result"]["threads"], serde_json::json!([]));
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_resume_reports_attach_failure_after_read_only_history() {
+    let mut h = Harness::new();
+    let tid = start_thread(&mut h).await;
+    install_refused_desktop_authority(&h);
+    h.send(
+        &serde_json::json!({"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{
+            "threadId":tid,"historyFirst":true,"historyToken":"managed-retry"
+        }})
+        .to_string(),
+    )
+    .await;
+    let mut history_ready = false;
+    let response = loop {
+        let frame = h.read_value().await;
+        if frame["method"] == "thread/historyReady" {
+            history_ready = true;
+            assert_eq!(frame["params"]["request_token"], "managed-retry");
+        }
+        if frame["id"] == 4 {
+            break frame;
+        }
+    };
+    assert!(
+        history_ready,
+        "runtime failure must not hide readable history"
+    );
+    assert!(
+        response.get("error").is_some(),
+        "a degraded managed resume must not become warm: {response}"
+    );
+    h.shutdown().await;
+}
+
 /// 新建会话时，`show_git_diff` 的默认基准必须落在**本会话的起点**上。
 ///
 /// 只有走真实 `thread/start` 才验得出：起点在 `start_thread_core` 里取（那时
