@@ -679,6 +679,29 @@ pub struct ProjectState {
     pub generation: Option<String>,
 }
 
+/// A fixed refusal classification, not an authority error or credential.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ReadinessFailure {
+    MissingState,
+    ProjectNotReady,
+    LeaseExpired,
+}
+
+/// Explicit allowlist for native diagnostics. Never serialize the intent,
+/// management session, lease grant, or capability into a diagnostic record.
+#[derive(Debug, serde::Serialize)]
+struct ReadinessDiagnostic {
+    scope_key: String,
+    attempt_id: Option<String>,
+    state: Option<AcquireState>,
+    held: bool,
+    ready: bool,
+    generation: Option<String>,
+    lease_live: Option<bool>,
+    reason: ReadinessFailure,
+}
+
 /// One in-flight acquisition per scope, so concurrent callers share one attempt.
 type AttemptSlot = tokio::sync::Mutex<()>;
 
@@ -1947,18 +1970,35 @@ impl DesktopRuntimeManager {
     /// recorded must not keep authorizing work, because the guardian has by then
     /// withdrawn the client.
     pub fn is_lifecycle_ready(&self, scope: &RuntimeScope) -> bool {
-        let ready = self
-            .project_state(&scope.key)
-            .map(|state| state.ready)
-            .unwrap_or(false);
-        if !ready {
-            return false;
+        self.check_lifecycle_ready(scope).is_ok()
+    }
+
+    fn check_lifecycle_ready(&self, scope: &RuntimeScope) -> Result<(), ReadinessDiagnostic> {
+        let state = self.project_state(&scope.key);
+        let mut diagnostic = ReadinessDiagnostic {
+            scope_key: scope.key.clone(),
+            attempt_id: state.as_ref().map(|state| state.attempt_id.clone()),
+            state: state.as_ref().map(|state| state.view.state),
+            held: state.as_ref().is_some_and(|state| state.held),
+            ready: state.as_ref().is_some_and(|state| state.ready),
+            generation: state.as_ref().and_then(|state| state.generation.clone()),
+            lease_live: None,
+            reason: ReadinessFailure::MissingState,
+        };
+        let Some(state) = state else {
+            return Err(diagnostic);
+        };
+        if !state.ready {
+            diagnostic.reason = ReadinessFailure::ProjectNotReady;
+            return Err(diagnostic);
         }
         if !self.backend.lease_is_live(scope) {
+            diagnostic.lease_live = Some(false);
+            diagnostic.reason = ReadinessFailure::LeaseExpired;
             self.forget_ready(&scope.key);
-            return false;
+            return Err(diagnostic);
         }
-        true
+        Ok(())
     }
 
     /// Notes the epoch of the sidecar this shell is currently talking to.
@@ -2019,7 +2059,10 @@ impl DesktopRuntimeManager {
                     request.scope_key
                 )
             })?;
-        if !self.is_lifecycle_ready(&scope) {
+        if let Err(diagnostic) = self.check_lifecycle_ready(&scope) {
+            if let Ok(line) = serde_json::to_string(&diagnostic) {
+                eprintln!("[runtime-readiness] {line}");
+            }
             return Err(format!(
                 "{} is not lifecycle-ready, so no root may be authorized there",
                 request.scope_key
@@ -4488,6 +4531,69 @@ mod tests {
         let back: ProjectAcquireView = serde_json::from_value(json).unwrap();
         assert_eq!(back, view);
         std::mem::forget(dir);
+    }
+
+    #[tokio::test]
+    async fn readiness_diagnostic_distinguishes_unprepared_and_unready() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::connected();
+        let absent = wired.manager.check_lifecycle_ready(&project).unwrap_err();
+        assert_eq!(absent.reason, ReadinessFailure::MissingState);
+        assert_eq!(absent.lease_live, None);
+        assert!(!absent.held);
+
+        wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        wired.manager.forget_ready(&project.key);
+        let unready = wired.manager.check_lifecycle_ready(&project).unwrap_err();
+        assert_eq!(unready.reason, ReadinessFailure::ProjectNotReady);
+        assert_eq!(unready.lease_live, None);
+        assert!(unready.held);
+        assert!(!unready.ready);
+    }
+
+    #[tokio::test]
+    async fn readiness_diagnostic_records_expired_lease_without_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::connected();
+        wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        wired.control.knobs.lock().unwrap().served = false;
+        let diagnostic = wired.manager.check_lifecycle_ready(&project).unwrap_err();
+        assert_eq!(diagnostic.reason, ReadinessFailure::LeaseExpired);
+        assert_eq!(diagnostic.lease_live, Some(false));
+        assert!(diagnostic.ready);
+        assert!(diagnostic.attempt_id.is_some());
+        assert!(!wired.manager.project_state(&project.key).unwrap().ready);
+        let json = serde_json::to_value(&diagnostic).unwrap();
+        let keys: std::collections::BTreeSet<_> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "scope_key",
+                "attempt_id",
+                "state",
+                "held",
+                "ready",
+                "generation",
+                "lease_live",
+                "reason",
+            ])
+        );
+        assert_eq!(json["reason"], "leaseExpired");
     }
 
     /// A ready project that loses its lease stops being ready on the next check.

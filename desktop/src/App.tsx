@@ -132,6 +132,8 @@ import { localRuntimeControl } from "./lib/runtimeLifecycle";
 import { useRuntimeScopeKey } from "./hooks/useRuntimeLifecycle";
 import { RuntimeVersionBanner } from "./components/RuntimeVersionBanner";
 import { RuntimeStartupNotice } from "./components/RuntimeStartupNotice";
+import { RuntimeActivationNotice } from "./components/RuntimeActivationNotice";
+import { ACQUIRE_FAILED_REASON, startupIssueReason } from "./lib/runtimeStartupIssue";
 import { wantedProjects } from "./lib/runtimeLease";
 import { subscribeDragDrop } from "./lib/dragDropSubscribe";
 import { insertDroppedPaths } from "./lib/droppedPaths";
@@ -390,9 +392,12 @@ export default function App() {
   const pendingResumes = useRef(new Map<string, {
     token: string;
     client: RpcClient;
+    phase: "preparing" | "replaying";
+    allowWaitingSend: boolean;
     historyReady: () => void;
     activation: Promise<boolean>;
   }>());
+  const activationRecoveries = useRef(new Map<string, symbol>());
   const notifyHistoryReady = useRef<(client: RpcClient, id: string, token: string) => void>(() => {});
   // Remote-only (S2): the LRU of threads we keep warm via `thread/subscribe`.
   // Content notifications are only delivered for subscribed threads, so the
@@ -1329,10 +1334,19 @@ export default function App() {
 
   const selectThread = async (
     id: string,
-    opts?: { forceResume?: boolean },
+    opts?: { forceResume?: boolean; recovery?: boolean },
   ) => {
     const prevId = store.currentId;
-    if (prevId !== id) selectionRevision.current += 1;
+    if (prevId !== id) {
+      selectionRevision.current += 1;
+      // A preparation is a navigation-bound intent, not an already-sent replay.
+      // Retire it synchronously so navigating away and back can start a fresh
+      // attempt without waiting for the old shell answer.
+      if (prevId && pendingResumes.current.get(prevId)?.phase === "preparing") {
+        pendingResumes.current.delete(prevId);
+        inFlightResume.current.delete(prevId);
+      }
+    }
     if (prevId !== id) captureTranscriptRef.current?.();
     // 只有**换了会话**才清附属视图：清空是为了「别把 A 的数据画在 B 上」，
     // 会话没变时（重连重放、点已选中的那一行）不存在错配，清掉纯属打断用户。
@@ -1608,22 +1622,18 @@ export default function App() {
     }
     const c = clientRef.current;
     if (!c) return;
-    // 对账开始：全量回放在途，内容随时可能是旧的，UI 与发送门槛据此收紧（spec §5.1）。
-    const coldView = store.peek(id);
-    if (coldView) {
-      coldView.syncState = "syncing";
-      coldView.activationError = null;
-    }
+    const slot = activeSlotRef.current;
+    const revision = selectionRevision.current;
+    const localPreparation = !isRemoteClient() && usesLocalPaths(slot);
+    const coldView = store.view(id);
+    if (coldView.activationError) coldView.session.lastError = null;
+    coldView.activationError = null;
     inFlightResume.current.add(id);
-    // 停滞检测：健康的回放每收一帧就续命，只有真的断了才会触发。
-    const watchdog = createWatchdog(SYNC_IDLE_TIMEOUT_MS, () =>
-      failSync(id, "内容加载超时，请重试"),
-    );
-    syncWatchdogs.current.set(id, watchdog);
-    // 全量回放期间收集服务端 item id；成功后据此删掉缓存里服务端已经没有的项
-    // （clear / compact / 裁剪造成的幽灵内容）。readItems 只补尾部，不走这条路径。
-    const replaySession = store.view(id).session;
-    replaySession.beginReplay();
+    // Preparing the project is not replaying history. Start the history idle
+    // budget only when the resume request actually leaves this client.
+    let watchdog: Watchdog | undefined;
+    let replayStarted = false;
+    const replaySession = coldView.session;
     // A correlation token is not a credential. Older WebViews may lack randomUUID.
     let token: string;
     try { token = globalThis.crypto?.randomUUID?.() ?? ""; } catch { token = ""; }
@@ -1632,12 +1642,24 @@ export default function App() {
     const historyReady = new Promise<void>((resolve) => { releaseHistory = resolve; });
     let reconciled = false;
     let authoritative = false;
+    const currentAttempt = () => clientRef.current === c &&
+      store.peek(id)?.session === replaySession &&
+      pendingResumes.current.get(id)?.token === token;
+    const currentPreparation = () => currentAttempt() &&
+      activeSlotRef.current === slot && selectionRevision.current === revision &&
+      store.currentId === id;
+    const activationFailed = (reason: string) => {
+      if (!currentAttempt()) return;
+      coldView.activationError = reason;
+      coldView.session.lastError = `运行环境未就绪：${reason}；请重试准备运行环境`;
+      warm.current.delete(id);
+      force((v) => v + 1);
+    };
     const finishHistory = (confirmed = false) => {
-      if (reconciled || clientRef.current !== c || store.peek(id)?.session !== replaySession ||
-          pendingResumes.current.get(id)?.token !== token) return;
+      if (!replayStarted || reconciled || !currentAttempt()) return;
       reconciled = true;
       confirmedHistory.current.add(replaySession);
-      watchdog.stop();
+      watchdog?.stop();
       const replayed = replaySession.endReplay();
       // A correlated completion explicitly confirms even an empty transcript.
       // Legacy servers without that signal keep the no-frames safety guard.
@@ -1654,6 +1676,42 @@ export default function App() {
     // are rendered below, never left as unhandled rejections.
     const activation = Promise.resolve().then(async (): Promise<boolean> => {
       try {
+        if (localPreparation) {
+          if (!currentPreparation()) return false;
+          const summary = sess.pinned.find((t) => t.thread_id === id) ??
+            sess.groups.flatMap((group) => group.threads).find((t) => t.thread_id === id);
+          const project = coldView.info?.cwd || summary?.cwd;
+          if (!project) {
+            activationFailed("无法确定此会话的项目目录，请刷新会话列表后重试");
+            return false;
+          }
+          const prepared = await prepareRuntimeProject(project);
+          if (!currentPreparation()) return false;
+          // Another frontend may have started work while preparation waited.
+          // Resume interrupts turns, so re-enter the existing read-only branch
+          // instead of using the idle status captured before the await.
+          if (coldView.status === "running" || coldView.status === "awaiting_approval") {
+            pendingResumes.current.delete(id);
+            inFlightResume.current.delete(id);
+            await selectThread(id);
+            return false;
+          }
+          bumpRuntimeScopeRevision();
+          if (prepared?.state !== "managedReady") {
+            activationFailed(startupIssueReason(prepared?.state) ?? ACQUIRE_FAILED_REASON);
+            return false;
+          }
+        }
+        if (!currentAttempt()) return false;
+        pendingResumes.current.get(id)!.phase = "replaying";
+        coldView.syncState = "syncing";
+        replayStarted = true;
+        replaySession.beginReplay();
+        watchdog = createWatchdog(SYNC_IDLE_TIMEOUT_MS, () => {
+          if (currentAttempt()) failSync(id, "内容加载超时，请重试");
+        });
+        syncWatchdogs.current.set(id, watchdog);
+        force((v) => v + 1);
         const resumed = await c.request<{
           permission_mode?: ThreadMode;
           reasoning_effort?: string | null;
@@ -1706,18 +1764,23 @@ export default function App() {
         // A runtime failure is not a transcript failure once replay is confirmed.
         const view = store.peek(id);
         if (view?.session === replaySession) {
-          if (reconciled) {
-            view.activationError = formatError(e);
-            view.session.lastError = `运行环境未就绪：${view.activationError}；请重新选择此会话重试`;
-            warm.current.delete(id);
-            force((v) => v + 1);
-          } else failSync(id, formatError(e));
+          if (reconciled || !replayStarted) {
+            activationFailed(localPreparation ? "运行环境激活失败，请重试准备" : formatError(e));
+          } else {
+            failSync(id, formatError(e));
+            // Disposal may reject replay before the replacement client is
+            // created. Preserve the same local recovery gate even after this
+            // attempt's finally removes its pending entry.
+            if (localPreparation && e instanceof ConnectionError) {
+              activationFailed("运行环境激活失败，请重试准备");
+            }
+          }
         }
         return false;
       } finally {
         // 停机是硬要求：不停的话，一次成功的加载会被这个定时器在 15s 后
         // 反向判成失败。
-        watchdog.stop();
+        watchdog?.stop();
         // 只摘**自己这条**条目。重试路径允许「上一趟仍在途」时再发一趟
         // （`forceResume` 跳过全部早退），若无条件 `delete(id)`，先落定那趟会
         // 把后起那趟的条目删掉，后者的续命信号就此丢失、健康回放被 15s 判死。
@@ -1730,8 +1793,34 @@ export default function App() {
         }
       }
     });
-    pendingResumes.current.set(id, { token, client: c, historyReady: () => finishHistory(true), activation });
-    await Promise.race([activation, historyReady]);
+    pendingResumes.current.set(id, {
+      token, client: c, phase: localPreparation ? "preparing" : "replaying",
+      allowWaitingSend: !opts?.recovery,
+      historyReady: () => finishHistory(true), activation,
+    });
+    force((v) => v + 1);
+    await (opts?.recovery ? activation : Promise.race([activation, historyReady]));
+  };
+
+  // Explicit failed-activation recovery never replays a failed send intent.
+  // Hold a synchronous per-thread lock through activation (not only historyReady).
+  const retryCurrentActivation = async () => {
+    const id = store.currentId;
+    const view = id ? store.peek(id) : undefined;
+    if (!id || !view?.activationError || isRemoteClient() ||
+        !usesLocalPaths(activeSlotRef.current) || activationRecoveries.current.has(id) ||
+        view.status === "running" || view.status === "awaiting_approval") return;
+    const marker = Symbol(id);
+    activationRecoveries.current.set(id, marker);
+    force((v) => v + 1);
+    try {
+      await selectThread(id, { recovery: true });
+    } finally {
+      if (activationRecoveries.current.get(id) === marker) {
+        activationRecoveries.current.delete(id);
+        force((v) => v + 1);
+      }
+    }
   };
 
   /**
@@ -2292,6 +2381,34 @@ export default function App() {
       wireClient,
       sideStore: sideStoreRef.current,
       onTraceConnection: (connection) => {
+        // Preparation is a native promise, so disposing an RPC client cannot
+        // reject it. Retire that client's barriers before its replacement
+        // handshakes; otherwise the new selectThread sees an old in-flight id
+        // and never starts its own activation.
+        const previous = registryRef.current.get(connection.slot);
+        if (previous && previous !== connection.client) {
+          for (const [id, pending] of pendingResumes.current) {
+            if (pending.client !== previous) continue;
+            syncWatchdogs.current.get(id)?.stop();
+            syncWatchdogs.current.delete(id);
+            pendingResumes.current.delete(id);
+            inFlightResume.current.delete(id);
+            activationRecoveries.current.delete(id);
+            // A replacement handshake can fail before it reselects this
+            // thread. Retiring the watchdog must not leave an invisible cold
+            // activation or a permanently syncing transcript with no retry.
+            const view = store.peek(id);
+            if (view?.syncState === "syncing") {
+              failSync(id, "连接已重建，内容尚未加载完成，请重试恢复会话");
+            }
+            if (view && connection.slot === LOCAL_SLOT && !isRemoteClient()) {
+              view.activationError = "连接已重建，请重试准备运行环境";
+              view.session.lastError = view.activationError;
+              warm.current.delete(id);
+              force((v) => v + 1);
+            }
+          }
+        }
         trace.controller.setConnection(connection);
       },
       serverBindingGeneration,
@@ -2511,25 +2628,25 @@ export default function App() {
     // 的上下文与服务端实际上下文可能不一致（spec §5.1）。
     // **失败态（failed）同样要拦**：它比 syncing 更危险——用户以为自己已经看到了
     // 完整上下文，其实一条都没到。这是加 failed 时最容易漏的一处。
-    const syncState = store.peek(id)?.syncState;
     const connecting = !isRemoteClient() && status !== "connected";
-    if (offline || connecting || syncState === "syncing" || syncState === "failed") {
-      store.view(id).session.lastError = offline || connecting
-        ? "正在连接，请稍候"
-        : syncState === "failed"
-          ? "内容尚未加载完成，请先重试"
-          : "正在同步，请稍候";
+    if (offline || connecting) {
+      store.view(id).session.lastError = "正在连接，请稍候";
       force((v) => v + 1);
       return false;
     }
     const activationError = store.peek(id)?.activationError;
     if (activationError) {
-      store.view(id).session.lastError = `运行环境未就绪：${activationError}；请重新选择此会话重试`;
+      store.view(id).session.lastError = `运行环境未就绪：${activationError}；请重试准备运行环境`;
       force((v) => v + 1);
       return false;
     }
     const activating = pendingResumes.current.get(id);
     if (activating) {
+      if (!activating.allowWaitingSend) {
+        store.view(id).session.lastError = "正在恢复运行环境，草稿已保留；恢复后请重新发送";
+        force((v) => v + 1);
+        return false;
+      }
       const target = store.peek(id);
       const revision = selectionRevision.current;
       const submittedDraft = target?.draft;
@@ -2558,6 +2675,13 @@ export default function App() {
       if (!activated || clientRef.current !== c || selectionRevision.current !== revision ||
           store.currentId !== id || store.peek(id) !== target || target?.draft !== submittedDraft ||
           sideConversationRef.current.active?.kind === "side" || pendingResumes.current.has(id)) return false;
+    }
+    const syncState = store.peek(id)?.syncState;
+    if (syncState === "syncing" || syncState === "failed") {
+      store.view(id).session.lastError = syncState === "failed"
+        ? "内容尚未加载完成，请先重试" : "正在同步，请稍候";
+      force((v) => v + 1);
+      return false;
     }
     // 这个会话待发送的附件。发送前先取快照：成功要清空它，失败要**留着**重试。
     const files = pending[id] ?? [];
@@ -3049,6 +3173,7 @@ export default function App() {
           warm.current.clear();
           inFlightResume.current.clear();
           pendingResumes.current.clear();
+          activationRecoveries.current.clear();
           selectionRevision.current += 1;
           cacheMetaRef.current.clear();
           cachedAt.current.clear();
@@ -3908,12 +4033,22 @@ export default function App() {
                   // This first-create target may not be in the active/busy set.
                   // Prepare it explicitly, but never replay thread/start or a turn.
                   void prepareRuntimeProject(project).finally(bumpRuntimeScopeRevision);
+                } else if (project === leaseActiveProject && store.current()?.activationError) {
+                  void retryCurrentActivation();
                 } else {
                   retryRuntimeProject(project);
                   bumpRuntimeScopeRevision();
                 }
                 // 没有 scope 的失败在重试后仍要能说明原因，故不清掉兜底项目。
               }}
+            />
+            <RuntimeActivationNotice
+              local={!isRemoteClient() && usesLocalPaths(activeSlotRef.current)}
+              failed={Boolean((current?.activationError ||
+                (sess.currentId && activationRecoveries.current.has(sess.currentId))) &&
+                current?.status !== "running" && current?.status !== "awaiting_approval")}
+              busy={Boolean(sess.currentId && activationRecoveries.current.has(sess.currentId))}
+              onRetry={() => { void retryCurrentActivation(); }}
             />
             {/* 运行时版本横幅：与本功能无关，来自 main 的 daemon 生命周期计划。 */}
             {runtimeScopeKey !== null && runtimeControl !== null && (

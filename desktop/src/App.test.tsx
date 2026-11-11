@@ -6657,7 +6657,8 @@ describe("App 同步状态机（手机端黑屏）", () => {
     expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
     expect((document.querySelector("textarea") as HTMLTextAreaElement).value).toBe("保留我的草稿");
     expect(document.body.textContent).toContain("可阅读的历史");
-    expect(document.body.textContent).toContain("activation refused");
+    expect(document.body.textContent).toContain("运行环境未就绪");
+    expect(document.body.textContent).not.toContain("activation refused");
   });
 
   it("desktop ignores another replay's historyReady and keeps sync guarded", async () => {
@@ -8087,6 +8088,21 @@ describe("App desktop history snapshot", () => {
     });
   };
 
+  it("keeps cached history and draft visible while local preparation is pending", async () => {
+    await seed();
+    runtimeNative.acquire = () => new Promise(() => {});
+    render(<App />);
+    await screen.findByText("desktop cached text");
+    await waitFor(() => expect(runtimeNative.calls.some((c) => c.cmd === "runtime_acquire_project")).toBe(true));
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "draft during preparation" } });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByText("desktop stale tail")).toBeTruthy();
+    expect(box.value).toBe("draft during preparation");
+    expect(clients[0].requests.some((r) => r.method === "thread/resume" || r.method === "turn/start")).toBe(false);
+  });
+
   it("shows cached content even before initialize and listAll resolve", async () => {
     await seed();
     state.dataSources.initialize = () => new Promise(() => {});
@@ -8251,6 +8267,302 @@ describe("App runtime preparation wiring", () => {
     const item = await screen.findByRole("menuitem", { name: new RegExp(`^${workspace}$`) });
     fireEvent.click(item);
   };
+
+  it("activation recovery prepares and resumes once without sending the draft", async () => {
+    let resumes = 0;
+    state.dataSources["thread/resume"] = (params) => {
+      const p = params as { threadId: string; historyToken: string };
+      resumes += 1;
+      state.notifHandlers[0]({ method: "thread/historyReady", params: {
+        thread_id: p.threadId, request_token: p.historyToken,
+      } });
+      if (resumes === 1) throw { code: -1, message: "rootcap1:private-failure" };
+      return { thread_id: p.threadId, permission_mode: "normal" };
+    };
+    render(<App />);
+    const retry = await screen.findByRole("button", { name: "准备运行环境并重试" });
+    const box = document.querySelector("textarea") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "keep this recovery draft" } });
+    state.picks = [["/tmp/recovery.pdf"]];
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "附加文件" })); });
+    expect(screen.getByText("recovery.pdf")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("rootcap1:private-failure");
+    let release!: () => void;
+    let prepares = 0;
+    runtimeNative.acquire = (project) => {
+      prepares += 1;
+      return new Promise((resolve) => { release = () => resolve({
+        scopeKey: `${project}/.yi-agent/runtime`, attemptId: "recovery",
+        state: "managedReady", retry: "doNotRetry", held: true,
+      }); });
+    };
+    fireEvent.click(retry);
+    fireEvent.click(retry);
+    await waitFor(() => expect(prepares).toBe(1));
+    expect(resumes).toBe(1);
+    fireEvent.keyDown(box, { key: "Enter" });
+    await act(async () => { release(); });
+    await waitFor(() => expect(resumes).toBe(2));
+    await waitFor(() => expect(screen.queryByRole("button", {
+      name: "准备运行环境并重试",
+    })).toBeNull());
+    expect(box.value).toBe("keep this recovery draft");
+    expect(screen.getByText("recovery.pdf")).toBeTruthy();
+    expect(clients[0].requests.some((r) => r.method === "turn/start" || r.method === "thread/start")).toBe(false);
+  });
+
+  it("activation recovery stays blocked when the new preparation fails", async () => {
+    runtimeNative.acquire = async (project) => blockedAnswer(project);
+    render(<App />);
+    const retry = await screen.findByRole("button", { name: "准备运行环境并重试" });
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "keep failed recovery" } });
+    state.picks = [["/tmp/keep.pdf"]];
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "附加文件" })); });
+    fireEvent.click(retry);
+    await waitFor(() => expect((retry as HTMLButtonElement).disabled).toBe(false));
+    expect(box.value).toBe("keep failed recovery");
+    expect(screen.getByText("keep.pdf")).toBeTruthy();
+    expect(clients[0].requests.some((r) => r.method === "thread/resume" || r.method === "turn/start")).toBe(false);
+    expect((await screen.findByRole("button", { name: "准备运行环境并重试" }))).toBeTruthy();
+  });
+
+  it("waits for managed readiness before resuming a cold local thread", async () => {
+    let release!: () => void;
+    let first = true;
+    runtimeNative.acquire = (project) => {
+      const ready = {
+        scopeKey: `${project}/.yi-agent/runtime`, attemptId: "attempt-cold",
+        state: "managedReady", retry: "doNotRetry", held: true,
+      };
+      if (!first) return Promise.resolve(ready);
+      first = false;
+      return new Promise((resolve) => { release = () => resolve(ready); });
+    };
+    render(<App />);
+    await waitFor(() => expect(runtimeNative.calls.some(
+      (call) => call.cmd === "runtime_acquire_project",
+    )).toBe(true));
+    expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(0);
+    await act(async () => { release(); });
+    await waitFor(() => expect(clients[0].requests.filter(
+      (r) => r.method === "thread/resume",
+    )).toHaveLength(1));
+  });
+
+  it("does not charge preparation time to the history idle budget", async () => {
+    vi.useFakeTimers();
+    try {
+      let release!: () => void;
+      let first = true;
+      runtimeNative.acquire = (project) => {
+        const ready = { scopeKey: `${project}/.yi-agent/runtime`, attemptId: "slow",
+          state: "managedReady", retry: "doNotRetry", held: true };
+        if (!first) return Promise.resolve(ready);
+        first = false;
+        return new Promise((resolve) => { release = () => resolve(ready); });
+      };
+      state.dataSources["thread/resume"] = () => new Promise(() => {});
+      render(<App />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(document.body.textContent).not.toContain("内容加载超时");
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(false);
+      await act(async () => { release(); await vi.advanceTimersByTimeAsync(0); });
+      expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(16_000); });
+      expect(document.body.textContent).toContain("内容加载超时");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("retires an old preparation when navigating away and back", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    let release!: () => void;
+    let first = true;
+    runtimeNative.acquire = (project) => {
+      const ready = { scopeKey: `${project}/.yi-agent/runtime`, attemptId: "navigation",
+        state: "managedReady", retry: "doNotRetry", held: true };
+      if (!first) return Promise.resolve(ready);
+      first = false;
+      return new Promise((resolve) => { release = () => resolve(ready); });
+    };
+    render(<App />);
+    await waitFor(() => expect(release).toBeTypeOf("function"));
+    fireEvent.click(screen.getByText("two"));
+    fireEvent.click(screen.getByText("one"));
+    fireEvent.click(screen.getByText("one"));
+    await act(async () => { release(); });
+    await waitFor(() => expect(clients[0].requests.filter(
+      (r) => r.method === "thread/resume",
+    )).toHaveLength(1));
+    expect(clients[0].requests.find((r) => r.method === "thread/resume")?.params)
+      .toMatchObject({ threadId: "t1" });
+  });
+
+  it("does not resume the old selection after preparation completes", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    let release!: () => void;
+    let first = true;
+    runtimeNative.acquire = (project) => {
+      const ready = { scopeKey: `${project}/.yi-agent/runtime`, attemptId: "switch",
+        state: "managedReady", retry: "doNotRetry", held: true };
+      if (!first) return Promise.resolve(ready);
+      first = false;
+      return new Promise((resolve) => { release = () => resolve(ready); });
+    };
+    render(<App />);
+    await waitFor(() => expect(release).toBeTypeOf("function"));
+    fireEvent.click(screen.getByText("two"));
+    await act(async () => { release(); });
+    await waitFor(() => expect(clients[0].requests.filter(
+      (r) => r.method === "thread/resume",
+    )).toHaveLength(1));
+    expect(clients[0].requests.find((r) => r.method === "thread/resume")?.params)
+      .toMatchObject({ threadId: "t2" });
+  });
+
+  it.each(["running", "awaiting_approval"])(
+    "does not interrupt a thread that becomes %s during preparation", async (status) => {
+      let release!: () => void;
+      let first = true;
+      runtimeNative.acquire = (project) => {
+        const answer = { scopeKey: `${project}/.yi-agent/runtime`, attemptId: "busy",
+          state: "managedReady", retry: "doNotRetry", held: true };
+        if (!first) return Promise.resolve(answer);
+        first = false;
+        return new Promise((resolve) => { release = () => resolve(answer); });
+      };
+      render(<App />);
+      await waitFor(() => expect(release).toBeTypeOf("function"));
+      act(() => { state.notifHandlers[0]({ method: "thread/status/updated",
+        params: { thread_id: "t1", status } }); });
+      await act(async () => { release(); });
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(false);
+      expect(screen.queryByRole("button", { name: "准备运行环境并重试" })).toBeNull();
+    },
+  );
+
+  it("refuses local activation without guessing a missing project directory", async () => {
+    state.dataSources["thread/listAll"] = () => ({ groups: [{ workspace: "/w", exists: true,
+      threads: [{ thread_id: "t1", title: "no directory", model: "m", status: "idle",
+        created_at: 0, updated_at: 0, permission_mode: "normal" }] }], pinned: [] });
+    render(<App />);
+    await screen.findByText(/无法确定此会话的项目目录/);
+    expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(false);
+    expect(runtimeNative.calls.some((c) => c.cmd === "runtime_acquire_project")).toBe(false);
+  });
+
+  it.each(["preparing", "replaying"])(
+    "keeps an explicit retry when replacing a %s client and the next handshake fails", async (phase) => {
+      let release!: () => void;
+      if (phase === "preparing") {
+        runtimeNative.acquire = (project) => new Promise((resolve) => {
+          release = () => resolve({ scopeKey: `${project}/.yi-agent/runtime`,
+            attemptId: "retired", state: "managedReady", retry: "doNotRetry", held: true });
+        });
+      } else {
+        state.dataSources["thread/resume"] = () => new Promise(() => {});
+      }
+      render(<App />);
+      await waitFor(() => {
+        if (phase === "preparing") expect(release).toBeTypeOf("function");
+        else expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true);
+      });
+      state.failList = true;
+      act(() => { for (const cb of state.statusHandlers) cb({ state: "exited", code: 1 }); });
+      await waitFor(() => expect(clients.length).toBeGreaterThan(1));
+      expect(await screen.findByRole("button", { name: "准备运行环境并重试" })).toBeTruthy();
+      if (phase === "preparing") await act(async () => { release(); });
+      const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(box, { target: { value: "keep after disconnect" } });
+      fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+      expect(box.value).toBe("keep after disconnect");
+      expect(clients.some((c) => c.requests.some((r) => r.method === "turn/start"))).toBe(false);
+    },
+  );
+
+  it("ignores preparation from an exited client after reconnect", async () => {
+    let release!: () => void;
+    let first = true;
+    runtimeNative.acquire = (project) => {
+      const answer = { scopeKey: `${project}/.yi-agent/runtime`, attemptId: "reconnect",
+        state: "managedReady", retry: "doNotRetry", held: true };
+      if (!first) return Promise.resolve(answer);
+      first = false;
+      return new Promise((resolve) => { release = () => resolve(answer); });
+    };
+    render(<App />);
+    await waitFor(() => expect(release).toBeTypeOf("function"));
+    const old = clients[0];
+    act(() => { for (const cb of state.statusHandlers) cb({ state: "exited", code: 1 }); });
+    await waitFor(() => expect(clients).toHaveLength(2));
+    await act(async () => { release(); });
+    await waitFor(() => expect(clients[1].requests.some((r) => r.method === "thread/resume")).toBe(true));
+    expect(old.requests.some((r) => r.method === "thread/resume")).toBe(false);
+  });
+
+  it("does not resume a thread deleted during local preparation", async () => {
+    let release!: () => void;
+    runtimeNative.acquire = (project) => new Promise((resolve) => {
+      release = () => resolve({ scopeKey: `${project}/.yi-agent/runtime`,
+        attemptId: "deleted", state: "managedReady", retry: "doNotRetry", held: true });
+    });
+    render(<App />);
+    await waitFor(() => expect(release).toBeTypeOf("function"));
+    state.dataSources["thread/delete"] = () => { state.threads = []; return {}; };
+    const row = screen.getByText("one");
+    fireEvent.mouseEnter(row.closest("[data-thread-row]") ?? row);
+    fireEvent.click(screen.getByRole("button", { name: "Delete thread" }));
+    await waitFor(() => expect(screen.queryByText("one")).toBeNull());
+    await act(async () => { release(); });
+    expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(false);
+  });
+
+  it("does not resume the old recovery selection after preparation completes", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    runtimeNative.acquire = async (project) => blockedAnswer(project);
+    render(<App />);
+    const retry = await screen.findByRole("button", { name: "准备运行环境并重试" });
+    let release!: () => void;
+    let first = true;
+    runtimeNative.acquire = (project) => {
+      const answer = { scopeKey: `${project}/.yi-agent/runtime`, attemptId: "recovery-nav",
+        state: "managedReady", retry: "doNotRetry", held: true };
+      if (!first) return Promise.resolve(answer);
+      first = false;
+      return new Promise((resolve) => { release = () => resolve(answer); });
+    };
+    fireEvent.click(retry);
+    await waitFor(() => expect(release).toBeTypeOf("function"));
+    fireEvent.click(screen.getByText("two"));
+    await act(async () => { release(); });
+    await waitFor(() => expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(1));
+    expect(clients[0].requests.find((r) => r.method === "thread/resume")?.params).toMatchObject({ threadId: "t2" });
+  });
+
+  it.each(["starting", "blocked", "unknown", "legacyChoiceRequired", "throw", "null"])(
+    "does not resume a non-ready cold local thread (%s)", async (result) => {
+      runtimeNative.acquire = async (project) => {
+        if (result === "throw") throw new Error("secret-rootcap1:private");
+        if (result === "null") return null;
+        return { ...blockedAnswer(project), state: result };
+      };
+      render(<App />);
+      await screen.findByRole("alert");
+      await act(async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); });
+      expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(0);
+      expect(document.body.textContent).not.toContain("secret-rootcap1:private");
+      expect(document.body.textContent).not.toContain("/Users/secret");
+    },
+  );
 
   it("blocks thread/start when the shell says the project is not ready", async () => {
     state.groupWorkspaces = ["/w"];
