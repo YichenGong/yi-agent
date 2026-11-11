@@ -128,7 +128,7 @@ pub(crate) async fn handle(
             // 内核负责「attach_delegation → 建 driver 通道 → insert 到
             // `threads` → spawn 守望者与 driver」;RPC 层的通知与响应仍在
             // 本分支完成,与抽取前逐字一致。
-            start_thread_core(
+            if let Err(error) = start_thread_core(
                 state.threads,
                 state.pending_activation,
                 state.process_watches,
@@ -170,7 +170,16 @@ pub(crate) async fn handle(
                 state.live_settings,
                 state.live_side_parents,
             )
-            .await?;
+            .await
+            {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(id, RpcError::internal(error.to_string())),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
 
             write_notification(
                 state.hub,

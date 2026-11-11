@@ -40,6 +40,21 @@ pub(crate) struct Activation {
     /// 决定是报 `RestoreFailed` 还是接受无委派(见 `server/driver_resume.rs`)。
     pub(crate) tooling_error: Option<String>,
 }
+
+impl Activation {
+    /// A desktop that promised managed delegation must not publish a successful
+    /// session with the base (no-delegation) registry. Keep the optional fallback
+    /// for embedded callers, but make managed failure retryable at the RPC edge.
+    /// The diagnostic stays in the trace; do not send raw authority errors to UI.
+    pub(crate) fn require_managed(self, required: bool) -> anyhow::Result<Self> {
+        if required && self.tooling_error.is_some() {
+            anyhow::bail!(
+                "managed subagent runtime is not ready; prepare this project and retry opening the conversation"
+            );
+        }
+        Ok(self)
+    }
+}
 /// The scope key a conversation in `cwd` belongs to.
 ///
 /// The same resolution the guardian, the shell and the runtime status all use: one
@@ -203,10 +218,12 @@ pub(crate) fn attach_delegation(
             tooling_error: Some(format!("subagent root could not attach: {cause}")),
         };
     }
-    thread_roots
+    // Do not publish a root until its tooling is ready. A failed reassembly must
+    // leave the previous conversation's root registered and usable.
+    let had_root = thread_roots
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(thread_id.to_string(), Arc::clone(&root));
+        .contains_key(thread_id);
     match build_runtime_tooling(
         &thread_cfg,
         &root,
@@ -226,12 +243,23 @@ pub(crate) fn attach_delegation(
         lead_agent_enabled,
         extra_session_env,
     ) {
-        Ok(tooling) => Activation {
-            built: wrap_for_delegation(built, tooling),
-            runtime: Some(root),
-            tooling_error: None,
-        },
+        Ok(tooling) => {
+            thread_roots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(thread_id.to_string(), Arc::clone(&root));
+            Activation {
+                built: wrap_for_delegation(built, tooling),
+                runtime: Some(root),
+                tooling_error: None,
+            }
+        }
         Err(cause) => {
+            // A stable root may already belong to the previous session. Only
+            // detach a root created solely for this failed assembly.
+            if !had_root {
+                root.detach();
+            }
             tracing::warn!(
                 stage = "tooling",
                 %cause,

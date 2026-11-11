@@ -83,6 +83,25 @@ describe("useRuntimeScopeKey", () => {
     expect(result.current).toBe("/p/b/.yi-agent/runtime");
   });
 
+  it("re-asks the shell when the caller says the scope may have changed", async () => {
+    // A preparation can succeed *after* the first lookup answered null (the
+    // runtime was still starting). The App bumps `revision` once a preparation
+    // settles so the banner can appear without a reload.
+    answer = async () => null;
+    const { result, rerender } = renderHook(
+      ({ revision }: { revision: number }) =>
+        useRuntimeScopeKey("/p/a", true, revision),
+      { initialProps: { revision: 0 } },
+    );
+    await waitFor(() => expect(calls.length).toBe(1));
+    expect(result.current).toBeNull();
+
+    answer = async (project) => `${project}/.yi-agent/runtime`;
+    rerender({ revision: 1 });
+    await waitFor(() => expect(result.current).toBe("/p/a/.yi-agent/runtime"));
+    expect(calls.length).toBe(2);
+  });
+
   it("treats a shell that cannot answer as no scope, not as an error", async () => {
     answer = async () => {
       throw new Error("unknown command runtime_scope_for_project");

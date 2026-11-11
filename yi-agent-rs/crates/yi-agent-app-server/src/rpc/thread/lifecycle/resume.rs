@@ -248,11 +248,13 @@ pub(crate) async fn handle(
             {
                 tracing::warn!(thread_id, %error, "could not persist the resolved sandbox baseline");
             }
+            let managed_authority = crate::server::managed_snapshot(state.managed);
+            let require_managed = managed_authority.is_some();
             let activation = attach_delegation(
                 state.runtimes,
                 state.thread_roots,
                 &runtime_dir,
-                crate::server::managed_snapshot(state.managed),
+                managed_authority,
                 state.models_path,
                 state.bringup,
                 state.cfg,
@@ -278,6 +280,18 @@ pub(crate) async fn handle(
                 Some(resolved_baseline.baseline),
                 built,
             );
+            let activation = match activation.require_managed(require_managed) {
+                Ok(activation) => activation,
+                Err(error) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(error.to_string())),
+                    )
+                    .await?;
+                    return Ok(Flow::Continue);
+                }
+            };
             let BuiltAgent {
                 agent,
                 provider,

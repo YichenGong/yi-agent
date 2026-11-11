@@ -392,11 +392,10 @@ impl AuthorizationLedger {
             AuthorizationUpdate::RevokeClient { client_run_id } => {
                 self.revoked_clients.insert(client_run_id.clone());
                 self.leased_clients.remove(&client_run_id);
-                if let Some(roots) = self.by_client.remove(&client_run_id) {
-                    for root in roots {
-                        self.revoked_roots.insert(root);
-                    }
-                }
+                // The client tombstone invalidates every old capability. A
+                // stable conversation root may later be granted to a different
+                // live client; only explicit RevokeRoot tombstones the root.
+                self.by_client.remove(&client_run_id);
                 self.bindings
                     .retain(|_, authorization| authorization.client_run_id != client_run_id);
                 Ok(())
@@ -674,6 +673,40 @@ mod tests {
         let error = ledger.verify(&authorization).unwrap_err();
         assert!(error.contains("released"), "{error}");
         assert!(ledger.resolve(&authorization.capability).is_err());
+    }
+
+    #[test]
+    fn revoking_a_client_allows_a_different_authorized_owner_of_the_same_root() {
+        let mut guardian = ledger();
+        let old = guardian
+            .issue("app-run-1", "/p", LeaseMode::Business)
+            .unwrap();
+        let mut daemon = AuthorizationLedger::verifier(
+            guardian.scope_key(),
+            guardian.daemon_instance_id(),
+            guardian.generation_secret(),
+        );
+        daemon
+            .apply(AuthorizationUpdate::Bind(Box::new(old.clone())))
+            .unwrap();
+        daemon
+            .apply(AuthorizationUpdate::RevokeClient {
+                client_run_id: "app-run-1".into(),
+            })
+            .unwrap();
+        let new = guardian
+            .issue("app-run-2", "/p", LeaseMode::Business)
+            .unwrap();
+        daemon
+            .apply(AuthorizationUpdate::Bind(Box::new(new.clone())))
+            .expect("a new trusted client grant is not the revoked old grant");
+        assert!(daemon.verify(&new).is_ok());
+        assert!(daemon.verify(&old).is_err());
+        assert!(
+            daemon
+                .apply(AuthorizationUpdate::Bind(Box::new(old)))
+                .is_err()
+        );
     }
 
     /// A late duplicate binding must not re-grant what a release took away.

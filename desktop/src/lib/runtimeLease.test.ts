@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isHeldLease,
+  isReadyLease,
   leaseDecision,
   normalizeProject,
   wantedProjects,
@@ -126,6 +127,51 @@ describe("acquire results are not leases", () => {
       expect(isHeldLease({ ...starting, state })).toBe(false);
     }
     expect(isHeldLease({ ...starting, state: "managedReady" })).toBe(true);
+  });
+
+  it("reports a lease the shell still holds for a blocked project", () => {
+    // A compatible version mismatch keeps its lease while the switch is being
+    // decided. Dropping it on the way out would leak a registration the quit
+    // barrier has to release.
+    const heldBlocked: AcquireView = {
+      scopeKey: "/p/a/.yi-agent/runtime",
+      attemptId: "attempt-1",
+      state: "blocked",
+      retry: "userAction",
+      held: true,
+    };
+    expect(isHeldLease(heldBlocked)).toBe(true);
+    // Held is not ready: business work stays shut until the switch completes.
+    expect(isReadyLease(heldBlocked)).toBe(false);
+  });
+
+  it("does not infer a lease from a refusal when the shell says held is false", () => {
+    const refused: AcquireView = {
+      scopeKey: "/p/a/.yi-agent/runtime",
+      attemptId: "attempt-1",
+      state: "blocked",
+      retry: "backoff",
+      held: false,
+    };
+    expect(isHeldLease(refused)).toBe(false);
+    expect(isReadyLease(refused)).toBe(false);
+  });
+
+  it("treats an unknown held as held only when the runtime is ready", () => {
+    // Older shells do not report held. A blocked answer from them proves nothing
+    // about a lease either way, so it must not be counted as one; the hook
+    // reconciles that case with `runtime_registered_projects` instead.
+    const noHeld: AcquireView = {
+      scopeKey: "/p/a/.yi-agent/runtime",
+      attemptId: "attempt-1",
+      state: "blocked",
+      retry: "backoff",
+    };
+    expect(isHeldLease(noHeld)).toBe(false);
+    expect(isHeldLease({ ...noHeld, state: "managedReady" })).toBe(true);
+    // Only managedReady permits work, whatever held says.
+    expect(isReadyLease({ ...noHeld, state: "managedReady" })).toBe(true);
+    expect(isReadyLease({ ...noHeld, state: "blocked", held: true })).toBe(false);
   });
 });
 

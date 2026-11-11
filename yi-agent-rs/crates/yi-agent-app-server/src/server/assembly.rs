@@ -214,7 +214,9 @@ pub(crate) fn attach_cwd_runtime_with(
             // is only in the cache because the bring-up happened to run during
             // the daemon's startup window. Re-run it and let the outcome replace
             // this entry.
-            Err(failure) if failure.retryable => {}
+            Err(failure)
+                if failure.retryable
+                    || bringup.policy == yi_agent_subagent::attach::BringUpPolicy::Managed => {}
             Err(failure) => return Err(failure.to_string()),
         }
     }

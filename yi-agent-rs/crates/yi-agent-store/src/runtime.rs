@@ -1180,12 +1180,41 @@ impl RuntimeCoordinator {
         // A root never provisions a worktree: it runs in the project directory.
         let root_mode = ChildWriteMode::ReadOnly;
         let existing = {
-            self.repository
+            let repository = self
+                .repository
                 .lock()
-                .expect("runtime repository mutex poisoned")
-                .application_root_attachment(idempotency_key)?
+                .expect("runtime repository mutex poisoned");
+            match repository.application_root_attachment(idempotency_key)? {
+                Some(attachment) => Some(attachment),
+                // A managed capability is per (generation, client, root) and changes
+                // whenever the App or the daemon restarts, while the root id is
+                // derived from the scope and thread key and deliberately does not.
+                // The presented key has already been authorized for that exact root
+                // above, so this looks up the *row* the authorized root already owns
+                // rather than trusting any caller-chosen identity.
+                None => match owner_kind.authorized_root() {
+                    Some(authorization) => repository.application_root_attachment_for_root(
+                        &authorization
+                            .root_id
+                            .parse::<yi_agent_core::TaskId>()
+                            .map_err(|_| {
+                                RuntimeCoordinatorError::AdmissionClosed(
+                                    "root authorization names a root id the daemon cannot parse"
+                                        .into(),
+                                )
+                            })?,
+                    )?,
+                    None => None,
+                },
+            }
         };
         if let Some(existing) = existing {
+            // Every durable write below belongs to the row that *created* the root.
+            // Its key is not necessarily the key this attach presented: a reconnect
+            // names the same root through a new capability, and using that one for a
+            // detach or for a legacy fallback capability would address a row that
+            // does not exist.
+            let attachment_key = existing.idempotency_key.clone();
             // A root runs in place, so it keeps no workspace row: its project is
             // validated against the durable attachment record, and the in-place
             // position is synthesized from the requested project.
@@ -1198,6 +1227,10 @@ impl RuntimeCoordinator {
                     "application root workspace does not match its recorded repository".into(),
                 ));
             }
+            if owner_kind.authorized_root().is_some() {
+                self.ensure_verified_root_can_rebind(&owner, &existing)
+                    .await?;
+            }
             let workspace = service
                 .read_only_workspace(None, &existing.root_task_id)
                 .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
@@ -1206,7 +1239,7 @@ impl RuntimeCoordinator {
                 self.repository
                     .lock()
                     .expect("runtime repository mutex poisoned")
-                    .reattach_application_root(idempotency_key)?;
+                    .reattach_application_root(&attachment_key)?;
             }
             self.application_root_workspace_services
                 .lock()
@@ -1236,10 +1269,20 @@ impl RuntimeCoordinator {
             let capability = existing
                 .capability_secret
                 .clone()
-                .unwrap_or_else(|| legacy_application_root_capability(idempotency_key));
+                .unwrap_or_else(|| legacy_application_root_capability(&attachment_key));
             // Re-attaching in this generation re-establishes ownership: the root
             // is that app's again, and a closed owner was refused above.
-            self.bind_root(&owner, &existing.root_task_id.to_string())?;
+            //
+            // A managed reconnect presents a capability the ledger verified for this
+            // same root, which is the one thing that may move ownership between
+            // clients. An unmanaged or project attach has no such proof and keeps
+            // the strict binding, so a guessed root id still cannot take a live
+            // session over.
+            if owner_kind.authorized_root().is_some() {
+                self.bind_verified_root(&owner, &existing.root_task_id.to_string())?;
+            } else {
+                self.bind_root(&owner, &existing.root_task_id.to_string())?;
+            }
             return Ok(AttachedApplicationRoot {
                 session_id: existing.root_session_id,
                 root_task_id: existing.root_task_id,
@@ -2096,7 +2139,13 @@ impl RuntimeCoordinator {
         // spawned microseconds after its client's release would be admitted into
         // a tree nobody can reclaim.
         let session_root = self.session_root(session).await?;
-        self.ensure_root_open(&session_root.to_string())?;
+        let admission_owner = {
+            let clients = self.clients.lock().expect("runtime clients mutex poisoned");
+            clients
+                .root_is_open(&session_root.to_string(), &self.generation)
+                .map_err(RuntimeCoordinatorError::AdmissionClosed)?;
+            clients.owner_of(&session_root.to_string())
+        };
         if self
             .repository
             .lock()
@@ -2307,6 +2356,7 @@ impl RuntimeCoordinator {
                     self.ensure_root_dispatchable(&session_root)?;
                     Ok(crate::runtime::foreground::AdmissionStamp {
                         root: session_root_key.clone(),
+                        owner: admission_owner.clone(),
                         task: child.clone(),
                         attempt: attempt.id.clone(),
                         generation: self.generation.clone(),
@@ -2793,9 +2843,16 @@ impl RuntimeCoordinator {
             // A root task is created by its supervisor rather than by a spawn, so it
             // has no commit to ride on. It still gets a slot: otherwise the first
             // execution of a session would be the one a release cannot see.
-            None => self
-                .foreground_commit_gate
-                .begin_root_start(task.clone(), session.to_string()),
+            None => {
+                let root = supervisor.root_task_id().to_string();
+                let owner = self
+                    .clients
+                    .lock()
+                    .expect("runtime clients mutex poisoned")
+                    .owner_of(&root);
+                self.foreground_commit_gate
+                    .begin_root_start(task.clone(), root, owner)
+            }
         };
         let admitted_factory = crate::runtime::foreground::AdmittedWorkerFactory {
             inner: worker_factory,
@@ -4297,8 +4354,19 @@ impl RuntimeCoordinator {
         let Some(ledger) = guard.as_mut() else {
             return Err("this daemon has no guardian authority to update".to_string());
         };
+        let revoked_client = match &update {
+            yi_agent_lifecycle::authorization::AuthorizationUpdate::RevokeClient {
+                client_run_id,
+            } => Some(client_run_id.clone()),
+            _ => None,
+        };
         let result = ledger.apply(update);
         drop(guard);
+        if result.is_ok()
+            && let Some(client) = revoked_client
+        {
+            self.close_client_admission(&client);
+        }
         self.refresh_attach_authority();
         result
     }
@@ -4425,10 +4493,91 @@ impl RuntimeCoordinator {
     }
 
     pub fn bind_root(&self, client: &str, root: &str) -> Result<(), RuntimeCoordinatorError> {
+        self.bind_root_with_authority(client, root, false)
+    }
+
+    /// A valid guardian capability authenticates the new client; it is not proof
+    /// that another client's execution has stopped. Admission of the old owner
+    /// must already be closed, and its registered executions must be settled.
+    /// The attach lock serializes reconnects; the closed old owner cannot race a
+    /// new spawn into the interval between this check and the binding write.
+    async fn ensure_verified_root_can_rebind(
+        &self,
+        client: &str,
+        attachment: &crate::repository::ApplicationRootAttachment,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        let root = attachment.root_task_id.to_string();
+        {
+            let clients = self.clients.lock().expect("runtime clients mutex poisoned");
+            match clients.owner_of(&root) {
+                None => return Ok(()), // A new daemon generation hydrates below.
+                Some(owner) if owner == client => return Ok(()),
+                Some(owner) if !clients.is_closed(&owner) => {
+                    return Err(RuntimeCoordinatorError::AdmissionClosed(format!(
+                        "root {root} is still owned by an active client"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        let pending = self.foreground_commit_gate.snapshot_root(&root);
+        let mut outstanding = pending.starting.len() + pending.running.len();
+        let handle = self.supervisor(&attachment.root_session_id)?;
+        let supervisor = handle.lock().await;
+        outstanding += supervisor.worker_task_ids().count();
+        let tasks = supervisor.task_ids();
+        outstanding += tasks
+            .iter()
+            .filter(|task| {
+                **task != attachment.root_task_id
+                    && supervisor
+                        .task(task)
+                        .is_some_and(|task| !task.state().is_terminal())
+            })
+            .count();
+        // A terminal row is not a join certificate. Keep the old owner's
+        // unconfirmed executions in the stop set even after worker reconciliation.
+        outstanding += self
+            .unconfirmed_stops()
+            .iter()
+            .filter(|(task, _)| tasks.contains(task))
+            .count();
+        outstanding += self
+            .unproven_lease_tasks()
+            .iter()
+            .filter(|task| tasks.contains(task))
+            .count();
+        if outstanding != 0 {
+            return Err(RuntimeCoordinatorError::StopUnproven {
+                outstanding,
+                roots: vec![root],
+            });
+        }
+        Ok(())
+    }
+
+    /// Binds an authenticated, quiescent historical root to its new client.
+    /// Only managed attach calls this after its authorization and idle checks.
+    fn bind_verified_root(&self, client: &str, root: &str) -> Result<(), RuntimeCoordinatorError> {
+        self.bind_root_with_authority(client, root, true)
+    }
+
+    fn bind_root_with_authority(
+        &self,
+        client: &str,
+        root: &str,
+        takeover_authorized: bool,
+    ) -> Result<(), RuntimeCoordinatorError> {
         let mut clients = self.clients.lock().expect("runtime clients mutex poisoned");
-        clients
-            .bind_root(client, root, &self.generation)
-            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        if takeover_authorized {
+            clients
+                .bind_verified_root(client, root, &self.generation)
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+        } else {
+            clients
+                .bind_root(client, root, &self.generation)
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+        }
         let repository = self
             .repository
             .lock()
@@ -6104,12 +6253,15 @@ impl RuntimeCoordinator {
         // step, for the same reason commit is: a spawn that commits after this must
         // be refused, and a spawn that committed before it must be cancelled rather
         // than left running with nobody to ask. Nothing awaits inside.
-        let (roots, _starting) = {
-            let mut clients = self.clients.lock().expect("runtime clients mutex poisoned");
-            let roots = clients.close_client_admission(client);
-            let released = self.foreground_commit_gate.release_owner(client);
-            (roots, released)
-        };
+        // Close the gate first: commit observes this owner's tombstone even
+        // before the client ledger is updated. Never hold clients while taking
+        // the gate (commit takes them in the opposite order).
+        self.foreground_commit_gate.release_owner(client);
+        let roots = self
+            .clients
+            .lock()
+            .expect("runtime clients mutex poisoned")
+            .close_client_admission(client);
         {
             // A released owner's driver capability must stop working with its
             // admission: leaving it in the map would let a driver that outlived the
@@ -6185,7 +6337,12 @@ impl RuntimeCoordinator {
         // ignored their cancellation or are running and their stop has not been
         // recorded; reporting them is what lets a caller retry instead of believing a
         // teardown succeeded.
-        let outstanding = self.foreground_commit_gate.live_count();
+        let outstanding = released
+            .starting
+            .iter()
+            .chain(&released.running)
+            .filter(|task| self.foreground_commit_gate.is_unsettled(task))
+            .count();
         if outstanding > 0 {
             return Err(RuntimeCoordinatorError::StopUnproven {
                 outstanding,

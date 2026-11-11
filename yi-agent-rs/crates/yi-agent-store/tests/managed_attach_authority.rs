@@ -1111,3 +1111,602 @@ async fn releasing_the_lease_stops_the_project_attach() {
         .expect_err("a released client must not open a new connection");
     assert!(format!("{error}").contains("app-run-1"), "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Reconnecting an already authorized root.
+//
+// A managed capability is minted per (generation, client, root). The root id
+// itself is derived from the scope and thread key and therefore survives both a
+// client restart and a daemon restart; the capability does not. Keying the
+// durable attachment *only* by capability meant the second attach missed the
+// first row and tried to create the same root id again.
+// ---------------------------------------------------------------------------
+
+/// A second client authorized for the same root inside one generation adopts the
+/// existing root instead of creating it again.
+#[tokio::test]
+async fn a_new_capability_for_the_same_authorized_root_reattaches_it() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let secret = guardian.generation_secret();
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .expect("the first client is authorizable");
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator
+        .adopt_managed_authority(daemon)
+        .expect("the ledger names this coordinator's generation");
+
+    let attached = coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .expect("the first attach is authorized");
+    assert_eq!(attached.root_task_id.to_string(), ROOT_ID);
+
+    // The shell reconnects under a new run id. The guardian mints a different
+    // capability for the same root; the daemon must recognize the root, not the
+    // secret that happens to name it this time.
+    let second = guardian
+        .issue("app-run-2", ROOT_ID, LeaseMode::Business)
+        .expect("a second client may be authorized for the same root");
+    assert_ne!(first.capability, second.capability);
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::Bind(Box::new(second.clone())))
+        .expect("the second binding reaches the daemon");
+
+    coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .expect_err("a capability must not steal a root from its still-open owner");
+    coordinator.close_client_admission("app-run-1");
+    let reattached = coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .expect("a new capability may adopt an idle root after its old owner closed");
+
+    assert_eq!(
+        reattached.session_id, attached.session_id,
+        "the same root must keep its session container"
+    );
+    assert_eq!(reattached.root_task_id, attached.root_task_id);
+    assert!(
+        coordinator.authorize_work("app-run-2", ROOT_ID).is_ok(),
+        "the reconnecting client must own the root it was authorized for"
+    );
+
+    // Reopening the historical root must not reopen the departed client's
+    // admission or let its old capability move ownership back again.
+    coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .expect_err("the departed client's capability must remain unusable");
+    assert!(coordinator.authorize_work("app-run-2", ROOT_ID).is_ok());
+}
+
+/// Reopening an idle conversation after its previous App client closed must not
+/// leave the stable root permanently unusable within the same daemon generation.
+#[tokio::test]
+async fn a_new_client_reopens_an_idle_root_after_the_previous_client_closed() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    let mut daemon = verifier_for(&directory, &coordinator, guardian.generation_secret());
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator.adopt_managed_authority(daemon).unwrap();
+    let attached = coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .unwrap();
+    // There are no workers or descendants: this is a closed frontend, not an
+    // unsettled tool execution that a new host would be allowed to overwrite.
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::RevokeClient {
+            client_run_id: "app-run-1".into(),
+        })
+        .unwrap();
+    let second = guardian
+        .issue("app-run-2", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::Bind(Box::new(second.clone())))
+        .unwrap();
+    let reopened = coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .expect("a newly authorized client must reopen an idle historical root");
+    assert_eq!(reopened.session_id, attached.session_id);
+    assert!(coordinator.authorize_work("app-run-2", ROOT_ID).is_ok());
+    assert!(coordinator.authorize_work("app-run-1", ROOT_ID).is_err());
+}
+
+/// A spawn paused before its durable commit must not survive client revocation,
+/// and its provisional supervisor entry must not permanently block reconnect.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn a_revoked_precommit_spawn_is_rejected_then_the_root_can_reconnect() {
+    use std::time::Duration;
+
+    let directory = TempDir::new().unwrap();
+    let coordinator = Arc::new(coordinator(&directory));
+    let workspace = workspace(&directory);
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    let mut daemon = verifier_for(&directory, &coordinator, guardian.generation_secret());
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator.adopt_managed_authority(daemon).unwrap();
+    let attached = coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .unwrap();
+    let barrier = Arc::new(yi_agent_store::foreground::TestBarrier::new());
+    coordinator.install_test_barrier("before_admission_commit", barrier.clone());
+    let spawning = {
+        let coordinator = coordinator.clone();
+        let session = attached.session_id.clone();
+        let root = attached.root_task_id.clone();
+        tokio::spawn(async move { coordinator.spawn_child(&session, &root).await })
+    };
+    // Shorter than the barrier's own fallback timeout: timeout cannot masquerade
+    // as an arrival and silently turn this into a sequential test.
+    tokio::time::timeout(Duration::from_secs(2), barrier.wait_arrival())
+        .await
+        .expect("the old spawn must reach the precommit barrier");
+    assert!(!spawning.is_finished());
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::RevokeClient {
+            client_run_id: "app-run-1".into(),
+        })
+        .unwrap();
+    let second = guardian
+        .issue("app-run-2", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::Bind(Box::new(second.clone())))
+        .unwrap();
+    let pending = coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        pending,
+        RuntimeCoordinatorError::StopUnproven { .. }
+    ));
+    barrier.release_shared();
+    let result = tokio::time::timeout(Duration::from_secs(3), spawning)
+        .await
+        .expect("revoked spawn must finish")
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(RuntimeCoordinatorError::AdmissionClosed(_))
+    ));
+    let reopened = coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .expect("the rejected provisional spawn must no longer block reconnect");
+    assert_eq!(reopened.session_id, attached.session_id);
+    assert!(coordinator.authorize_work("app-run-2", ROOT_ID).is_ok());
+    assert!(coordinator.authorize_work("app-run-1", ROOT_ID).is_err());
+}
+
+/// A closed frontend is not itself proof that its registered child execution
+/// settled. Reconnect must leave that tree closed until recovery proves the stop.
+#[tokio::test]
+async fn a_closed_client_with_an_unsettled_child_cannot_be_replaced() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    let mut daemon = verifier_for(&directory, &coordinator, guardian.generation_secret());
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator.adopt_managed_authority(daemon).unwrap();
+    let attached = coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .unwrap();
+    let child = coordinator
+        .spawn_child(&attached.session_id, &attached.root_task_id)
+        .await
+        .unwrap();
+    let release = coordinator.release_owner_and_stop("app-run-1").await;
+    assert!(
+        matches!(release, Err(RuntimeCoordinatorError::StopUnproven { .. })),
+        "cancellation of a parked start is not a stop certificate: {release:?}"
+    );
+    let second = guardian
+        .issue("app-run-2", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::Bind(Box::new(second.clone())))
+        .unwrap();
+    let error = coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, RuntimeCoordinatorError::StopUnproven { .. }),
+        "{error}"
+    );
+    assert!(coordinator.authorize_work("app-run-2", ROOT_ID).is_err());
+    assert!(
+        coordinator
+            .authorize_work("app-run-1", &child.to_string())
+            .is_err()
+    );
+}
+
+/// A daemon restart is a new generation. The App presents a capability minted by
+/// the new guardian for the same stable root, and the durable attachment from the
+/// old generation must be adopted, not duplicated.
+#[tokio::test]
+async fn a_restarted_daemon_reattaches_the_same_authorized_root() {
+    let directory = TempDir::new().unwrap();
+    let workspace = workspace(&directory);
+    let database = directory.path().join("runtime.sqlite");
+
+    let first_coordinator = coordinator(&directory);
+    let mut first_guardian = guardian_for(&directory, &first_coordinator);
+    let first_secret = first_guardian.generation_secret();
+    let first = first_guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .expect("the first client is authorizable");
+    let mut first_daemon = verifier_for(&directory, &first_coordinator, first_secret);
+    first_daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    first_coordinator
+        .adopt_managed_authority(first_daemon)
+        .expect("the ledger names the first generation");
+
+    let attached = first_coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .expect("the first attach is authorized");
+    let first_generation = first_coordinator.generation().to_string();
+    drop(first_coordinator);
+
+    // A replacement daemon over the same database: different generation, and the
+    // previous ledger is gone with the process.
+    let restarted = coordinator(&directory);
+    assert_ne!(
+        first_generation,
+        restarted.generation(),
+        "reopening the database is a new daemon generation"
+    );
+    let mut restarted_guardian = guardian_for(&directory, &restarted);
+    let secret = restarted_guardian.generation_secret();
+    let reconnected = restarted_guardian
+        .issue("app-run-restarted", ROOT_ID, LeaseMode::Business)
+        .expect("the restarted guardian authorizes the same stable root");
+    let mut daemon = verifier_for(&directory, &restarted, secret);
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(reconnected.clone())))
+        .unwrap();
+    restarted
+        .adopt_managed_authority(daemon)
+        .expect("the ledger names the restarted generation");
+
+    let reattached = restarted
+        .attach_application_root(&reconnected.capability, &workspace, &[], None)
+        .await
+        .expect("a restarted daemon must adopt the root it already has");
+
+    assert_eq!(
+        reattached.root_task_id, attached.root_task_id,
+        "the stable root id is the identity a reconnect must preserve"
+    );
+    assert_eq!(
+        reattached.session_id, attached.session_id,
+        "the restarted daemon must hydrate the original container, not make a new one"
+    );
+    assert!(
+        restarted
+            .authorize_work("app-run-restarted", ROOT_ID)
+            .is_ok(),
+        "the restarted generation must bind the root to the new client"
+    );
+    // The old generation's capability cannot be replayed on the new daemon: it is
+    // not in this ledger, and nothing names a client that would admit it.
+    restarted
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .expect_err("a capability from a previous generation must not be replayed");
+
+    assert!(database.exists());
+}
+
+/// Restoring a root must not rewrite the properties recorded at creation. The
+/// linked roots are the durable half of "same session"; a reconnect that carried
+/// none must still start the worker with the original set.
+#[tokio::test]
+async fn reattaching_an_authorized_root_keeps_its_linked_roots() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+    let linked = directory.path().join("linked");
+    std::fs::create_dir_all(&linked).unwrap();
+    let linked_roots = vec![linked.to_string_lossy().into_owned()];
+
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let secret = guardian.generation_secret();
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator.adopt_managed_authority(daemon).unwrap();
+
+    let attached = coordinator
+        .attach_application_root(&first.capability, &workspace, &linked_roots, None)
+        .await
+        .expect("the first attach records its linked roots");
+    coordinator.close_client_admission("app-run-1");
+
+    let second = guardian
+        .issue("app-run-2", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::Bind(Box::new(second.clone())))
+        .unwrap();
+
+    let reattached = coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .expect("the reconnect must adopt the recorded root");
+
+    let repository = yi_agent_store::repository::RuntimeRepository::open(
+        directory.path().join("runtime.sqlite"),
+    )
+    .unwrap();
+    assert_eq!(
+        repository
+            .task_extra_roots(&reattached.root_task_id)
+            .unwrap(),
+        linked_roots,
+        "a reconnect that carries no roots must not erase the recorded ones"
+    );
+    assert_eq!(reattached.session_id, attached.session_id);
+}
+
+/// A detached root is re-adopted on reconnect, and the durable row is restored
+/// through its own key -- the capability that created it is not the key of the
+/// row forever.
+#[tokio::test]
+async fn reattaching_an_authorized_root_restores_its_detached_attachment() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let secret = guardian.generation_secret();
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator.adopt_managed_authority(daemon).unwrap();
+
+    let attached = coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .expect("the first attach is authorized");
+    // Detach authenticates with the capability the daemon issued for this root
+    // (`message_capability`), not with the guardian's attach capability: they are
+    // different secrets with different lifetimes.
+    coordinator
+        .detach_application_root(
+            &attached.session_id,
+            &attached.root_task_id,
+            &attached.message_capability,
+        )
+        .await
+        .expect("the App may detach its own root");
+
+    let database = directory.path().join("runtime.sqlite");
+    let repository = yi_agent_store::repository::RuntimeRepository::open(&database).unwrap();
+    assert_eq!(
+        repository
+            .application_root_attachment(&first.capability)
+            .unwrap()
+            .expect("the attachment row survives the detach")
+            .state,
+        "detached"
+    );
+    drop(repository);
+    coordinator.close_client_admission("app-run-1");
+
+    let second = guardian
+        .issue("app-run-2", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::Bind(Box::new(second.clone())))
+        .unwrap();
+
+    coordinator
+        .attach_application_root(&second.capability, &workspace, &[], None)
+        .await
+        .expect("a reconnect must re-adopt a detached root");
+
+    let repository = yi_agent_store::repository::RuntimeRepository::open(&database).unwrap();
+    let restored = repository
+        .application_root_attachment(&first.capability)
+        .unwrap()
+        .expect("the row is identified by the key it was created with");
+    assert_eq!(
+        restored.state, "attached",
+        "the reconnect must clear the durable detached state"
+    );
+}
+
+/// The root is stable, but its project is not negotiable: a capability for this
+/// root must not adopt it while pointing at another workspace.
+#[tokio::test]
+async fn an_authorized_root_cannot_be_reattached_to_another_workspace() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+    let elsewhere = directory.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let secret = guardian.generation_secret();
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator.adopt_managed_authority(daemon).unwrap();
+    // The project a root belongs to is recorded by the guardian's reservation, not
+    // derived from the root id. Without one this test would be asserting only the
+    // permissive workspace factory, not the check a real managed attach runs.
+    coordinator
+        .reserve_foreground_root_for_test(
+            ROOT_ID,
+            "app-run-1",
+            &first.scope_key,
+            yi_agent_lifecycle::foreground::RootBindIntent {
+                operation_id: "managed-root:thread:workspace".into(),
+                thread_key: "thread:workspace".into(),
+                workspace: workspace.clone(),
+                extra_roots: Vec::new(),
+                previous_root_capability: None,
+            },
+            yi_agent_lifecycle::foreground::RootAuthorityScope::Business,
+        )
+        .expect("the bridge reserves the root for its project");
+    coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .expect("the first attach is authorized");
+
+    let second = guardian
+        .issue("app-run-2", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::Bind(Box::new(second.clone())))
+        .unwrap();
+    let error = coordinator
+        .attach_application_root(&second.capability, &elsewhere, &[], None)
+        .await
+        .expect_err("a root's project is recorded, not chosen by the reconnect");
+    let rendered = format!("{error}");
+    assert!(
+        rendered.contains("workspace") || rendered.contains("project"),
+        "the refusal must name the workspace mismatch: {rendered}"
+    );
+}
+
+/// A reconnect is not a resurrection: after the guardian withdraws the root, the
+/// durable attachment must not be reachable any more.
+///
+/// This is the dangerous half of "look the row up by root id": the lookup is only
+/// correct because it happens *after* the capability is verified. A revoked root's
+/// binding is gone, so nothing can resolve to it, and a project attach (which never
+/// names a root) must not adopt it either just because the row still exists.
+#[tokio::test]
+async fn a_revoked_root_cannot_be_reattached() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let secret = guardian.generation_secret();
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator.adopt_managed_authority(daemon).unwrap();
+    let attached = coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .expect("the first attach is authorized");
+
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::RevokeRoot {
+            root_id: ROOT_ID.to_string(),
+        })
+        .expect("the guardian may withdraw the root");
+
+    // The capability that named the root is spent.
+    let error = coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .expect_err("a revoked root must not reattach");
+    assert!(format!("{error}").contains("authorization"), "{error}");
+
+    // A project attach is authorized as a *connection*, not for a root, so it may
+    // open one -- but it must open its own, never the revoked conversation root.
+    coordinator
+        .apply_authority_update(AuthorizationUpdate::ClientLeased {
+            client_run_id: "app-run-2".to_string(),
+        })
+        .expect("the guardian may lease a new client");
+    let project = coordinator
+        .attach_application_root("project:1234:/p:uuid", &workspace, &[], Some("app-run-2"))
+        .await
+        .expect("a leased client may open its own connection");
+    assert_ne!(
+        project.root_task_id, attached.root_task_id,
+        "a project attach must not adopt a revoked root through its stable id"
+    );
+}
+
+/// The durable lookup is reachable only through an authorized capability: naming a
+/// stable root id as the key is still the unattributed attach it always was.
+#[tokio::test]
+async fn a_known_root_id_is_not_an_attach_credential() {
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+
+    let mut guardian = guardian_for(&directory, &coordinator);
+    let secret = guardian.generation_secret();
+    let first = guardian
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
+        .unwrap();
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
+    daemon
+        .apply(AuthorizationUpdate::Bind(Box::new(first.clone())))
+        .unwrap();
+    coordinator.adopt_managed_authority(daemon).unwrap();
+    coordinator
+        .attach_application_root(&first.capability, &workspace, &[], None)
+        .await
+        .expect("the first attach is authorized");
+
+    let error = coordinator
+        .attach_application_root(ROOT_ID, &workspace, &[], None)
+        .await
+        .expect_err("a root id must not act as a capability");
+    assert!(format!("{error}").contains("authorization"), "{error}");
+}

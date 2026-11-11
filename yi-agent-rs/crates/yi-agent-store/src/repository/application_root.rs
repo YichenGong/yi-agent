@@ -39,6 +39,59 @@ impl RuntimeRepository {
             .map_err(RepositoryError::from)
     }
 
+    /// The attachment that created one root, independent of the capability that
+    /// named it at the time.
+    ///
+    /// A managed capability is minted per (generation, client, root) and therefore
+    /// changes across a client or daemon restart, while the root id is derived from
+    /// the scope and thread key and deliberately stays the same. Looking a reconnect
+    /// up by its *new* capability would miss the row that already owns that root and
+    /// then try to create the same task id again.
+    ///
+    /// Callers must only use this after the presented capability has been authorized
+    /// for this very root: a root id is public enough to be worth guessing, and this
+    /// query says nothing about who may attach it.
+    pub fn application_root_attachment_for_root(
+        &self,
+        root_task_id: &TaskId,
+    ) -> Result<Option<ApplicationRootAttachment>, RepositoryError> {
+        self.connection
+            .query_row(
+                "SELECT idempotency_key, root_session_id, root_task_id, capability_digest,
+                        capability_secret, workspace_root, state
+                 FROM application_root_attachments WHERE root_task_id = ?1
+                 ORDER BY CASE state WHEN 'attached' THEN 0 ELSE 1 END,
+                          created_at, idempotency_key
+                 LIMIT 1",
+                params![root_task_id.to_string()],
+                |row| {
+                    Ok(ApplicationRootAttachment {
+                        idempotency_key: row.get(0)?,
+                        root_session_id: row.get::<_, String>(1)?.parse().map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                1,
+                                "root_session_id".into(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?,
+                        root_task_id: row.get::<_, String>(2)?.parse().map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                2,
+                                "root_task_id".into(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?,
+                        capability_digest: row.get(3)?,
+                        capability_secret: row.get(4)?,
+                        workspace_root: row.get(5)?,
+                        state: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(RepositoryError::from)
+    }
+
     pub fn record_application_root_attachment(
         &mut self,
         idempotency_key: &str,

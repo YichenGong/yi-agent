@@ -118,11 +118,13 @@ pub(crate) async fn start_thread_core(
     // 委派是可选能力:项目 runtime 起不来就保留原 agent,只记 trace。
     // 接线刻意放在这里(而非 `threads` 守卫之内),避免与其可变借用冲突。
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(Path::new(cwd));
+    let managed_authority = crate::server::managed_snapshot(managed);
+    let require_managed = managed_authority.is_some();
     let activation = attach_delegation(
         runtimes,
         thread_roots,
         &runtime_dir,
-        crate::server::managed_snapshot(managed),
+        managed_authority,
         models_path,
         bringup,
         cfg,
@@ -145,6 +147,7 @@ pub(crate) async fn start_thread_core(
         Some(sandbox_baseline),
         built,
     );
+    let activation = activation.require_managed(require_managed)?;
     let BuiltAgent {
         agent,
         provider,

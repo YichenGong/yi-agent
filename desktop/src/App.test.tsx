@@ -15,7 +15,7 @@ type ThreadSeed = {
   driver_ref?: string;
 };
 
-const { clients, state, dragDrop } = vi.hoisted(() => ({
+const { clients, state, dragDrop, runtimeNative } = vi.hoisted(() => ({
   clients: [] as Array<{
     requests: { method: string; params: unknown }[];
     // The recovery hook the App injects as `RpcClient`'s 2nd constructor arg.
@@ -24,6 +24,16 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     // recovery" suite). Its arg is the raw request fn the real client passes.
     recover?: ((raw: (m: string, a: unknown) => Promise<unknown>) => Promise<void>) | null;
   }>,
+  // 本机壳命令的替身。App 测试跑在没有 Tauri host 的 jsdom 里，真 `invoke`
+  // 会直接抛错——那正是既有用例的既有环境。默认保持同样的抛错，只有显式设了
+  // `runtimeNative.answer` 的用例才拿到运行时就绪相关的回答。
+  runtimeNative: {
+    acquire: null as null | ((project: string) => Promise<unknown>),
+    scope: null as null | ((project: string) => Promise<unknown>),
+    // 壳里"最近一次操作"的读：这些用例都没有进行中的操作，答 null 是真实答案。
+    operation: null as null | ((scopeKey: string) => Promise<unknown>),
+    calls: [] as Array<{ cmd: string; args: unknown }>,
+  },
   state: {
     mode: "normal" as Mode,
     failSet: false,
@@ -149,6 +159,38 @@ vi.mock("./lib/contentStore", async (importOriginal) => {
 
 // The board panel's enqueue control opens the native picker twice. Stub it at
 // the module boundary the component imports lazily.
+// 壳命令：默认与"没有 Tauri host"时一致地抛错，避免改动既有用例的行为；只有
+// 显式配置的运行时回答才被采用。注解类命令（runtime_*）之外的调用一律照旧失败，
+// 因为 App 的其他路径本来就不该在测试里真的走 IPC。
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: async (cmd: string, args: unknown) => {
+    runtimeNative.calls.push({ cmd, args });
+    if (cmd === "runtime_acquire_project") {
+      // 真实桌面壳有这个命令，默认答案就该是"已就绪"。让替身抛错会把 App 的每
+      // 条既有用例都变成"本机环境准备失败"，而那不是它们要测的东西。
+      if (runtimeNative.acquire) {
+        return runtimeNative.acquire((args as { project: string }).project);
+      }
+      return {
+        scopeKey: `${(args as { project: string }).project}/.yi-agent/runtime`,
+        attemptId: "attempt-default",
+        state: "managedReady",
+        retry: "doNotRetry",
+        held: true,
+      };
+    }
+    if (cmd === "runtime_scope_for_project" && runtimeNative.scope) {
+      return runtimeNative.scope((args as { project: string }).project);
+    }
+    if (cmd === "runtime_active_operation") {
+      return runtimeNative.operation
+        ? runtimeNative.operation((args as { scopeKey: string }).scopeKey)
+        : null;
+    }
+    throw new Error(`no tauri host: ${cmd}`);
+  },
+}));
+
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: async () => state.picks.shift() ?? null,
 }));
@@ -598,6 +640,10 @@ beforeEach(() => {
   state.dataSources = {};
   state.platformUa = "";
   state.processes = [];
+  runtimeNative.acquire = null;
+  runtimeNative.scope = null;
+  runtimeNative.operation = null;
+  runtimeNative.calls.length = 0;
   state.leadCwds = [];
   state.failLead = false;
   state.leadAttempts = [];
@@ -8185,6 +8231,180 @@ describe("App desktop history snapshot", () => {
     await waitFor(() => expect(screen.getByText("saved desktop reply")).toBeTruthy());
     expect(localStorage.getItem("yi-agent.threadListCache")).toBeNull();
     expect(contentStore.current).toBeNull();
+  });
+});
+
+describe("App runtime preparation wiring", () => {
+  const blockedAnswer = (project: string) => ({
+    scopeKey: `${project}/.yi-agent/runtime`,
+    attemptId: `attempt-${project}`,
+    state: "blocked",
+    retry: "backoff",
+    reason: "/Users/secret/project/.yi-agent/runtime refused",
+    held: true,
+  });
+
+  const clickNewThreadHere = async (workspace = "w") => {
+    // 有最近目录时「新建」先开菜单，菜单条目的文案就是目录名（basename）。
+    const button = await screen.findByRole("button", { name: /new thread/i });
+    fireEvent.click(button);
+    const item = await screen.findByRole("menuitem", { name: new RegExp(`^${workspace}$`) });
+    fireEvent.click(item);
+  };
+
+  it("blocks thread/start when the shell says the project is not ready", async () => {
+    state.groupWorkspaces = ["/w"];
+    state.workspaceGroups = [];
+    state.dataSources["workspace/list"] = () => ({
+      workspaces: [{ path: "/w", exists: true }],
+    });
+    runtimeNative.acquire = async (project) => blockedAnswer(project);
+    runtimeNative.scope = async (project) => `${project}/.yi-agent/runtime`;
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+
+    await clickNewThreadHere();
+    await waitFor(() =>
+      expect(runtimeNative.calls.some((c) => c.cmd === "runtime_acquire_project")).toBe(true),
+    );
+    // 准备没就绪就不建会话：建出来的会话永远拿不到工具。
+    expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(false);
+  });
+
+  it("blocks thread/start when local preparation throws", async () => {
+    state.groupWorkspaces = ["/w"];
+    state.workspaceGroups = [];
+    state.dataSources["workspace/list"] = () => ({ workspaces: [{ path: "/w", exists: true }] });
+    runtimeNative.acquire = async () => { throw new Error("fixture IPC failure"); };
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    await clickNewThreadHere();
+    await waitFor(() => expect(runtimeNative.calls.some((c) => c.cmd === "runtime_acquire_project")).toBe(true));
+    expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(false);
+    expect(await screen.findByRole("alert")).toBeTruthy();
+  });
+
+  it("creates the thread once the project is managed-ready", async () => {
+    state.groupWorkspaces = ["/w"];
+    state.workspaceGroups = [];
+    state.dataSources["workspace/list"] = () => ({
+      workspaces: [{ path: "/w", exists: true }],
+    });
+    runtimeNative.acquire = async (project) => ({
+      scopeKey: `${project}/.yi-agent/runtime`,
+      attemptId: `attempt-${project}`,
+      state: "managedReady",
+      retry: "doNotRetry",
+      held: true,
+    });
+    runtimeNative.scope = async (project) => `${project}/.yi-agent/runtime`;
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+
+    await clickNewThreadHere();
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(true),
+    );
+  });
+
+  it("shows the fixed preparation reason without a resolved scope", async () => {
+    // 没有 scope（壳还没解析出来）时也必须能说明原因；原生文案带路径，不得透传。
+    state.groupWorkspaces = ["/w"];
+    state.workspaceGroups = [];
+    runtimeNative.acquire = async () => ({
+      scopeKey: "/w/.yi-agent/runtime",
+      attemptId: "attempt-w",
+      state: "blocked",
+      retry: "backoff",
+      reason: "/Users/secret/project/.yi-agent/runtime refused",
+      held: true,
+    });
+    runtimeNative.scope = async () => null;
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+
+    const notice = await screen.findByRole("alert");
+    expect(notice.textContent).not.toContain("/Users/secret");
+    expect(notice.textContent).toContain("未能就绪");
+    // 桌面本机才有的重试入口。
+    expect(within(notice).getByRole("button", { name: "重试" })).toBeTruthy();
+    expect(runtimeNative.calls.some((c) => c.cmd === "runtime_scope_for_project")).toBe(true);
+  });
+
+  it("retries through the shell without sending a turn or replaying the draft", async () => {
+    state.groupWorkspaces = ["/w"];
+    state.workspaceGroups = [];
+    let attempts = 0;
+    runtimeNative.acquire = async (project) => {
+      attempts += 1;
+      return blockedAnswer(project);
+    };
+    runtimeNative.scope = async (project) => `${project}/.yi-agent/runtime`;
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const notice = await screen.findByRole("alert");
+    const before = attempts;
+
+    fireEvent.click(within(notice).getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(attempts).toBe(before + 1));
+    // 重试只再准备一次，不发 turn、不重放。
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+  });
+
+  it("shows the reason for the directory whose first thread was refused", async () => {
+    // 屏上的会话属于 /w，用户从侧栏在 /w2 新建却被拦：只按当前会话项目渲染，
+    // 用户只会看到"点了没反应"。
+    state.groupWorkspaces = ["/w", "/w2"];
+    state.workspaceGroups = [];
+    state.dataSources["workspace/list"] = () => ({
+      workspaces: [
+        { path: "/w", exists: true },
+        { path: "/w2", exists: true },
+      ],
+    });
+    runtimeNative.acquire = async (project) =>
+      project === "/w"
+        ? {
+            scopeKey: "/w/.yi-agent/runtime",
+            attemptId: "attempt-w",
+            state: "managedReady",
+            retry: "doNotRetry",
+            held: true,
+          }
+        : { ...blockedAnswer(project), scopeKey: `${project}/.yi-agent/runtime` };
+    runtimeNative.scope = async (project) => `${project}/.yi-agent/runtime`;
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+
+    await clickNewThreadHere("w2");
+    await waitFor(() =>
+      expect(runtimeNative.calls.filter((c) => c.cmd === "runtime_acquire_project")).toEqual(
+        expect.arrayContaining([{ cmd: "runtime_acquire_project", args: { project: "/w2" } }]),
+      ),
+    );
+    const notice = await screen.findByRole("alert");
+    expect(notice.textContent).toContain("未能就绪");
+    expect(notice.textContent).not.toContain("/Users/secret");
+    expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(false);
+    const before = runtimeNative.calls.filter(
+      (c) => c.cmd === "runtime_acquire_project" && (c.args as { project?: string }).project === "/w2",
+    ).length;
+    fireEvent.click(within(notice).getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(runtimeNative.calls.filter(
+      (c) => c.cmd === "runtime_acquire_project" && (c.args as { project?: string }).project === "/w2",
+    ).length).toBe(before + 1));
+    expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(false);
+  });
+
+  it("never offers the local retry on a paired remote client", async () => {
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    // 远端没有本机壳：本地命令一次都不该发。
+    expect(runtimeNative.calls.filter((c) => c.cmd === "runtime_acquire_project")).toEqual([]);
   });
 });
 

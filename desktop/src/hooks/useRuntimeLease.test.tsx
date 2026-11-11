@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { useRuntimeLease, type LeaseDeps } from "./useRuntimeLease";
 
 const calls: Array<{ cmd: string; args: unknown }> = [];
@@ -34,8 +34,11 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 
-// The hook short-circuits for the remote web client; these tests are desktop.
-vi.mock("../lib/platform", () => ({ isRemoteClient: () => false }));
+// The hook short-circuits for the remote web client; these tests are desktop
+// unless a case flips `remote`. `vi.hoisted` keeps the flag visible to the
+// hoisted mock factory (a plain `let` would be in its temporal dead zone).
+const { remote } = vi.hoisted(() => ({ remote: { value: false } }));
+vi.mock("../lib/platform", () => ({ isRemoteClient: () => remote.value }));
 
 function deps(over: Partial<LeaseDeps> = {}): LeaseDeps {
   return {
@@ -47,7 +50,12 @@ function deps(over: Partial<LeaseDeps> = {}): LeaseDeps {
 }
 
 const flush = async () => {
-  for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  // The hook's work is a promise chain over several awaited commands, so a few
+  // turns is not enough to observe its settled state. `act` also commits the
+  // state updates the hook makes from that chain.
+  await act(async () => {
+    for (let i = 0; i < 50; i += 1) await Promise.resolve();
+  });
 };
 
 describe("useRuntimeLease", () => {
@@ -223,8 +231,9 @@ describe("useRuntimeLease: only real leases count", () => {
     const releasedAfterLateAnswer = calls
       .filter((call) => call.cmd === "runtime_release_project")
       .map((call) => (call.args as { scopeKey: string }).scopeKey);
-    // A late lease must not be left behind: the answer is "discarded" by being
-    // released at once, not by being forgotten.
+    // A late lease must not be left behind, and must not be released twice: the
+    // decision made while its acquire was in flight cannot release a lease that
+    // did not exist yet, so the late answer is the one that lets it go.
     expect(releasedAfterLateAnswer).toEqual(["/p/a/.yi-agent/runtime"]);
 
     calls.length = 0;
@@ -332,5 +341,456 @@ describe("useRuntimeLease: plugin views are demand too", () => {
     // Two views are aggregated into one project upstream, so the lease sees one
     // entry; a second decision with the same set must not acquire again.
     expect(calls).toEqual([]);
+  });
+});
+
+describe("useRuntimeLease: preparation failures are reported, not swallowed", () => {
+  beforeEach(async () => {
+    cleanup();
+    await flush();
+    calls.length = 0;
+    invokeImpl = null;
+    remote.value = false;
+  });
+
+  /** A refused preparation, as the shell reports it. */
+  const blocked = (project: string, reason = "runtime refused a lease") => ({
+    scopeKey: `${project}/.yi-agent/runtime`,
+    attemptId: `attempt-${project}`,
+    state: "blocked",
+    retry: "backoff",
+    reason,
+  });
+
+  it("reports a blocked preparation against its project", async () => {
+    invokeImpl = async (cmd) => {
+      if (cmd === "runtime_acquire_project") return blocked("/p/a");
+      return undefined;
+    };
+
+    const { result } = renderHook(() => useRuntimeLease(deps()));
+    await flush();
+
+    const issue = result.current.issues.get("/p/a");
+    expect(issue?.project).toBe("/p/a");
+    expect(issue?.stage).toBe("acquire");
+    // Fixed wording, not the native sentence: the reason can name paths.
+    expect(issue?.reason).not.toContain("refused a lease");
+    expect(issue?.reason.length).toBeGreaterThan(0);
+    expect(issue?.attemptId).toBe("attempt-/p/a");
+  });
+
+  it("shows a fixed reason when the shell command itself fails", async () => {
+    // A thrown command is a refusal too. It carries no state, so naive handling
+    // reads it as "not a problem" and silently drops it: the user sees a new
+    // conversation that never got prepared, with nothing to explain it.
+    invokeImpl = async (cmd) => {
+      if (cmd === "runtime_acquire_project") {
+        throw new Error("ipc broken at /Users/secret/.yi-agent/runtime");
+      }
+      return undefined;
+    };
+
+    const { result } = renderHook(() => useRuntimeLease(deps()));
+    await flush();
+
+    const issue = result.current.issues.get("/p/a");
+    expect(issue).toBeDefined();
+    expect(issue?.stage).toBe("acquire");
+    expect(issue?.reason).toContain("准备失败");
+    expect(issue?.reason).not.toContain("/Users/secret");
+  });
+
+  it("keeps a thrown failure visible after an explicit retry that also throws", async () => {
+    let attempts = 0;
+    invokeImpl = async (cmd) => {
+      if (cmd === "runtime_acquire_project") {
+        attempts += 1;
+        throw new Error("ipc broken");
+      }
+      return undefined;
+    };
+
+    const { result } = renderHook(() => useRuntimeLease(deps()));
+    await flush();
+    expect(result.current.issues.get("/p/a")).toBeDefined();
+
+    act(() => result.current.retryProject("/p/a"));
+    await flush();
+    expect(attempts).toBe(2);
+    expect(result.current.issues.get("/p/a")).toBeDefined();
+    expect(result.current.issues.get("/p/a")?.reason).toContain("准备失败");
+  });
+
+  it("still releases a held lease after an explicit retry throws", async () => {
+    let attempts = 0;
+    invokeImpl = async (cmd) => {
+      if (cmd === "runtime_acquire_project") {
+        if (++attempts > 1) throw new Error("fixture IPC failure");
+        return { ...leaseAnswer("/p/a"), held: true };
+      }
+      if (cmd === "runtime_scope_for_project") return "/p/a/.yi-agent/runtime";
+      return undefined;
+    };
+    const { result, rerender } = renderHook((props: LeaseDeps) => useRuntimeLease(props), { initialProps: deps() });
+    await flush();
+    act(() => result.current.retryProject("/p/a"));
+    await flush();
+    rerender(deps({ activeProject: null, revision: "left" }));
+    await flush();
+    expect(calls.some((call) => call.cmd === "runtime_release_project")).toBe(true);
+  });
+
+  it("does not spin: a blocked answer is not retried until the user asks", async () => {
+    let acquireCount = 0;
+    invokeImpl = async (cmd, args) => {
+      if (cmd === "runtime_acquire_project") {
+        acquireCount += 1;
+        return blocked((args as { project: string }).project);
+      }
+      return undefined;
+    };
+
+    const { rerender } = renderHook((props: LeaseDeps) => useRuntimeLease(props), {
+      initialProps: deps(),
+    });
+    await flush();
+    expect(acquireCount).toBe(1);
+
+    // Re-rendering with the same wanted set must not start another preparation.
+    rerender(deps({ revision: "a" }));
+    await flush();
+    rerender(deps({ revision: "a" }));
+    await flush();
+    expect(acquireCount).toBe(1);
+  });
+
+  it("retries the same wanted project once when the user asks", async () => {
+    let acquireCount = 0;
+    invokeImpl = async (cmd, args) => {
+      if (cmd === "runtime_acquire_project") {
+        acquireCount += 1;
+        return blocked((args as { project: string }).project);
+      }
+      if (cmd === "runtime_scope_for_project") {
+        return `${(args as { project: string }).project}/.yi-agent/runtime`;
+      }
+      return undefined;
+    };
+
+    const { result } = renderHook(() => useRuntimeLease(deps()));
+    await flush();
+    expect(acquireCount).toBe(1);
+
+    act(() => result.current.retryProject("/p/a"));
+    await flush();
+    expect(acquireCount).toBe(2);
+    // One retry is one preparation; it must not loop on its own.
+    await flush();
+    expect(acquireCount).toBe(2);
+  });
+
+  it("drops a late failure for a project the user already left", async () => {
+    let answerA: (view: unknown) => void = () => {};
+    const acquireA = new Promise((resolve) => {
+      answerA = resolve;
+    });
+    invokeImpl = async (cmd, args) => {
+      if (cmd === "runtime_acquire_project") {
+        const project = (args as { project: string }).project;
+        if (project === "/p/a") return acquireA;
+        return {
+          scopeKey: `${project}/.yi-agent/runtime`,
+          attemptId: `attempt-${project}`,
+          state: "managedReady",
+          retry: "doNotRetry",
+          held: true,
+        };
+      }
+      if (cmd === "runtime_scope_for_project") {
+        return `${(args as { project: string }).project}/.yi-agent/runtime`;
+      }
+      return undefined;
+    };
+
+    const { result, rerender } = renderHook((props: LeaseDeps) => useRuntimeLease(props), {
+      initialProps: deps(),
+    });
+    await flush();
+
+    rerender(deps({ activeProject: "/p/b", revision: "b" }));
+    await flush();
+
+    answerA(blocked("/p/a", "late refusal"));
+    await flush();
+
+    // A is wanted no longer, so its failure is not the current project's problem.
+    expect(result.current.issues.get("/p/a")).toBeUndefined();
+    expect(result.current.issues.get("/p/b")).toBeUndefined();
+  });
+
+  it("releases a blocked project the shell still holds when the user leaves", async () => {
+    invokeImpl = async (cmd, args) => {
+      if (cmd === "runtime_acquire_project") {
+        const project = (args as { project: string }).project;
+        return {
+          ...blocked(project, "a newer runtime is serving this project"),
+          held: true,
+          retry: "userAction",
+        };
+      }
+      if (cmd === "runtime_scope_for_project") {
+        return `${(args as { project: string }).project}/.yi-agent/runtime`;
+      }
+      return undefined;
+    };
+
+    const { rerender } = renderHook((props: LeaseDeps) => useRuntimeLease(props), {
+      initialProps: deps(),
+    });
+    await flush();
+    calls.length = 0;
+
+    rerender(deps({ activeProject: null, revision: "none" }));
+    await flush();
+
+    expect(calls).toEqual([
+      { cmd: "runtime_release_project", args: { scopeKey: "/p/a/.yi-agent/runtime" } },
+    ]);
+  });
+
+  it("keeps a blocked project's failure visible after the lease is released", async () => {
+    invokeImpl = async (cmd) => {
+      if (cmd === "runtime_acquire_project") {
+        return {
+          ...blocked("/p/a", "a newer runtime is serving this project"),
+          held: true,
+          retry: "userAction",
+        };
+      }
+      if (cmd === "runtime_scope_for_project") return "/p/a/.yi-agent/runtime";
+      return undefined;
+    };
+
+    const { result, rerender } = renderHook((props: LeaseDeps) => useRuntimeLease(props), {
+      initialProps: deps(),
+    });
+    await flush();
+    expect(result.current.issues.get("/p/a")?.stage).toBe("acquire");
+
+    rerender(deps({ activeProject: null, revision: "none" }));
+    await flush();
+    // Leaving is not a retry: the problem must still be there for the user to act
+    // on, in fixed wording rather than the native sentence.
+    expect(result.current.issues.get("/p/a")?.reason).not.toContain("newer runtime");
+    expect(result.current.issues.get("/p/a")?.state).toBe("blocked");
+  });
+
+  it("keeps working after the scope lookup fails, and can still release", async () => {
+    // A rejected `runtime_scope_for_project` used to reject the serialised chain
+    // itself, so every later acquire and release silently stopped running. The
+    // lease was then held by a shell that would never let it go.
+    let failScope = true;
+    invokeImpl = async (cmd, args) => {
+      if (cmd === "runtime_acquire_project") {
+        const project = (args as { project: string }).project;
+        return { ...blocked(project), held: true, retry: "userAction" };
+      }
+      if (cmd === "runtime_scope_for_project") {
+        if (failScope) throw new Error("the shell could not resolve /p/a");
+        return `${(args as { project: string }).project}/.yi-agent/runtime`;
+      }
+      return undefined;
+    };
+
+    const { result, rerender } = renderHook((props: LeaseDeps) => useRuntimeLease(props), {
+      initialProps: deps(),
+    });
+    await flush();
+
+    // The user asks for another attempt; the scope lookup now succeeds.
+    failScope = false;
+    act(() => result.current.retryProject("/p/a"));
+    await flush();
+    expect(
+      calls.filter((call) => call.cmd === "runtime_acquire_project").length,
+    ).toBeGreaterThanOrEqual(2);
+
+    // Leaving must still release: a failed lookup earlier cannot poison the chain.
+    calls.length = 0;
+    rerender(deps({ activeProject: null, revision: "none" }));
+    await flush();
+    expect(calls).toContainEqual({
+      cmd: "runtime_release_project",
+      args: { scopeKey: "/p/a/.yi-agent/runtime" },
+    });
+  });
+
+  it("releases a held project when the scope lookup keeps failing and the user leaves", async () => {
+    // The acquire did happen, so a lease exists even though its key could not be
+    // resolved. The shell's own canonical key is asked for once more at release
+    // time rather than being remembered from a failed lookup.
+    let scopeCalls = 0;
+    invokeImpl = async (cmd, args) => {
+      if (cmd === "runtime_acquire_project") {
+        const project = (args as { project: string }).project;
+        return { ...blocked(project), held: true, retry: "userAction" };
+      }
+      if (cmd === "runtime_scope_for_project") {
+        scopeCalls += 1;
+        if (scopeCalls === 1) throw new Error("transient scope failure");
+        return `${(args as { project: string }).project}/.yi-agent/runtime`;
+      }
+      return undefined;
+    };
+
+    const { rerender } = renderHook((props: LeaseDeps) => useRuntimeLease(props), {
+      initialProps: deps(),
+    });
+    await flush();
+    calls.length = 0;
+
+    rerender(deps({ activeProject: null, revision: "none" }));
+    await flush();
+
+    expect(calls).toContainEqual({
+      cmd: "runtime_release_project",
+      args: { scopeKey: "/p/a/.yi-agent/runtime" },
+    });
+  });
+
+  it("never renders the native reason verbatim", async () => {
+    // A native reason can name an absolute path or an error from a socket. Only
+    // the fixed table may reach the page.
+    invokeImpl = async (cmd) => {
+      if (cmd === "runtime_acquire_project") {
+        return blocked("/p/a", "/Users/secret/project/.yi-agent/runtime refused");
+      }
+      return undefined;
+    };
+
+    const { result } = renderHook(() => useRuntimeLease(deps()));
+    await flush();
+
+    const issue = result.current.issues.get("/p/a");
+    expect(issue?.stage).toBe("acquire");
+    expect(issue?.reason).not.toContain("/Users/secret");
+    expect(issue?.reason).not.toContain(".yi-agent");
+    expect(issue?.state).toBe("blocked");
+  });
+
+  it("invalidates the in-flight reply as soon as the user retries", async () => {
+    // The retry must supersede the request already on the wire, not only the
+    // next one: otherwise a late failure from the first attempt can land after
+    // the retry and describe a request the user has already replaced.
+    let answerFirst: (view: unknown) => void = () => {};
+    const first = new Promise((resolve) => {
+      answerFirst = resolve;
+    });
+    let acquireCount = 0;
+    invokeImpl = async (cmd, args) => {
+      if (cmd === "runtime_acquire_project") {
+        acquireCount += 1;
+        if (acquireCount === 1) return first;
+        return blocked((args as { project: string }).project);
+      }
+      return undefined;
+    };
+
+    const { result } = renderHook(() => useRuntimeLease(deps()));
+    await flush();
+    expect(acquireCount).toBe(1);
+
+    // Retry while the first acquire is still in flight. The decisions are
+    // serialised, so the second acquire starts once the first settles.
+    act(() => result.current.retryProject("/p/a"));
+    await flush();
+
+    // The first attempt's late answer must be dropped, not applied: its sequence
+    // was superseded when the retry was queued.
+    answerFirst(blocked("/p/a", "a stale refusal"));
+    await flush();
+    expect(acquireCount).toBe(2);
+    expect(result.current.issues.get("/p/a")?.reason).not.toContain("stale refusal");
+  });
+
+  it("prepares a project on demand and reports the shell's answer", async () => {
+    // The create-conversation path needs the answer *before* `thread/start`: a
+    // conversation created against a project that is not managed-ready can never
+    // run a tool.
+    const { result } = renderHook(() =>
+      useRuntimeLease(deps({ activeProject: null, revision: "none" })),
+    );
+    await flush();
+
+    let view: unknown = null;
+    await act(async () => {
+      view = await result.current.prepareProject("/p/a");
+    });
+    expect((view as { state: string }).state).toBe("managedReady");
+    expect(calls).toContainEqual({
+      cmd: "runtime_acquire_project",
+      args: { project: "/p/a" },
+    });
+    // A managed-ready answer is not a problem, so nothing is shown.
+    expect(result.current.issues.get("/p/a")).toBeUndefined();
+  });
+
+  it("reports a failed on-demand preparation and keeps it visible", async () => {
+    invokeImpl = async (cmd) => {
+      if (cmd === "runtime_acquire_project") return blocked("/p/a");
+      return undefined;
+    };
+    const { result } = renderHook(() =>
+      useRuntimeLease(deps({ activeProject: null, revision: "none" })),
+    );
+    await flush();
+
+    let view: unknown = "not asked";
+    await act(async () => {
+      view = await result.current.prepareProject("/p/a");
+    });
+    expect((view as { state: string }).state).toBe("blocked");
+    const issue = result.current.issues.get("/p/a");
+    expect(issue?.stage).toBe("acquire");
+    expect(issue?.reason).not.toContain("refused a lease");
+  });
+
+  it("does not acquire the prepared project twice when it becomes active", async () => {
+    const { result, rerender } = renderHook(
+      (props: LeaseDeps) => useRuntimeLease(props),
+      { initialProps: deps({ activeProject: null, revision: "none" }) },
+    );
+    await flush();
+
+    await act(async () => {
+      await result.current.prepareProject("/p/a");
+    });
+    calls.length = 0;
+
+    rerender(deps({ activeProject: "/p/a", revision: "a" }));
+    await flush();
+    expect(calls.filter((call) => call.cmd === "runtime_acquire_project")).toEqual([]);
+  });
+
+  it("prepares nothing for the remote client", async () => {
+    remote.value = true;
+    const { result } = renderHook(() => useRuntimeLease(deps()));
+    await flush();
+    let view: unknown = "not asked";
+    await act(async () => {
+      view = await result.current.prepareProject("/p/a");
+    });
+    expect(view).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
+  it("makes no local preparation calls for the remote client", async () => {
+    // The remote web client has no shell and no sidecar, so a local command would
+    // fail for a reason that says nothing about the project. Keep it a no-op.
+    remote.value = true;
+    renderHook(() => useRuntimeLease(deps()));
+    await flush();
+    expect(calls.filter((c) => c.cmd === "runtime_acquire_project")).toEqual([]);
   });
 });

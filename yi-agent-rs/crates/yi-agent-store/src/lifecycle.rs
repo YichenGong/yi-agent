@@ -92,7 +92,20 @@ impl RuntimeClients {
     /// Refuses to rebind a live root to a different client: a second frontend
     /// must not be able to take over a running session by guessing its thread id.
     pub fn bind_root(&mut self, client: &str, root: &str, generation: &str) -> Result<(), String> {
-        self.bind_root_with_parent(client, root, generation, None)
+        self.bind_root_with_parent(client, root, generation, None, false)
+    }
+
+    /// Binds an authenticated root after the coordinator proved it quiescent.
+    /// A different owner must already have closed admission. The coordinator
+    /// checks pending execution slots and workers before calling this method;
+    /// a capability alone is never permission to steal a live owner's root.
+    pub fn bind_verified_root(
+        &mut self,
+        client: &str,
+        root: &str,
+        generation: &str,
+    ) -> Result<(), String> {
+        self.bind_root_with_parent(client, root, generation, None, true)
     }
 
     /// Bind a descendant root, inheriting ownership from its parent.
@@ -107,7 +120,7 @@ impl RuntimeClients {
             .get(parent)
             .map(|binding| binding.owner.clone())
             .ok_or_else(|| format!("parent root {parent} is not bound"))?;
-        self.bind_root_with_parent(&owner, root, generation, Some(parent.to_string()))
+        self.bind_root_with_parent(&owner, root, generation, Some(parent.to_string()), false)
     }
 
     /// Records a descendant's ownership under its parent's, *without* consulting
@@ -160,14 +173,42 @@ impl RuntimeClients {
         root: &str,
         generation: &str,
         parent: Option<RootId>,
+        takeover_authorized: bool,
     ) -> Result<(), String> {
+        if self.closed.contains(client) {
+            return Err(format!("client {client} has closed admission"));
+        }
+        if takeover_authorized {
+            if let Some(existing) = self.roots.get(root) {
+                if existing.generation != generation {
+                    return Err(format!("root {root} belongs to another generation"));
+                }
+                if existing.owner != client && !self.closed.contains(&existing.owner) {
+                    return Err(format!(
+                        "root {root} is still owned by active client {}",
+                        existing.owner
+                    ));
+                }
+            }
+            if self
+                .exited
+                .iter()
+                .any(|entry| entry.root == root && entry.reason == ExitReason::Maintenance)
+            {
+                return Err(format!("root {root} is closed by maintenance"));
+            }
+            // The coordinator only reaches this after checking that the departed
+            // owner's workers and gate slots have settled. This reopens the root,
+            // never the old client's admission, and never an arbitrary task.
+            self.exited.retain(|entry| entry.root != root);
+        }
         if self.is_exited(root) {
             return Err(format!(
                 "root {root} already stopped accepting work; it cannot be rebound"
             ));
         }
         if let Some(existing) = self.roots.get(root) {
-            if existing.owner != client {
+            if existing.owner != client && !takeover_authorized {
                 return Err(format!(
                     "root {root} is owned by client {}; client {client} cannot take it over",
                     existing.owner
@@ -179,7 +220,9 @@ impl RuntimeClients {
                     existing.generation
                 ));
             }
-            return Ok(());
+            if existing.owner == client {
+                return Ok(());
+            }
         }
         if self.closed.contains(client) {
             return Err(format!("client {client} has closed admission"));

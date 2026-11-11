@@ -38,6 +38,7 @@ use crate::runtime::RuntimeCoordinatorError;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AdmissionStamp {
     pub(crate) root: RootId,
+    pub(crate) owner: Option<String>,
     pub(crate) task: TaskId,
     pub(crate) attempt: AttemptId,
     pub(crate) generation: String,
@@ -67,6 +68,7 @@ struct ExecutionSlot {
     /// root B's spawns in the same session tree, and a rebind of one conversation
     /// must not stop another's work.
     root: RootId,
+    owner: Option<String>,
     phase: StartPhase,
     cancellation: CancellationToken,
     /// Present once a handle exists.
@@ -216,6 +218,17 @@ impl ForegroundCommitGate {
     ) -> Result<(AdmissionStamp, StartingPermit, T), CommitRefusal<E>> {
         let mut state = self.state.lock().expect("foreground gate mutex poisoned");
         let stamp = may_admit().map_err(CommitRefusal::Refused)?;
+        if stamp
+            .owner
+            .as_ref()
+            .is_some_and(|owner| state.closed_owners.contains(owner))
+        {
+            return Err(CommitRefusal::Refused(
+                RuntimeCoordinatorError::AdmissionClosed(
+                    "the execution's original owner has closed admission".into(),
+                ),
+            ));
+        }
         if state.frozen_roots.contains(&stamp.root) {
             // Checked after the caller's own admission check so the refusal names the
             // real reason when both apply, and inside the lock so a freeze that landed
@@ -232,6 +245,7 @@ impl ForegroundCommitGate {
             stamp.task.clone(),
             ExecutionSlot {
                 root: stamp.root.clone(),
+                owner: stamp.owner.clone(),
                 phase: StartPhase::Starting,
                 cancellation: CancellationToken::new(),
                 handle: None,
@@ -256,6 +270,16 @@ impl ForegroundCommitGate {
         state.slots.get(task).is_some_and(|slot| {
             slot.phase != StartPhase::Stopped && !slot.cancellation.is_cancelled()
         })
+    }
+
+    /// Whether an execution still lacks a recorded stop. Cancellation only
+    /// withdraws permission to run; it is not evidence that a factory answered.
+    pub(crate) fn is_unsettled(&self, task: &TaskId) -> bool {
+        let state = self.state.lock().expect("foreground gate mutex poisoned");
+        state
+            .slots
+            .get(task)
+            .is_some_and(|slot| slot.phase != StartPhase::Stopped)
     }
 
     /// The token a released slot must observe. Public within the crate because the
@@ -309,6 +333,9 @@ impl ForegroundCommitGate {
         state.closed_owners.insert(owner.to_string());
         let mut released = ReleasedOwner::default();
         for (task, slot) in state.slots.iter_mut() {
+            if slot.owner.as_deref() != Some(owner) {
+                continue;
+            }
             match slot.phase {
                 StartPhase::Starting => {
                     slot.cancellation.cancel();
@@ -438,6 +465,7 @@ impl ForegroundCommitGate {
     /// Diagnostics for tests today; the stop-proof path reports this so a release
     /// can say how much work it still has outstanding instead of reporting success.
     #[cfg_attr(test, allow(dead_code))]
+    #[cfg(any(test, feature = "foreground-test-support"))]
     pub(crate) fn live_count(&self) -> usize {
         let state = self.state.lock().expect("foreground gate mutex poisoned");
         state
@@ -453,7 +481,12 @@ impl ForegroundCommitGate {
     /// no commit to ride on. It still needs a slot: a release has to be able to see
     /// and cancel a root that is starting, or the very first execution of a session
     /// would be the one execution nobody tracks.
-    pub(crate) fn begin_root_start(self: &Arc<Self>, task: TaskId, root: RootId) -> StartingPermit {
+    pub(crate) fn begin_root_start(
+        self: &Arc<Self>,
+        task: TaskId,
+        root: RootId,
+        owner: Option<String>,
+    ) -> StartingPermit {
         let mut state = self.state.lock().expect("foreground gate mutex poisoned");
         // A retry starts the *same* task id under a new attempt, so a stopped slot
         // from the previous attempt must be replaced rather than reused: its token is
@@ -463,12 +496,20 @@ impl ForegroundCommitGate {
         });
         if !reuse {
             let (witness, _confirmation) = StopWitness::pair();
+            let cancellation = CancellationToken::new();
+            if owner
+                .as_ref()
+                .is_some_and(|owner| state.closed_owners.contains(owner))
+            {
+                cancellation.cancel();
+            }
             state.slots.insert(
                 task.clone(),
                 ExecutionSlot {
                     root: root.clone(),
+                    owner,
                     phase: StartPhase::Starting,
-                    cancellation: CancellationToken::new(),
+                    cancellation,
                     handle: None,
                     witness: Some(witness),
                 },
@@ -683,6 +724,7 @@ mod tests {
     fn stamp(root: &str) -> AdmissionStamp {
         AdmissionStamp {
             root: root.to_string(),
+            owner: Some("app".into()),
             task: TaskId::new(),
             attempt: AttemptId::new(),
             generation: "g1".into(),
@@ -745,6 +787,27 @@ mod tests {
         assert!(refused(outcome));
         assert!(!wrote.get());
         assert_eq!(gate.live_count(), 0);
+    }
+
+    #[test]
+    fn releasing_one_owner_keeps_other_owners_slots_live() {
+        let gate = gate();
+        let mut other = stamp("thread:b");
+        other.owner = Some("other-app".into());
+        let (_, other_permit, ()) = gate.commit(|| Ok(other), |_| Ok::<_, ()>(())).unwrap();
+        let (mine, mine_permit, ()) = gate
+            .commit(|| Ok(stamp("thread:a")), |_| Ok::<_, ()>(()))
+            .unwrap();
+        let released = gate.release_owner("app");
+        assert_eq!(released.starting, vec![mine.task]);
+        assert!(!mine_permit.is_live());
+        assert!(
+            other_permit.is_live(),
+            "another client's slot must not be cancelled"
+        );
+        assert!(refused(
+            gate.commit(|| Ok(stamp("thread:new")), |_| Ok::<_, ()>(()))
+        ));
     }
 
     #[test]

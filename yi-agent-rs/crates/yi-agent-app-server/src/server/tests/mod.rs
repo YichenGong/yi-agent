@@ -601,6 +601,7 @@ pub(crate) struct Harness {
     /// second `Arc` here would be a second slot, and every assertion about "the
     /// handshake installed this session's identity" would pass against an empty one.
     pub(crate) managed: crate::server::ManagedSlot,
+    pub(crate) thread_roots: crate::server::ThreadRoots,
     pub(crate) plugins_dir: tempfile::TempDir,
     pub(crate) daemon_calls: DaemonCalls,
     /// The host policy this harness installed. Kept (rather than dropped after
@@ -1395,6 +1396,7 @@ impl Harness {
         // 与 `view_frames` / `managed` 同一手法：宿主写入、测试观察。
         let live_side_parents = live_side_parents
             .unwrap_or_else(|| Arc::new(crate::side_conversation::LiveSideParents::new()));
+        let thread_roots: crate::server::ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
         let handle = tokio::spawn(serve_scoped(
             server_r,
             server_w,
@@ -1405,7 +1407,7 @@ impl Harness {
             Arc::clone(&hub),
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
-                thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                thread_roots: Arc::clone(&thread_roots),
                 managed: Arc::clone(&managed),
                 bringup: Arc::clone(&bringup),
                 models_path: models_dir.path().join("models.json"),
@@ -1478,6 +1480,7 @@ impl Harness {
             lead_control_replies,
             view_frames,
             managed,
+            thread_roots,
             plugins_dir,
             daemon_calls,
             bringup,
