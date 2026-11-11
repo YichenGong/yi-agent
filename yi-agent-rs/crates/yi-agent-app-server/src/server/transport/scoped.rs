@@ -457,6 +457,7 @@ where
         inbound_tx.clone(),
         if merged { Some(stdio_eof_tx) } else { None },
         management.clone(),
+        Arc::clone(&hub),
     ));
     // scope 随连接登记一次;主循环按 `client` id 查它。stdio 会话只此一条,故
     // 传入的表就是一张只装 `local` 的注册表(与 ws 的动态注册同型,便于共享)。

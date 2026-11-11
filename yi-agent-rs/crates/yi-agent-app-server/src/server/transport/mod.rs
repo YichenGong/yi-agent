@@ -66,6 +66,154 @@ pub use scoped::{
 #[allow(unused_imports)]
 pub(crate) use stdio::{pump_stdout, read_lines};
 
+/// Processes only private local frames, independently of business dispatch.
+/// Both the stdio reader and the in-memory transport harness use this same gate.
+async fn handle_local_management(
+    value: &serde_json::Value,
+    handle: &Arc<crate::server::local_management::ManagementHandle>,
+    hub: &Arc<crate::broadcast::Broadcaster>,
+    client: &crate::broadcast::ClientId,
+) -> anyhow::Result<bool> {
+    // bootstrap 必须**先于**普通管理请求判定：它是唯一一条没有
+    // `id`、也不是请求的帧，而它的方法名同样落在 `_shell/` 前缀
+    // 里。反过来写就会让凭据帧被当成"未知管理方法"拒掉，然后
+    // 一个永远认证不上的会话把所有业务帧一起挡在门外。
+    //
+    // 判定条件刻意写成「没有 id + 带 secret」而不只看方法名：
+    // 凭据帧不该有机会冒充一条带 id 的请求。
+    let is_bootstrap = value.get("id").is_none()
+        && value.get("secret").is_some()
+        && value
+            .get("method")
+            .and_then(|m| m.as_str())
+            .is_none_or(|method| method == crate::server::local_management::BOOTSTRAP_METHOD);
+    if is_bootstrap {
+        match serde_json::from_value::<crate::server::local_management::BootstrapFrame>(
+            value.clone(),
+        ) {
+            Ok(frame) => {
+                // The session guard must not outlive this block. It is
+                // the same lock every `prepare`, every migration call
+                // and the per-frame business gate take (see below), and
+                // the reply write at the end of this arm is an `.await`
+                // on the outbound hub: a client that stops draining its
+                // fd would otherwise stall every authenticated request on
+                // this connection behind one unrelated bootstrap ack.
+                let session = handle.session();
+                let (admission, reply) = {
+                    let mut session = session.lock().await;
+                    let admission = session.bootstrap(&frame);
+                    let ack = match admission {
+                        crate::server::local_management::Admission::Accepted => "accepted",
+                        crate::server::local_management::Admission::AlreadyBootstrapped => {
+                            "already-bootstrapped"
+                        }
+                        crate::server::local_management::Admission::Unauthorized => "unauthorized",
+                    };
+                    let reply = crate::server::local_management::bootstrap_ack(
+                        ack,
+                        session.sidecar_epoch(),
+                    );
+                    (admission, reply)
+                };
+                // The outbound half of the channel exists only after the
+                // credential is fixed: before that there is no epoch to
+                // name in a request, and the shell would refuse it.
+                if admission == crate::server::local_management::Admission::Accepted {
+                    // The epoch is fixed here, once, by the frame that was
+                    // authenticated. Nothing later may move it: a snapshot
+                    // that could name its own epoch would be able to install
+                    // authority for a generation the shell never spoke for.
+                    handle.fix_epoch(&frame.sidecar_epoch);
+                    handle.install_outbound(Arc::new(
+                        crate::server::management_client::ManagementClient::new(
+                            frame.secret.clone(),
+                            frame.sidecar_epoch.clone(),
+                            Arc::new(crate::server::management_client::HubWrite::new(
+                                Arc::clone(hub),
+                                client.clone(),
+                            )),
+                        ),
+                    ));
+                }
+                hub.reply(client, serde_json::to_value(&reply)?).await.ok();
+            }
+            Err(error) => {
+                let refused = crate::server::local_management::refusal_for(
+                    value.get("id"),
+                    format!("malformed bootstrap frame: {error}"),
+                );
+                hub.reply(client, serde_json::to_value(&refused)?)
+                    .await
+                    .ok();
+            }
+        }
+        return Ok(true);
+    }
+    if crate::server::local_management::is_reserved_method(value) {
+        let parsed: Option<crate::server::local_management::ManagementRequest> =
+            serde_json::from_value(value.clone()).ok();
+        let Some(request) = parsed else {
+            // 占用了保留前缀却没有合法形状：同样不回落，直接拒绝。
+            let refused = crate::server::local_management::refusal_for(
+                value.get("id"),
+                "malformed management frame",
+            );
+            hub.reply(client, serde_json::to_value(&refused)?)
+                .await
+                .ok();
+            return Ok(true);
+        };
+        // prepare 走后台任务，**不**在读取循环里 await。
+        //
+        // 一次 bring-up 的预算是 30s。若在这里同步等，整条 stdio
+        // 会被占满：壳既发不出取消，也没法对第二个 scope 发起准备，
+        // 而"同 scope 并发只启动一次"这条去重根本不会发生——请求
+        // 被串行化之后永远不重叠。其余管理方法很快，保持内联即可。
+        let slow =
+            request.method == SLOW_MANAGEMENT_METHOD || request.method == SLOW_AUTHORIZE_METHOD;
+        // 后台任务需要 `'static`：先克隆一份句柄，别借用外层绑定。
+        let owned_handle = Arc::clone(handle);
+        let deadline = yi_agent_lifecycle::deadline::Deadline::after(
+            yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT,
+        );
+        let reply_to = client.clone();
+        let reply_hub = Arc::clone(hub);
+        let work = async move {
+            let response =
+                crate::server::local_management::dispatch(owned_handle.as_ref(), request, deadline)
+                    .await;
+            let Ok(frame) = serde_json::to_value(&response) else {
+                return;
+            };
+            // 私有响应同样受帧上限约束：不该比业务帧多出一条不受限
+            // 的通道。
+            if frame.to_string().len()
+                > crate::server::local_management::MAX_MANAGEMENT_RESPONSE_BYTES
+            {
+                let refused = crate::server::local_management::refusal(
+                    "management response exceeds the frame limit",
+                );
+                if let Ok(refused) = serde_json::to_value(&refused) {
+                    reply_hub.reply(&reply_to, refused).await.ok();
+                }
+                return;
+            }
+            // 私有响应直接定向回写，**不**经 hub 广播、也不进
+            // `app.emit`：它携带 epoch 与授权相关结果，前端页面
+            // 不该看见，更不该能代答。
+            reply_hub.reply(&reply_to, frame).await.ok();
+        };
+        if slow {
+            tokio::spawn(work);
+        } else {
+            work.await;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Records the identity this session was authorized under, for the managed attach path.
 ///
 /// Only the *identity* comes from the handshake: the epoch was fixed by the authenticated
@@ -561,162 +709,8 @@ where
                 }
                 if local_managed
                     && let Some(handle) = management.as_ref()
+                    && handle_local_management(&value, handle, &hub, &client).await?
                 {
-                    // bootstrap 必须**先于**普通管理请求判定：它是唯一一条没有
-                    // `id`、也不是请求的帧，而它的方法名同样落在 `_shell/` 前缀
-                    // 里。反过来写就会让凭据帧被当成"未知管理方法"拒掉，然后
-                    // 一个永远认证不上的会话把所有业务帧一起挡在门外。
-                    //
-                    // 判定条件刻意写成「没有 id + 带 secret」而不只看方法名：
-                    // 凭据帧不该有机会冒充一条带 id 的请求。
-                    let is_bootstrap = value.get("id").is_none()
-                        && value.get("secret").is_some()
-                        && value
-                            .get("method")
-                            .and_then(|m| m.as_str())
-                            .is_none_or(|method| {
-                                method == crate::server::local_management::BOOTSTRAP_METHOD
-                            });
-                    if is_bootstrap {
-                        match serde_json::from_value::<
-                            crate::server::local_management::BootstrapFrame,
-                        >(value.clone())
-                        {
-                            Ok(frame) => {
-                                // The session guard must not outlive this block. It is
-                                // the same lock every `prepare`, every migration call
-                                // and the per-frame business gate take (see below), and
-                                // the reply write at the end of this arm is an `.await`
-                                // on the outbound hub: a client that stops draining its
-                                // fd would otherwise stall every authenticated request on
-                                // this connection behind one unrelated bootstrap ack.
-                                let session = handle.session();
-                                let (admission, reply) = {
-                                    let mut session = session.lock().await;
-                                    let admission = session.bootstrap(&frame);
-                                    let ack = match admission {
-                                        crate::server::local_management::Admission::Accepted => {
-                                            "accepted"
-                                        }
-                                        crate::server::local_management::Admission::AlreadyBootstrapped => {
-                                            "already-bootstrapped"
-                                        }
-                                        crate::server::local_management::Admission::Unauthorized => {
-                                            "unauthorized"
-                                        }
-                                    };
-                                    let reply = crate::server::local_management::bootstrap_ack(
-                                        ack,
-                                        session.sidecar_epoch(),
-                                    );
-                                    (admission, reply)
-                                };
-                                // The outbound half of the channel exists only after the
-                                // credential is fixed: before that there is no epoch to
-                                // name in a request, and the shell would refuse it.
-                                if admission
-                                    == crate::server::local_management::Admission::Accepted
-                                {
-                                    // The epoch is fixed here, once, by the frame that was
-                                    // authenticated. Nothing later may move it: a snapshot
-                                    // that could name its own epoch would be able to install
-                                    // authority for a generation the shell never spoke for.
-                                    handle.fix_epoch(&frame.sidecar_epoch);
-                                    handle.install_outbound(Arc::new(
-                                        crate::server::management_client::ManagementClient::new(
-                                            frame.secret.clone(),
-                                            frame.sidecar_epoch.clone(),
-                                            Arc::new(
-                                                crate::server::management_client::HubWrite::new(
-                                                    Arc::clone(&hub),
-                                                    client.clone(),
-                                                ),
-                                            ),
-                                        ),
-                                    ));
-                                }
-                                hub.reply(&client, serde_json::to_value(&reply)?)
-                                    .await
-                                    .ok();
-                            }
-                            Err(error) => {
-                                let refused = crate::server::local_management::refusal_for(
-                                    value.get("id"),
-                                    format!("malformed bootstrap frame: {error}"),
-                                );
-                                hub.reply(&client, serde_json::to_value(&refused)?)
-                                    .await
-                                    .ok();
-                            }
-                        }
-                        continue;
-                    }
-                }
-                if local_managed
-                    && let Some(handle) = management.as_ref()
-                    && crate::server::local_management::is_reserved_method(&value)
-                {
-                    let parsed: Option<crate::server::local_management::ManagementRequest> =
-                        serde_json::from_value(value.clone()).ok();
-                    let Some(request) = parsed else {
-                        // 占用了保留前缀却没有合法形状：同样不回落，直接拒绝。
-                        let refused = crate::server::local_management::refusal_for(
-                            value.get("id"),
-                            "malformed management frame",
-                        );
-                        hub.reply(&client, serde_json::to_value(&refused)?)
-                            .await
-                            .ok();
-                        continue;
-                    };
-                    // prepare 走后台任务，**不**在读取循环里 await。
-                    //
-                    // 一次 bring-up 的预算是 30s。若在这里同步等，整条 stdio
-                    // 会被占满：壳既发不出取消，也没法对第二个 scope 发起准备，
-                    // 而"同 scope 并发只启动一次"这条去重根本不会发生——请求
-                    // 被串行化之后永远不重叠。其余管理方法很快，保持内联即可。
-                    let slow = request.method == SLOW_MANAGEMENT_METHOD
-                        || request.method == SLOW_AUTHORIZE_METHOD;
-                    // 后台任务需要 `'static`：先克隆一份句柄，别借用外层绑定。
-                    let owned_handle = Arc::clone(handle);
-                    let deadline = yi_agent_lifecycle::deadline::Deadline::after(
-                        yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT,
-                    );
-                    let reply_to = client.clone();
-                    let reply_hub = Arc::clone(&hub);
-                    let work = async move {
-                        let response = crate::server::local_management::dispatch(
-                            owned_handle.as_ref(),
-                            request,
-                            deadline,
-                        )
-                        .await;
-                        let Ok(frame) = serde_json::to_value(&response) else {
-                            return;
-                        };
-                        // 私有响应同样受帧上限约束：不该比业务帧多出一条不受限
-                        // 的通道。
-                        if frame.to_string().len()
-                            > crate::server::local_management::MAX_MANAGEMENT_RESPONSE_BYTES
-                        {
-                            let refused = crate::server::local_management::refusal(
-                                "management response exceeds the frame limit",
-                            );
-                            if let Ok(refused) = serde_json::to_value(&refused) {
-                                reply_hub.reply(&reply_to, refused).await.ok();
-                            }
-                            return;
-                        }
-                        // 私有响应直接定向回写，**不**经 hub 广播、也不进
-                        // `app.emit`：它携带 epoch 与授权相关结果，前端页面
-                        // 不该看见，更不该能代答。
-                        reply_hub.reply(&reply_to, frame).await.ok();
-                    };
-                    if slow {
-                        tokio::spawn(work);
-                    } else {
-                        work.await;
-                    }
                     continue;
                 }
                 if local_managed

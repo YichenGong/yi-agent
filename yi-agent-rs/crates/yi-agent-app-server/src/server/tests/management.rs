@@ -693,6 +693,95 @@ async fn closing_the_session_drains_pending_prepares() {
 }
 
 #[tokio::test]
+async fn prepare_completes_while_the_business_loop_is_blocked() {
+    use tokio::io::AsyncWriteExt;
+
+    let backend = CountingBackend::new(Duration::ZERO, connected());
+    let handle = Arc::new(ManagementHandle::new(backend));
+    let bootstrap = serde_json::from_str(&bootstrap_frame("s3cret", "epoch-1")).unwrap();
+    handle.session().lock().await.bootstrap(&bootstrap);
+    handle.fix_epoch("epoch-1");
+    let hub = Arc::new(crate::broadcast::Broadcaster::new());
+    let client = crate::broadcast::ClientId::local();
+    let mut replies = hub.register_reliable(client.clone());
+    let (mut shell, reader) = tokio::io::duplex(8192);
+    let (tx, mut business) = tokio::sync::mpsc::channel(64);
+    let task = tokio::spawn(crate::server::transport::stdio::read_lines(
+        reader,
+        client,
+        tx,
+        None,
+        Some(handle),
+        hub,
+    ));
+    // Intentionally do not consume the business queue: thread/resume is waiting
+    // for the business lease that the shell registers only AFTER prepare replies.
+    let frame = management_frame(
+        "prepare-during-resume",
+        "_shell/prepare",
+        "s3cret",
+        "epoch-1",
+        prepare_params("/tmp/project-a"),
+    );
+    shell
+        .write_all(format!("{frame}\n").as_bytes())
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(1), replies.recv()).await;
+    task.abort();
+    let reply = reply
+        .expect("prepare must not wait for the blocked business loop")
+        .expect("local output remains open");
+    assert_eq!(reply["id"], "prepare-during-resume");
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert!(
+        business.try_recv().is_err(),
+        "private request leaked into business routing"
+    );
+}
+
+#[tokio::test]
+async fn closing_business_dispatch_stops_the_management_reader() {
+    use tokio::io::AsyncWriteExt;
+
+    let backend = CountingBackend::new(Duration::ZERO, connected());
+    let handle = Arc::new(ManagementHandle::new(backend.clone()));
+    let bootstrap = serde_json::from_str(&bootstrap_frame("s3cret", "epoch-1")).unwrap();
+    handle.session().lock().await.bootstrap(&bootstrap);
+    let hub = Arc::new(crate::broadcast::Broadcaster::new());
+    let client = crate::broadcast::ClientId::local();
+    let _replies = hub.register_reliable(client.clone());
+    let (mut shell, reader) = tokio::io::duplex(8192);
+    let (tx, business) = tokio::sync::mpsc::channel(64);
+    drop(business);
+    let task = tokio::spawn(crate::server::transport::stdio::read_lines(
+        reader,
+        client,
+        tx,
+        None,
+        Some(handle),
+        hub,
+    ));
+    let frame = management_frame(
+        "after-close",
+        "_shell/prepare",
+        "s3cret",
+        "epoch-1",
+        prepare_params("/tmp/project-a"),
+    );
+    shell
+        .write_all(format!("{frame}\n").as_bytes())
+        .await
+        .unwrap();
+    let finished = tokio::time::timeout(Duration::from_secs(1), task).await;
+    assert!(
+        finished.is_ok(),
+        "a closed business session must stop its reader without waiting for stdin EOF"
+    );
+    assert_eq!(backend.calls(), 0, "a closed session started a runtime");
+}
+
+#[tokio::test]
 async fn the_default_deadline_budget_is_bounded() {
     // 管理请求的预算不该是"等到底"：一个卡住的 prepare 会把退出拖过壳的 15s
     // 全局预算。这里把常量本身钉住，避免有人悄悄放大它。

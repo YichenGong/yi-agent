@@ -33,7 +33,7 @@ yi-agent-plugins = { workspace = true }
 tempfile = "3"
 yi-agent-lifecycle = { workspace = true }
 # 集成测试要造一个「未来 schema」的库，证明启动前就被拒绝。
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "fallible_uint"] }
 # 装配测试要现场打签名包：与 `yi-agent/tests/plugins_exec.rs` 同一套夹具做法。
 tar = "0.4"
 flate2 = "1"
