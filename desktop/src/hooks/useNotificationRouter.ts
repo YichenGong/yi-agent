@@ -67,6 +67,8 @@ export interface NotificationRouterDeps {
    * 续命会掩盖「当前会话真的卡住」的事实（设计 §4.2）。
    */
   notifySyncActivity: (threadId: string) => void;
+  /** Targeted, request-correlated transcript completion; runtime may still be preparing. */
+  onHistoryReady?: (client: RpcClient, threadId: string, token: string) => void;
   disposed: boolean;
   scheduleReconnect: () => void;
   /**
@@ -178,6 +180,10 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
           if (typeof params?.thread_id === "string") {
             notifySyncActivity(params.thread_id);
           }
+        }
+        if (n.method === "thread/historyReady") {
+          deps.onHistoryReady?.(client, n.params.thread_id, n.params.request_token);
+          return;
         }
         // A driven session is created outside the desktop's thread/start RPC, so
         // it may not exist in the cached groups when its first Running status

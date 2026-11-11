@@ -1,5 +1,5 @@
 /**
- * First-paint cache of the thread list, for the remote (phone) client.
+ * First-paint thread-list cache. Desktop local and paired remote use distinct keys.
  *
  * The authoritative list lives on the server (`thread/listAll`); this is only a
  * synchronous snapshot so the sidebar can paint before the relay round-trip
@@ -11,6 +11,8 @@ import type { WorkspaceGroup, ThreadSummary } from "./protocol";
 import type { StorageLike } from "./remoteConfig";
 
 export const THREAD_LIST_CACHE_KEY = "yi-agent.threadListCache";
+/** Desktop local snapshots must never share the paired remote client's cache. */
+export const DESKTOP_THREAD_LIST_CACHE_KEY = "yi-agent.desktop.threadListCache";
 export const THREAD_LIST_CACHE_VERSION = 1;
 
 /**
@@ -79,10 +81,13 @@ export function parseListCache(raw: string | null): ThreadListCache | null {
 }
 
 /** Read the snapshot, or `null` when absent/corrupt/unavailable. */
-export function readListCache(storage: StorageLike | undefined = defaultStorage()): ThreadListCache | null {
+export function readListCache(
+  storage: StorageLike | undefined = defaultStorage(),
+  key: string = THREAD_LIST_CACHE_KEY,
+): ThreadListCache | null {
   if (!storage) return null;
   try {
-    return parseListCache(storage.getItem(THREAD_LIST_CACHE_KEY));
+    return parseListCache(storage.getItem(key));
   } catch {
     return null;
   }
@@ -94,6 +99,7 @@ export function writeListCache(
   groups: WorkspaceGroup[],
   pinned: ThreadSummary[],
   selectedId: string | null,
+  key: string = THREAD_LIST_CACHE_KEY,
 ): void {
   if (!storage) return;
   const { groups: cappedGroups, truncated } = capListCache(groups, pinned);
@@ -108,7 +114,7 @@ export function writeListCache(
     ...(truncated ? { truncated: true } : {}),
   };
   try {
-    storage.setItem(THREAD_LIST_CACHE_KEY, JSON.stringify(payload));
+    storage.setItem(key, JSON.stringify(payload));
   } catch {
     // Quota / private mode: losing the cache is not worth breaking the app.
   }

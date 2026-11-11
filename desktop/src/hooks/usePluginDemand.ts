@@ -90,6 +90,18 @@ export function usePluginDemand(deps: PluginDemandDeps = {}): string[] {
   const [attempt, setAttempt] = useState(0);
   const retries = useRef(0);
   const retryMs = deps.retryMs ?? 250;
+  const mounted = useRef(false);
+  const retryTimers = useRef(new Set<ReturnType<typeof setTimeout>>());
+
+  useEffect(() => {
+    mounted.current = true;
+    const timers = retryTimers.current;
+    return () => {
+      mounted.current = false;
+      for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
 
   useEffect(() => {
     if (remote) return;
@@ -127,9 +139,13 @@ export function usePluginDemand(deps: PluginDemandDeps = {}): string[] {
           // state it was in before this feature existed.
         }
       }
-      if (waitingForScope && retries.current < MAX_SCOPE_RETRIES) {
+      if (mounted.current && waitingForScope && retries.current < MAX_SCOPE_RETRIES) {
         retries.current += 1;
-        setTimeout(() => setAttempt((value) => value + 1), retryMs);
+        const timer = setTimeout(() => {
+          retryTimers.current.delete(timer);
+          if (mounted.current) setAttempt((value) => value + 1);
+        }, retryMs);
+        retryTimers.current.add(timer);
       } else if (!waitingForScope) {
         retries.current = 0;
       }

@@ -1,12 +1,18 @@
 /** @vitest-environment jsdom */
-import { act, renderHook, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 
 import { usePluginDemand, type Writer } from "./usePluginDemand";
 import {
   registerPluginConsumer,
   resetPluginConsumers,
 } from "../lib/pluginDemandRegistry";
+
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 /** The remote web client has no shell, so the hook must stay silent there. */
 const platform = { remote: false };
@@ -42,6 +48,32 @@ function recorder(unresolved: string[] = []): { writer: Writer; calls: Call[] } 
 
 describe("usePluginDemand", () => {
   beforeEach(() => resetPluginConsumers());
+
+  it("cancels a pending scope retry on unmount", async () => {
+    vi.useFakeTimers();
+    const { writer } = recorder(["/p/a"]);
+    const { unmount } = renderHook(() => usePluginDemand({ writer, retryMs: 250 }));
+    await act(async () => {
+      registerPluginConsumer({ project: "/p/a", plugin: "board", consumer: "v1" });
+    });
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not schedule a retry when scope resolution finishes after unmount", async () => {
+    vi.useFakeTimers();
+    let resolve!: (scope: string | null) => void;
+    const { writer } = recorder(["/p/a"]);
+    writer.scopeFor = vi.fn(() => new Promise<string | null>((done) => { resolve = done; }));
+    const { unmount } = renderHook(() => usePluginDemand({ writer, retryMs: 250 }));
+    await act(async () => {
+      registerPluginConsumer({ project: "/p/a", plugin: "board", consumer: "v1" });
+    });
+    unmount();
+    await act(async () => { resolve(null); });
+    expect(vi.getTimerCount()).toBe(0);
+  });
 
   it("acquires once for the first view and names the consumer", async () => {
     const { writer, calls } = recorder();

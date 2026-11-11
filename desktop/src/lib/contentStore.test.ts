@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Item } from "./protocol";
 import {
   applyTrim,
@@ -27,6 +27,28 @@ describe("applyTrim", () => {
   it("returns items unchanged when under the budget", () => {
     const items = [msg("a", "hello"), msg("b", "world")];
     expect(applyTrim(items, 1_000_000)).toEqual({ items, trimmed: false });
+  });
+
+  it("serializes at most linear item volume while trimming a long history", () => {
+    const items = Array.from({ length: 300 }, (_, i) => msg(String(i), "长历史🙂".repeat(100)));
+    const budget = estimateItemsBytes([items[299]]);
+    const stringify = vi.spyOn(JSON, "stringify");
+    let out: ReturnType<typeof applyTrim>;
+    let serializedItems: number;
+    try {
+      out = applyTrim(items, budget);
+      serializedItems = stringify.mock.calls.reduce((sum, [value]) =>
+        sum + (Array.isArray(value) ? value.length : 1), 0);
+    } finally { stringify.mockRestore(); }
+    expect(out.items).toEqual([items[299]]);
+    expect(serializedItems).toBeLessThanOrEqual(items.length + 1);
+  });
+
+  it("uses exact UTF-8 bytes including array brackets and separators", () => {
+    const items = [msg("a", "旧🙂"), msg("b", "新é"), msg("c", "尾巴")];
+    const exact = estimateItemsBytes(items.slice(1));
+    expect(applyTrim(items, exact).items).toEqual(items.slice(1));
+    expect(applyTrim(items, exact - 1).items).toEqual(items.slice(2));
   });
 
   it("drops from the head (oldest) until it fits, keeping the tail", () => {

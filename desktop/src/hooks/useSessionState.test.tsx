@@ -4,6 +4,7 @@ import { renderHook, act } from "@testing-library/react";
 import { useSessionState } from "./useSessionState";
 import { ThreadStore } from "../lib/threadStore";
 import { SubagentRailStore } from "../lib/subagents";
+import type { RpcClient } from "../lib/rpc";
 
 // 宿主层的像素断言依赖真实布局，jsdom 下不可靠；位置的**真实**行为已由
 // `ChatView` 的测试钉住。这里只钉存储语义：按会话分开、`undefined`（从没记过）
@@ -22,6 +23,26 @@ const mount = () =>
   );
 
 describe("useSessionState view anchors", () => {
+  it("ignores a late list response from a replaced client instead of caching it locally", async () => {
+    localStorage.removeItem("yi-agent.desktop.threadListCache");
+    let resolve!: (value: unknown) => void;
+    let client = { request: () => new Promise((done) => { resolve = done; }) } as unknown as RpcClient;
+    const { result } = renderHook(() => useSessionState({
+      rpc: () => client, store: new ThreadStore(), force: vi.fn(), setCurrentError: vi.fn(),
+      railStore: new SubagentRailStore(), initialListCache: null, pairingVersion: 0,
+      cacheLocal: () => true,
+    }));
+    let pending!: Promise<unknown>;
+    act(() => { pending = result.current.refreshThreads(); });
+    client = {} as RpcClient;
+    await act(async () => {
+      resolve({ groups: [{ workspace: "/old-host", exists: true, threads: [] }], pinned: [] });
+      await pending;
+    });
+    expect(result.current.groups).toEqual([]);
+    expect(localStorage.getItem("yi-agent.desktop.threadListCache")).toBeNull();
+  });
+
   it("distinguishes never-recorded from recorded-at-bottom", () => {
     const { result } = mount();
     expect(result.current.anchorFor("t1")).toBeUndefined();
