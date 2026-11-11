@@ -1,5 +1,9 @@
 # yi-agent-mcp
 
+## 依赖安全维护（2026-11-11）
+
+`Cargo.toml` 的生产/测试 `rmcp` 下限同步提升至 3.9，修复 RUSTSEC-2026-0457/0462/0461（SSRF 地址过滤、响应体与 schema 缓存上限）；未新增审计豁免。完成判据：`cd yi-agent-rs && cargo nextest run --all-features -p yi-agent-mcp --profile ci`、`cargo audit`。本次与 store/supervisors/管理通道联合运行 1285 项通过，完整 `just ci` exit 0；Rust 1.89 实编译通过，在线 RustSec 审计无漏洞。
+
 ## 模块说明
 
 yi-agent 的 Model Context Protocol（MCP）客户端 crate。目标是连接 MCP server、发现远端工具，并通过 `yi-agent-core::Tool` 将其暴露给 agent。

@@ -1,5 +1,9 @@
 # yi-agent-store
 
+## 依赖安全维护（2026-11-11）
+
+`Cargo.toml` 与 supervisors 测试依赖同步升级至 `rusqlite 0.41.1` / `libsqlite3-sys 0.39.1`，修复 RUSTSEC-2026-0459。保留 bundled SQLite；显式启用 `fallible_uint`，保持原 `u64/usize` 的受检 SQL 转换，超范围仍报错而非截断。完成判据：`cd yi-agent-rs && cargo nextest run --all-features -p yi-agent-store -p yi-agent-supervisors --profile ci`、`cargo audit`、`just msrv-check`。本次与 MCP/管理通道联合运行 1285 项通过，完整 `just ci` exit 0，MSRV 仍为经实际编译验证的 1.89；未新增审计豁免。
+
 ## 模块说明
 
 yi-agent 的会话持久化 crate。目标是保存和恢复 `yi-agent-core::Session`，使会话可跨进程继续。

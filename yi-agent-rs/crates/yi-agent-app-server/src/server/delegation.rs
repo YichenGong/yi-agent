@@ -24,6 +24,83 @@ pub(crate) fn payload(failure: &DelegationFailure) -> crate::protocol::Delegatio
     }
 }
 
+/// Where a conversation's delegation authority comes from.
+///
+/// The two kinds of conversation ask *different* sources, and the difference is the
+/// whole reason this type exists. A managed conversation must never ask the guardian
+/// for a fresh lease -- the App's lease belongs to the desktop shell, and a sidecar
+/// registering its own would be a second App frontend -- while an embedded one has no
+/// guardian at all. Reading the wrong source does not fail loudly: it yields "no
+/// authority", the turn falls back to a self-declared identity, the managed daemon
+/// refuses that, and the five delegation tools are never installed, so the model calls
+/// a `spawn_agent` that is not there.
+pub(crate) enum AuthoritySource<'a> {
+    /// The shell already brokered this conversation's root; read the root's own store.
+    Brokered(&'a Arc<yi_agent_subagent::thread_root::ThreadRoot>),
+    /// No shell: ask the guardian for a lease of our own, about this root.
+    Guardian {
+        host: &'a crate::server::foreground::ForegroundDispatch,
+        root: &'a Arc<yi_agent_subagent::thread_root::ThreadRoot>,
+    },
+    /// Nothing to ask: an embedded runtime, or a conversation with no root.
+    None,
+}
+
+/// Decides which source answers for this conversation, before anything is asked.
+///
+/// Pure, and separated out so the mapping itself is testable. The bug this fixes was
+/// not in either source: it was a `match` that could only take the guardian arm,
+/// leaving every managed conversation permanently unauthorized.
+///
+/// A managed root carries the shell's brokered capability in its own store, and the
+/// managed branch of the turn driver never registers a lease, so `host` is `None`
+/// there by construction -- which is exactly why the managed arm has to come first.
+pub(crate) fn authority_source<'a>(
+    root: Option<&'a Arc<yi_agent_subagent::thread_root::ThreadRoot>>,
+    host: Option<&'a crate::server::foreground::ForegroundDispatch>,
+) -> AuthoritySource<'a> {
+    match root {
+        // An entry the shell already brokered is the identity the daemon minted this
+        // conversation's container under, so it is the only one that can name it later.
+        Some(root) if root.is_managed() && root.managed_root_authorization().is_some() => {
+            AuthoritySource::Brokered(root)
+        }
+        // A managed root with *nothing* brokered yet keeps whatever identity this
+        // process would otherwise use. Reporting it as a hard failure here would turn
+        // a slow shell into a broken conversation, and the fallback is not silent:
+        // `prepare_turn` is where a daemon that disagrees says so, by name.
+        Some(root) => match host {
+            Some(host) => AuthoritySource::Guardian { host, root },
+            None => AuthoritySource::None,
+        },
+        None => AuthoritySource::None,
+    }
+}
+
+/// Asks the chosen source, reporting a failure in the shape the driver records.
+///
+/// A managed root whose store has no entry yet is *reported*, never degraded: falling
+/// through to the embedded resume secret would turn "the shell has not authorized this
+/// conversation" into "this host is allowed", which the daemon then refuses at a layer
+/// that can no longer name the cause.
+pub(crate) fn resolve_authority(
+    source: AuthoritySource<'_>,
+    operation_id: &str,
+) -> Result<yi_agent_subagent::thread_root::ForegroundAuthority, String> {
+    match source {
+        AuthoritySource::Brokered(root) => match root.managed_root_authorization() {
+            Some(authorization) => {
+                Ok(yi_agent_subagent::thread_root::ForegroundAuthority::Managed(authorization))
+            }
+            None => {
+                Err("the shell has not brokered authority for this conversation yet".to_string())
+            }
+        },
+        AuthoritySource::Guardian { host, root } => host.authority(root, operation_id),
+        AuthoritySource::None => Ok(yi_agent_subagent::thread_root::ForegroundAuthority::Embedded),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,82 +282,5 @@ mod tests {
             authority_source(None, None),
             AuthoritySource::None
         ));
-    }
-}
-
-/// Where a conversation's delegation authority comes from.
-///
-/// The two kinds of conversation ask *different* sources, and the difference is the
-/// whole reason this type exists. A managed conversation must never ask the guardian
-/// for a fresh lease -- the App's lease belongs to the desktop shell, and a sidecar
-/// registering its own would be a second App frontend -- while an embedded one has no
-/// guardian at all. Reading the wrong source does not fail loudly: it yields "no
-/// authority", the turn falls back to a self-declared identity, the managed daemon
-/// refuses that, and the five delegation tools are never installed, so the model calls
-/// a `spawn_agent` that is not there.
-pub(crate) enum AuthoritySource<'a> {
-    /// The shell already brokered this conversation's root; read the root's own store.
-    Brokered(&'a Arc<yi_agent_subagent::thread_root::ThreadRoot>),
-    /// No shell: ask the guardian for a lease of our own, about this root.
-    Guardian {
-        host: &'a crate::server::foreground::ForegroundDispatch,
-        root: &'a Arc<yi_agent_subagent::thread_root::ThreadRoot>,
-    },
-    /// Nothing to ask: an embedded runtime, or a conversation with no root.
-    None,
-}
-
-/// Decides which source answers for this conversation, before anything is asked.
-///
-/// Pure, and separated out so the mapping itself is testable. The bug this fixes was
-/// not in either source: it was a `match` that could only take the guardian arm,
-/// leaving every managed conversation permanently unauthorized.
-///
-/// A managed root carries the shell's brokered capability in its own store, and the
-/// managed branch of the turn driver never registers a lease, so `host` is `None`
-/// there by construction -- which is exactly why the managed arm has to come first.
-pub(crate) fn authority_source<'a>(
-    root: Option<&'a Arc<yi_agent_subagent::thread_root::ThreadRoot>>,
-    host: Option<&'a crate::server::foreground::ForegroundDispatch>,
-) -> AuthoritySource<'a> {
-    match root {
-        // An entry the shell already brokered is the identity the daemon minted this
-        // conversation's container under, so it is the only one that can name it later.
-        Some(root) if root.is_managed() && root.managed_root_authorization().is_some() => {
-            AuthoritySource::Brokered(root)
-        }
-        // A managed root with *nothing* brokered yet keeps whatever identity this
-        // process would otherwise use. Reporting it as a hard failure here would turn
-        // a slow shell into a broken conversation, and the fallback is not silent:
-        // `prepare_turn` is where a daemon that disagrees says so, by name.
-        Some(root) => match host {
-            Some(host) => AuthoritySource::Guardian { host, root },
-            None => AuthoritySource::None,
-        },
-        None => AuthoritySource::None,
-    }
-}
-
-/// Asks the chosen source, reporting a failure in the shape the driver records.
-///
-/// A managed root whose store has no entry yet is *reported*, never degraded: falling
-/// through to the embedded resume secret would turn "the shell has not authorized this
-/// conversation" into "this host is allowed", which the daemon then refuses at a layer
-/// that can no longer name the cause.
-pub(crate) fn resolve_authority(
-    source: AuthoritySource<'_>,
-    operation_id: &str,
-) -> Result<yi_agent_subagent::thread_root::ForegroundAuthority, String> {
-    match source {
-        AuthoritySource::Brokered(root) => match root.managed_root_authorization() {
-            Some(authorization) => {
-                Ok(yi_agent_subagent::thread_root::ForegroundAuthority::Managed(authorization))
-            }
-            None => {
-                Err("the shell has not brokered authority for this conversation yet".to_string())
-            }
-        },
-        AuthoritySource::Guardian { host, root } => host.authority(root, operation_id),
-        AuthoritySource::None => Ok(yi_agent_subagent::thread_root::ForegroundAuthority::Embedded),
     }
 }

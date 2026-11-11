@@ -20,18 +20,57 @@ pub(crate) async fn read_lines<R>(
     // 发起授权的会话正是在主循环任务上阻塞等待,由主循环去读自己的应答必然
     // 自己等自己。本任务独占 reader,是唯一能同时看到应答的地方。
     management: Option<std::sync::Arc<super::super::local_management::ManagementHandle>>,
+    hub: Arc<crate::broadcast::Broadcaster>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut reader = MessageReader::new(reader);
     loop {
-        match reader.next_line().await {
+        let next = tokio::select! {
+            biased;
+            // Cancellation is safe only here: the reader is discarded on exit,
+            // never reused after a partially consumed line. Once serve drops its
+            // receiver, private frames must not start work for a closed session.
+            _ = tx.closed() => break,
+            next = reader.next_line() => next,
+        };
+        match next {
             Ok(Some(line)) => {
                 if let Some(handle) = management.as_ref()
                     && let Some(outbound) = handle.outbound()
                     && deliver_management_response(&outbound, &line)
                 {
                     continue;
+                }
+                // A resume can wait for ClientLeased. The shell cannot register
+                // that lease until prepare replies, so management REQUESTS must
+                // bypass the business loop just like authorization responses do.
+                if client == crate::broadcast::ClientId::local()
+                    && let Some(handle) = management.as_ref()
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                {
+                    match super::handle_local_management(&value, handle, &hub, &client).await {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::error!(%error, "local management frame failed");
+                            break;
+                        }
+                    }
+                    // Check at ingress too: a later bootstrap must not admit a
+                    // business frame that arrived before authentication.
+                    if handle.session().lock().await.admit_business()
+                        != super::super::local_management::Admission::Accepted
+                    {
+                        let refused = super::super::local_management::refusal_for(
+                            value.get("id"),
+                            "the local session has not completed its bootstrap",
+                        );
+                        if let Ok(frame) = serde_json::to_value(refused) {
+                            hub.reply(&client, frame).await.ok();
+                        }
+                        continue;
+                    }
                 }
                 if tx.send((client.clone(), Ok(line))).await.is_err() {
                     break;
