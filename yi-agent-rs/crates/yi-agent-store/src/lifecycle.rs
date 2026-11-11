@@ -92,7 +92,28 @@ impl RuntimeClients {
     /// Refuses to rebind a live root to a different client: a second frontend
     /// must not be able to take over a running session by guessing its thread id.
     pub fn bind_root(&mut self, client: &str, root: &str, generation: &str) -> Result<(), String> {
-        self.bind_root_with_parent(client, root, generation, None)
+        self.bind_root_with_parent(client, root, generation, None, false)
+    }
+
+    /// Binds a root whose capability the daemon has already verified for this exact
+    /// root, allowing it to move to the client that presented that capability.
+    ///
+    /// A plain [`Self::bind_root`] must keep refusing a takeover: knowing a stable
+    /// root id is not authority, and the guardian's whole point is that only a
+    /// capability it minted is. But a capability *is* that authority, and a client
+    /// reconnect (a new App run id on the same generation) presents exactly that.
+    /// Refusing it would leave the root owned by a process that no longer exists,
+    /// so every later work request from the reconnected client would be denied.
+    ///
+    /// `takeover_authorized` is not a caller's opinion: the only call site reaches
+    /// it after `AuthorizationLedger::verify` accepted the capability for this root.
+    pub fn bind_verified_root(
+        &mut self,
+        client: &str,
+        root: &str,
+        generation: &str,
+    ) -> Result<(), String> {
+        self.bind_root_with_parent(client, root, generation, None, true)
     }
 
     /// Bind a descendant root, inheriting ownership from its parent.
@@ -107,7 +128,7 @@ impl RuntimeClients {
             .get(parent)
             .map(|binding| binding.owner.clone())
             .ok_or_else(|| format!("parent root {parent} is not bound"))?;
-        self.bind_root_with_parent(&owner, root, generation, Some(parent.to_string()))
+        self.bind_root_with_parent(&owner, root, generation, Some(parent.to_string()), false)
     }
 
     /// Records a descendant's ownership under its parent's, *without* consulting
@@ -160,6 +181,7 @@ impl RuntimeClients {
         root: &str,
         generation: &str,
         parent: Option<RootId>,
+        takeover_authorized: bool,
     ) -> Result<(), String> {
         if self.is_exited(root) {
             return Err(format!(
@@ -167,7 +189,7 @@ impl RuntimeClients {
             ));
         }
         if let Some(existing) = self.roots.get(root) {
-            if existing.owner != client {
+            if existing.owner != client && !takeover_authorized {
                 return Err(format!(
                     "root {root} is owned by client {}; client {client} cannot take it over",
                     existing.owner
@@ -179,7 +201,9 @@ impl RuntimeClients {
                     existing.generation
                 ));
             }
-            return Ok(());
+            if existing.owner == client {
+                return Ok(());
+            }
         }
         if self.closed.contains(client) {
             return Err(format!("client {client} has closed admission"));

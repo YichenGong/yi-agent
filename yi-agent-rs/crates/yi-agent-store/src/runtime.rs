@@ -1180,12 +1180,41 @@ impl RuntimeCoordinator {
         // A root never provisions a worktree: it runs in the project directory.
         let root_mode = ChildWriteMode::ReadOnly;
         let existing = {
-            self.repository
+            let repository = self
+                .repository
                 .lock()
-                .expect("runtime repository mutex poisoned")
-                .application_root_attachment(idempotency_key)?
+                .expect("runtime repository mutex poisoned");
+            match repository.application_root_attachment(idempotency_key)? {
+                Some(attachment) => Some(attachment),
+                // A managed capability is per (generation, client, root) and changes
+                // whenever the App or the daemon restarts, while the root id is
+                // derived from the scope and thread key and deliberately does not.
+                // The presented key has already been authorized for that exact root
+                // above, so this looks up the *row* the authorized root already owns
+                // rather than trusting any caller-chosen identity.
+                None => match owner_kind.authorized_root() {
+                    Some(authorization) => repository.application_root_attachment_for_root(
+                        &authorization
+                            .root_id
+                            .parse::<yi_agent_core::TaskId>()
+                            .map_err(|_| {
+                                RuntimeCoordinatorError::AdmissionClosed(
+                                    "root authorization names a root id the daemon cannot parse"
+                                        .into(),
+                                )
+                            })?,
+                    )?,
+                    None => None,
+                },
+            }
         };
         if let Some(existing) = existing {
+            // Every durable write below belongs to the row that *created* the root.
+            // Its key is not necessarily the key this attach presented: a reconnect
+            // names the same root through a new capability, and using that one for a
+            // detach or for a legacy fallback capability would address a row that
+            // does not exist.
+            let attachment_key = existing.idempotency_key.clone();
             // A root runs in place, so it keeps no workspace row: its project is
             // validated against the durable attachment record, and the in-place
             // position is synthesized from the requested project.
@@ -1206,7 +1235,7 @@ impl RuntimeCoordinator {
                 self.repository
                     .lock()
                     .expect("runtime repository mutex poisoned")
-                    .reattach_application_root(idempotency_key)?;
+                    .reattach_application_root(&attachment_key)?;
             }
             self.application_root_workspace_services
                 .lock()
@@ -1236,10 +1265,20 @@ impl RuntimeCoordinator {
             let capability = existing
                 .capability_secret
                 .clone()
-                .unwrap_or_else(|| legacy_application_root_capability(idempotency_key));
+                .unwrap_or_else(|| legacy_application_root_capability(&attachment_key));
             // Re-attaching in this generation re-establishes ownership: the root
             // is that app's again, and a closed owner was refused above.
-            self.bind_root(&owner, &existing.root_task_id.to_string())?;
+            //
+            // A managed reconnect presents a capability the ledger verified for this
+            // same root, which is the one thing that may move ownership between
+            // clients. An unmanaged or project attach has no such proof and keeps
+            // the strict binding, so a guessed root id still cannot take a live
+            // session over.
+            if owner_kind.authorized_root().is_some() {
+                self.bind_verified_root(&owner, &existing.root_task_id.to_string())?;
+            } else {
+                self.bind_root(&owner, &existing.root_task_id.to_string())?;
+            }
             return Ok(AttachedApplicationRoot {
                 session_id: existing.root_session_id,
                 root_task_id: existing.root_task_id,
@@ -4425,10 +4464,36 @@ impl RuntimeCoordinator {
     }
 
     pub fn bind_root(&self, client: &str, root: &str) -> Result<(), RuntimeCoordinatorError> {
+        self.bind_root_with_authority(client, root, false)
+    }
+
+    /// Binds a root whose capability this daemon has already verified for exactly
+    /// that root, allowing a reconnecting client to take ownership.
+    ///
+    /// Only the managed attach path may call this, and only after
+    /// `AuthorizationLedger::verify` accepted the presented capability for this
+    /// root. It is not a general relaxation of `bind_root`: an unmanaged caller or
+    /// a project attach still cannot take a root over just by naming its id.
+    fn bind_verified_root(&self, client: &str, root: &str) -> Result<(), RuntimeCoordinatorError> {
+        self.bind_root_with_authority(client, root, true)
+    }
+
+    fn bind_root_with_authority(
+        &self,
+        client: &str,
+        root: &str,
+        takeover_authorized: bool,
+    ) -> Result<(), RuntimeCoordinatorError> {
         let mut clients = self.clients.lock().expect("runtime clients mutex poisoned");
-        clients
-            .bind_root(client, root, &self.generation)
-            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        if takeover_authorized {
+            clients
+                .bind_verified_root(client, root, &self.generation)
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+        } else {
+            clients
+                .bind_root(client, root, &self.generation)
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+        }
         let repository = self
             .repository
             .lock()
