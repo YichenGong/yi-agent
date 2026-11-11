@@ -58,3 +58,11 @@ Final verification of the source tree submitted with this record: frontend **194
 An earlier CI run concurrent with native release compilation (`yi-history-ci-ship.log`) had 6414 passes / one failure: unchanged TUI managed-runtime bring-up exceeded its 30 s budget. This is not counted as green. The subsequent **entire** CI ran without competing compilation and passed, including that test; no tests were removed and no budgets relaxed.
 
 Additional regression evidence: handshake-before-send RED `/private/tmp/yi-history-cache-send-red.log`, GREEN snapshot suite; asynchronous cache metadata / live-tail RED `/private/tmp/yi-history-running-late-red.log`, GREEN full frontend suite. `usePluginDemand` unmount regression RED `/private/tmp/yi-plugin-unmount-red.log`; both queued retry and post-unmount async scope resolution are covered by its nine passing tests. This fixes a real teardown timer leak exposed by repeated full-suite runs, rather than suppressing unhandled errors.
+
+## Local integration verification
+
+User selected local merge on 2026-11-11. Code merged with `git merge --no-ff` as **`f6f4fea4d6a4ec0bd145bc3c292bd40ca91eaa49`**. On the main checkout, frontend **194 files / 2879 tests** and build passed (`/private/tmp/yi-history-ui-merged.log`, `/private/tmp/yi-history-ui-merged-build.log`).
+
+The first main-directory `just ci` stopped at fmt-check because an existing, untracked user file `yi-agent-rs/crates/yi-agent-lifecycle/examples/probe_guardian.rs` is not rustfmt-clean (`/private/tmp/yi-history-ci-merged.log`). The file was neither modified, moved, staged nor removed. Its SHA-256 remained `1514599bb01c07fd45ca58c7ddd2c944dc0d70eab62cfcdcd0b3cc8eef3cbcde`.
+
+To verify the merged source without changing that unrelated file, the clean feature worktree was fast-forwarded to the **exact same merge commit** (HEAD identity checked) and the **entire unmodified `just ci`** rerun. Result: **exit 0; 6415 passed / 41 skipped; 50 bindings passed**; log `/private/tmp/yi-history-ci-merged-clean.log`. No checks were skipped and no code changes were made to obtain this result. The subsequent integration-record commit changes documentation only, covered by the project's documentation-only CI exemption. Formal App installation, active processes and relay state remain untouched; nothing was pushed to a remote.

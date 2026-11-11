@@ -36,5 +36,5 @@
 
 - [x] Independent final review completed; findings covered by bounded activation wait, competing-read guard, full read before cache metadata, linear snapshot trimming, and stale-client list regression tests.
 - [x] Commit verified implementation and project-management / regression records on `fix/desktop-startup-content`.
-- [ ] User-selected integration: no-ff merge to main, then full just ci on the merge result (or retain branch / create PR).
+- [x] User selected local integration: code merged with `--no-ff` as `f6f4fea4`; complete `just ci` passed on that exact merged commit in a clean worktree (6415 tests + 50 bindings). Main-directory frontend passed 2879 tests and build. See regression record for the unrelated untracked-file fmt obstruction and verification logs.
 - Formal App deployment is deliberately not included: the active host and current work must not be interrupted.
