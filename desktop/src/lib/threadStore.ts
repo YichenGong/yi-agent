@@ -66,7 +66,7 @@ export interface ThreadView {
    * 判据、不会漏。新增消费者请照同样的门控写，不要直接拿它描述当前状态。
    */
   syncError?: string | null;
-  /** Runtime preparation failed after history completed; never invalidates the transcript. */
+  /** Project preparation or runtime activation failed; never invalidates the transcript. */
   activationError?: string | null;
 }
 

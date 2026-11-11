@@ -264,7 +264,11 @@ export function useRuntimeLease(deps: LeaseDeps): RuntimeLeaseFeedback {
         return null;
       }
       await settleAcquire(project, seq, view);
-      return view;
+      // A newer explicit preparation superseded this answer. Its caller must
+      // not use an old managedReady to activate work the latest attempt refused.
+      return acceptsStartupReply(requestSeq.current.get(project) ?? 0, seq)
+        ? view
+        : null;
     },
     [noteIssue, settleAcquire],
   );

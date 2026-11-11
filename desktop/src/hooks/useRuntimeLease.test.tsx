@@ -714,6 +714,36 @@ describe("useRuntimeLease: preparation failures are reported, not swallowed", ()
     expect(result.current.issues.get("/p/a")?.reason).not.toContain("stale refusal");
   });
 
+  it("returns null for a superseded on-demand success", async () => {
+    let answerFirst!: (view: unknown) => void;
+    let attempts = 0;
+    invokeImpl = async (cmd) => {
+      if (cmd !== "runtime_acquire_project") return "/p/a/.yi-agent/runtime";
+      attempts += 1;
+      if (attempts === 1) return new Promise((resolve) => { answerFirst = resolve; });
+      return blocked("/p/a");
+    };
+    const { result } = renderHook(() =>
+      useRuntimeLease(deps({ activeProject: null, revision: "none" })),
+    );
+    await flush();
+    let old!: Promise<unknown>;
+    let latest!: Promise<unknown>;
+    act(() => { old = result.current.prepareProject("/p/a"); });
+    await flush();
+    act(() => { latest = result.current.prepareProject("/p/a"); });
+    await flush();
+    let oldView: unknown;
+    let newView: unknown;
+    await act(async () => {
+      answerFirst(leaseAnswer("/p/a"));
+      [oldView, newView] = await Promise.all([old, latest]);
+    });
+    expect(oldView).toBeNull();
+    expect((newView as { state: string }).state).toBe("blocked");
+    expect(result.current.issues.get("/p/a")?.state).toBe("blocked");
+  });
+
   it("prepares a project on demand and reports the shell's answer", async () => {
     // The create-conversation path needs the answer *before* `thread/start`: a
     // conversation created against a project that is not managed-ready can never
