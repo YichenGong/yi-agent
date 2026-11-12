@@ -68,7 +68,24 @@ log "构建 sidecar（release 模式 CLI）"
 
 gh_note "stage: tauri build"
 log "tauri build（只出 .app）"
-(cd "$HERE" && npm run tauri build -- --bundles app) || { gh_err "tauri build failed"; exit 1; }
+# 完整输出落盘，失败时把尾部转成 annotation。原因：这个仓库是私有的，CI
+# 日志要 admin 权限才能读（匿名 API 对 logs 与 job logs 都回 403），唯一能
+# 匿名读到的是 check-run annotations。而 `tauri build` 的失败原因藏在几十行
+# 输出里（cargo 报错、build script panic、bundle 失败），只回一句
+# "tauri build failed" 等于什么都没说。
+TAURI_LOG="$(mktemp -t yi-agent-tauri-build)"
+if ! (cd "$HERE" && npm run tauri build -- --bundles app) 2>&1 | tee "$TAURI_LOG"; then
+  # 也把尾部原样打到 stdout，便于本地复现时阅读。
+  echo "---- tauri build: last 20 lines ----"
+  tail -20 "$TAURI_LOG"
+  echo "-------------------------------------"
+  # annotation 单条有长度上限，压缩连续空白并截断，保留最能定位的尾部。
+  detail="$(tail -20 "$TAURI_LOG" | tr -s '[:space:]' ' ' | cut -c1-1200)"
+  gh_err "tauri build failed: $detail"
+  rm -f "$TAURI_LOG"
+  exit 1
+fi
+rm -f "$TAURI_LOG"
 
 # target 目录不能假定是 src-tauri/target：CI 把 CARGO_TARGET_DIR 指到
 # $HOME/cargo-target/github，tauri 的产物会跟着走。cargo metadata 是唯一
