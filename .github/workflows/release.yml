@@ -221,11 +221,13 @@ jobs:
             echo "::error title=npm-package-log::$stages" || true
             echo "== end of packaging log =="
           fi
+          # 日志必须落在 workspace 内、且在第 14 步还能读到：annotation 会被
+          # 丢弃（tauri/vite 输出里带 `::` 的行会让命令解析器改变状态），而
+          # 上面那些 echo 走的是 stdout，CI 上根本读不到。
+          cp "$PKG_LOG" "$GITHUB_WORKSPACE/npm-pack-desktop.log" 2>/dev/null || true
           if [ "$rc" -ne 0 ]; then
             echo "::error::npm-pack-desktop failed with code $rc"
-            echo "== disk after failure =="
             df -h "$HOME" || true
-            echo "== bundle dir =="
             ls -l "${CARGO_TARGET_DIR:-$PWD/target}/release/bundle/macos/" 2>&1 || true
           fi
           exit "$rc"
@@ -236,6 +238,17 @@ jobs:
         run: |
           # 这一步失败时也没有信息量（v0.1.15 第六次就在这里 0 秒退 1），
           # 所以先确认路径与目录内容，再逐条断言。
+          # 第 13 步"返回 0 但产物不在"已经连续发生三次，而它的 notice 只到
+          # `stage: tauri build` 就没有下文——可能是脚本真没跑完，也可能是
+          # tauri 输出里的 `::` 行让后续 annotation 全被丢弃。这一步是全新的
+          # step，解析状态已重置，所以把上一段的阶段标记在这里重发一次。
+          if [ -f "$GITHUB_WORKSPACE/npm-pack-desktop.log" ]; then
+            echo "== packaging stages (re-emitted) =="
+            grep -E '^(>>>|::)' "$GITHUB_WORKSPACE/npm-pack-desktop.log" || true
+            echo "== end =="
+          else
+            echo "::error title=npm-package::packaging log missing"
+          fi
           echo "== cwd =="; pwd
           echo "== platforms dir =="
           ls -la yi-agent-rs/yi-agent-cli/platforms/ 2>&1 || true
