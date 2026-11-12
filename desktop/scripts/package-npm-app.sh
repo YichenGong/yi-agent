@@ -56,7 +56,25 @@ mv "$CONF.tmp" "$CONF"
 # 退出码必须自己写出来：CI 上第 13 步返回 0 却只跑到 `stage: tauri build`
 # 就没有下文，而 `set -euo pipefail` 下没有任何路径能安静地退 0。到底是脚本
 # 跑完了（日志被吞）还是被谁中途终止，只有这行能分清。
+# 退出时把这个文件清掉。tauri-build 会把 sidecar 复制成
+# `$CARGO_TARGET_DIR/release/build/yi-agent`（写成文件），而 cargo 的 build
+# script 需要同一个名字是**目录**（`<pkg>/<hash>/out`）。留着它，下一次任何
+# cargo 构建都会以
+#   error: failed to create directory .../release/build/yi-agent/<hash>/out
+#   Caused by: Not a directory (os error 20)
+# 立刻失败——v0.1.15 的第十八次就是栽在这里：第 13 步刚跑完，第 16 步的
+# `npm-publish` 依赖 `npm-pack` → `package-all`，一开场就撞上自己的残留。
+cleanup_external_bin_file() {
+  local f="${TAURI_TARGET_DIR_PRE:-}/release/build/yi-agent"
+  [ -n "${TAURI_TARGET_DIR_PRE:-}" ] || return 0
+  [ -e "$f" ] || return 0
+  [ -d "$f" ] && return 0
+  chmod u+w "$f" 2>/dev/null || true
+  chflags nouchg "$f" 2>/dev/null || true
+  rm -f "$f" 2>/dev/null || true
+}
 trap 'rc=$?; git -C "$ROOT" checkout -- "$CONF" 2>/dev/null || true; \
+      cleanup_external_bin_file; \
       log "script exiting rc=$rc"' EXIT
 
 gh_note() { [ -n "${GITHUB_ACTIONS:-}" ] && echo "::notice title=npm-pack-desktop::$*" || true; }
