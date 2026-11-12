@@ -83,19 +83,32 @@ TAURI_TARGET_DIR_PRE="$(cargo metadata --manifest-path "$HERE/src-tauri/Cargo.to
   --format-version 1 --no-deps 2>/dev/null \
   | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 [ -n "$TAURI_TARGET_DIR_PRE" ] || TAURI_TARGET_DIR_PRE="$HERE/src-tauri/target"
-STALE_SIDECAR="$TAURI_TARGET_DIR_PRE/release/yi-agent"
-if [ -e "$STALE_SIDECAR" ]; then
-  log "清理陈旧的 externalBin 目标: $STALE_SIDECAR"
-  chmod u+w "$STALE_SIDECAR" 2>/dev/null || true
-  chflags nouchg "$STALE_SIDECAR" 2>/dev/null || true
-  rm -f "$STALE_SIDECAR" 2>/dev/null || true
-  if [ -e "$STALE_SIDECAR" ]; then
-    echo "ERROR: 无法删除 $STALE_SIDECAR（tauri-build 会在同一位置 panic）" >&2
-    ls -lO "$STALE_SIDECAR" >&2 || true
-    gh_err "cannot remove stale externalBin target: $STALE_SIDECAR"
+# 目标路径按 tauri-build 自己的算法推导，不要凭直觉：
+#   out_dir = <target>/release/build/desktop/<hash>/out
+#   target_dir = out_dir.parent().parent().parent() = <target>/release/build
+#   dest = target_dir / "yi-agent"
+# 也就是 `<target>/release/build/yi-agent`。曾经的实现在 `<target>/release/`
+# 下找，那里根本没有该文件，于是清理形同虚设、panic 照旧（v0.1.15 的第五次
+# 失败就是 59 秒时仍在同一行 panic）。
+#
+# 两个候选都清：<target>/release/build 是上面算出来的真正目标；
+# <target>/release 是早先版本的布局，留着只会让排查时看到两个同名文件。
+for stale in "$TAURI_TARGET_DIR_PRE/release/build/yi-agent" \
+             "$TAURI_TARGET_DIR_PRE/release/yi-agent"; do
+  [ -e "$stale" ] || continue
+  log "清理陈旧的 externalBin 目标: $stale"
+  # chmod 管只读位，chflags 管 immutable（uchg）。两者都试，失败不致命，
+  # 真删不掉时下面的 [ -e ] 会兜住并打印 ls -lO。
+  chmod u+w "$stale" 2>/dev/null || true
+  chflags nouchg "$stale" 2>/dev/null || true
+  rm -f "$stale" 2>/dev/null || true
+  if [ -e "$stale" ]; then
+    echo "ERROR: 无法删除 $stale（tauri-build 会在同一位置 panic）" >&2
+    ls -lO "$stale" >&2 || true
+    gh_err "cannot remove stale externalBin target: $stale"
     exit 1
   fi
-fi
+done
 
 # 完整输出落盘，失败时把尾部转成 annotation。原因：这个仓库是私有的，CI
 # 日志要 admin 权限才能读（匿名 API 对 logs 与 job logs 都回 403），唯一能
