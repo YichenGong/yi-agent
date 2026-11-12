@@ -210,8 +210,16 @@ jobs:
         # 构建「成功」但 .app 没进包的情况最难查（用户装完发现没有 App）。
         # 这里在发布前直接验白名单产物。
         run: |
+          # 这一步失败时也没有信息量（v0.1.15 第六次就在这里 0 秒退 1），
+          # 所以先确认路径与目录内容，再逐条断言。
+          echo "== cwd =="; pwd
+          echo "== platforms dir =="
+          ls -la yi-agent-rs/yi-agent-cli/platforms/ 2>&1 || true
+          ls -la yi-agent-rs/yi-agent-cli/platforms/darwin-arm64/ 2>&1 || true
           cd yi-agent-rs/yi-agent-cli/platforms/darwin-arm64
-          test -d yi-agent.app || { echo "ERROR: yi-agent.app missing"; exit 1; }
+          test -d yi-agent.app || {
+            echo "::error title=npm-package::yi-agent.app missing under $(pwd)" || true
+            echo "ERROR: yi-agent.app missing"; exit 1; }
           # 不用 --deep 校验：清单记录的是 sidecar 的最终字节摘要，而 --deep
           # 会强制校验嵌套二进制，语义与发布时的实际签名顺序不一致。
           codesign --verify --strict yi-agent.app
