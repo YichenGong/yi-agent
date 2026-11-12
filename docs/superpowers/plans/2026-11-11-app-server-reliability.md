@@ -56,7 +56,9 @@ Files: docs/project-management/yi-agent-app-server.md and README.md.
 - [x] Review diff against all six invariants; see reliability verification report for red/green evidence; snapshot/probe/delta tasks remain incomplete.
 - [x] Run `cargo fmt --all`, app-server all-features tests and full `just ci` (workspace coverage supersedes the narrower affected run): 6453 passed / 41 skipped; see verification report.
 - [x] Update module/index counts (95/98), commit conventional fix without co-author trailer.
-- [ ] Await integration choice; if local merge is selected, merge --no-ff to main, run `just ci` again on merged result, remove only this worktree/branch after success.
+- [x] Local `--no-ff` merge to main (`26fab411`); run complete `just ci` on that exact committed merge result in the clean worktree: 6456 passed / 41 skipped, 50 binding checks, exit 0. Main's pre-existing untracked example fails fmt-check and is preserved untouched; audit used the existing cached-db fallback. See verification report for limitations.
+
+Cleanup policy: after successful integration, preserve the verification logs under main's `yi-agent-rs/target/` and remove only this worktree and branch. Documentation-only acceptance updates follow the same worktree and `--no-ff` workflow.
 
 ## Verification record
 
