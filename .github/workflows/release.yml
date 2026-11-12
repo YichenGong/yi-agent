@@ -129,6 +129,7 @@ jobs:
             tail -25 "$LOG" | tr '\n' '|' | cut -c1-1800
             exit 1; }
           cat "$LOG"
+          echo "::notice title=package-all::setup ok, starting package-all"
           # 这里**不**跑 `just release-targets-check`。它校验的正是下面
           # `package-all` 要编的三个目标，放在这里是纯重复：实测让这一步从
           # 2m36s（v0.1.13）涨到 8m13s，并多占 6.1G target 空间。发布失败的
@@ -142,9 +143,11 @@ jobs:
           PKG_RC="${PIPESTATUS[0]:-1}"
           set -e
           if [ "$PKG_RC" -ne 0 ]; then
+            # xargs 那层在 runner 上吞掉了内容（只留下 "failed rc=101"），
+            # 直接用命令替换把尾部塞进消息体，不经过第二道进程。
+            detail="$(tail -25 "$LOG" | tr '\n' '|' | tr -s ' ' | cut -c1-1800)"
+            echo "::error title=package-all-log::$detail"
             echo "::error title=package-all::failed rc=$PKG_RC"
-            tail -25 "$LOG" | tr '\n' '|' | tr -s ' ' | cut -c1-1800 \
-              | xargs -I{} echo "::error title=package-all-log::{}" || true
             df -h "$HOME" || true
             du -sh "${CARGO_TARGET_DIR:-target}" 2>/dev/null || true
             exit "$PKG_RC"
