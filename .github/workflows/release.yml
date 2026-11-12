@@ -195,16 +195,31 @@ jobs:
           df -h "$HOME" || true
           echo "== target dir =="
           du -sh "${CARGO_TARGET_DIR:-$PWD/target}" 2>/dev/null || true
+          # 第 13 步返回 0 却没有产物（v0.1.15 的第八次），而脚本第 5 段
+          # 「复制到 npm 子包」之后必有输出。要判断它是跑完了但复制到别处，
+          # 还是压根没跑到那段，必须有完整输出。日志只能从 annotation 读
+          # （logs 接口对匿名回 403），所以把输出先存盘，失败时压缩成一条
+          # error annotation 带出去。
+          PKG_LOG="$(mktemp -t npm-pack-desktop)"
           rc=0
-          just npm-pack-desktop || rc=$?
-          # 脚本 0 退但产物不在，是第 14 步 0 秒失败的那种形状（v0.1.15 的
-          # 第七次就是）。这里立刻核对产物，避免下一段只能看到一个缺失断言。
+          # 必须取 PIPESTATUS[0]：不带 pipefail 时 `cmd | tee` 的 $? 是 tee 的
+          # 状态，恒为 0，会把脚本失败悄悄吞成成功。
+          set -o pipefail
+          just npm-pack-desktop 2>&1 | tee "$PKG_LOG" || rc=$?
+          set +o pipefail
           PKG_DIR="yi-agent-cli/platforms/darwin-arm64"
           if [ -d "$PKG_DIR/yi-agent.app" ]; then
             echo "::notice title=npm-package::packaged $(du -sh "$PKG_DIR/yi-agent.app" | cut -f1)"
           else
             echo "::error title=npm-package::no yi-agent.app in $(pwd)/$PKG_DIR after packaging (rc=$rc)"
             ls -la "$PKG_DIR" 2>&1 || true
+            echo "== packaging log: $(wc -l < "$PKG_LOG") lines =="
+            # stdout 在 CI 上读不到（logs 接口对匿名回 403），只有 annotation
+            # 能带出信息，所以阶段标记必须写进 ::error:: 的消息体本身。
+            stages="$(grep -E '^(>>>|::)' "$PKG_LOG" | tail -25 \
+              | tr -s '[:space:]' ' ' | cut -c1-1400)"
+            echo "::error title=npm-package-log::$stages" || true
+            echo "== end of packaging log =="
           fi
           if [ "$rc" -ne 0 ]; then
             echo "::error::npm-pack-desktop failed with code $rc"
