@@ -170,6 +170,23 @@ jobs:
         working-directory: yi-agent-rs
         run: |
           source "$HOME/.cargo/env"
+          # 这里的 `tauri build` 会编 desktop/src-tauri 并链接 release 依赖，
+          # 与第 10 步是同一类工作，所以需要同一套环境准备。之前只有
+          # `source ~/.cargo/env`，漏掉了 `setup-build-env.sh` 做的两件事：
+          #
+          #   1. 重排 PATH，让 rustup 的 shim 排在 Homebrew 的 rust 之前。
+          #      runner 的 /opt/homebrew/bin 里有 Homebrew 装的 rust，抢到
+          #      `cargo` 后它的 sysroot 里没有 rustup 装的跨平台 std，交叉
+          #      编译以 E0463 秒挂（第 10 步的注释记着实测 0.5~3 秒）。
+          #   2. 把 fd 上限从 launchd 默认的 256 抬到 65536。并行链接 release
+          #      依赖时 256 会撞 `ProcessFdQuotaExceeded`。
+          #
+          # 第 12 步现在 34s 内失败（v0.1.13 那会儿是 186s 成功），符合
+          # 「环境不对、早早退 1」而不是「编译到一半报错」的形状。
+          #
+          # 只校验 host 目标：这一步不交叉编译，默认那三个目标里的 linux
+          # 会连带要求 zig 与 cargo-zigbuild，凭空多出两个失败点。
+          SETUP_BUILD_ENV_TARGETS=aarch64-apple-darwin source scripts/setup-build-env.sh
           # 失败几乎没有信息量：`just` 只回一行 "exit status 1"，而真正的
           # 原因（磁盘写满 / .app 缺失 / codesign 拒绝）要往上翻几十行。
           # v0.1.15 的这次失败就因此无法从日志判断。runner 是持久机器，
