@@ -54,8 +54,8 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        CFBundleShortVersionString: 0.1.14
-        CFBundleVersion: "0.1.14"
+        CFBundleShortVersionString: 0.1.15
+        CFBundleVersion: "0.1.15"
         CFBundleDisplayName: Yi-Agent
     entitlements:
       path: desktop_iOS/desktop_iOS.entitlements
