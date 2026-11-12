@@ -248,7 +248,7 @@ audit-deps-check:
 nightly-workflow-check:
     bash ../scripts/test_nightly_workflow.sh
 
-ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check plugin-release-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check msrv-check eval-baseline-check nightly-workflow-check audit-deps-check reclaim-check affected-check audit
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check plugin-release-check build-env-check release-targets-check-test model-setup-docs-check desktop-target-dir-check rebuild-install-check msrv-check eval-baseline-check nightly-workflow-check audit-deps-check reclaim-check affected-check audit
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`
@@ -434,6 +434,20 @@ plugin-release-check:
 # 正是 v0.1.4~v0.1.7 每次 release 的失败形态；另外要抬高文件描述符上限。
 build-env-check:
     bash scripts/test_setup_build_env.sh
+
+# 发布目标门禁自测：环境缺失必须退 2（不是跳过）、编译失败必须退 1 并点名
+# target、全绿必须退 0。`just ci` 只编 host 目标，`release.yml` 只在 tag 上
+# 交叉编译，所以「Linux 目标编不过」在两者之间是不可见的——v0.1.14 就是这样
+# 一路绿到发布，然后整条 release 失败。这个自测毫秒级，无需 zig，进 `ci`。
+release-targets-check-test:
+    bash scripts/test_check_release_targets.sh
+
+# 三个发布目标（两个 darwin + 一个 linux）必须真的能编译。需要 zig 与
+# cargo-zigbuild；不做进 `ci`（`just ci` 要在无 zig 的机器上也能跑），由
+# release workflow 与本地发布前手动调用。只查 host 目标时可加快：
+#   just release-targets-check --host-only
+release-targets-check *ARGS:
+    bash scripts/check-release-targets.sh {{ARGS}}
 
 # 在当前 shell 装好构建环境（重排 PATH、抬高 fd、校验三平台 std 与 zig）。
 # 用法：`source <(just --evaluate ...)` 不适用，直接 source 脚本：
