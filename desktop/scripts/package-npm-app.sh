@@ -173,24 +173,28 @@ log "TAURI_LOG=$TAURI_LOG"
 #
 # 改成重定向到文件再取 `$?`：退出码来自那个子 shell，没有管道、没有
 # PIPESTATUS、也没有 set -u 的坑。要实时输出的部分（失败时）后面再 cat。
-set +e
-(cd "$HERE" && npm run tauri build -- --bundles app) >"$TAURI_LOG" 2>&1
-TAURI_RC=$?
-set -e
-cat "$TAURI_LOG"
-log "tauri build 退出码 $TAURI_RC（日志 $(wc -l < "$TAURI_LOG") 行）"
-if [ "$TAURI_RC" -ne 0 ]; then
-  # 也把尾部原样打到 stdout，便于本地复现时阅读。
+# 这里既不写管道、也不存退出码。
+#
+# 两种旧写法都踩过坑：
+#   `if ! cmd | tee log; then` —— `!` 作用于整条管道，模板的退出码是 tee 的
+#     （恒为 0），`then` 永不进入，构建失败被静默吞掉；
+#   `cmd | tee log; RC=${PIPESTATUS[0]}` —— PIPESTATUS 只反映紧邻的上一条
+#     管道，`set -e` 之类插一行就清空，在 `set -u` 下变成
+#     `line NNN: TAURI_RC: unbound variable`，构建明明成功却在读码处崩掉。
+#
+# 没有管道的 `if ! (...)` 里，`!` 直接作用在那个子 shell 上，语义就是它的
+# 退出码取反，不需要任何变量。
+if ! (cd "$HERE" && npm run tauri build -- --bundles app) >"$TAURI_LOG" 2>&1; then
   echo "---- tauri build: last 30 lines ----"
   tail -30 "$TAURI_LOG"
   echo "-------------------------------------"
-  # annotation 单条有长度上限，压缩连续空白并截断，保留最能定位的尾部。
+  # annotation 单条有长度上限，压掉空白并截断，保留最能定位的尾部。
   detail="$(tail -30 "$TAURI_LOG" | tr '\n' '|' | tr -s ' ' | cut -c1-1800)"
-  gh_err "tauri build failed (rc=$TAURI_RC): $detail"
+  gh_err "tauri build failed: $detail"
   rm -f "$TAURI_LOG"
   exit 1
 fi
-log "tauri build 结束（成功），日志行数 $(wc -l < "$TAURI_LOG")"
+cat "$TAURI_LOG"
 rm -f "$TAURI_LOG"
 
 # target 目录不能假定是 src-tauri/target：CI 把 CARGO_TARGET_DIR 指到
