@@ -97,22 +97,58 @@ TAURI_TARGET_DIR_PRE="$(cargo metadata --manifest-path "$HERE/src-tauri/Cargo.to
 #
 # 两个候选都清：<target>/release/build 是上面算出来的真正目标；
 # <target>/release 是早先版本的布局，留着只会让排查时看到两个同名文件。
-for stale in "$TAURI_TARGET_DIR_PRE/release/build/yi-agent" \
-             "$TAURI_TARGET_DIR_PRE/release/yi-agent"; do
-  [ -e "$stale" ] || continue
+# 候选路径：<target>/release/build 是 tauri-build 真正的 dest；
+# <target>/release 是更早版本的布局，两个都清。
+clear_stale_external_bin() {
+  local stale="$1"
+  local parent
+  parent="$(dirname "$stale")"
+  [ -e "$stale" ] || return 0
   log "清理陈旧的 externalBin 目标: $stale"
-  # chmod 管只读位，chflags 管 immutable（uchg）。两者都试，失败不致命，
-  # 真删不掉时下面的 [ -e ] 会兜住并打印 ls -lO。
-  chmod u+w "$stale" 2>/dev/null || true
-  chflags nouchg "$stale" 2>/dev/null || true
-  rm -f "$stale" 2>/dev/null || true
+  ls -lO "$stale" >&2 || true
+  # 只给文件解标志是不够的：真正卡住删除的是**父目录**。实测这台 runner 上
+  # `release/build` 目录本身是 `dr-xr-xr-x` + `uchg`（一次中断的构建留下的），
+  # 目录不可写 + immutable 时，里面文件的删除一律 EPERM，而文件自己看起来
+  # 完全正常（`-rw-r--r--`）。先解父目录，再解文件。
+  chflags nouchg "$parent" 2>/dev/null || true
+  chmod u+w "$parent" 2>/dev/null || true
+  # chmod 管只读位，chflags 管 immutable（uchg）与 system-immutable（schg）。
+  # 都试一遍，失败不致命，删不掉时由下面的校验兜住。
+  chmod -Rf u+w "$stale" 2>/dev/null || true
+  chflags -Rf nouchg noschg "$stale" 2>/dev/null || true
+  rm -rf "$stale" 2>/dev/null || true
   if [ -e "$stale" ]; then
-    echo "ERROR: 无法删除 $stale（tauri-build 会在同一位置 panic）" >&2
+    # 返回非零而不是 exit：调用方会用「换一个全新 target 目录」兜底，
+    # 直接退出就没有兜底机会了。消息全部用 ASCII——这一支曾在 CI 上只打印
+    # 出 bash 的 "line 110: stale"，看不到具体是哪个文件。
+    echo "ERROR: cannot remove stale externalBin target: $stale" >&2
     ls -lO "$stale" >&2 || true
     gh_err "cannot remove stale externalBin target: $stale"
-    exit 1
+    return 1
   fi
-done
+  return 0
+}
+
+clear_stale_external_bin "$TAURI_TARGET_DIR_PRE/release/build/yi-agent" || true
+clear_stale_external_bin "$TAURI_TARGET_DIR_PRE/release/yi-agent" || true
+
+# 兜底：上面清不掉时，不要试图修那台机器的文件权限（我们连它是谁建的都
+# 不知道，也可能带 system-immutable 需要 root），而是给这次构建换一个全新
+# 的 target 目录。代价是重编一次依赖，但比「构建失败却报成功」便宜得多。
+# 环境变量统一在这里 export，后面 `cargo metadata` 解析 APP_SRC 才能跟
+# 构建产物走到同一个目录。
+# 只认「文件」，不认目录：`release/build` 下还有 tauri 自己的
+# `yi-agent-<hash>/` 构建缓存目录（正常产物，不能算陈旧）。早先这里用
+# `-name 'yi-agent*'` 把那些目录也算进去，导致每次构建都误走兜底、丢掉
+# 全部增量缓存。
+if [ -e "$TAURI_TARGET_DIR_PRE/release/build/yi-agent" ] && \
+   [ ! -d "$TAURI_TARGET_DIR_PRE/release/build/yi-agent" ]; then
+  FRESH_TARGET="${CARGO_TARGET_DIR:-$TAURI_TARGET_DIR_PRE}/desktop-fresh-$RANDOM"
+  log "陈旧目标无法删除，改用全新 target 目录: $FRESH_TARGET"
+  mkdir -p "$FRESH_TARGET"
+  export CARGO_TARGET_DIR="$FRESH_TARGET"
+  gh_note "stage: fresh target dir ($FRESH_TARGET)"
+fi
 
 # 完整输出落盘，失败时把尾部转成 annotation。原因：这个仓库是私有的，CI
 # 日志要 admin 权限才能读（匿名 API 对 logs 与 job logs 都回 403），唯一能
