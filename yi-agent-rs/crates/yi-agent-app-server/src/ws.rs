@@ -369,6 +369,8 @@ pub(crate) fn attach_ws_frontend(
                             initialized,
                             device_id,
                             devices,
+                            pairing,
+                            token,
                         )
                     })
                 }
@@ -535,29 +537,49 @@ async fn handle_ws(
     initialized: ClientInitialized,
     device_id: String,
     devices: crate::server::WsDeviceRegistry,
+    pairing: Arc<PairingState>,
+    token: String,
 ) {
     let outbound = hub.register(id.clone());
     scopes.lock().await.insert(id.clone(), scope);
     devices
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(device_id.clone(), id.clone());
+        .entry(device_id.clone())
+        .or_default()
+        .insert(id.clone());
+    // Registration and revocation can race after the HTTP authentication.
+    // A revocation before insertion is caught here; one after it drains the set.
+    if pairing.authenticate(&token).is_none() {
+        teardown_ws_client(&hub, &id, &scopes, &initialized, &devices, &device_id).await;
+        return;
+    }
     let (mut sink, mut stream) = socket.split();
 
     // 出口泵:把该客户端的出站帧写成 Text 帧。
+    let pump_hub = Arc::clone(&hub);
+    let pump_id = id.clone();
     let pump = tokio::spawn(async move {
         let mut outbound = outbound;
         while let Some(frame) = outbound.recv().await {
             let text = frame.to_string();
-            if sink.send(Message::Text(text.into())).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    sink.send(Message::Text(text.into()))
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
+        pump_hub.unregister(&pump_id);
     });
 
     // 入站:每个 Text/Binary 帧当作一行 JSONL。低频 tick 用于发现「已被踢」。
     let mut kick_check = tokio::time::interval(std::time::Duration::from_millis(200));
-    loop {
+    'connection: loop {
         let msg = tokio::select! {
             _ = kick_check.tick() => {
                 if !hub.is_connected(&id) {
@@ -583,8 +605,15 @@ async fn handle_ws(
             tracing::warn!("ws frame exceeds max size; closing");
             break;
         }
-        if inbound_tx.send((id.clone(), Ok(line))).await.is_err() {
-            break;
+        let send = inbound_tx.send((id.clone(), Ok(line)));
+        tokio::pin!(send);
+        loop {
+            tokio::select! {
+                result = &mut send => { if result.is_err() { break 'connection; } break; }
+                _ = kick_check.tick() => {
+                    if !hub.is_connected(&id) { break 'connection; }
+                }
+            }
         }
     }
 
@@ -614,8 +643,11 @@ async fn teardown_ws_client(
     let mut guard = devices.lock().unwrap_or_else(|p| p.into_inner());
     // 只有仍指向本连接的条目才摘除:同一设备可能已重连(新 ClientId),
     // 迟到关闭的旧连接不得把新连接的映射抹掉。
-    if guard.get(device_id) == Some(id) {
-        guard.remove(device_id);
+    if let Some(ids) = guard.get_mut(device_id) {
+        ids.remove(id);
+        if ids.is_empty() {
+            guard.remove(device_id);
+        }
     }
 }
 
@@ -1093,6 +1125,8 @@ mod tests {
         // 被撤销的手机:一台 Control 设备,先正常连上并握手。
         let (victim_device, victim_token) =
             pairing.seed_device("victim-phone", crate::protocol::Scope::Control);
+        let mut victim_old = connect_authed(addr, &victim_token).await;
+        initialize(&mut victim_old).await;
         let mut victim = connect_authed(addr, &victim_token).await;
         initialize(&mut victim).await;
 
@@ -1121,6 +1155,16 @@ mod tests {
                 Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(ClientMessage::Close(_))))
             ),
             "a revoked device must be disconnected, got {closed:?}"
+        );
+
+        let old_closed =
+            tokio::time::timeout(std::time::Duration::from_secs(3), victim_old.next()).await;
+        assert!(
+            matches!(
+                old_closed,
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(ClientMessage::Close(_))))
+            ),
+            "all connections of a revoked device must close, got {old_closed:?}"
         );
 
         // token 立即失效:拿旧 token 重连会被 4401 拒绝。
@@ -1186,10 +1230,10 @@ mod tests {
             .await
             .insert(id.clone(), crate::protocol::Scope::Control);
         initialized.lock().await.insert(id.clone(), true);
-        devices
-            .lock()
-            .unwrap()
-            .insert("dev-x".to_string(), id.clone());
+        devices.lock().unwrap().insert(
+            "dev-x".to_string(),
+            std::collections::HashSet::from([id.clone()]),
+        );
 
         teardown_ws_client(&hub, &id, &scopes, &initialized, &devices, "dev-x").await;
 
@@ -1205,6 +1249,27 @@ mod tests {
         assert!(
             devices.lock().unwrap().get("dev-x").is_none(),
             "device mapping must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_connection_teardown_preserves_a_new_connection_of_the_same_device() {
+        let hub = Broadcaster::new();
+        let old = ClientId::ws(uuid::Uuid::new_v4());
+        let new = ClientId::ws(uuid::Uuid::new_v4());
+        let _old_rx = hub.register(old.clone());
+        let _new_rx = hub.register(new.clone());
+        let scopes = Arc::new(Mutex::new(HashMap::new()));
+        let initialized = Arc::new(Mutex::new(HashMap::new()));
+        let devices = Arc::new(std::sync::Mutex::new(HashMap::from([(
+            "device".into(),
+            std::collections::HashSet::from([old.clone(), new.clone()]),
+        )])));
+        teardown_ws_client(&hub, &old, &scopes, &initialized, &devices, "device").await;
+        assert!(hub.is_connected(&new));
+        assert_eq!(
+            devices.lock().unwrap()["device"],
+            std::collections::HashSet::from([new])
         );
     }
 

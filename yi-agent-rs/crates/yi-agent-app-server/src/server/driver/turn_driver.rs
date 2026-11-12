@@ -20,8 +20,8 @@ use futures::StreamExt;
 
 use crate::server::{
     DeltaCoalescer, PartialTurnInput, TurnEvent, apply_session_command, build_partial, checkpoint,
-    finished_event, generate_title_for_first_input, lead_reply_text, persist_and_finish_turn,
-    saturate_u32, update_status, write_notification,
+    finished_event, generate_title_for_first_input, persist_and_finish_turn, saturate_u32,
+    update_status, write_notification,
 };
 
 /// Whether the process groups this turn started are all gone.
@@ -159,6 +159,9 @@ pub(crate) async fn run_thread_driver(
     // 内层 select 期间收到的会话命令。此刻 turn 正在跑，不能改 agent，
     // 暂存到这里，等本轮收尾时执行（见 persist_and_finish_turn 之后的处理）。
     let mut pending_session_command: Option<SessionCommand> = None;
+    // Execution completion alone is not evidence that the final snapshot was saved.
+    let mut last_persist: Result<(), String> = Ok(());
+    let mut pending_persistence = crate::server::turn::persist::PendingPersistence::default();
     loop {
         // 空闲路径:没有 turn 在跑时收到的会话命令,立即执行——此刻改 agent 是安全的。
         // 没有这条路径,空闲 thread 永远读不到 clear / compact(命令会一直躺在 channel 里)。
@@ -167,12 +170,33 @@ pub(crate) async fn run_thread_driver(
         // 按值消费并返回 agent,若写进分支体就会与另一分支的 `prompt_rx` 借用冲突。
         let turn_prompt = tokio::select! {
             Some(command) = session_rx.recv() => {
+                if let SessionCommand::PauseWriter { reply } = command {
+                    if pending_persistence.has_work() { last_persist = pending_persistence.retry(&store, &thread_id); }
+                    match &last_persist {
+                        Err(error) => { let _ = reply.send(Err(error.clone())); },
+                        Ok(()) => {
+                            let (control, resume) = tokio::sync::oneshot::channel();
+                            if reply.send(Ok(control)).is_ok() && resume.await == Ok(true) { break; }
+                        }
+                    }
+                    continue;
+                }
+                if pending_persistence.has_work() {
+                    last_persist = pending_persistence.retry(&store, &thread_id);
+                    if let Err(error) = &last_persist {
+                        command.refuse(format!("previous turn is unsaved: {error}"));
+                        continue;
+                    }
+                }
                 let clearing = matches!(&command, SessionCommand::Clear { .. });
-                agent = apply_session_command(
+                let outcome = apply_session_command(
                     agent, command, &provider, &config, &store, &thread_id, &hub, &turn_tx,
                     &status, mcp.as_ref(), &mcp_workdir,
+                    &mut pending_persistence,
                 )
                 .await;
+                agent = outcome.0;
+                last_persist = last_persist.and(outcome.1);
                 if clearing {
                     // 顺序要紧：先把当前原始汇总钉成基线，再归零 translator。
                     // 不钉的话，下一次 children 推送仍带着 clear 前的量，数字会
@@ -214,6 +238,36 @@ pub(crate) async fn run_thread_driver(
         else {
             break; // prompt_rx 关闭:driver 收尾退出
         };
+        if pending_persistence.has_work() {
+            last_persist = pending_persistence.retry(&store, &thread_id);
+            if let Err(error) = &last_persist {
+                let _ = write_notification(
+                    &hub,
+                    &Notification::Error {
+                        message: format!(
+                            "Previous turn is unsaved: {error}; repair storage before retrying"
+                        ),
+                    },
+                )
+                .await;
+                let _ = write_notification(
+                    &hub,
+                    &Notification::TurnCompleted {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        status: crate::protocol::TurnStatus::Failed,
+                        error: Some(error.clone()),
+                        completed_at: None,
+                    },
+                )
+                .await;
+                let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
+                let _ = turn_tx
+                    .send(finished_event(&thread_id, &turn_id, None, lead_request_id))
+                    .await;
+                continue;
+            }
+        }
         // Activation is attempted once per thread *per success*, not once per thread.
         //
         // Marking it attempted before knowing the outcome is how one startup race
@@ -608,32 +662,31 @@ pub(crate) async fn run_thread_driver(
                 for n in translator.on_event(yi_agent_core::AgentEvent::Error(e)) {
                     let _ = write_notification(&hub, &n).await;
                 }
-                // 这条路径不走 `persist_and_finish_turn`，但它**确实**是一次回合
-                // 结束（`turn/completed(failed)` 已发出）。不记完成时间的话，
-                // 「失败也是跑完了」这件事在另一端的未读判定里就查不到——重连后
-                // 蓝点不亮，用户以为还在跑。
-                // 复用刚广播出去的那个完成时刻，理由同常规收尾：落盘值若更晚，
-                // 另一端的 markRead 就盖不住它，蓝点会复活。
+                // A startup failure still owns a user input. Persist it through the
+                // same retryable path rather than permanently poisoning the barrier.
                 let failed_at = match translator.completed_at() {
                     0 => crate::thread_store::now_millis(),
                     at => at,
                 };
-                if let Err(e) = store.mark_turn_completed(&thread_id, failed_at) {
-                    eprintln!("[app-server] failed to record turn completion for {thread_id}: {e}");
-                }
-                // 中途失败没有「组长说了什么」可言:回复传 `None`,绝不伪造一条
-                // 空回复去糊弄等待方(那比拿不到回复更难排查)。
-                let _ = turn_tx
-                    .send(finished_event(&thread_id, &turn_id, None, None))
-                    .await;
-                // run() 失败即本轮结束:thread 立刻回 Idle(失败是事件不是状态)。
-                let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
-                // 本轮已结束（失败）：turn 开始写的 checkpoint 必须清掉，否则盘上会
-                // 留一条已结束 turn 的残留，重启后被 resume 当成待恢复 turn。
-                // 与其它 clear 站点同款：尽力删，失败只记 stderr，绝不影响 turn 收尾。
-                if let Err(e) = store.clear_partial(&thread_id) {
-                    eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
-                }
+                last_persist = persist_and_finish_turn(
+                    &thread_id,
+                    Some(&turn_id),
+                    failed_at,
+                    Some(&user_prompt),
+                    &user_attachments,
+                    &user_image_refs,
+                    lead_request_id,
+                    &agent,
+                    std::mem::take(&mut completed_items),
+                    last_usage.take(),
+                    turn_usage_total.take(),
+                    &store,
+                    &hub,
+                    &turn_tx,
+                    &status,
+                    &mut pending_persistence,
+                )
+                .await;
                 // A failed run is still a finished turn: closing it here keeps the
                 // daemon's view from holding a turn that can never end.
                 if let Some(mut turn) = foreground_turn.take() {
@@ -998,6 +1051,9 @@ pub(crate) async fn run_thread_driver(
                             SessionCommand::SetPreserveThinking { reply, .. } => {
                                 let _ = reply.send(Err("另有一个会话命令待执行".into()));
                             }
+                            SessionCommand::PauseWriter { reply } => {
+                                let _ = reply.send(Err("writer is still busy; retry later".into()));
+                            }
                             SessionCommand::ReloadMcp { reply } => {
                                 let _ = reply.send(Err("另有一个会话命令待执行".into()));
                             }
@@ -1009,11 +1065,46 @@ pub(crate) async fn run_thread_driver(
             }
         }
 
-        // 先执行本轮暂存的会话命令（此刻 turn 已结束，改 agent 是安全的），
-        // 再为刚结束的 turn 收尾。
+        // 先保存本轮结果，再执行任何暂存命令。
+        // 与已广播的 `turn/completed.completed_at` 同源；若本轮没有走终结事件
+        // （流意外结束时 `translator` 没来得及定时刻），在这里补一个，以免这次
+        // 回合结束在未读口径里凭空消失。
+        let turn_completed_at = match translator.completed_at() {
+            0 => crate::thread_store::now_millis(),
+            at => at,
+        };
+        last_persist = persist_and_finish_turn(
+            &thread_id,
+            Some(&turn_id),
+            turn_completed_at,
+            Some(&user_prompt),
+            &user_attachments,
+            &user_image_refs,
+            lead_request_id.clone(),
+            &agent,
+            std::mem::take(&mut completed_items),
+            last_usage.take(),
+            turn_usage_total.take(),
+            &store,
+            &hub,
+            &turn_tx,
+            &status,
+            &mut pending_persistence,
+        )
+        .await;
+
+        // 此刻本轮已经保存；暂存命令可以安全地变更上下文。
         if let Some(command) = pending_session_command.take() {
+            if let Err(error) = &last_persist {
+                command.refuse(format!("turn could not be saved: {error}"));
+                if let Some(mut turn) = foreground_turn.take() {
+                    turn.finish();
+                }
+                finish_delegation!(run_control, processes_at_start.as_slice());
+                continue;
+            }
             let clearing = matches!(&command, SessionCommand::Clear { .. });
-            agent = apply_session_command(
+            let outcome = apply_session_command(
                 agent,
                 command,
                 &provider,
@@ -1025,8 +1116,11 @@ pub(crate) async fn run_thread_driver(
                 &status,
                 mcp.as_ref(),
                 &mcp_workdir,
+                &mut pending_persistence,
             )
             .await;
+            agent = outcome.0;
+            last_persist = last_persist.and(outcome.1);
             if clearing {
                 for n in translator.reset_totals() {
                     let _ = write_notification(&hub, &n).await;
@@ -1037,26 +1131,6 @@ pub(crate) async fn run_thread_driver(
             if let Some(source) = &side_source {
                 source.refresh(&agent);
             }
-            // 命令路径已 append 过最终状态;这里只需为这个 turn 发 Finished 让主循环清
-            // active_turn_id,且**不要**再 append 一次(否则会用 turn 前的 session 覆盖)。
-            let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
-            // 本轮的助手文本仍待回填给可能的等待方:命令路径结束的也是一个正常跑完的
-            // turn,与下面的常规收尾同一口径(`completed_items` 此刻尚未被 take)。
-            // 身份同样随事件上报:若本轮是替某条阻塞式 `ask_lead` 跑的,等待方收的
-            // 仍是**这一轮**的答案(命令不改变谁在等哪一轮)。
-            let _ = turn_tx
-                .send(finished_event(
-                    &thread_id,
-                    &turn_id,
-                    lead_reply_text(&completed_items),
-                    lead_request_id,
-                ))
-                .await;
-            // 这条路径不走常规收尾；本轮 checkpoint 同样必须清掉，否则会在盘上
-            // 留一条已结束 turn 的残留，重启后被 resume 当成待恢复 turn。
-            if let Err(e) = store.clear_partial(&thread_id) {
-                eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
-            }
             if let Some(mut turn) = foreground_turn.take() {
                 turn.finish();
             }
@@ -1064,37 +1138,6 @@ pub(crate) async fn run_thread_driver(
             continue;
         }
 
-        // 无暂存命令：常规收尾（把本轮结果落盘）。
-        // 与已广播的 `turn/completed.completed_at` 同源；若本轮没有走终结事件
-        // （流意外结束时 `translator` 没来得及定时刻），在这里补一个，以免这次
-        // 回合结束在未读口径里凭空消失。
-        let turn_completed_at = match translator.completed_at() {
-            0 => crate::thread_store::now_millis(),
-            at => at,
-        };
-        persist_and_finish_turn(
-            &thread_id,
-            Some(&turn_id),
-            turn_completed_at,
-            Some(&user_prompt),
-            &user_attachments,
-            &user_image_refs,
-            lead_request_id,
-            &agent,
-            std::mem::take(&mut completed_items),
-            last_usage.take(),
-            turn_usage_total.take(),
-            &store,
-            &hub,
-            &turn_tx,
-            &status,
-        )
-        .await;
-
-        // 收尾已把整轮 append 进主 jsonl；checkpoint 的使命结束。
-        if let Err(e) = store.clear_partial(&thread_id) {
-            eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
-        }
         // 本轮已经进了父会话的历史。下一次 `/side` 必须看到它——这不是「父变了
         // 所以作废旧旁支」，而是「父有了新内容所以新旁支要包含它」。已打开的旁支
         // 早已按快照冻结，不会因为这次发布而变。

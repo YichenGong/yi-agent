@@ -57,14 +57,23 @@ pub(crate) async fn handle(
             // 若该 thread 仍在内存且有活跃 turn,先请求中断,再等待 driver
             // 落盘完成,否则紧随 turn/completed 的 resume 会读到尚未写入
             // 的历史。详见 `interrupt_and_wait_for_persist`。
-            interrupt_and_wait_for_persist(
+            let paused_writer = match interrupt_and_wait_for_persist(
                 state.threads,
                 state.turn_rx,
                 &thread_id,
                 state.pending_lead_replies,
                 state.lead_replies,
             )
-            .await;
+            .await
+            {
+                Ok(paused) => paused,
+                Err(error) => {
+                    let mut rpc_error = RpcError::internal(error);
+                    rpc_error.data = Some(json!({"retryable":true,"sessionRetained":true}));
+                    write_response(state.hub, state.client, err_response(id, rpc_error)).await?;
+                    return Ok(Flow::Continue);
+                }
+            };
 
             // Strict activation read: a meta that exists but cannot be parsed
             // must refuse to run tools, not silently rebuild into a conversation
@@ -384,6 +393,10 @@ pub(crate) async fn handle(
                     side_source: side_source.clone(),
                 },
             );
+
+            if let Some(paused) = paused_writer {
+                paused.stop();
+            }
 
             // 与 `thread/start` 同款:先停旧守望者、再对本次生效的 manager 重订。
             // 这里正是缺陷所在——resume 一个活 thread 会新建 manager,若沿用

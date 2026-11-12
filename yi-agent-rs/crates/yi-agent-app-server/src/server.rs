@@ -85,7 +85,7 @@ pub(crate) use crate::protocol::ResponseEnvelope;
 pub(crate) use rpc_io::{
     DEVICE_REGISTRY, IMAGE_READ_CHUNK_BYTES, IMAGE_READ_MAX_BYTES, SideResponseSender,
     device_registry, err_response, forget_ws_device, install_device_registry, ok_response,
-    write_notification, write_notification_await, write_response, ws_client_for_device,
+    write_notification, write_notification_await, write_response,
 };
 #[allow(unused_imports)]
 pub(crate) use task_bridge::{
@@ -612,7 +612,8 @@ pub(crate) type ClientInitialized = Arc<Mutex<HashMap<crate::broadcast::ClientId
 pub(crate) type ClientShellAuthorizations =
     Arc<Mutex<HashMap<crate::broadcast::ClientId, crate::shell_authorization::ShellAuthorization>>>;
 
-pub(crate) type WsDeviceRegistry = Arc<StdMutex<HashMap<String, crate::broadcast::ClientId>>>;
+pub(crate) type WsDeviceRegistry =
+    Arc<StdMutex<HashMap<String, std::collections::HashSet<crate::broadcast::ClientId>>>>;
 
 #[cfg(test)]
 mod resident_rpc_tests;
@@ -646,3 +647,6 @@ mod plugin_ready_tests;
 
 #[cfg(test)]
 mod evict_idle_tests;
+
+#[cfg(test)]
+pub(crate) use rpc_io::ws_clients_for_device;

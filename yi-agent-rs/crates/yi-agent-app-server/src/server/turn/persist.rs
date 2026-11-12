@@ -7,10 +7,40 @@ use std::sync::Arc;
 // 这些项仍由 `server.rs`（或其子模块经其 re-export）提供。
 use crate::protocol::ThreadStatus;
 use crate::server::{
-    PartialTurnInput, TurnEvent, completed_items_agent_text, finished_event, opening_user_item,
+    PartialTurnInput, TurnEvent, finished_event, lead_reply_text, opening_user_item,
     record_last_item_id, update_status,
 };
 use tokio::sync::mpsc;
+
+/// At most one final snapshot awaits repair; no later turn may overwrite it.
+#[derive(Default)]
+pub(crate) struct PendingPersistence {
+    record: Option<crate::thread_store::TurnLine>,
+    clear_partial: bool,
+}
+impl PendingPersistence {
+    pub(crate) fn has_work(&self) -> bool {
+        self.record.is_some() || self.clear_partial
+    }
+    pub(crate) fn retry(
+        &mut self,
+        store: &crate::thread_store::ThreadStore,
+        thread_id: &str,
+    ) -> Result<(), String> {
+        if let Some(record) = self.record.as_ref() {
+            store
+                .append_turn(thread_id, record)
+                .map_err(|e| e.to_string())?;
+            // Commit before cleanup: a failed remove must never duplicate the append.
+            self.record = None;
+        }
+        if self.clear_partial {
+            store.clear_partial(thread_id).map_err(|e| e.to_string())?;
+            self.clear_partial = false;
+        }
+        Ok(())
+    }
+}
 
 /// 组装当前 turn 的 checkpoint：已 finalize 的 item（含开头的用户提问）+ 当前
 /// 上下文快照。进行中的流式文本不在 `completed_items` 里，故天然不入内。
@@ -76,7 +106,8 @@ pub(crate) async fn persist_and_finish_turn(
     hub: &crate::broadcast::Broadcaster,
     turn_tx: &mpsc::Sender<TurnEvent>,
     status: &Arc<std::sync::Mutex<ThreadStatus>>,
-) {
+    pending: &mut PendingPersistence,
+) -> Result<(), String> {
     let mut items = Vec::with_capacity(completed_items.len() + 1);
     if let Some(prompt) = user_prompt {
         // 基线 server 不 emit userMessage，必须在落盘时补齐，否则 resume 会丢用户提问。
@@ -90,7 +121,7 @@ pub(crate) async fn persist_and_finish_turn(
     items.extend(completed_items);
 
     // 先取助手侧材料：`items` 接下来会 move 进 `record`，此后无法再借用。
-    let assistant_text = completed_items_agent_text(&items);
+    let assistant_text = lead_reply_text(&items);
     // 落盘副本：关闭跨轮保留（`preserve_thinking == false`）时剥离思考块，使磁盘
     // 与「已放弃跨轮保留」的会话状态一致——否则每轮追加的日志行仍携带刚产出的
     // 凭证，重开会话即「复活」（spec §4.1/§7.4）。session 本体（展示与请求的权威）
@@ -108,8 +139,38 @@ pub(crate) async fn persist_and_finish_turn(
         messages: persisted_messages,
     };
     // append 失败则跳过 meta 维护：避免出现"幽灵" thread。
-    if let Err(e) = store.append_turn(thread_id, &record) {
+    let persisted = store
+        .append_turn(thread_id, &record)
+        .map_err(|e| e.to_string());
+    pending.record = persisted.is_err().then(|| record.clone());
+    pending.clear_partial = turn_id.is_some();
+    if let Err(e) = &persisted {
         eprintln!("[app-server] failed to persist turn {thread_id}: {e}");
+        if let (
+            Some(turn_id),
+            crate::thread_store::TurnLine::Turn {
+                items,
+                messages,
+                usage,
+                usage_total,
+            },
+        ) = (turn_id, &record)
+        {
+            checkpoint(
+                store,
+                thread_id,
+                crate::thread_store::PartialTurn {
+                    turn_id: turn_id.into(),
+                    items: items.clone(),
+                    messages: messages.clone(),
+                    usage: usage.clone(),
+                    usage_total: usage_total.clone(),
+                },
+            );
+        }
+        let _ = crate::server::write_notification(hub, &crate::protocol::Notification::Error {
+            message: format!("Turn ended but could not be saved: {e}. Session retained; retry after repairing storage."),
+        }).await;
     } else {
         // `last_item_id` 供 `thread/listAll` 报告"客户端是否落后"的**保守下界**；
         // 「锚点是否仍在」的权威判据是读真实 jsonl 的 `contains_item_id`（spec §3）。
@@ -150,7 +211,9 @@ pub(crate) async fn persist_and_finish_turn(
         eprintln!("[app-server] failed to record turn completion for {thread_id}: {e}");
     }
 
-    // 广播「本轮已落盘」：delete/interrupt 路径靠这枚 Finished 判定落盘完成。
+    // Finish all turn-owned disk writes before publishing completion.
+    let persisted = persisted.and_then(|()| pending.retry(store, thread_id));
+    // Finished settles execution only. Lifecycle callers also require the idle writer handshake.
     // 标题生成已前移到 turn 开始处，收尾路径不再有任何可等待的模型调用。
     let _ = update_status(hub, status, thread_id, ThreadStatus::Idle).await;
     if let Some(turn_id) = turn_id {
@@ -166,4 +229,5 @@ pub(crate) async fn persist_and_finish_turn(
             ))
             .await;
     }
+    persisted
 }

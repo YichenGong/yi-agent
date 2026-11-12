@@ -738,8 +738,10 @@ async fn set_preserve_thinking_false_strips_the_shared_session() {
         &ThreadSession::new_status(),
         None,
         &std::env::temp_dir(),
+        &mut Default::default(),
     )
-    .await;
+    .await
+    .0;
     answer
         .await
         .expect("the set-preserve reply channel must be fulfilled")
@@ -847,8 +849,10 @@ async fn set_preserve_thinking_true_leaves_the_shared_session_untouched() {
         &ThreadSession::new_status(),
         None,
         &std::env::temp_dir(),
+        &mut Default::default(),
     )
-    .await;
+    .await
+    .0;
     answer.await.unwrap().unwrap();
 
     assert!(agent.config().preserve_thinking);
@@ -994,8 +998,10 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
         &ThreadSession::new_status(),
         None,
         &std::env::temp_dir(),
+        &mut Default::default(),
     )
-    .await;
+    .await
+    .0;
     answer.await.unwrap().unwrap();
     drop(agent);
 
@@ -1109,8 +1115,10 @@ async fn a_turn_while_off_persists_without_credentials() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        &mut Default::default(),
     )
-    .await;
+    .await
+    .unwrap();
 
     let loaded = store
         .load(tid)
@@ -1214,8 +1222,10 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        &mut Default::default(),
     )
-    .await;
+    .await
+    .unwrap();
 
     let loaded = store
         .load(tid)
@@ -3627,6 +3637,52 @@ async fn a_failed_append_still_records_the_completion() {
         "a failed append must not swallow the completion stamp: {meta}"
     );
 
+    for (id, method) in [(935, "thread/delete"), (936, "thread/resume")] {
+        h.send(
+            &serde_json::json!({"id":id,"method":method,"params":{"threadId":tid,"force":true}})
+                .to_string(),
+        )
+        .await;
+        let response = read_response(&mut h, id).await;
+        assert!(
+            response.get("error").is_some(),
+            "unsaved turn must refuse {method}: {response}"
+        );
+        assert!(
+            log.is_dir(),
+            "failed barrier must preserve original storage"
+        );
+    }
+
+    let partial = log.with_extension("partial.json");
+    let recovered: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&partial).expect("final checkpoint retained"),
+    )
+    .unwrap();
+    assert!(
+        recovered["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "agentMessage")
+    );
+    std::fs::remove_dir(&log).unwrap();
+    h.send(
+        &serde_json::json!({"id":937,"method":"thread/resume","params":{"threadId":tid}})
+            .to_string(),
+    )
+    .await;
+    let response = read_response(&mut h, 937).await;
+    assert!(
+        response.get("error").is_none(),
+        "repairing storage must allow a real persistence retry: {response}"
+    );
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("agentMessage")
+    );
+
     h.shutdown().await;
 }
 
@@ -4254,4 +4310,77 @@ async fn a_server_reloaded_during_a_turn_reaches_the_registry_on_the_next_turn()
 
     drop(prompt_tx);
     let _ = tokio::time::timeout(EVENT_WAIT, handle).await;
+}
+
+#[tokio::test]
+async fn persistence_barrier_refuses_closed_completion_and_retains_session() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut session = tick_test_session(dir.path(), "t", ThreadStatus::Running);
+    session.active_turn_id = Some("active".into());
+    let mut threads = HashMap::from([("t".into(), session)]);
+    let (tx, mut rx) = mpsc::channel(1);
+    drop(tx);
+    let result = interrupt_and_wait_for_persist(
+        &mut threads,
+        &mut rx,
+        "t",
+        &mut HashMap::new(),
+        &crate::lead::LeadReplies::new(),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(threads["t"].active_turn_id.as_deref(), Some("active"));
+}
+
+#[tokio::test]
+async fn persistence_barrier_timeout_retains_active_session() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut session = tick_test_session(dir.path(), "t", ThreadStatus::Running);
+    session.active_turn_id = Some("active".into());
+    let mut threads = HashMap::from([("t".into(), session)]);
+    let (_tx, mut rx) = mpsc::channel(1);
+    let result = interrupt_and_wait_for_persist(
+        &mut threads,
+        &mut rx,
+        "t",
+        &mut HashMap::new(),
+        &crate::lead::LeadReplies::new(),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(threads["t"].active_turn_id.as_deref(), Some("active"));
+}
+
+#[tokio::test]
+async fn dropping_a_writer_pause_resumes_the_original_session() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut session = tick_test_session(dir.path(), "t", ThreadStatus::Idle);
+    let (tx, mut commands) = mpsc::channel(1);
+    session.session_tx = tx;
+    let driver = tokio::spawn(async move {
+        let Some(crate::session::SessionCommand::PauseWriter { reply }) = commands.recv().await
+        else {
+            panic!("expected pause");
+        };
+        let (control, resume) = tokio::sync::oneshot::channel();
+        reply.send(Ok(control)).unwrap();
+        resume.await.unwrap()
+    });
+    let mut threads = HashMap::from([("t".into(), session)]);
+    let (_tx, mut rx) = mpsc::channel(1);
+    let pause = interrupt_and_wait_for_persist(
+        &mut threads,
+        &mut rx,
+        "t",
+        &mut HashMap::new(),
+        &crate::lead::LeadReplies::new(),
+    )
+    .await
+    .unwrap();
+    drop(pause);
+    assert!(
+        !driver.await.unwrap(),
+        "early return must resume, not stop, the old writer"
+    );
+    assert!(threads.contains_key("t"));
 }

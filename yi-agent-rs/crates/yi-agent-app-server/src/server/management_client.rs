@@ -65,8 +65,7 @@ impl HubWrite {
 impl ManagementWrite for HubWrite {
     async fn write_frame(&self, frame: &Value) -> Result<(), String> {
         self.hub
-            .reply(&self.client, frame.clone())
-            .await
+            .try_reply(&self.client, frame.clone())
             .map_err(|_| "the local client is gone".to_string())
     }
 }

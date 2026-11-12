@@ -118,8 +118,13 @@ async fn permit_is_released_when_session_clears_the_turn() {
 
     // 模拟"回合结束"那条路径：活跃 turn 与 permit 同时清空。
     let session = threads.get_mut(&prepared.thread_id).expect("session");
-    session.active_turn_id = None;
-    session.turn_permit = None;
+    crate::server::transport::complete_session_turn(session, "stale-turn");
+    assert_eq!(
+        admission.live_before_barrier_permits(),
+        1,
+        "stale completion must preserve the permit"
+    );
+    crate::server::transport::complete_session_turn(session, &prepared.turn_id);
 
     assert_eq!(
         admission.live_before_barrier_permits(),

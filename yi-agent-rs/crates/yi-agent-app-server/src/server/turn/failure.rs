@@ -36,10 +36,7 @@ pub(crate) async fn rollback_turn(
     // 先改内存、拿到「属于本次」的判断，再从 session 里 clone 状态句柄：
     // `update_status` 是 async，不能持着对 `threads` 的借用等它。
     let Some(status) = threads.get_mut(thread_id).and_then(|session| {
-        if session.active_turn_id.as_deref() == Some(turn_id) {
-            session.active_turn_id = None;
-            // 与活跃 turn 同生共死：drop 即释放准入 permit。
-            session.turn_permit = None;
+        if session.finish_turn(turn_id) {
             Some(Arc::clone(&session.status))
         } else {
             None

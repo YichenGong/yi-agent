@@ -71,6 +71,11 @@ pub struct InterjectionRequest {
 /// 必须走 driver 而不是主循环：`Agent::session()` 只返回 `Session` 的 clone，
 /// 修改 session 的可变访问权只存在于持有 agent 的 driver 内部。
 pub enum SessionCommand {
+    /// Pause at the idle boundary. The receiver chooses stop (true) or resume (false).
+    /// A dropped acknowledgement or control receiver resumes; it never destroys data.
+    PauseWriter {
+        reply: oneshot::Sender<Result<oneshot::Sender<bool>, String>>,
+    },
     /// 清空该 thread 的上下文，并截断其持久化对话日志。
     Clear {
         reply: oneshot::Sender<Result<(), String>>,
@@ -118,6 +123,26 @@ pub enum SessionCommand {
     ReloadMcp {
         reply: oneshot::Sender<Result<(), String>>,
     },
+}
+
+impl SessionCommand {
+    pub(crate) fn refuse(self, error: String) {
+        match self {
+            Self::Compact { reply } => {
+                let _ = reply.send(CompactOutcome::Failed(error));
+            }
+            Self::PauseWriter { reply } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Clear { reply }
+            | Self::SetModel { reply, .. }
+            | Self::SetReasoningEffort { reply, .. }
+            | Self::SetPreserveThinking { reply, .. }
+            | Self::ReloadMcp { reply } => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
 }
 
 /// `/compact` 的三种结果。`NotReduced` 是"历史太短、无需压缩"，**不是错误**。
@@ -189,6 +214,16 @@ pub struct ThreadSession {
 }
 
 impl ThreadSession {
+    /// Release only the matching turn's occupancy and admission permit.
+    pub(crate) fn finish_turn(&mut self, turn_id: &str) -> bool {
+        if self.active_turn_id.as_deref() != Some(turn_id) {
+            return false;
+        }
+        self.active_turn_id = None;
+        self.turn_permit = None;
+        true
+    }
+
     /// 新建一个共享状态句柄（初值 `Idle`）。
     pub fn new_status() -> Arc<Mutex<ThreadStatus>> {
         Arc::new(Mutex::new(ThreadStatus::Idle))
@@ -213,7 +248,9 @@ mod tests {
             SessionCommand::SetModel { .. } => panic!("expected Clear"),
             SessionCommand::SetReasoningEffort { .. } => panic!("expected Clear"),
             SessionCommand::SetPreserveThinking { .. } => panic!("expected Clear"),
-            SessionCommand::ReloadMcp { .. } => panic!("expected Clear"),
+            SessionCommand::ReloadMcp { .. } | SessionCommand::PauseWriter { .. } => {
+                panic!("expected Clear")
+            }
         }
         assert_eq!(answer.await.unwrap(), Ok(()));
     }

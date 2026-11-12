@@ -239,8 +239,10 @@ async fn set_model_command_rebuilds_with_the_new_model() {
         &ThreadSession::new_status(),
         None,
         &std::env::temp_dir(),
+        &mut Default::default(),
     )
-    .await;
+    .await
+    .0;
     answer
         .await
         .expect("the set-model reply channel must be fulfilled")
@@ -346,8 +348,10 @@ async fn set_reasoning_effort_command_rebuilds_without_a_new_provider() {
         &ThreadSession::new_status(),
         None,
         &std::env::temp_dir(),
+        &mut Default::default(),
     )
-    .await;
+    .await
+    .0;
     answer
         .await
         .expect("the set-effort reply channel must be fulfilled")
@@ -433,8 +437,10 @@ async fn set_model_command_keeps_the_agent_when_the_provider_fails() {
         &ThreadSession::new_status(),
         None,
         &std::env::temp_dir(),
+        &mut Default::default(),
     )
-    .await;
+    .await
+    .0;
     let error = answer
         .await
         .expect("the set-model reply channel must be fulfilled")

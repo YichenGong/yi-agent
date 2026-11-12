@@ -714,6 +714,13 @@ async fn prepare_completes_while_the_business_loop_is_blocked() {
         Some(handle),
         hub,
     ));
+    // Fill dispatch and send one extra ordinary request before the private frame.
+    for n in 0..65 {
+        shell
+            .write_all(format!("{{\"id\":{n},\"method\":\"thread/list\"}}\n").as_bytes())
+            .await
+            .unwrap();
+    }
     // Intentionally do not consume the business queue: thread/resume is waiting
     // for the business lease that the shell registers only AFTER prepare replies.
     let frame = management_frame(
@@ -727,17 +734,32 @@ async fn prepare_completes_while_the_business_loop_is_blocked() {
         .write_all(format!("{frame}\n").as_bytes())
         .await
         .unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(1), replies.recv()).await;
+    let reply = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let frame = replies.recv().await.expect("local output remains open");
+            if frame["id"] == "prepare-during-resume" {
+                break frame;
+            }
+            assert!(
+                frame.get("error").is_some(),
+                "overload must be explicit: {frame}"
+            );
+        }
+    })
+    .await;
     task.abort();
-    let reply = reply
-        .expect("prepare must not wait for the blocked business loop")
-        .expect("local output remains open");
+    let reply = reply.expect("prepare must not wait for saturated business dispatch");
     assert_eq!(reply["id"], "prepare-during-resume");
     assert!(reply.get("error").is_none(), "{reply}");
-    assert!(
-        business.try_recv().is_err(),
-        "private request leaked into business routing"
-    );
+    let mut count = 0;
+    while let Ok((_, line)) = business.try_recv() {
+        assert!(
+            !line.unwrap().contains("_shell/"),
+            "private request leaked into business routing"
+        );
+        count += 1;
+    }
+    assert_eq!(count, 64);
 }
 
 #[tokio::test]
@@ -921,5 +943,131 @@ async fn a_migration_confirmation_carries_the_backend_refusal() {
         "the backend refusal was not carried back: {frame}"
     );
     assert_eq!(calls.confirms.load(Ordering::SeqCst), 1);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn full_management_output_closes_instead_of_stalling_ingress() {
+    let handle = Arc::new(ManagementHandle::new(CountingBackend::new(
+        Duration::ZERO,
+        connected(),
+    )));
+    let hub = Arc::new(crate::broadcast::Broadcaster::new());
+    let client = crate::broadcast::ClientId::local();
+    let _outbound = hub.register_reliable(client.clone());
+    for _ in 0..256 {
+        hub.broadcast(serde_json::json!({"delta":"x"}));
+    }
+    let (tx, _business) = tokio::sync::mpsc::channel(64);
+    let input = format!("{}\n", bootstrap_frame("s3cret", "epoch-1"));
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::server::transport::stdio::read_lines(
+            input.as_bytes(),
+            client.clone(),
+            tx,
+            None,
+            Some(handle),
+            Arc::clone(&hub),
+        ),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "a management ack must not indefinitely block ingress"
+    );
+    assert!(
+        !hub.is_connected(&client),
+        "full control output must fail explicitly"
+    );
+}
+
+#[tokio::test]
+async fn saturated_business_ingress_still_delivers_private_authorize_responses() {
+    use crate::server::management_client::{HubWrite, ManagementClient};
+    use tokio::io::AsyncWriteExt;
+    let handle = Arc::new(ManagementHandle::new(CountingBackend::new(
+        Duration::ZERO,
+        connected(),
+    )));
+    let bootstrap = serde_json::from_str(&bootstrap_frame("s3cret", "epoch-1")).unwrap();
+    handle.session().lock().await.bootstrap(&bootstrap);
+    handle.fix_epoch("epoch-1");
+    let hub = Arc::new(crate::broadcast::Broadcaster::new());
+    let client = crate::broadcast::ClientId::local();
+    let mut replies = hub.register_reliable(client.clone());
+    let outbound = handle.install_outbound(Arc::new(ManagementClient::new(
+        "s3cret",
+        "epoch-1",
+        Arc::new(HubWrite::new(Arc::clone(&hub), client.clone())),
+    )));
+    let request = serde_json::from_value(serde_json::json!({
+        "sidecar_epoch":"epoch-1", "scope_key":"/p/.yi-agent/runtime", "client_run_id":"app-run-1",
+        "intent":{"operation_id":"managed-root:t", "thread_key":"thread:t", "workspace":"/p", "extra_roots":[], "previous_root_capability":null}
+    })).unwrap();
+    let waiting = tokio::spawn(async move {
+        outbound
+            .authorize(request, Deadline::after(Duration::from_secs(2)))
+            .await
+    });
+    let issued = replies.recv().await.unwrap();
+    let (mut shell, reader) = tokio::io::duplex(8192);
+    let (tx, mut business) = tokio::sync::mpsc::channel(64);
+    let task = tokio::spawn(crate::server::transport::stdio::read_lines(
+        reader,
+        client,
+        tx,
+        None,
+        Some(handle),
+        hub,
+    ));
+    for id in 0..65 {
+        shell
+            .write_all(format!("{{\"id\":{id},\"method\":\"thread/list\"}}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    let answer = serde_json::json!({"jsonrpc":"2.0","id":issued["id"],"sidecar_epoch":"epoch-1","error":"intent refused by shell"});
+    shell
+        .write_all(format!("{answer}\n").as_bytes())
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("private response must bypass a saturated business queue")
+        .unwrap();
+    assert_eq!(result.unwrap_err(), "intent refused by shell");
+    task.abort();
+    while let Ok((_, line)) = business.try_recv() {
+        assert!(!line.unwrap().contains("intent refused"));
+    }
+}
+
+#[tokio::test]
+async fn management_ingress_refuses_excess_work_without_starting_backend() {
+    let backend = CountingBackend::new(Duration::ZERO, connected());
+    let handle = Arc::new(ManagementHandle::new(backend.clone()));
+    let held = Arc::clone(&handle.ingress_slots)
+        .try_acquire_many_owned(32)
+        .unwrap();
+    let mut h = Harness::with_management(handle).await;
+    h.send(&bootstrap_frame("s3cret", "epoch-1")).await;
+    next_private_frame(&mut h, "bootstrap ack").await;
+    h.send(&management_frame(
+        "overflow",
+        "_shell/prepare",
+        "s3cret",
+        "epoch-1",
+        prepare_params("/tmp/project-a"),
+    ))
+    .await;
+    let response = next_private_frame(&mut h, "overload refusal").await;
+    assert_eq!(response["id"], "overflow");
+    assert!(
+        response["error"].to_string().contains("overloaded"),
+        "{response}"
+    );
+    assert_eq!(backend.calls(), 0);
+    drop(held);
     h.shutdown().await;
 }
