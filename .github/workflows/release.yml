@@ -118,6 +118,11 @@ jobs:
           # 并校验三平台 std 与 zig/zigbuild 真的可用。任一不满足即失败，
           # 避免把「环境不对」伪装成「代码编译错误」。
           source scripts/setup-build-env.sh
+          # 先确认三个目标都能编译，再花几分钟打包。打包本身也会暴露同一个
+          # 错误，但那是三条构建并行跑了 1 分多钟之后才失败（v0.1.14 的实际
+          # 耗时：两个 darwin 目标各 ~1m17s 成功，linux 目标才报 E0425）。
+          # 这步失败会点名是哪个 target，比读 package-all 的混合输出快。
+          just release-targets-check
           just package-all
 
       - name: Verify the binary reports the release version

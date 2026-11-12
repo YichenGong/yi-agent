@@ -156,12 +156,12 @@ fn read_bsdinfo(pid: i32) -> io::Result<Option<proc_bsdinfo>> {
     Ok(Some(info))
 }
 
+#[cfg(target_os = "macos")]
 impl proc_bsdinfo {
     /// The process's start time in microseconds, or `NotFound` once it has exited.
     ///
     /// `SZOMB` (status 5) is an exited process still awaiting reaping: it keeps its
     /// process-table entry but can never run again.
-    #[cfg(target_os = "macos")]
     fn start_micros(&self) -> io::Result<u64> {
         if self.pbi_status == ZOMBIE_STATUS {
             return Err(io::Error::new(

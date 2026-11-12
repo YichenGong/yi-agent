@@ -822,19 +822,31 @@ fn read_identity(socket: &Path, deadline: &Deadline) -> Result<RuntimeIdentity, 
 }
 
 /// The kernel's uid for the peer of a unix socket.
+///
+/// `getpeereid` is BSD-only; Linux answers the same question through
+/// `SO_PEERCRED`, which returns uid/gid/pid in one `ucred`. Both are wrapped here
+/// so the rest of the module never has to know which platform it is on.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn peer_uid_of(socket: &Path) -> Result<u32, String> {
-    let stream = UnixStream::connect(socket)
-        .map_err(|error| format!("cannot connect to {}: {error}", socket.display()))?;
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-    let outcome = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    if outcome != 0 {
-        return Err(format!(
-            "the kernel would not report the socket peer: {}",
-            io::Error::last_os_error()
-        ));
+    #[cfg(target_os = "macos")]
+    {
+        let stream = UnixStream::connect(socket)
+            .map_err(|error| format!("cannot connect to {}: {error}", socket.display()))?;
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        let outcome = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+        if outcome != 0 {
+            return Err(format!(
+                "the kernel would not report the socket peer: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok(uid)
     }
-    Ok(uid)
+    #[cfg(target_os = "linux")]
+    {
+        Ok(peer_credentials_of(socket)?.0)
+    }
 }
 
 /// The kernel's pid for the peer of a unix socket.
@@ -842,27 +854,78 @@ fn peer_uid_of(socket: &Path) -> Result<u32, String> {
 /// This is the fact the runtime's own report cannot supply: `RuntimeIdentity` says
 /// what the process *claims*, and the kernel says *which process* is holding the
 /// socket. Identity is the agreement between the two, so both are needed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn peer_pid_of(socket: &Path) -> Result<u32, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let stream = UnixStream::connect(socket)
+            .map_err(|error| format!("cannot connect to {}: {error}", socket.display()))?;
+        let mut pid: libc::pid_t = 0;
+        let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        let outcome = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                &mut pid as *mut _ as *mut libc::c_void,
+                &mut length,
+            )
+        };
+        if outcome != 0 || pid <= 0 {
+            return Err(format!(
+                "the kernel would not report the socket peer's pid: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok(pid as u32)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(peer_credentials_of(socket)?.1)
+    }
+}
+
+/// Linux: uid and pid of the peer that holds a unix socket, in one syscall.
+///
+/// `SO_PEERCRED` is the closest equivalent to `getpeereid` + `LOCAL_PEERPID`: the
+/// kernel fills a `ucred` for the connected peer, so the two facts a caller needs
+/// come from the same answer and cannot describe different processes.
+#[cfg(target_os = "linux")]
+fn peer_credentials_of(socket: &Path) -> Result<(u32, u32), String> {
     let stream = UnixStream::connect(socket)
         .map_err(|error| format!("cannot connect to {}: {error}", socket.display()))?;
-    let mut pid: libc::pid_t = 0;
-    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     let outcome = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            &mut pid as *mut _ as *mut libc::c_void,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut credentials as *mut _ as *mut libc::c_void,
             &mut length,
         )
     };
-    if outcome != 0 || pid <= 0 {
+    if outcome != 0 || credentials.pid <= 0 {
         return Err(format!(
-            "the kernel would not report the socket peer's pid: {}",
+            "the kernel would not report the socket peer: {}",
             io::Error::last_os_error()
         ));
     }
-    Ok(pid as u32)
+    Ok((credentials.uid, credentials.pid as u32))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn peer_uid_of(_socket: &Path) -> Result<u32, String> {
+    Err("socket peer credentials are only implemented for macOS and Linux".to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn peer_pid_of(_socket: &Path) -> Result<u32, String> {
+    Err("socket peer credentials are only implemented for macOS and Linux".to_string())
 }
 
 /// Kernel-reported start identity and executable path for a pid.
@@ -871,6 +934,12 @@ fn peer_pid_of(socket: &Path) -> Result<u32, String> {
 /// Public because the migration has to re-ask the same question *after* a preview:
 /// a pid that matches a recorded number proves nothing if the process behind the
 /// number was replaced in between.
+///
+/// `Err` means "this pid cannot be identified", which callers read as "it is gone".
+/// That is why the non-Linux/non-macOS branch must not pretend: it returns an error
+/// naming the missing platform support, and `SystemFacts::process_identity` turns
+/// that into `Unknown` rather than into a verified absence.
+#[cfg(target_os = "macos")]
 pub fn process_identity_of(pid: u32) -> Result<(String, PathBuf), String> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -908,6 +977,43 @@ pub fn process_identity_of(pid: u32) -> Result<(String, PathBuf), String> {
     // that matches a previous reading means nothing.
     let start_identity = format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec);
     Ok((start_identity, executable))
+}
+
+/// Linux: the same identity as [`process_identity_of`]'s macOS branch, read from
+/// `/proc` instead of `proc_pidinfo`.
+///
+/// `starttime` (field 22 of `/proc/<pid>/stat`) is the kernel's birth stamp in
+/// clock ticks since boot; like the macOS pair it is stable for one process and
+/// differs for a recycled pid. [`crate::lifecycle::processes::ProcessBirth`] already
+/// uses exactly that field, so this branch keeps the two modules' notion of "the
+/// same process" identical.
+#[cfg(target_os = "linux")]
+pub fn process_identity_of(pid: u32) -> Result<(String, PathBuf), String> {
+    let birth = crate::lifecycle::processes::ProcessBirth::of(pid as i32)
+        .map_err(|error| format!("the kernel would not describe pid {pid}: {error}"))?;
+    // A zombie keeps its `/proc` entry and its birth stamp but can never run
+    // again, so it must read as gone rather than as a live identity.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|error| format!("the kernel would not describe pid {pid}: {error}"))?;
+    let after_name = stat
+        .rfind(')')
+        .ok_or_else(|| format!("pid {pid} has a malformed /proc stat"))?;
+    let state = stat[after_name + 1..]
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format!("pid {pid} has no process state"))?;
+    if state == "Z" {
+        return Err(format!("process {pid} has exited"));
+    }
+    let executable = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|error| {
+        format!("the kernel would not report the executable of pid {pid}: {error}")
+    })?;
+    Ok((birth.started_at().to_string(), executable))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn process_identity_of(_pid: u32) -> Result<(String, PathBuf), String> {
+    Err("process identity is only implemented for macOS and Linux".to_string())
 }
 
 /// Whether another process holds the advisory lock on `path`.
