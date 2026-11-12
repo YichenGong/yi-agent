@@ -348,7 +348,45 @@ jobs:
         working-directory: yi-agent-rs
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: just npm-publish
+        run: |
+          # `npm-publish` 依赖 `npm-pack` → `package-all`，也就是说这一步会
+          # 重新做一次三平台交叉编译。与第 10 步是同一类工作，需要同一套
+          # 环境准备（PATH 让 rustup 的 cargo 优先、抬高 fd 上限）。
+          source scripts/setup-build-env.sh
+          LOG="$(mktemp -t npm-publish)"
+          set +e
+          just npm-publish >"$LOG" 2>&1
+          PUB_RC=$?
+          set -e
+          cat "$LOG"
+          if [ "$PUB_RC" -ne 0 ]; then
+            detail="$(grep -E 'npm error|ERR!|ERROR|Publishing' "$LOG" \
+              | tail -20 | tr '\n' '|' | tr -s ' ' | cut -c1-1800)"
+            echo "::error title=npm-publish::$detail"
+            exit "$PUB_RC"
+          fi
+          # 退出码不够：`publish_if_new` 会跳过注册表上已存在的版本，于是
+          # 「某个子包没发上去，主包照样发出去」这种情况本步会报 success，
+          # 用户装完得到 Platform package not installed。这里逐个核对注册表
+          # 上的实际版本，缺一个就失败。
+          #
+          # 必须显式指定官方源：开发机上 `registry` 常指向国内镜像，而镜像是
+          # 异步同步的，刚发布的版本要过一阵才出现——用默认配置核对会把「已
+          # 发布」误判成「缺失」（本项目 `~/.npmrc` 就是 npmmirror）。
+          REG="https://registry.npmjs.org"
+          V="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          missing=""
+          for d in yi-agent-cli/platforms/*/; do
+            n="@yi-agent/yi-agent-$(basename "$d")@$V"
+            npm view "$n" --registry="$REG" >/dev/null 2>&1 || missing="$missing $n"
+          done
+          npm view "@yi-agent/yi-agent@$V" --registry="$REG" >/dev/null 2>&1 \
+            || missing="$missing @yi-agent/yi-agent@$V"
+          if [ -n "$missing" ]; then
+            echo "::error title=npm-publish::not on registry:$missing"
+            exit 1
+          fi
+          echo "::notice title=npm-publish::all $V packages are on the registry"
 
       - name: Update Homebrew tap
         env:
