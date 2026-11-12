@@ -117,7 +117,18 @@ jobs:
           # （launchd 默认 256，并行链接 Linux 目标会 ProcessFdQuotaExceeded），
           # 并校验三平台 std 与 zig/zigbuild 真的可用。任一不满足即失败，
           # 避免把「环境不对」伪装成「代码编译错误」。
-          source scripts/setup-build-env.sh
+          # 这一步曾在 2 秒内以 exit 101（Rust panic）失败，而 annotation 里
+          # 只有一句 "Process completed with exit code 101"，看不出是哪条命令
+          # 挂的。把 setup 与 package-all 的输出都落到文件，失败时压成
+          # annotation 带出去。
+          LOG="$(mktemp -t package-all)"
+          # source 不能进管道：管道会把它放进子 shell，export/ulimit 全部
+          # 丢失。先重定向取输出，再读回变量环境。
+          source scripts/setup-build-env.sh >"$LOG" 2>&1 || {
+            echo "::error title=setup-build-env::failed"
+            tail -25 "$LOG" | tr '\n' '|' | cut -c1-1800
+            exit 1; }
+          cat "$LOG"
           # 这里**不**跑 `just release-targets-check`。它校验的正是下面
           # `package-all` 要编的三个目标，放在这里是纯重复：实测让这一步从
           # 2m36s（v0.1.13）涨到 8m13s，并多占 6.1G target 空间。发布失败的
@@ -126,7 +137,18 @@ jobs:
           # 它的位置在 PR/合并前（GitLab `ci-push`），那才是能在 tag 之前
           # 拦住「用了只有 macOS 才有的 API、却没有 cfg 隔离」的地方：
           # v0.1.14 就是这么一路绿到 tag 才翻车的。
-          just package-all
+          set +e
+          just package-all 2>&1 | tee -a "$LOG"
+          PKG_RC="${PIPESTATUS[0]:-1}"
+          set -e
+          if [ "$PKG_RC" -ne 0 ]; then
+            echo "::error title=package-all::failed rc=$PKG_RC"
+            tail -25 "$LOG" | tr '\n' '|' | tr -s ' ' | cut -c1-1800 \
+              | xargs -I{} echo "::error title=package-all-log::{}" || true
+            df -h "$HOME" || true
+            du -sh "${CARGO_TARGET_DIR:-target}" 2>/dev/null || true
+            exit "$PKG_RC"
+          fi
 
       - name: Verify the binary reports the release version
         working-directory: yi-agent-rs
