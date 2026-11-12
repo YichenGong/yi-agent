@@ -163,10 +163,21 @@ log "TAURI_LOG=$TAURI_LOG"
 # `then` 分支永不进入，tauri build 的失败被彻底吞掉，脚本带着 rc=0 往下
 # 走——这正是 v0.1.15 连续多次「第 13 步成功但产物不在」的成因：构建其实
 # 早就失败了，只是没人看它的退出码。
+# 这里**不用管道**。`cmd | tee log` 的退出码是 tee 的（恒为 0），必须靠
+# PIPESTATUS 补救；而 PIPESTATUS 只反映紧邻的上一条管道，任何插入的命令都会
+# 把它清空，在 `set -u` 下变成
+#   package-npm-app.sh: line NNN: TAURI_RC: unbound variable
+# ——v0.1.15 的第十二次正是栽在这：构建明明成功（日志里已有
+# "Finished 1 bundle at: .../yi-agent.app"），脚本却在读退出码那行崩掉，
+# 产物因此没被复制，第 14 步只能看到一个空目录。
+#
+# 改成重定向到文件再取 `$?`：退出码来自那个子 shell，没有管道、没有
+# PIPESTATUS、也没有 set -u 的坑。要实时输出的部分（失败时）后面再 cat。
 set +e
-(cd "$HERE" && npm run tauri build -- --bundles app) 2>&1 | tee "$TAURI_LOG"
-TAURI_RC="${PIPESTATUS[0]}"
+(cd "$HERE" && npm run tauri build -- --bundles app) >"$TAURI_LOG" 2>&1
+TAURI_RC=$?
 set -e
+cat "$TAURI_LOG"
 log "tauri build 退出码 $TAURI_RC（日志 $(wc -l < "$TAURI_LOG") 行）"
 if [ "$TAURI_RC" -ne 0 ]; then
   # 也把尾部原样打到 stdout，便于本地复现时阅读。
