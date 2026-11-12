@@ -53,7 +53,11 @@ log "注入版本 $VERSION 并收窄 targets 为 app"
 jq --arg v "$VERSION" '.bundle.targets = ["app"] | .version = $v' "$CONF" > "$CONF.tmp"
 mv "$CONF.tmp" "$CONF"
 # 只在工作区改，不提交；CI 里用完即弃。
-trap 'git -C "$ROOT" checkout -- "$CONF" 2>/dev/null || true' EXIT
+# 退出码必须自己写出来：CI 上第 13 步返回 0 却只跑到 `stage: tauri build`
+# 就没有下文，而 `set -euo pipefail` 下没有任何路径能安静地退 0。到底是脚本
+# 跑完了（日志被吞）还是被谁中途终止，只有这行能分清。
+trap 'rc=$?; git -C "$ROOT" checkout -- "$CONF" 2>/dev/null || true; \
+      log "script exiting rc=$rc"' EXIT
 
 gh_note() { [ -n "${GITHUB_ACTIONS:-}" ] && echo "::notice title=npm-pack-desktop::$*" || true; }
 gh_err()  { [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=npm-pack-desktop::$*" || true; }
@@ -115,18 +119,31 @@ done
 # 匿名读到的是 check-run annotations。而 `tauri build` 的失败原因藏在几十行
 # 输出里（cargo 报错、build script panic、bundle 失败），只回一句
 # "tauri build failed" 等于什么都没说。
+log "清理完成，准备 tauri build (target=$TAURI_TARGET_DIR_PRE)"
 TAURI_LOG="$(mktemp -t yi-agent-tauri-build)"
-if ! (cd "$HERE" && npm run tauri build -- --bundles app) 2>&1 | tee "$TAURI_LOG"; then
+log "TAURI_LOG=$TAURI_LOG"
+# 这里**不能**写 `if ! cmd 2>&1 | tee log; then`：`!` 作用于整条管道，而
+# 管道的退出码是最后一条命令（tee）的，恒为 0。于是 `!` 把成功翻成失败、
+# `then` 分支永不进入，tauri build 的失败被彻底吞掉，脚本带着 rc=0 往下
+# 走——这正是 v0.1.15 连续多次「第 13 步成功但产物不在」的成因：构建其实
+# 早就失败了，只是没人看它的退出码。
+set +e
+(cd "$HERE" && npm run tauri build -- --bundles app) 2>&1 | tee "$TAURI_LOG"
+TAURI_RC="${PIPESTATUS[0]}"
+set -e
+log "tauri build 退出码 $TAURI_RC（日志 $(wc -l < "$TAURI_LOG") 行）"
+if [ "$TAURI_RC" -ne 0 ]; then
   # 也把尾部原样打到 stdout，便于本地复现时阅读。
-  echo "---- tauri build: last 20 lines ----"
-  tail -20 "$TAURI_LOG"
+  echo "---- tauri build: last 30 lines ----"
+  tail -30 "$TAURI_LOG"
   echo "-------------------------------------"
   # annotation 单条有长度上限，压缩连续空白并截断，保留最能定位的尾部。
-  detail="$(tail -20 "$TAURI_LOG" | tr -s '[:space:]' ' ' | cut -c1-1200)"
-  gh_err "tauri build failed: $detail"
+  detail="$(tail -30 "$TAURI_LOG" | tr '\n' '|' | tr -s ' ' | cut -c1-1800)"
+  gh_err "tauri build failed (rc=$TAURI_RC): $detail"
   rm -f "$TAURI_LOG"
   exit 1
 fi
+log "tauri build 结束（成功），日志行数 $(wc -l < "$TAURI_LOG")"
 rm -f "$TAURI_LOG"
 
 # target 目录不能假定是 src-tauri/target：CI 把 CARGO_TARGET_DIR 指到

@@ -213,13 +213,12 @@ jobs:
           else
             echo "::error title=npm-package::no yi-agent.app in $(pwd)/$PKG_DIR after packaging (rc=$rc)"
             ls -la "$PKG_DIR" 2>&1 || true
-            echo "== packaging log: $(wc -l < "$PKG_LOG") lines =="
-            # stdout 在 CI 上读不到（logs 接口对匿名回 403），只有 annotation
-            # 能带出信息，所以阶段标记必须写进 ::error:: 的消息体本身。
-            stages="$(grep -E '^(>>>|::)' "$PKG_LOG" | tail -25 \
-              | tr -s '[:space:]' ' ' | cut -c1-1400)"
-            echo "::error title=npm-package-log::$stages" || true
-            echo "== end of packaging log =="
+            # 上一次只 grep 了 `>>>`/`::` 行，把 tauri build 的真实输出滤掉了，
+            # 于是只知道「停在清理陈旧目标之后」，不知道之后发生了什么。这次
+            # 原样取尾部 12 行压成一条 annotation（stdout 在 CI 上读不到）。
+            tail12="$(tail -12 "$PKG_LOG" | tr '\n' '|' | tr -s ' ' | cut -c1-1500)"
+            echo "::error title=npm-package-log::$tail12" || true
+            cp "$PKG_LOG" "$GITHUB_WORKSPACE/npm-pack-desktop.log" 2>/dev/null || true
           fi
           # 日志必须落在 workspace 内、且在第 14 步还能读到：annotation 会被
           # 丢弃（tauri/vite 输出里带 `::` 的行会让命令解析器改变状态），而
