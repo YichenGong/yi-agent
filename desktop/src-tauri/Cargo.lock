@@ -5646,14 +5646,14 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-flags"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "yi-agent-lifecycle"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -5664,7 +5664,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-plugins"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
