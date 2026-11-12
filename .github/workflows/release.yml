@@ -143,6 +143,25 @@ jobs:
           bash scripts/check-release-version.sh "${{ steps.version.outputs.version }}" \
             "$("$BIN" --version | awk '{print $2}')"
 
+      - name: Setup Node.js
+        # 必须排在桌面构建**之前**。`just npm-pack-desktop` 会跑
+        # `tauri build`，其 beforeBuildCommand 是 `npm run build`
+        # （`tsc && vite build`），而 vite 8 的 engines 是
+        # `^20.19.0 || >=22.12.0` 这种硬约束。
+        #
+        # 之前这一步排在发布之后，桌面构建用的是 self-hosted runner 预装的
+        # node——那是一台持久机器，node 版本会随机器维护漂移，而同一步在
+        # v0.1.13 通过、v0.1.15 失败（34s 秒挂，缓存已热说明不是编译慢）。
+        # 把 node 固定成 22（LTS，满足上面的 engines），构建就不再依赖
+        # runner 当下装了什么。
+        #
+        # registry-url 一并放在这里：后面的 `Publish to npm` 依赖它写
+        # .npmrc，setup-node 只需执行一次。
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
       - name: Build macOS desktop app for npm
         # 只有 arm64 的 .app 会进 darwin-arm64 子包。Linux/Intel 用户
         # 不会因此多下载——npm 按 os/cpu 只装匹配的子包。
@@ -204,12 +223,6 @@ jobs:
             yi-agent-rs/dist/*.tar.gz
             yi-agent-rs/dist/*.sha256
           generate_release_notes: true
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          registry-url: "https://registry.npmjs.org"
 
       - name: Publish to npm
         working-directory: yi-agent-rs

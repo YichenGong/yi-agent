@@ -55,14 +55,20 @@ mv "$CONF.tmp" "$CONF"
 # 只在工作区改，不提交；CI 里用完即弃。
 trap 'git -C "$ROOT" checkout -- "$CONF" 2>/dev/null || true' EXIT
 
+gh_note() { [ -n "${GITHUB_ACTIONS:-}" ] && echo "::notice title=npm-pack-desktop::$*" || true; }
+gh_err()  { [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=npm-pack-desktop::$*" || true; }
+
+gh_note "stage: npm ci"
 log "npm ci"
-(cd "$HERE" && npm ci)
+(cd "$HERE" && npm ci) || { gh_err "npm ci failed"; exit 1; }
 
+gh_note "stage: build sidecar"
 log "构建 sidecar（release 模式 CLI）"
-(cd "$HERE" && npm run sidecar:release)
+(cd "$HERE" && npm run sidecar:release) || { gh_err "sidecar:release failed"; exit 1; }
 
+gh_note "stage: tauri build"
 log "tauri build（只出 .app）"
-(cd "$HERE" && npm run tauri build -- --bundles app)
+(cd "$HERE" && npm run tauri build -- --bundles app) || { gh_err "tauri build failed"; exit 1; }
 
 # target 目录不能假定是 src-tauri/target：CI 把 CARGO_TARGET_DIR 指到
 # $HOME/cargo-target/github，tauri 的产物会跟着走。cargo metadata 是唯一
@@ -74,6 +80,7 @@ TAURI_TARGET_DIR="$(cargo metadata --manifest-path "$HERE/src-tauri/Cargo.toml" 
 [ -n "$TAURI_TARGET_DIR" ] || TAURI_TARGET_DIR="$HERE/src-tauri/target"
 APP_SRC="$TAURI_TARGET_DIR/release/bundle/macos/yi-agent.app"
 if [ ! -d "$APP_SRC" ]; then
+  echo "::error title=npm-pack-desktop::no .app at $APP_SRC" || true
   echo "ERROR: 未找到 $APP_SRC" >&2
   ls -l "$TAURI_TARGET_DIR/release/bundle/macos/" >&2 || true
   exit 1
@@ -85,9 +92,11 @@ fi
 # digest。**不能再 --deep**：它会把已签的 sidecar 重签一遍，使刚写下的
 # digest 与实际文件不符，而清单正是桌面壳用来证明「要跑的 daemon 就是
 # 我发的那个」的依据。
+gh_note "stage: finalize bundle"
 log "finalize 运行时清单并重签"
-bash "$HERE/scripts/finalize-runtime-bundle.sh" "$APP_SRC"
+bash "$HERE/scripts/finalize-runtime-bundle.sh" "$APP_SRC" || { gh_err "finalize-runtime-bundle failed"; exit 1; }
 
+gh_note "stage: verify signature"
 log "校验签名"
 if ! codesign --verify --strict "$APP_SRC"; then
   echo "ERROR: 重签后签名仍无效，拒绝打包坏产物" >&2
