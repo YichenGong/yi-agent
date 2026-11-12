@@ -134,14 +134,40 @@ pub(crate) async fn handle(
             // (`create(true)`)会把 `<id>.jsonl` 复活,导致删除后
             // `store.exists` 仍为真、`thread/resume` 能把已删 thread 拉回。
             // 故复用 resume 的等待模式,等落盘后再删。
-            interrupt_and_wait_for_persist(
+            let paused_writer = match interrupt_and_wait_for_persist(
                 state.threads,
                 state.turn_rx,
                 &thread_id,
                 state.pending_lead_replies,
                 state.lead_replies,
             )
-            .await;
+            .await
+            {
+                Ok(paused) => paused,
+                Err(error) => {
+                    let mut rpc_error = RpcError::internal(error);
+                    rpc_error.data = Some(json!({"retryable":true,"sessionRetained":true}));
+                    write_response(state.hub, state.client, err_response(id, rpc_error)).await?;
+                    return Ok(Flow::Continue);
+                }
+            };
+            if let Err(error) = thread_store.delete(&thread_id) {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(
+                        id,
+                        RpcError::internal(format!(
+                            "failed to delete thread files: {error}; session retained"
+                        )),
+                    ),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+            if let Some(paused) = paused_writer {
+                paused.stop();
+            }
             // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
             state.threads.remove(&thread_id);
             state.pending_activation.remove(&thread_id);
@@ -173,9 +199,6 @@ pub(crate) async fn handle(
                 .map(|session| session.cwd.clone())
                 .collect::<Vec<_>>();
             detach_unused_runtimes(state.runtimes, &live_cwds);
-            if let Err(e) = thread_store.delete(&thread_id) {
-                eprintln!("[app-server] failed to delete thread files for {thread_id}: {e}");
-            }
             // 会话已删：成员表不能留悬空 id（spec「不变量 2」）。失败只记日志——
             // 会话删除本身已经成功，不该因为一次分组清理写失败而回滚。
             if let Some(cwd) = thread_store.root().parent().and_then(|p| p.parent())

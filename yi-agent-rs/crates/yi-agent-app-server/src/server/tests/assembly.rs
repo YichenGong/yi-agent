@@ -1168,28 +1168,28 @@ fn lead_tools_follow_the_flag() {
 }
 
 /// `device/revoke` 对**在线** ws 设备的映射查找必须真的接上:撤销某设备时,
-/// 主循环经 `ws_client_for_device` 找到它的 ws 连接并摘除。这里直接验证这条
+/// 主循环经 `ws_clients_for_device` 找到它的 ws 连接并摘除。这里直接验证这条
 /// 查找路径——ws 的 E2E 里 B 是"另一台设备",它靠这条映射被踢下线。
 #[tokio::test(flavor = "multi_thread")]
-async fn ws_client_for_device_resolves_through_the_installed_registry() {
+async fn ws_clients_for_device_resolves_through_the_installed_registry() {
     let registry: WsDeviceRegistry = Arc::new(StdMutex::new(HashMap::new()));
     // `install_device_registry` 幂等:进程里若已有 ws server 先设过全局句柄,
     // 它返回的是那**第一张**表,而不是本次传入的。故必须往返回值里插,才能
-    // 保证 `ws_client_for_device` 读到;往局部 `registry` 里插会在并发测试下
+    // 保证 `ws_clients_for_device` 读到;往局部 `registry` 里插会在并发测试下
     // 抖动失败。
     let global = install_device_registry(registry);
     let cid = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
-    global
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert("dev-abc".to_string(), cid.clone());
+    global.lock().unwrap_or_else(|p| p.into_inner()).insert(
+        "dev-abc".to_string(),
+        std::collections::HashSet::from([cid.clone()]),
+    );
 
     assert!(
-        ws_client_for_device("dev-abc").is_some(),
+        !ws_clients_for_device("dev-abc").is_empty(),
         "an online ws device must resolve to its ClientId"
     );
     // 未知设备(或连接已摘除)返回 None,`device/revoke` 于是只改设备表。
-    assert!(ws_client_for_device("dev-missing").is_none());
+    assert!(ws_clients_for_device("dev-missing").is_empty());
 }
 
 /// 每个 thread 的工具集都必须带主题工具——这是「对话切主题」的落点。

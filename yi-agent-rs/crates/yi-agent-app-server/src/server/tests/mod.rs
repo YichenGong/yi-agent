@@ -3565,6 +3565,7 @@ mod plugin_theme;
 #[cfg(test)]
 mod process;
 #[cfg(test)]
+mod reliability;
 mod runtime_settings;
 mod runtime_status;
 #[cfg(test)]

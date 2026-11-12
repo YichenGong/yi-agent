@@ -26,6 +26,9 @@ pub(crate) async fn read_lines<R>(
 {
     let mut reader = MessageReader::new(reader);
     loop {
+        if !hub.is_connected(&client) {
+            break;
+        }
         let next = tokio::select! {
             biased;
             // Cancellation is safe only here: the reader is discarded on exit,
@@ -66,23 +69,49 @@ pub(crate) async fn read_lines<R>(
                             value.get("id"),
                             "the local session has not completed its bootstrap",
                         );
-                        if let Ok(frame) = serde_json::to_value(refused) {
-                            hub.reply(&client, frame).await.ok();
+                        if let Ok(frame) = serde_json::to_value(refused)
+                            && hub.try_reply(&client, frame).is_err()
+                        {
+                            break;
                         }
                         continue;
                     }
                 }
-                if tx.send((client.clone(), Ok(line))).await.is_err() {
+                if management.is_some() {
+                    match tx.try_send((client.clone(), Ok(line))) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        Err(mpsc::error::TrySendError::Full((_, Ok(line)))) => {
+                            let id = serde_json::from_str::<serde_json::Value>(&line)
+                                .ok()
+                                .and_then(|v| v.get("id").cloned())
+                                .unwrap_or(serde_json::Value::Null);
+                            let frame = serde_json::json!({"jsonrpc":"2.0", "id":id,
+                                "error":{"code":-32000,"message":"business ingress overloaded; retry later"}});
+                            if hub.try_reply(&client, frame).is_err() {
+                                break;
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => unreachable!(),
+                    }
+                } else if tx.send((client.clone(), Ok(line))).await.is_err() {
                     break;
                 }
             }
             Ok(None) => break, // EOF → 丢弃 tx → 主循环优雅退出
             Err(e) => {
                 tracing::error!("app-server read error: {e}");
-                let _ = tx.send((client.clone(), Err(e))).await;
+                if management.is_some() {
+                    let _ = tx.try_send((client.clone(), Err(e)));
+                } else {
+                    let _ = tx.send((client.clone(), Err(e))).await;
+                }
                 break;
             }
         }
+    }
+    if let Some(handle) = management.as_ref() {
+        handle.close_now();
     }
     // 通知主循环「stdio 读端结束了」。纯 stdio 下 `eof_tx` 为 `None`,no-op。
     if let Some(eof_tx) = eof_tx {
@@ -126,7 +155,7 @@ pub(crate) async fn pump_stdout<W>(
         if let Err(e) = writer.write_value(&frame).await {
             tracing::error!("app-server stdout write failed: {e}");
             // 出口泵写失败 = 对端真的没了(stdout 管道断裂)。这是 stdio 会话的
-            // **唯一**断连判据:可靠登记不会被背压摘除,故此处必须显式摘除,
+            // 断连判据之一:最终材料无法入队也会显式断开；此处必须摘除,
             // 让主循环随后的 `reply`/`write_response` 拿到 `Closed` 并按既有
             // 致命语义结束会话(`driver_reports_finished_when_writer_fails`)。
             hub.unregister(&client);

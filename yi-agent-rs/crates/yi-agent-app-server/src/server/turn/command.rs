@@ -72,8 +72,13 @@ pub(crate) async fn apply_session_command(
     status: &Arc<std::sync::Mutex<ThreadStatus>>,
     mcp: Option<&Arc<yi_agent_mcp::McpManager>>,
     mcp_workdir: &std::path::Path,
-) -> yi_agent_core::Agent {
+    pending: &mut super::persist::PendingPersistence,
+) -> (yi_agent_core::Agent, Result<(), String>) {
+    let mut persisted = Ok(());
     match command {
+        SessionCommand::PauseWriter { reply } => {
+            let _ = reply.send(Err("writer has not reached the idle boundary".into()));
+        }
         SessionCommand::Clear { reply } => {
             agent.set_session_messages(Vec::new());
             // `set_session_messages` 只换消息,不碰 `last_input_tokens`;若不在此清零,
@@ -106,7 +111,7 @@ pub(crate) async fn apply_session_command(
                 }
             }
             // 不是 turn 收尾：turn_id 传 None（不发 Finished），也不 touch meta。
-            persist_and_finish_turn(
+            persisted = persist_and_finish_turn(
                 thread_id,
                 None,
                 // 不是回合结束（turn_id 为 None），完成时刻不写盘；传 0 明示。
@@ -124,10 +129,15 @@ pub(crate) async fn apply_session_command(
                 hub,
                 turn_tx,
                 status,
+                pending,
             )
             .await;
             // `truncate` 返回 io::Result<bool>，而 reply 通道是 Result<(), String>。
-            let _ = reply.send(truncate.map(|_| ()).map_err(|e| e.to_string()));
+            persisted = truncate
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+                .and(persisted);
+            let _ = reply.send(persisted.clone());
         }
         SessionCommand::Compact { reply } => {
             let session = agent.session();
@@ -166,7 +176,7 @@ pub(crate) async fn apply_session_command(
                 Ok(None) => CompactOutcome::NotReduced,
                 Err(e) => CompactOutcome::Failed(e.to_string()),
             };
-            persist_and_finish_turn(
+            persisted = persist_and_finish_turn(
                 thread_id,
                 None,
                 // 不是回合结束（turn_id 为 None），完成时刻不写盘；传 0 明示。
@@ -184,9 +194,13 @@ pub(crate) async fn apply_session_command(
                 hub,
                 turn_tx,
                 status,
+                pending,
             )
             .await;
-            let _ = reply.send(outcome);
+            let _ = reply.send(match &persisted {
+                Ok(()) => outcome,
+                Err(e) => CompactOutcome::Failed(e.clone()),
+            });
         }
         SessionCommand::SetModel {
             effective,
@@ -200,7 +214,7 @@ pub(crate) async fn apply_session_command(
                 Err(error) => {
                     tracing::warn!(%error, ?model_ref, "session model switch failed; keeping the old agent");
                     let _ = reply.send(Err(error.to_string()));
-                    return agent;
+                    return (agent, persisted);
                 }
             };
             // 新 cfg 只覆盖 model（provider/api_url/api_key 已烤进新 provider；其余
@@ -237,7 +251,7 @@ pub(crate) async fn apply_session_command(
                 },
             )
             .await;
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(persisted.clone());
             agent = rebuilt;
         }
         SessionCommand::SetReasoningEffort { effort, reply } => {
@@ -343,7 +357,7 @@ pub(crate) async fn apply_session_command(
             // `agent.config().preserve_thinking` 决定落盘副本是否剥离，读到旧值就
             // 会在关闭时仍把凭证写盘。与 `Clear` / `Compact` 同款：`turn_id` 传
             // `None`（不发 Finished），也不 touch meta（meta 已由 RPC 层落盘）。
-            persist_and_finish_turn(
+            persisted = persist_and_finish_turn(
                 thread_id,
                 None,
                 // 不是回合结束（turn_id 为 None），完成时刻不写盘；传 0 明示。
@@ -361,10 +375,11 @@ pub(crate) async fn apply_session_command(
                 hub,
                 turn_tx,
                 status,
+                pending,
             )
             .await;
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(persisted.clone());
         }
     }
-    agent
+    (agent, persisted)
 }

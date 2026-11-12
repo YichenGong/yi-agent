@@ -69,7 +69,7 @@ impl ClientId {
 /// 一个客户端在 hub 里的登记项。
 struct Client {
     tx: mpsc::Sender<Value>,
-    /// 可靠客户端(仅 stdio 的 `local`):它的出站队列**永不**因背压被摘除。
+    /// 本地 stdio：逐字流拥塞可丢弃；最终材料无法入队则显式断连。
     /// 见 [`Broadcaster::broadcast`]。
     reliable: bool,
     feed: Feed,
@@ -106,12 +106,9 @@ impl Broadcaster {
 
     /// 注册一个**可靠**客户端(仅 stdio 的 `local` 使用)。
     ///
-    /// 与 [`Broadcaster::register`] 唯一的不同在 [`Broadcaster::broadcast`]:它的
-    /// 队列写满时**保留登记、丢弃当前帧**,而不是把客户端摘除。stdio 只有这一条
-    /// 出站流,把它当慢消费者摘除会让主循环随即写响应失败、整个 sidecar 以错误
-    /// 退出——桌面 host 一旦来不及读 stdout(WebKit/Tauri 事件循环繁忙)就会
-    /// 触发。可靠客户端的真正断连只由它的出口泵(`pump_stdout`)在**写失败**时
-    /// 摘除,即"对端确实没了",而不是"暂时读得慢"。
+    /// Delta frames may be dropped under transient pressure; replies and historical
+    /// replay retain backpressure. Final material uses `broadcast_required`: inability
+    /// to admit it explicitly disconnects even local stdio for recovery.
     pub fn register_reliable(&self, id: ClientId) -> mpsc::Receiver<Value> {
         self.register_inner(id, true)
     }
@@ -203,6 +200,25 @@ impl Broadcaster {
         });
     }
 
+    /// Final material cannot be dropped while pretending the connection is healthy.
+    /// Admission is nonblocking and follows the same subscription scope as deltas.
+    pub fn broadcast_required(&self, key: Option<&str>, frame: Value) {
+        self.clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|id, client| {
+                if !client.feed.accepts(key) || client.tx.try_send(frame.clone()).is_ok() {
+                    true
+                } else {
+                    tracing::warn!(
+                        client = id.as_str(),
+                        "final material not admitted; disconnecting for recovery"
+                    );
+                    false
+                }
+            });
+    }
+
     /// 历史/关键帧按 thread 键带背压扇出：本地 reliable 客户端等待入队，
     /// WebSocket 客户端最多等待十秒，持续停滞才摘除并由 ws 连接循环关闭。
     /// 实时流仍用 [`Self::broadcast_for`]，不改变其慢消费者策略。
@@ -253,6 +269,16 @@ impl Broadcaster {
         if closed { Err(Closed) } else { Ok(()) }
     }
 
+    /// Bounded ingress-control response: never stall the reader behind output.
+    pub(crate) fn try_reply(&self, id: &ClientId, frame: Value) -> Result<(), Closed> {
+        let mut guard = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.get(id).is_some_and(|c| c.tx.try_send(frame).is_ok()) {
+            return Ok(());
+        }
+        guard.remove(id);
+        Err(Closed)
+    }
+
     /// 只发给指定客户端。
     ///
     /// 与 `broadcast` 不同,这里 `await` 到**入队**成功为止——即等到帧进入该
@@ -261,16 +287,31 @@ impl Broadcaster {
     /// 仍提供背压。客户端已注销或队列关闭时返回 `Err(Closed)`,调用方据此终止
     /// 会话。
     pub async fn reply(&self, id: &ClientId, frame: Value) -> Result<(), Closed> {
-        let tx = self
+        let target = self
             .clients
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(id)
-            .map(|client| client.tx.clone());
-        match tx {
-            Some(tx) => tx.send(frame).await.map_err(|_| Closed),
-            None => Err(Closed),
+            .map(|c| (c.tx.clone(), c.reliable));
+        let Some((tx, reliable)) = target else {
+            return Err(Closed);
+        };
+        let delivered = if reliable {
+            tx.send(frame).await.is_ok()
+        } else {
+            matches!(
+                tokio::time::timeout(WS_SEND_TIMEOUT, tx.send(frame)).await,
+                Ok(Ok(()))
+            )
+        };
+        if delivered {
+            return Ok(());
         }
+        let mut guard = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.get(id).is_some_and(|c| c.tx.same_channel(&tx)) {
+            guard.remove(id);
+        }
+        Err(Closed)
     }
 }
 
@@ -633,5 +674,90 @@ mod tests {
         assert_eq!(got.len(), total, "reliable client must receive every frame");
         assert_eq!(got[0], 0);
         assert_eq!(*got.last().unwrap(), (total - 1) as u64);
+    }
+    #[tokio::test]
+    async fn directed_reply_evicts_only_a_stalled_ws() {
+        let hub = Broadcaster::new();
+        let slow = ClientId::ws(uuid::Uuid::new_v4());
+        let _slow_rx = hub.register(slow.clone());
+        for n in 0..CLIENT_QUEUE {
+            hub.reply(&slow, serde_json::json!({"n":n})).await.unwrap();
+        }
+        let fast = ClientId::ws(uuid::Uuid::new_v4());
+        let mut fast_rx = hub.register(fast.clone());
+        let result = tokio::time::timeout(
+            WS_SEND_TIMEOUT + Duration::from_secs(1),
+            hub.reply(&slow, serde_json::json!({"reply":true})),
+        )
+        .await;
+        assert_eq!(
+            result,
+            Ok(Err(Closed)),
+            "a directed WS response must have a deadline"
+        );
+        assert!(!hub.is_connected(&slow));
+        hub.reply(&fast, serde_json::json!({"ok":true}))
+            .await
+            .unwrap();
+        assert_eq!(fast_rx.recv().await.unwrap()["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn final_content_is_delivered_or_the_connection_explicitly_fails() {
+        for reliable in [true, false] {
+            let hub = Broadcaster::new();
+            let id = if reliable {
+                ClientId::local()
+            } else {
+                ClientId::ws(uuid::Uuid::new_v4())
+            };
+            let mut rx = if reliable {
+                hub.register_reliable(id.clone())
+            } else {
+                hub.register(id.clone())
+            };
+            for n in 0..CLIENT_QUEUE {
+                hub.broadcast(serde_json::json!({"n":n}));
+            }
+            crate::server::write_notification(
+                &hub,
+                &crate::protocol::Notification::ItemCompleted {
+                    thread_id: "t1".into(),
+                    item: crate::protocol::Item::AgentMessage {
+                        id: "answer".into(),
+                        text: "complete answer".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let mut found = false;
+            while let Ok(frame) = rx.try_recv() {
+                found |= frame["method"] == "item/completed";
+            }
+            assert!(
+                found || !hub.is_connected(&id),
+                "full queue must not silently lose a final item while staying connected"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn required_content_preserves_subscription_filtering() {
+        let hub = Broadcaster::new();
+        let wanted = ClientId::ws(uuid::Uuid::new_v4());
+        let other = ClientId::ws(uuid::Uuid::new_v4());
+        let mut wanted_rx = hub.register(wanted.clone());
+        let _other_rx = hub.register(other.clone());
+        hub.subscribe(&wanted, vec!["t1".into()]);
+        hub.subscribe(&other, vec!["t2".into()]);
+        for n in 0..CLIENT_QUEUE {
+            hub.try_reply(&other, serde_json::json!({"n":n})).unwrap();
+        }
+        hub.broadcast_required(Some("t1"), serde_json::json!({"final":"answer"}));
+        assert_eq!(wanted_rx.recv().await.unwrap()["final"], "answer");
+        assert!(
+            hub.is_connected(&other),
+            "a full non-subscriber must not be evicted"
+        );
     }
 }

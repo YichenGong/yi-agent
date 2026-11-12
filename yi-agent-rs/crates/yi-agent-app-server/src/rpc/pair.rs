@@ -11,9 +11,7 @@ use serde_json::json;
 
 use crate::protocol::{RequestEnvelope, RequestId, RpcError};
 use crate::rpc::{AppState, Flow};
-use crate::server::{
-    err_response, forget_ws_device, ok_response, write_response, ws_client_for_device,
-};
+use crate::server::{err_response, forget_ws_device, ok_response, write_response};
 
 /// 处理本域的一个 RPC 请求。
 ///
@@ -137,14 +135,7 @@ pub(crate) async fn handle(
             };
             let revoked = state.pairing.revoke(&device_id).unwrap_or(false);
             if revoked {
-                // 先取当前连接:撤销即掉线由「`hub.unregister` + 读循环
-                // 的 disconnected tick」共同完成。用 `get` + `forget`
-                // 两步是为了兼顾两种语义——`ws_client_for_device` 仍是
-                // 「此刻该设备连在哪」的权威读法(测试与将来 RPC 复用),
-                // `forget_ws_device` 顺带把该映射从全局表摘掉,不留陈旧项。
-                let cid = ws_client_for_device(&device_id);
-                forget_ws_device(&device_id);
-                if let Some(cid) = cid {
+                for cid in forget_ws_device(&device_id) {
                     state.hub.unregister(&cid);
                 }
             }

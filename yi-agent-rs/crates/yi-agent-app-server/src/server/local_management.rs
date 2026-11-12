@@ -293,6 +293,7 @@ pub trait PrepareBackend: Send + Sync {
 /// 每个 scope 一个进行中的槽位：并发的同 scope 请求等待**同一个**结果，因此
 /// runtime 只会被启动一次。不同 scope 不共享任何锁。
 pub struct ManagementHandle {
+    pub(crate) ingress_slots: Arc<tokio::sync::Semaphore>,
     session: Arc<Mutex<ManagementSession>>,
     /// 进行中的 prepare，按 scope key 索引。
     ///
@@ -327,6 +328,7 @@ struct Inflight {
 impl ManagementHandle {
     pub fn new(backend: Arc<dyn PrepareBackend>) -> Self {
         Self {
+            ingress_slots: Arc::new(tokio::sync::Semaphore::new(32)),
             session: Arc::new(Mutex::new(ManagementSession::new())),
             inflight: std::sync::Mutex::new(HashMap::new()),
             outbound: std::sync::Mutex::new(None),
@@ -547,6 +549,7 @@ impl ManagementHandle {
     /// 与 [`Self::close`] 的差别只在能否 await：`uninstall` 在同步上下文里被
     /// 调用（进程收尾），不能等一把 async 锁。
     pub fn close_now(&self) {
+        self.ingress_slots.close();
         let mut locks = self.lock_inflight();
         for (_, entry) in locks.drain() {
             let _ = entry.outcome.send(None);

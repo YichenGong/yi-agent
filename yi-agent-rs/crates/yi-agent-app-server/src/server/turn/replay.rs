@@ -134,66 +134,88 @@ pub(crate) fn settle_pending_lead_replies(
         let _ = replies.resolve(&request_id, reply);
     }
 }
-/// 若 `thread_id` 有活跃 turn,中断它并等待 driver 落盘完成。
-///
-/// driver 是「先发 turn/completed,后 append/touch」,而 `TurnEvent::Finished`
-/// 在落盘之后才发出;因此本函数返回后,调用方可以依赖「该 turn 已落盘」。
-/// 有界等待:driver 异常卡死时不至于拖垮整个请求循环。
+/// A held pause prevents any old-driver write while lifecycle code touches storage.
+/// Early returns resume the original session. Success explicitly stops its driver.
+pub(crate) struct PausedWriter(Option<oneshot::Sender<bool>>);
+impl PausedWriter {
+    pub(crate) fn stop(mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(true);
+        }
+    }
+}
+impl Drop for PausedWriter {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(false);
+        }
+    }
+}
+
+/// Interrupt, settle matching execution, then pause the writer at its idle boundary.
+/// Timeouts, closed channels and unsaved content refuse mutation, retaining the session.
 pub(crate) async fn interrupt_and_wait_for_persist(
     threads: &mut HashMap<String, ThreadSession>,
     turn_rx: &mut mpsc::Receiver<TurnEvent>,
     thread_id: &str,
-    // 本函数会把 `turn_rx` 里的 `Finished` 取走(包括别的 thread 的),故也必须
-    // 替主循环把这些事件的待回填队列收口,否则它们会悬到下一次投递。
     pending_lead_replies: &mut HashMap<String, Vec<String>>,
     lead_replies: &crate::lead::LeadReplies,
-) {
-    let Some(tid) = threads
-        .get(thread_id)
-        .and_then(|s| s.active_turn_id.clone())
-    else {
-        return;
-    };
-    if let Some(s) = threads.get(thread_id) {
-        let _ = s.interrupt_tx.try_send(tid.clone());
+) -> Result<Option<PausedWriter>, String> {
+    if !threads.contains_key(thread_id) {
+        return Ok(None);
     }
-    let wait_for_persist = async {
-        while let Some(TurnEvent::Finished {
-            thread_id: done_id,
-            turn_id: done_turn,
-            reply,
-            lead_request_id,
-        }) = turn_rx.recv().await
+    let barrier = async {
+        if let Some(tid) = threads
+            .get(thread_id)
+            .and_then(|s| s.active_turn_id.clone())
         {
-            if let Some(s) = threads.get_mut(&done_id)
-                && s.active_turn_id.as_deref() == Some(done_turn.as_str())
-            {
-                s.active_turn_id = None;
-                s.turn_permit = None;
+            if let Some(s) = threads.get(thread_id) {
+                let _ = s.interrupt_tx.try_send(tid.clone());
             }
-            // 这枚完成事件不会回到主循环了,它的回填机会就在此处(见函数说明)。
-            // 同样只认事件自己携带的身份:别的 thread 的那一轮与这里的等待方无关。
-            settle_pending_lead_replies(
-                &done_id,
-                lead_request_id,
-                reply,
-                pending_lead_replies,
-                lead_replies,
-            );
-            if done_id == thread_id && done_turn == tid {
-                break;
+            loop {
+                let Some(TurnEvent::Finished {
+                    thread_id: done_id,
+                    turn_id: done_turn,
+                    reply,
+                    lead_request_id,
+                }) = turn_rx.recv().await
+                else {
+                    return Err(
+                        "completion stream closed before the writer settled; retry later".into(),
+                    );
+                };
+                if let Some(s) = threads.get_mut(&done_id) {
+                    s.finish_turn(&done_turn);
+                }
+                settle_pending_lead_replies(
+                    &done_id,
+                    lead_request_id,
+                    reply,
+                    pending_lead_replies,
+                    lead_replies,
+                );
+                if done_id == thread_id && done_turn == tid {
+                    break;
+                }
             }
         }
+        let session = threads.get(thread_id).ok_or("session disappeared")?;
+        let (reply, answer) = oneshot::channel();
+        session
+            .session_tx
+            .send(crate::session::SessionCommand::PauseWriter { reply })
+            .await
+            .map_err(|_| "writer unavailable; session retained".to_string())?;
+        let control = answer
+            .await
+            .map_err(|_| "writer did not acknowledge pause; retry later".to_string())??;
+        Ok(Some(PausedWriter(Some(control))))
     };
-    if tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_persist)
+    tokio::time::timeout(std::time::Duration::from_secs(5), barrier)
         .await
-        .is_err()
-    {
-        eprintln!(
-            "[app-server] timed out waiting for turn of {thread_id} to persist; \
-             a late driver append may resurrect its files"
-        );
-    }
+        .map_err(|_| {
+            "timed out waiting for safe persistence; session retained, retry later".to_string()
+        })?
 }
 /// 从本轮 items 里取第一条助手文本：作为回填给组长等待方的回复。
 ///

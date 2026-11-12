@@ -19,29 +19,29 @@ pub(crate) const IMAGE_READ_CHUNK_BYTES: u64 = 512 * 1024;
 /// `image/read` 允许服务的最大文件字节数。分片只是传输形态,不代表可以无上限地
 /// 服务任意大文件;与 `image_prep::MAX_IMAGE_BYTES` 同值(20 MiB)。
 pub(crate) const IMAGE_READ_MAX_BYTES: u64 = 20 * 1024 * 1024;
-/// 把一个设备 id 映射到它当前的 ws `ClientId`——设备被撤销时据此摘除连接。
-///
-/// 这张表在 **ws 传输内部**维护(`ws.rs`):每个已认证的连接把自己
-/// `device_id → ClientId` 登记进去,断连即摘除。主循环(本文件)不能直接持有
-/// 它——`ws.rs` 依赖 `server.rs`,反向依赖会成环——故 ws 层在启动时把
-/// `Arc<Mutex<HashMap<String, ClientId>>>` 交给本函数要读的进程级句柄
-/// ([`install_device_registry`])。表为空(纯 stdio、无 ws,或尚未起 ws)时
-/// 安全返回 `None`。
-pub(crate) fn ws_client_for_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
-    let registry = device_registry().get()?;
+/// Snapshot all connections authenticated as a device.
+#[cfg(test)]
+pub(crate) fn ws_clients_for_device(device_id: &str) -> Vec<crate::broadcast::ClientId> {
+    let Some(registry) = device_registry().get() else {
+        return Vec::new();
+    };
     let guard = registry.lock().unwrap_or_else(|p| p.into_inner());
-    guard.get(device_id).cloned()
+    guard
+        .get(device_id)
+        .map(|ids| ids.iter().cloned().collect())
+        .unwrap_or_default()
 }
-/// 取出并移除某设备 id 的连接映射(撤销时用)。
-///
-/// 与 [`ws_client_for_device`] 同一张表,但顺带摘掉条目:设备已撤销,它的
-/// `device_id → ClientId` 映射不该留在全局表里等下一个同名设备(或迟到的清理)
-/// 撞上。真正的连接关闭由调用方 `hub.unregister` + ws 读循环的 disconnected
-/// tick 完成;这里只负责让主循环侧不再记得它。
-pub(crate) fn forget_ws_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
-    let registry = device_registry().get()?;
-    let mut guard = registry.lock().unwrap_or_else(|p| p.into_inner());
-    guard.remove(device_id)
+/// Atomically remove every registered connection of a revoked device.
+pub(crate) fn forget_ws_device(device_id: &str) -> Vec<crate::broadcast::ClientId> {
+    let Some(registry) = device_registry().get() else {
+        return Vec::new();
+    };
+    registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(device_id)
+        .map(|ids| ids.into_iter().collect())
+        .unwrap_or_default()
 }
 /// 进程级「设备 id → ws `ClientId`」句柄。
 ///
@@ -173,6 +173,16 @@ pub(crate) async fn write_notification(
         // 这不是本帧的问题：主循环随后的 `reply` 会拿到 `Closed` 并按既有致命语义
         // 收尾，故此处忽略即可。
         let _ = hub.broadcast_await(key, frame).await;
+    } else if matches!(
+        n,
+        Notification::ItemStarted { .. }
+            | Notification::ItemCompleted { .. }
+            | Notification::ItemsCompleted { .. }
+            | Notification::TurnStarted { .. }
+            | Notification::InterjectionsReturned { .. }
+            | Notification::TurnRetry { .. }
+    ) {
+        hub.broadcast_required(key, frame);
     } else {
         hub.broadcast_for(key, frame);
     }

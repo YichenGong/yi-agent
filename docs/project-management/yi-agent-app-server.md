@@ -1,5 +1,16 @@
 # yi-agent-app-server（GUI app-server）
 
+## App-server 可靠性修复（六项）
+
+[设计](../superpowers/specs/2026-11-11-app-server-reliability-design.md) · [计划](../superpowers/plans/2026-11-11-app-server-reliability.md) · [验证记录](../superpowers/reports/2026-11-11-app-server-reliability-verification.md)。本组不等价于下方完整只读同步协议，snapshot/probe/delta 对账仍保持未完成。
+
+- [x] 设备撤销覆盖所有现存 WS 连接，登记后复核 token，旧连接 teardown 不移除同设备新连接 — `src/ws.rs`、`server/rpc_io.rs`、`rpc/pair.rs`；判据：`cargo nextest run --all-features -p yi-agent-app-server -E 'test(a_revoked_device) | test(old_connection_teardown)'`。
+- [x] turn 完成按身份统一释放占位和准入许可 — `src/session.rs::finish_turn`，正常消费者、屏障消费者及失败 rollback 共用；判据：`cargo test -p yi-agent-app-server --all-features --lib permit_is_released_when_session_clears_the_turn`（含 stale completion）。
+- [x] WS 定向回复和 socket 发送最多等待 10 秒，仅摘除对应慢连接；业务队列堵塞时撤销检查仍运行 — `src/broadcast.rs::reply`、`src/ws.rs::handle_ws`；判据：`cargo test -p yi-agent-app-server --all-features --lib directed_reply_evicts_only_a_stalled_ws` 及 WS 套件。
+- [x] 执行结束与保存成功分离；delete/resume 在 driver 空闲暂停握手后才改存储，超时/断流/保存失败返回可重试错误并保留会话；最终 checkpoint 与内存快照可在存储修复后重试，删除 I/O 错误不返回成功 — `src/server/turn/{persist,replay}.rs`、`driver/turn_driver.rs`、`rpc/thread/lifecycle/{delete,resume}.rs`；判据：`cargo nextest run --all-features -p yi-agent-app-server -E 'test(a_failed_append) | test(persistence_barrier) | test(dropping_a_writer_pause) | test(failed_file_delete)'`。
+- [x] 最终 item/batch 的可靠性与 Delivery 订阅范围分离：必须进入既有有界队列，否则显式断连进入恢复；本地出口失效也能被主循环识别，不新增 driver 等待 — `src/broadcast.rs::broadcast_required`、`server/rpc_io.rs::write_notification`；判据：`cargo nextest run --all-features -p yi-agent-app-server -E 'test(final_content) | test(required_content)'`。完整 delta 丢帧定向失效和新恢复协议不在本条完成范围。
+- [x] 管理请求和响应不受饱和业务入站队列阻塞；保留原 64 槽业务顺序队列，超限显式拒绝，满控制出口显式断连，慢管理工作最多并发 32 个 — `src/server/transport/{stdio,mod}.rs`、`local_management.rs`、`management_client.rs`；判据：`cargo test -p yi-agent-app-server --all-features --lib server::tests::management::`（饱和请求/响应、满出口、超限拒绝、关闭后不启动 runtime）。
+
 ## 本地历史回放与激活解耦
 
 - [x] 本地 `thread/resume` opt-in `historyFirst` + `historyToken` 在建 agent / 等 managed runtime 前可靠定向回放正文、usage、崩溃 partial 并发送对应 `thread/historyReady` — `src/rpc/thread/lifecycle/resume.rs`、`src/protocol.rs`。仅 stdio local 生效；远端保持旧时序，订阅过滤不会吞正文却留下 ready；严格载入 / 模型检查仍前置，partial 只在激活成功及 writer lock 后 promote，`ThreadStarted` 与最终回包仍代表真实激活成功。判据：`cd yi-agent-rs && just ci`（6415 测试 + 50 绑定通过），`server/tests/thread_lifecycle.rs` 包含工厂阻塞前可读、legacy / remote 时序、订阅隔离、usage / partial 单次回放和激活失败保留 partial 回归。原生长历史 3251 项 / 142 批先于激活可读，当前隔离候选双启动缓存验收通过；[回归记录](../testing/desktop-history-first-regression.md)。

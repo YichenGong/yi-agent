@@ -136,16 +136,14 @@ async fn handle_local_management(
                         ),
                     ));
                 }
-                hub.reply(client, serde_json::to_value(&reply)?).await.ok();
+                hub.try_reply(client, serde_json::to_value(&reply)?).ok();
             }
             Err(error) => {
                 let refused = crate::server::local_management::refusal_for(
                     value.get("id"),
                     format!("malformed bootstrap frame: {error}"),
                 );
-                hub.reply(client, serde_json::to_value(&refused)?)
-                    .await
-                    .ok();
+                hub.try_reply(client, serde_json::to_value(&refused)?).ok();
             }
         }
         return Ok(true);
@@ -159,9 +157,7 @@ async fn handle_local_management(
                 value.get("id"),
                 "malformed management frame",
             );
-            hub.reply(client, serde_json::to_value(&refused)?)
-                .await
-                .ok();
+            hub.try_reply(client, serde_json::to_value(&refused)?).ok();
             return Ok(true);
         };
         // prepare 走后台任务，**不**在读取循环里 await。
@@ -172,6 +168,21 @@ async fn handle_local_management(
         // 被串行化之后永远不重叠。其余管理方法很快，保持内联即可。
         let slow =
             request.method == SLOW_MANAGEMENT_METHOD || request.method == SLOW_AUTHORIZE_METHOD;
+        let slot = if slow {
+            match Arc::clone(&handle.ingress_slots).try_acquire_owned() {
+                Ok(slot) => Some(slot),
+                Err(_) => {
+                    let refused = crate::server::local_management::refusal_for(
+                        value.get("id"),
+                        "management ingress overloaded; retry later",
+                    );
+                    hub.try_reply(client, serde_json::to_value(refused)?).ok();
+                    return Ok(true);
+                }
+            }
+        } else {
+            None
+        };
         // 后台任务需要 `'static`：先克隆一份句柄，别借用外层绑定。
         let owned_handle = Arc::clone(handle);
         let deadline = yi_agent_lifecycle::deadline::Deadline::after(
@@ -180,6 +191,7 @@ async fn handle_local_management(
         let reply_to = client.clone();
         let reply_hub = Arc::clone(hub);
         let work = async move {
+            let _slot = slot;
             let response =
                 crate::server::local_management::dispatch(owned_handle.as_ref(), request, deadline)
                     .await;
@@ -195,14 +207,14 @@ async fn handle_local_management(
                     "management response exceeds the frame limit",
                 );
                 if let Ok(refused) = serde_json::to_value(&refused) {
-                    reply_hub.reply(&reply_to, refused).await.ok();
+                    reply_hub.try_reply(&reply_to, refused).ok();
                 }
                 return;
             }
             // 私有响应直接定向回写，**不**经 hub 广播、也不进
             // `app.emit`：它携带 epoch 与授权相关结果，前端页面
             // 不该看见，更不该能代答。
-            reply_hub.reply(&reply_to, frame).await.ok();
+            reply_hub.try_reply(&reply_to, frame).ok();
         };
         if slow {
             tokio::spawn(work);
@@ -591,12 +603,19 @@ where
         }};
     }
 
+    let local_required = hub.is_connected(&crate::broadcast::ClientId::local());
+    let mut local_health = tokio::time::interval(Duration::from_millis(200));
     loop {
         // 上传登记表的 TTL 清理：每轮循环开头收走超时的 staging 会话。放在这里
         // 而不是另起定时器，理由同通用会话驱动器——登记表是主循环局部量，`&mut`
         // 借用必须串行。
         uploads.sweep_expired();
         tokio::select! {
+            _ = local_health.tick(), if local_required => {
+                if !hub.is_connected(&crate::broadcast::ClientId::local()) {
+                    return Err(anyhow::anyhow!("local output disconnected; reconnect to recover final material"));
+                }
+            }
             // 合并模式:stdio 读端 EOF → 结束整个循环(并丢弃 `inbound`),故
             // 桌面关闭即整进程优雅退出(spec §3.2 不变量 4)。纯 stdio / 纯 ws
             // 下该 future 为 `pending`(或 `None` 分支永不就绪)。
@@ -1134,11 +1153,7 @@ where
             ev = turn_rx.recv() => {
                 if let Some(TurnEvent::Finished { thread_id, turn_id, reply, lead_request_id }) = ev {
                     if let Some(s) = threads.get_mut(&thread_id) {
-                        // 仅当完成的正是当前活跃 turn 时才清除,避免迟到的
-                        // 完成事件误清掉已开始的下一个 turn。
-                        if s.active_turn_id.as_deref() == Some(turn_id.as_str()) {
-                            s.active_turn_id = None;
-                        }
+                        complete_session_turn(s, &turn_id);
                     }
                     // 组长那轮跑完 = 阻塞等待方的收口时刻。只回填**这一轮**替其跑
                     // 的那个 request_id(身份随事件带上来);这一轮若与任何等待方
@@ -1473,4 +1488,9 @@ where
     }
 
     Ok(())
+}
+
+// Shared by the production consumer and its regression test.
+pub(crate) fn complete_session_turn(s: &mut crate::session::ThreadSession, turn_id: &str) {
+    s.finish_turn(turn_id);
 }

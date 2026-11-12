@@ -1854,8 +1854,10 @@ async fn session_commands_clear_the_stale_input_tokens_without_changing_the_hand
                 &status,
                 None,
                 &std::env::temp_dir(),
+                &mut Default::default(),
             )
-            .await;
+            .await
+            .0;
             answer
                 .await
                 .expect("the clear reply channel must be fulfilled")
@@ -1874,8 +1876,10 @@ async fn session_commands_clear_the_stale_input_tokens_without_changing_the_hand
                 &status,
                 None,
                 &std::env::temp_dir(),
+                &mut Default::default(),
             )
-            .await;
+            .await
+            .0;
             assert_eq!(
                 answer
                     .await
