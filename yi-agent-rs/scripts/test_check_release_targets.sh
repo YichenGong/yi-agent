@@ -17,7 +17,12 @@ SCRIPT="$HERE/check-release-targets.sh"
 
 # 绝对路径解析一次，后面用受限 PATH 调用时不必再依赖 PATH。
 BASH_ABS="$(command -v bash)"
-ZIG_ABS="$(command -v zig 2>/dev/null || true)"
+# zig 的绝对路径：`command -v` 在没有导出 PATH 时会落空，而这条断言是
+# 「环境缺失必须退 2」的防护，不能因为 shell 环境不同就被跳过。
+for candidate in "$(command -v zig 2>/dev/null)" \
+                 /opt/homebrew/bin/zig /usr/local/bin/zig /usr/bin/zig; do
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then ZIG_ABS="$candidate"; break; fi
+done
 
 FAILED=0
 n=0

@@ -118,11 +118,14 @@ jobs:
           # 并校验三平台 std 与 zig/zigbuild 真的可用。任一不满足即失败，
           # 避免把「环境不对」伪装成「代码编译错误」。
           source scripts/setup-build-env.sh
-          # 先确认三个目标都能编译，再花几分钟打包。打包本身也会暴露同一个
-          # 错误，但那是三条构建并行跑了 1 分多钟之后才失败（v0.1.14 的实际
-          # 耗时：两个 darwin 目标各 ~1m17s 成功，linux 目标才报 E0425）。
-          # 这步失败会点名是哪个 target，比读 package-all 的混合输出快。
-          just release-targets-check
+          # 这里**不**跑 `just release-targets-check`。它校验的正是下面
+          # `package-all` 要编的三个目标，放在这里是纯重复：实测让这一步从
+          # 2m36s（v0.1.13）涨到 8m13s，并多占 6.1G target 空间。发布失败的
+          # 信息量也不会更好——package-all 失败时同样会点名是哪个目标。
+          #
+          # 它的位置在 PR/合并前（GitLab `ci-push`），那才是能在 tag 之前
+          # 拦住「用了只有 macOS 才有的 API、却没有 cfg 隔离」的地方：
+          # v0.1.14 就是这么一路绿到 tag 才翻车的。
           just package-all
 
       - name: Verify the binary reports the release version
@@ -148,7 +151,24 @@ jobs:
         working-directory: yi-agent-rs
         run: |
           source "$HOME/.cargo/env"
-          just npm-pack-desktop
+          # 失败几乎没有信息量：`just` 只回一行 "exit status 1"，而真正的
+          # 原因（磁盘写满 / .app 缺失 / codesign 拒绝）要往上翻几十行。
+          # v0.1.15 的这次失败就因此无法从日志判断。runner 是持久机器，
+          # 磁盘与 target 目录状态本来就会漂移，所以先把它们打出来。
+          echo "== runner disk =="
+          df -h "$HOME" || true
+          echo "== target dir =="
+          du -sh "${CARGO_TARGET_DIR:-$PWD/target}" 2>/dev/null || true
+          rc=0
+          just npm-pack-desktop || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::npm-pack-desktop failed with code $rc"
+            echo "== disk after failure =="
+            df -h "$HOME" || true
+            echo "== bundle dir =="
+            ls -l "${CARGO_TARGET_DIR:-$PWD/target}/release/bundle/macos/" 2>&1 || true
+          fi
+          exit "$rc"
 
       - name: Verify the desktop app is in the npm package
         # 构建「成功」但 .app 没进包的情况最难查（用户装完发现没有 App）。

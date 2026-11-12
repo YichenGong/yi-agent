@@ -55,11 +55,22 @@ cd "$MANIFEST_DIR" || fail "cannot cd to $MANIFEST_DIR"
 status=0
 for target in $TARGETS; do
   printf '== %s ==\n' "$target"
-  # 用 release profile 完整构建，与 `just build-target` / release.yml 的打包
-  # 路径一致。`cargo zigbuild --check` 不存在（该子命令不接受 --check），
-  # 裸 `cargo check --target linux` 又会卡在 cc-rs 找 C 交叉编译器上，
-  # 那证明的是环境不齐而非代码能否编译。
-  if ! cargo zigbuild --release --locked --target "$target" 2>&1 | tail -25; then
+  # 编译命令必须与 `just build-target` 逐字一致（规则也一样：只有 linux 走
+  # zigbuild），否则连环后果是实测过的：
+  #   同样的 darwin 目标，`cargo zigbuild` 与 `cargo build` 的链接器配置不同，
+  #   指纹不共享，于是这里会把另两个 darwin 目标完整重编一遍。v0.1.15 的
+  #   release 里第 10 步因此从 2m36s 涨到 8m13s，并且污染了下一步要复用的
+  #   target 缓存。命令对齐后，紧跟 package-all 跑几乎是白拿。
+  #
+  # `cargo zigbuild --check` 不存在（该子命令不接受 --check），裸
+  # `cargo check --target linux` 又会卡在 cc-rs 找 C 交叉编译器上——那证明的
+  # 是环境不齐而非代码能否编译，所以这里只能真编。
+  if echo "$target" | grep -q linux; then
+    build=(cargo zigbuild --release --target "$target")
+  else
+    build=(cargo build --release --target "$target")
+  fi
+  if ! "${build[@]}" 2>&1 | tail -25; then
     printf 'release-targets-check: %s does not compile\n' "$target" >&2
     status=1
   fi
