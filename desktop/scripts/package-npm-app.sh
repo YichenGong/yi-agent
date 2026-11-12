@@ -68,6 +68,35 @@ log "构建 sidecar（release 模式 CLI）"
 
 gh_note "stage: tauri build"
 log "tauri build（只出 .app）"
+
+# tauri-build 会把 sidecar 复制到 `<target>/release/yi-agent`，复制前对已存在
+# 的目标文件做 `fs::remove_file(...).unwrap()`（tauri-build-2.6.3/src/lib.rs:80）。
+# 那个 unwrap 在删除失败时直接 panic，错误是
+#   Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+#
+# self-hosted runner 是持久机器，`CARGO_TARGET_DIR` 跨 run 复用；一次被中断的
+# 构建足够留下一个删不掉的残留（只读位 / immutable 标志 / 中途 kill）。之后
+# 每次构建都在 33 秒左右的同一位置挂掉，而本地（缓存干净）永远复现不出来。
+#
+# 所以构建前先把它清掉：先给写权限再删，两者都失败才算真错误。
+TAURI_TARGET_DIR_PRE="$(cargo metadata --manifest-path "$HERE/src-tauri/Cargo.toml" \
+  --format-version 1 --no-deps 2>/dev/null \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+[ -n "$TAURI_TARGET_DIR_PRE" ] || TAURI_TARGET_DIR_PRE="$HERE/src-tauri/target"
+STALE_SIDECAR="$TAURI_TARGET_DIR_PRE/release/yi-agent"
+if [ -e "$STALE_SIDECAR" ]; then
+  log "清理陈旧的 externalBin 目标: $STALE_SIDECAR"
+  chmod u+w "$STALE_SIDECAR" 2>/dev/null || true
+  chflags nouchg "$STALE_SIDECAR" 2>/dev/null || true
+  rm -f "$STALE_SIDECAR" 2>/dev/null || true
+  if [ -e "$STALE_SIDECAR" ]; then
+    echo "ERROR: 无法删除 $STALE_SIDECAR（tauri-build 会在同一位置 panic）" >&2
+    ls -lO "$STALE_SIDECAR" >&2 || true
+    gh_err "cannot remove stale externalBin target: $STALE_SIDECAR"
+    exit 1
+  fi
+fi
+
 # 完整输出落盘，失败时把尾部转成 annotation。原因：这个仓库是私有的，CI
 # 日志要 admin 权限才能读（匿名 API 对 logs 与 job logs 都回 403），唯一能
 # 匿名读到的是 check-run annotations。而 `tauri build` 的失败原因藏在几十行
