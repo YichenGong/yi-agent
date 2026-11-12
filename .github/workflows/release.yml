@@ -197,6 +197,15 @@ jobs:
           du -sh "${CARGO_TARGET_DIR:-$PWD/target}" 2>/dev/null || true
           rc=0
           just npm-pack-desktop || rc=$?
+          # 脚本 0 退但产物不在，是第 14 步 0 秒失败的那种形状（v0.1.15 的
+          # 第七次就是）。这里立刻核对产物，避免下一段只能看到一个缺失断言。
+          PKG_DIR="yi-agent-cli/platforms/darwin-arm64"
+          if [ -d "$PKG_DIR/yi-agent.app" ]; then
+            echo "::notice title=npm-package::packaged $(du -sh "$PKG_DIR/yi-agent.app" | cut -f1)"
+          else
+            echo "::error title=npm-package::no yi-agent.app in $(pwd)/$PKG_DIR after packaging (rc=$rc)"
+            ls -la "$PKG_DIR" 2>&1 || true
+          fi
           if [ "$rc" -ne 0 ]; then
             echo "::error::npm-pack-desktop failed with code $rc"
             echo "== disk after failure =="
