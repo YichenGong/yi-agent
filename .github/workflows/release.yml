@@ -47,6 +47,40 @@ jobs:
           echo "CARGO_TARGET_DIR=$HOME/cargo-target/github"
           ls -ld "$HOME/cargo-target/github"
 
+          # 持久 runner 上最容易踩的一颗雷，必须在**任何**构建之前清掉：
+          # `$CARGO_TARGET_DIR/release/build/yi-agent` 这个名字被两方争夺——
+          #   - cargo 的 build script 目录：release/build/<pkg>/<hash>/out，
+          #     这里要求 `yi-agent` 是**目录**；
+          #   - tauri-build 的 externalBin 目标：它会把 sidecar 复制成
+          #     release/build/yi-agent，也就是把这个名字变成**文件**。
+          # 上一轮 release 第 13 步跑完就留下那个文件，于是下一轮第 10 步的
+          # `package-all` 在 2 秒内以
+          #   error: failed to create directory
+          #   `.../release/build/yi-agent/7f9f392ebb96ba69/out`
+          #   Caused by: Not a directory (os error 20)
+          # 退出 101。第 10 步先于第 13 步运行，所以只在第 13 步清理没用。
+          #
+          # 同时解父目录：实测该类残留常伴随 `release/build` 变成
+          # `dr-xr-xr-x` + `uchg`，不解父目录则文件删不掉。
+          STALE="$HOME/cargo-target/github/release/build/yi-agent"
+          if [ -e "$STALE" ] && [ ! -d "$STALE" ]; then
+            echo "::notice title=runner::removing stale externalBin file $STALE"
+            ls -lO "$STALE" || true
+            chflags nouchg "$(dirname "$STALE")" 2>/dev/null || true
+            chmod u+w "$(dirname "$STALE")" 2>/dev/null || true
+            chmod u+w "$STALE" 2>/dev/null || true
+            chflags nouchg "$STALE" 2>/dev/null || true
+            rm -f "$STALE" || true
+            if [ -e "$STALE" ]; then
+              echo "::error title=runner::cannot remove $STALE"
+              exit 1
+            fi
+          elif [ -d "$STALE" ]; then
+            # 目录形态是上面说的正常缓存结构时不要动；它若是 cargo 的
+            # build script 输出目录，删掉只会让这一轮重编一个 crate。
+            ls -ldO "$STALE" || true
+          fi
+
       - name: Verify the tag is on main
         run: |
           # release.yml 只由 tag 触发，且只打包、不跑测试。一个打在未合并
